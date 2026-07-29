@@ -41,47 +41,37 @@ be **trashed once 2.0 verifies** (do NOT push it anywhere).
 | `5dbe50f` | **Engine surgery: all 20 D-rules land; acceptance + 42 unit tests green** |
 | `290a73d` | Refine D20 (fixed 44 m11-inversion regressions) |
 | `0d0926e` | Fix invisible white-key separators (bug the owner caught on-device) |
+| `da487fa` | This HANDOFF doc |
+| `60bc651` | **Verify phase: teach layer + differential classification + D21 note-drop fixes** |
 
-**The engine is complete and green:** `cargo test -p ivory-core` → 42 unit +
-3 acceptance groups (200+ vectors, both flat/sharp naming), all pass. The GUI
-builds, launches on this Mac, and was screenshot-verified against the reference
-build (window, geometry, colors, dark-mode idle-swap, separators, CLI parity).
+**Engine + teach + verify are all DONE and green.** `cargo test --workspace` →
+GUI 11 + engine 54 unit + 3 acceptance + differential(fast); `--features
+learning` → 58 + 3. The verify workflow (classifier + adversarial reviewer +
+teach agent) completed:
+- **Teach layer done**: `overrides.rs` (exact overrides + feature-gated
+  `learning` perceptron, off by default, zero-weights no-op), wired into the
+  detector (consulted before scoring) and the two GUI menu items. 0 engine
+  regressions vs the frozen baseline.
+- **Classification done** (`tests/golden/`): `rust-golden.json` (frozen
+  baseline), `classified-divergences.json` (every corpus divergence → D-rule),
+  `classify.py`, `UNEXPLAINED.md`, `README.md`, and
+  `ivory-core/tests/differential.rs` (self-consistency guard — regenerate the
+  baseline + re-run `classify.py` after ANY engine change; procedure in
+  `tests/golden/README.md`). Corpus mismatch vs raw Python is now 5057.
+- **Adversarial review done**: no misfire found in the 7 broad scoring changes.
+- **D21 note-drop fixes**: the classifier caught 28 drop-2 voicings dropping a
+  #5/#11; fixed via a completeness preference + a maj7#11 perfect-inversion
+  boost. One residual non-blocking slash-simplify note-drop is documented in
+  DIVERGENCES.md D21 and `tests/golden/UNEXPLAINED.md` (top note).
 
-### In flight (a background Workflow was running at last checkpoint)
-A `Workflow` named **ivory-verify** (3 parallel agents) was editing files when
-this doc was written. Uncommitted changes touch: `ivory-core/src/{detector.rs,
-lib.rs,overrides.rs}`, `ivory/src/menu.rs`, both Cargo.toml, Cargo.lock. The
-three agents:
-- **classify** — writes `tests/golden/{rust-golden.json, classified-divergences.json,
-  classify.py, README.md, UNEXPLAINED.md}` + `ivory-core/tests/differential.rs`.
-  Its job: prove every one of the ~5195 corpus divergences vs raw Python is an
-  intended D-rule fix, and **flag genuine regressions** (musically wrong answers
-  Python got right). **When it lands, read `tests/golden/UNEXPLAINED.md` — the
-  suspected-regression list is the thing to act on.**
-- **review** — adversarial engine reviewer; reports confirmed misfires of the
-  broad scoring changes (D4 shell penalty, "13 needs its 13th" skip, dominant9
-  inversion, D5 blanket-380 gate, rootless re-root, 9#11_no5). Read-only.
-- **teach** — implements `overrides.rs` (already substantially written) + wires
-  the two GUI menu items. Adds the `learning` cargo feature (off by default).
-
-**On resume:** check the workflow result (its transcript dir is under
-`~/.claude/projects/.../subagents/workflows/`), or just check
-`git status` + run the test/verification commands in §5. If the workflow died
-mid-edit, `cargo test -p ivory-core` will tell you if the tree is coherent;
-worst case `git checkout -- <file>` any half-written file and re-run the
-relevant agent (the teach layer and classifier are both re-runnable).
-
-### Remaining work (tasks 6-8)
-- **Teach layer** (task 6): finish/verify `overrides.rs` + GUI dialogs (the
-  workflow's `teach` agent). Acceptance: `cargo test -p ivory-core` green with
-  AND without `--features learning`; the two menu items work.
-- **Verify** (task 7): act on the classifier/reviewer findings (fix real
-  regressions), run `/code-review` or an adversarial pass, confirm the app
-  end-to-end.
-- **Finalize** (task 8): packaging dry-run (`scripts/build-macos.sh`,
-  `build-cross.sh`), real icon art (current `assets/ivory.png` is a 543-byte
-  placeholder — **blocks release**), push to Codeberg (see §7), then trash
-  `~/Dropbox/Projects/Apps/ivory-rust`.
+### Remaining work (task 8 — FINALIZE only)
+Everything above is committed. What's left is packaging + release + cleanup:
+- Real icon art (current `assets/ivory.png` is a 543-byte placeholder — **blocks
+  release**), then packaging dry-run (`scripts/build-macos.sh`, `build-cross.sh`).
+- Push to Codeberg (see §7), then trash `~/Dropbox/Projects/Apps/ivory-rust`.
+- Optional polish: 7 cosmetic unused-variable warnings in `ivory-core` (inherited
+  from the base); reconcile `docs/DESIGN.md`/`DIVERGENCES.md` prose with the
+  final implemented mechanisms if desired (HANDOFF §4 is already accurate).
 
 ---
 
