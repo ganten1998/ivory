@@ -128,12 +128,29 @@ are post-review.
 - **D19** (B27): dead code not ported: `INVERSION_NAMES`, `PREFER_FLATS`
   global, ignored `lowest_note` param.
 - **D20** (new, per review — the load-bearing mechanism behind D2/D7/D11):
-  the m11-family "perfect match" +8000 bonus applies only when root ==
-  bass. Root-position m11 voicings keep it (F#-A-B-E → `Gbm11`, #73);
-  non-bass m11 readings compete on ordinary scoring, letting bass-coherent
-  sus/6-9/7sus readings win (C-F-G-Bb → `C7sus4`; spread C-Bb-D-F-G →
-  `C9(sus)`; C-G-A-D → `C6/9`). Corpus-impact audited during
-  classification.
+  the m11-family "perfect match" +8000 bonus is suppressed only when the bass
+  roots the competing resolved chord — bass interval ∈ {3 (relative-major
+  6/9), 5 (the 9sus root)}. Root-position m11 voicings keep it (F#-A-B-E →
+  `Gbm11`, #73), and inversions where the bass is another chord tone (a Gm11
+  drop-2 with the 9th in the bass) stay `Gm11`; only the two competing-root
+  intervals demote it, letting bass-coherent sus/6-9/7sus readings win
+  (C-F-G-Bb → `C7sus4`; spread C-Bb-D-F-G → `C9(sus)`; C-G-A-D → `C6/9`).
+  (The initial blunt root==bass gate flipped 44 m11 inversions to the relative
+  major; the interval-{3,5} refinement fixed them. Corpus-audited.)
+- **D21** (new, from the differential classifier's regression hunt): two
+  linked completeness fixes so a reading never hides a played tension.
+  (a) When the top-scored reading drops a sounded note (extra > 0) and a
+  note-complete reading (extra == 0) scored within 12 points, the complete
+  one wins — fixes drop-2 voicings where a bare triad/Δ7 edged the full
+  tertian by ~2 points via the inversion bonus (Ab-C-E-B → `CΔ7#5/Ab`, not
+  `E/Ab`; a maj7#5 drop-2, 15 rows). (b) The major7#11 boost also applies to a
+  perfect full voicing (5th present, nothing missing/extra) from a non-bass
+  root — a genuine inversion (B-C-E-F#-G → `CΔ7(#11)/B`, 13 rows) — while a
+  no-5th shell from a non-bass root stays gated so v120 (E-A-Bb-D →
+  `Em7b5(11)`) is preserved. KNOWN RESIDUAL: a slash-simplification step can
+  still drop a #11 on a non-root-bass tritone voicing (Bb-C-E-F# → `Gb7/Bb`);
+  left as a documented limitation (reviewer-rated non-blocking; Python is also
+  wrong; the slash logic is parity-critical).
 
 Naming preference note: all examples above are written in flats
 (prefer_flats=true, the default); every rule is pitch-class-relational and

@@ -2,3 +2,6 @@
 /dist
 *.app
 .DS_Store
+
+# python classifier cache
+tests/golden/__pycache__/

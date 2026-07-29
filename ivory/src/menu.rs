@@ -200,19 +200,19 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         }
     }
     // D-UI-5: teach items, inside the detection block, right after the
-    // Detach/Attach entry, preceded by their own separator.
-    // TEACH-HOOK(D-UI-5): a later agent enables these ("Teach Chord Name..."
-    // greyed only when !view.notes_held) and wires the teach dialogs.
+    // Detach/Attach entry, preceded by their own separator. "Teach Chord
+    // Name..." is greyed only when no notes are held; "Manage Taught
+    // Chords..." is always available.
     e.push(Entry::Separator);
     e.push(Entry::Item {
         label: "Teach Chord Name...".to_owned(),
         action: MenuAction::TeachChordName,
-        enabled: false,
+        enabled: view.notes_held,
     });
     e.push(Entry::Item {
         label: "Manage Taught Chords...".to_owned(),
         action: MenuAction::ManageTaughtChords,
-        enabled: false,
+        enabled: true,
     });
     e.push(Entry::Separator);
     e.push(item("About", MenuAction::ShowAbout));

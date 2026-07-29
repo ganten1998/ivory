@@ -9,6 +9,7 @@ use egui::{
     Align, Button, Color32, CornerRadius, FontId, Layout, RichText, Stroke, Vec2, ViewportBuilder,
     ViewportId,
 };
+use ivory_core::OverrideInfo;
 
 pub enum Dialog {
     MidiPicker {
@@ -25,14 +26,37 @@ pub enum Dialog {
         target: ColorTarget,
         color: Color32,
     },
-    // TEACH-HOOK(D-UI-5): TeachChord { .. } and ManageTaught { .. } dialogs
-    // are added here by a later agent (notes + current label + name input +
-    // "apply in all keys"; list + delete).
+    // D-UI-5 teach dialogs.
+    TeachChord {
+        /// Snapshot of the held MIDI notes (used to key the override on save).
+        notes: Vec<u8>,
+        /// Held notes pre-rendered as names under the active preference.
+        note_names: String,
+        /// The current detected label (or a placeholder when none).
+        current_label: String,
+        /// Editable name, prefilled with the current label.
+        input: String,
+        apply_all_keys: bool,
+    },
+    ManageTaught {
+        rows: Vec<OverrideInfo>,
+    },
 }
 
 pub enum DialogAction {
     ConnectPort(String),
     ApplyColor(ColorTarget, Color32),
+    /// Teach `name` for the held `notes`, transposition-invariant when
+    /// `apply_all_keys` and the name begins with a note name.
+    TeachSave {
+        notes: Vec<u8>,
+        name: String,
+        apply_all_keys: bool,
+    },
+    /// Delete the override with this interval-set-from-bass key.
+    DeleteOverride {
+        intervals: Vec<u8>,
+    },
 }
 
 fn dialog_vp_id() -> ViewportId {
@@ -372,6 +396,157 @@ pub fn show(
                         });
                 },
             )
+        }
+
+        Dialog::TeachChord {
+            notes,
+            note_names,
+            current_label,
+            input,
+            apply_all_keys,
+        } => {
+            let t = theme(dark_mode);
+            let notes = notes.clone();
+            show_dialog_viewport(
+                ctx,
+                "Teach Chord Name",
+                Vec2::new(420.0, 240.0),
+                Vec2::new(360.0, 200.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.visuals_mut().extreme_bg_color = t.bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!("Notes: {note_names}"))
+                                    .font(bold(12.0))
+                                    .color(t.text),
+                            );
+                            ui.label(
+                                RichText::new(format!("Detected: {current_label}"))
+                                    .font(bold(12.0))
+                                    .color(t.text),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(RichText::new("Name:").font(bold(11.0)).color(t.text));
+                            let edit = egui::TextEdit::singleline(input)
+                                .font(bold(12.0))
+                                .text_color(t.text)
+                                .desired_width(f32::INFINITY);
+                            ui.add(edit);
+                            ui.add_space(6.0);
+                            let mut apply = *apply_all_keys;
+                            if ui
+                                .checkbox(
+                                    &mut apply,
+                                    RichText::new("Apply in all keys")
+                                        .font(bold(11.0))
+                                        .color(t.text),
+                                )
+                                .changed()
+                            {
+                                *apply_all_keys = apply;
+                            }
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let ok_enabled = !input.trim().is_empty();
+                                if ui
+                                    .add_enabled(
+                                        ok_enabled,
+                                        Button::new(RichText::new("OK").color(t.text)),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::TeachSave {
+                                        notes: notes.clone(),
+                                        name: input.trim().to_owned(),
+                                        apply_all_keys: *apply_all_keys,
+                                    });
+                                    result.close = true;
+                                }
+                                if ui
+                                    .add(Button::new(RichText::new("Cancel").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
+        Dialog::ManageTaught { rows } => {
+            let t = theme(dark_mode);
+            let mut to_delete: Option<Vec<u8>> = None;
+            let r = show_dialog_viewport(
+                ctx,
+                "Manage Taught Chords",
+                Vec2::new(460.0, 360.0),
+                Vec2::new(360.0, 240.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            if rows.is_empty() {
+                                ui.label(
+                                    RichText::new("No taught chords yet.")
+                                        .font(bold(12.0))
+                                        .color(t.text),
+                                );
+                            }
+                            let bottom_h = 34.0;
+                            let list_h = (ui.available_height() - bottom_h).max(40.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(list_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for row in rows.iter() {
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .add(Button::new(
+                                                    RichText::new("Delete").color(t.text),
+                                                ))
+                                                .clicked()
+                                            {
+                                                to_delete = Some(row.intervals.clone());
+                                            }
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{}   [{}]",
+                                                    row.display_name, row.voicing
+                                                ))
+                                                .font(bold(12.0))
+                                                .color(t.text),
+                                            );
+                                        });
+                                    }
+                                });
+                            ui.add_space(6.0);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(Button::new(RichText::new("Close").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            );
+            if let Some(intervals) = to_delete {
+                // Reflect the deletion locally so the list updates immediately,
+                // and tell the app to persist it.
+                rows.retain(|r| r.intervals != intervals);
+                action = Some(DialogAction::DeleteOverride { intervals });
+            }
+            r
         }
     };
 

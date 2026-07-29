@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use crate::patterns::*;
+use crate::overrides::OverrideStore;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -38,6 +39,14 @@ pub struct ChordDetector {
     pub max_notes_for_chord: usize,
     debug_mode: bool,
     debug_candidates: Vec<(String, f64)>,
+    /// Teach-layer store, consulted before scoring. `None` => stock behavior,
+    /// byte-identical to a detector that never had a store (the 42 unit tests
+    /// and the differential harness both run with no store).
+    overrides: Option<OverrideStore>,
+    /// Learned-re-ranker candidate capture, active only while
+    /// `train_on_correction` is collecting features.
+    #[cfg(feature = "learning")]
+    learn_capture: Option<Vec<(String, crate::overrides::CandidateFeatures)>>,
 }
 
 impl Default for ChordDetector {
@@ -54,11 +63,84 @@ impl ChordDetector {
             max_notes_for_chord: 7,
             debug_mode: false,
             debug_candidates: Vec::new(),
+            overrides: None,
+            #[cfg(feature = "learning")]
+            learn_capture: None,
         }
     }
 
     pub fn set_note_preference(&mut self, prefer_flats: bool) {
         self.prefer_flats = prefer_flats;
+    }
+
+    // ── teach layer ────────────────────────────────────────────────────────
+
+    /// Attach an override store (builder form).
+    pub fn with_overrides(mut self, store: OverrideStore) -> Self {
+        self.overrides = Some(store);
+        self
+    }
+
+    /// Replace (or clear) the override store. `None` restores stock behavior.
+    pub fn set_overrides(&mut self, store: Option<OverrideStore>) {
+        self.overrides = store;
+    }
+
+    pub fn overrides(&self) -> Option<&OverrideStore> {
+        self.overrides.as_ref()
+    }
+
+    pub fn overrides_mut(&mut self) -> Option<&mut OverrideStore> {
+        self.overrides.as_mut()
+    }
+
+    /// Exact teach-layer lookup, consulted before any scoring. `None` when there
+    /// is no store or no exact interval-set-from-bass match.
+    fn override_lookup(&self, notes: &HashSet<u8>) -> Option<String> {
+        self.overrides
+            .as_ref()
+            .and_then(|s| s.lookup(notes, self.prefer_flats))
+    }
+
+    /// Learned re-ranker: nudge the store's weights so this voicing scores
+    /// `correct_label` above the reading it currently produces. Requires an
+    /// attached store; does nothing if the correct label is not among the
+    /// scored candidates (the re-ranker only reorders existing candidates).
+    #[cfg(feature = "learning")]
+    pub fn train_on_correction(&mut self, notes: &HashSet<u8>, correct_label: &str) {
+        if self.overrides.is_none() {
+            return;
+        }
+        // Collect every scored candidate's (name, features) for this voicing.
+        self.learn_capture = Some(Vec::new());
+        let winner = self.detect_chord(notes);
+        let captured = self.learn_capture.take().unwrap_or_default();
+
+        let correct = captured.iter().find(|(name, _)| name == correct_label);
+        let (Some((_, correct_f)), Some(winner)) = (correct, winner) else {
+            return;
+        };
+        // Train against whatever currently wins (if it is already correct,
+        // nothing to do).
+        if winner == correct_label {
+            return;
+        }
+        let wrong_f = match captured.iter().find(|(name, _)| *name == winner) {
+            Some((_, f)) => *f,
+            None => return,
+        };
+        let correct_f = *correct_f;
+        if let Some(store) = self.overrides.as_mut() {
+            store.train(&correct_f, &wrong_f);
+        }
+    }
+
+    /// Forget all learned weights.
+    #[cfg(feature = "learning")]
+    pub fn reset_learning(&mut self) {
+        if let Some(store) = self.overrides.as_mut() {
+            store.reset_learning();
+        }
     }
 
     pub fn get_note_name(&self, pitch_class: u8) -> &'static str {
@@ -69,6 +151,17 @@ impl ChordDetector {
     // ── public API ───────────────────────────────────────────────────────────
 
     pub fn detect_chord(&mut self, active_notes_in: &HashSet<u8>) -> Option<String> {
+        if active_notes_in.is_empty() {
+            return None;
+        }
+
+        // Teach layer: an exact interval-set-from-bass override wins outright,
+        // before any scoring. No store => this is a no-op and behavior is
+        // identical to the stock engine.
+        if let Some(name) = self.override_lookup(active_notes_in) {
+            return Some(name);
+        }
+
         let n = active_notes_in.len();
         if n < self.min_notes_for_chord {
             return None;
@@ -243,6 +336,19 @@ impl ChordDetector {
         let mut best_match: Option<String> = None;
         let mut best_score: f64 = 0.0;
         let mut best_root_pc: u8 = 0;
+        // Best reading that leaves NO sounded note unexplained, plus whether the
+        // overall best dropped a note. Used to prefer a complete reading over a
+        // near-tie that hides a played tension (maj7#5/maj7#11 drop-2 voicings).
+        let mut best_complete: Option<(String, f64, u8)> = None;
+        let mut best_is_complete = true;
+
+        #[cfg(feature = "learning")]
+        let learn_span = (active_notes.iter().max().copied().unwrap_or(0)
+            - active_notes.iter().min().copied().unwrap_or(0)) as u8;
+        #[cfg(feature = "learning")]
+        let learn_clustered = self.is_clustered(&active_notes);
+        #[cfg(feature = "learning")]
+        let learn_note_count = active_notes.len() as u8;
 
         for &root_pc in &pcs_all {
             let intervals: Vec<u8> = pcs_all.iter()
@@ -250,20 +356,62 @@ impl ChordDetector {
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter().collect();
 
-            if let Some((chord_name, score)) = self.match_chord_pattern(
+            if let Some((chord_name, score, complete)) = self.match_chord_pattern(
                 &intervals, root_pc, &active_notes,
                 highest_note, highest_pc, lowest_pc, has_global_dominant_quality,
             ) {
+                // Feature-gated learned re-ranker. With no store, learning off,
+                // or zero (untrained) weights this adds exactly 0.0, so the
+                // default build and the differential harness are unaffected.
+                #[allow(unused_mut)]
+                let mut score = score;
+                #[cfg(feature = "learning")]
+                {
+                    let feats = crate::overrides::CandidateFeatures {
+                        root_bass_interval: pc_interval(root_pc, lowest_pc),
+                        span: learn_span,
+                        note_count: learn_note_count,
+                        clustered: learn_clustered,
+                        root_is_bass: root_pc == lowest_pc,
+                        pattern_hash: crate::overrides::pattern_class_hash(&chord_name),
+                    };
+                    if let Some(store) = self.overrides.as_ref() {
+                        score += store.learning_adjustment(&feats);
+                    }
+                    if let Some(buf) = self.learn_capture.as_mut() {
+                        buf.push((chord_name.clone(), feats));
+                    }
+                }
                 if self.debug_mode {
                     self.debug_candidates.push((chord_name.clone(), score));
+                }
+                if complete && score > best_complete.as_ref().map_or(0.0, |c| c.1) {
+                    best_complete = Some((chord_name.clone(), score, root_pc));
                 }
                 if score > best_score {
                     best_score = score;
                     best_match = Some(chord_name);
                     best_root_pc = root_pc;
+                    best_is_complete = complete;
                 }
             }
         }
+
+        // If the winning reading dropped a sounded note (extra_count > 0) but a
+        // note-complete reading scored within a small margin, prefer the complete
+        // one — it names every played tension (fixes maj7#5/maj7#11 drop-2 voicings
+        // and tritone-subs where a bare triad/Δ7 edged the full tertian by ~2 pts).
+        if !best_is_complete {
+            if let Some((cname, cscore, croot)) = best_complete.clone() {
+                if cscore >= best_score - 12.0 {
+                    best_match = Some(cname);
+                    best_score = cscore;
+                    best_root_pc = croot;
+                    best_is_complete = true;
+                }
+            }
+        }
+        let _ = best_is_complete;
 
         // Dim7 + M3 below = 7(b9) override
         if pcs_all.len() == 4 || pcs_all.len() == 5 {
@@ -286,7 +434,7 @@ impl ChordDetector {
                             .map(|&pc| pc_interval(potential_root, pc))
                             .collect::<std::collections::BTreeSet<_>>()
                             .into_iter().collect();
-                        if let Some((cname, cscore)) = self.match_chord_pattern(
+                        if let Some((cname, cscore, _)) = self.match_chord_pattern(
                             &intervals_from_root, potential_root, &active_notes,
                             highest_note, highest_pc, lowest_pc, has_global_dominant_quality,
                         ) {
@@ -329,7 +477,7 @@ impl ChordDetector {
                         .map(|&pc| pc_interval(lowest_pc, pc))
                         .collect::<std::collections::BTreeSet<_>>()
                         .into_iter().collect();
-                    if let Some((cname, _)) = self.match_chord_pattern(
+                    if let Some((cname, _, _)) = self.match_chord_pattern(
                         &ivs, lowest_pc, &active_notes,
                         highest_note, highest_pc, lowest_pc, has_global_dominant_quality,
                     ) {
@@ -676,7 +824,7 @@ impl ChordDetector {
                 .map(|&pc| pc_interval(root_pc, pc))
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter().collect();
-            if let Some((name, score)) = self.match_chord_pattern(
+            if let Some((name, score, _)) = self.match_chord_pattern(
                 &intervals, root_pc, active_notes, highest, highest_pc, lowest_pc, has_gdq,
             ) {
                 if score > best_score { best_score = score; best = Some(name); }
@@ -759,8 +907,8 @@ impl ChordDetector {
         highest_pc: u8,
         lowest_pc: u8,
         has_global_dominant_quality: bool,
-    ) -> Option<(String, f64)> {
-        let mut best_match: Option<(String, f64)> = None;
+    ) -> Option<(String, f64, bool)> {
+        let mut best_match: Option<(String, f64, bool)> = None;
         let mut best_score = 0.0_f64;
 
         let input_pc_count = active_notes.iter().map(|&n| n % 12).collect::<HashSet<_>>().len();
@@ -915,7 +1063,10 @@ impl ChordDetector {
 
                 let root_name = self.get_note_name(final_root);
                 let chord_name = format_chord_name(root_name, final_type);
-                best_match = Some((chord_name, score));
+                // `complete` = this pattern leaves no sounded pitch class
+                // unexplained (extra_count == 0). Used to prefer a note-complete
+                // reading over one that drops a tension (see detect_chord).
+                best_match = Some((chord_name, score, extra_count == 0));
             }
         }
         best_match
@@ -1018,11 +1169,14 @@ impl ChordDetector {
             }
         }
 
-        // Major extended with #11 — only when the major-7 root is itself in the bass.
-        // From a non-bass root this shell must not out-bonus a bass-rooted reading
-        // (E-A-Bb-D is Em7b5(11), not BbΔ7(#11)).
+        // Major extended with #11. Boost when the major-7 root is in the bass, OR
+        // when it is a PERFECT full voicing (5th present, nothing missing/extra) —
+        // that is a genuine inversion like CΔ7(#11)/B and should win. A no-5th shell
+        // from a non-bass root stays gated, so E-A-Bb-D is Em7b5(11), not BbΔ7(#11).
         if matches!(chord_type, "major7#11"|"major7#11_no5"|"major9#11"|"major13#11")
-            && intervals_set.contains(&6) && root_pc == lowest_pc
+            && intervals_set.contains(&6)
+            && (root_pc == lowest_pc
+                || (missing_count == 0 && extra_count == 0 && intervals_set.contains(&7)))
         {
             bonus += if missing_count == 0 && extra_count == 0 { 250.0 } else if missing_count <= 1 { 150.0 } else { 0.0 };
         }

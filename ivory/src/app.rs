@@ -13,7 +13,7 @@ use crate::midi;
 use crate::piano;
 use crate::settings::{Rgb, Settings};
 use egui::{Pos2, Rect, Vec2, ViewportCommand};
-use ivory_core::ChordDetector;
+use ivory_core::{ChordDetector, OverrideStore};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -71,6 +71,10 @@ impl IvoryApp {
 
         let mut detector = ChordDetector::new();
         detector.set_note_preference(settings.prefer_flats);
+        // Teach layer: load user overrides (~/.config/ivory/overrides.json).
+        // A missing or corrupt file yields an empty store; the detector then
+        // behaves exactly like the stock engine until something is taught.
+        detector.set_overrides(Some(OverrideStore::load()));
 
         let (midi_tx, midi_rx) = mpsc::channel();
         // Startup connection (spec §10): explicit -p port, else auto-connect
@@ -375,10 +379,8 @@ impl IvoryApp {
             }
             MenuAction::DetachChordWindow => self.detach_chord_window(),
             MenuAction::AttachChordWindow => self.reattach_chord_window(),
-            MenuAction::TeachChordName | MenuAction::ManageTaughtChords => {
-                // TEACH-HOOK(D-UI-5): wired by a later agent. Unreachable
-                // while the menu items are disabled stubs.
-            }
+            MenuAction::TeachChordName => self.open_teach_dialog(),
+            MenuAction::ManageTaughtChords => self.open_manage_dialog(),
             MenuAction::ShowAbout => self.dialog = Some(Dialog::About),
             MenuAction::ResetSettings => self.reset_settings(ctx),
         }
@@ -407,8 +409,68 @@ impl IvoryApp {
         self.settings.save();
     }
 
+    // ── Teach layer (D-UI-5) ───────────────────────────────────────────────
+
+    /// Open "Teach Chord Name…" for the currently-held voicing. No-op if
+    /// nothing is held (the menu item is greyed in that case anyway).
+    fn open_teach_dialog(&mut self) {
+        let display = self.display_notes();
+        if display.is_empty() {
+            return;
+        }
+        // Render the chord tones from the bass, matching the stored key and the
+        // "Manage" voicing display.
+        let (bass_pc, ivs) = OverrideStore::interval_set_from_bass(&display);
+        let note_names = ivs
+            .iter()
+            .map(|&iv| self.detector.get_note_name((bass_pc + iv) % 12))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let current_label = self
+            .current_chord
+            .clone()
+            .unwrap_or_else(|| "(none)".to_owned());
+        let input = self.current_chord.clone().unwrap_or_default();
+        let mut notes: Vec<u8> = display.iter().copied().collect();
+        notes.sort_unstable();
+        self.dialog = Some(Dialog::TeachChord {
+            notes,
+            note_names,
+            current_label,
+            input,
+            apply_all_keys: false,
+        });
+    }
+
+    /// Open "Manage Taught Chords…" listing all stored overrides.
+    fn open_manage_dialog(&mut self) {
+        let rows = self
+            .detector
+            .overrides()
+            .map(|s| s.list(self.settings.prefer_flats))
+            .unwrap_or_default();
+        self.dialog = Some(Dialog::ManageTaught { rows });
+    }
+
     fn apply_dialog_action(&mut self, ctx: &egui::Context, action: DialogAction) {
         match action {
+            DialogAction::TeachSave {
+                notes,
+                name,
+                apply_all_keys,
+            } => {
+                let set: HashSet<u8> = notes.iter().copied().collect();
+                if let Some(store) = self.detector.overrides_mut() {
+                    store.teach(&set, &name, apply_all_keys);
+                }
+                self.detection_tick(true); // re-detect immediately (D-UI-5)
+            }
+            DialogAction::DeleteOverride { intervals } => {
+                if let Some(store) = self.detector.overrides_mut() {
+                    store.delete(&intervals);
+                }
+                self.detection_tick(true);
+            }
             DialogAction::ConnectPort(name) => {
                 // Close the old port first (parity), then open the new one.
                 self.midi_conn = None;
