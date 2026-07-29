@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ivory
+GenericName=MIDI Keyboard Monitor
+Comment=MIDI keyboard monitor with advanced chord detection
+Exec=ivory
+Icon=ivory
+Terminal=false
+Categories=AudioVideo;Audio;Music;
+Keywords=midi;keyboard;piano;music;chord;detection;ivory;monitor;88-key;visualizer;
+StartupWMClass=Ivory

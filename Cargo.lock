@@ -1502,6 +1502,7 @@ version = "2.0.0"
 dependencies = [
  "dirs",
  "eframe",
+ "egui",
  "fd-lock",
  "ivory-core",
  "midir",
