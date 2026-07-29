@@ -57,6 +57,22 @@ No signing story required. tar.gz now; `.deb` (with a proper
 `/usr/share/doc/ivory/copyright` folding MIT + OFL) once the tar.gz path is
 proven.
 
+**Cross-build blocker (verified 2026-07-29):** `midir` links **ALSA** on Linux,
+and `alsa-sys`'s build script cannot cross-compile from macOS — pkg-config has
+no ALSA sysroot for the Linux target (`cargo zigbuild` fails on `alsa-sys`).
+macOS (native) and Windows (`cargo xwin`, no ALSA) both cross/native-build fine
+from this Mac; only Linux is affected. Fix options, pick one before shipping
+Linux:
+1. **Build Linux on Linux** — a GitHub Actions / Codeberg CI job on
+   `ubuntu-latest` with `libasound2-dev` installed (simplest; recommended, and
+   matches the deferred-CI plan below).
+2. Install an ALSA sysroot for the target and export `PKG_CONFIG_SYSROOT_DIR` +
+   `PKG_CONFIG_PATH` + `PKG_CONFIG_ALLOW_CROSS=1` before `build-cross.sh`.
+3. A prebuilt cross toolchain that bundles ALSA headers (e.g. a `cross` Docker
+   image with `libasound2-dev`).
+`scripts/build-cross.sh` still produces the Windows zip; its Linux stage will
+fail loudly until one of the above is in place.
+
 ## Licensing & pay-what-you-can
 
 - **MIT retention.** The Python releases (through 1.1.0) are public under MIT,

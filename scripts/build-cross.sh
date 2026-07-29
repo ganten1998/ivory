@@ -95,11 +95,16 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   echo "==> ${stage}.tar.gz"
 }
 
+# Linux stages are non-fatal: midir links ALSA, and alsa-sys cannot cross-compile
+# from macOS without an ALSA sysroot (see docs/RELEASE.md → "Cross-build blocker").
+# Build Linux on Linux (CI with libasound2-dev) or provide a sysroot. Windows
+# (no ALSA) still builds below regardless.
+LINUX_OK=1
 echo "==> Ivory $VERSION — Linux x86_64"
-package_linux x86_64-unknown-linux-gnu x86_64
+package_linux x86_64-unknown-linux-gnu x86_64 || { LINUX_OK=0; echo "!! Linux x86_64 build failed (ALSA sysroot? see docs/RELEASE.md)"; }
 
 echo "==> Ivory $VERSION — Linux aarch64"
-package_linux aarch64-unknown-linux-gnu aarch64
+package_linux aarch64-unknown-linux-gnu aarch64 || { LINUX_OK=0; echo "!! Linux aarch64 build failed (ALSA sysroot? see docs/RELEASE.md)"; }
 
 echo "==> Ivory $VERSION — Windows x86_64"
 cargo xwin build --release --target x86_64-pc-windows-msvc -p ivory
@@ -115,3 +120,4 @@ rm -rf "$WINSTAGE"
 echo "==> $WINZIP"
 
 ls -lh dist/ivory-"${VERSION}"-* 2>/dev/null | sed 's/^/    /'
+[ "$LINUX_OK" = 1 ] || echo "NOTE: Linux artifacts were skipped (ALSA cross-build). Windows built OK."

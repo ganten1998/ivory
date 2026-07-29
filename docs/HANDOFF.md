@@ -244,9 +244,17 @@ About box (D-UI-6). Full research in `docs/spec/font-licensing.md`.
       proper PNG → `.icns` (mac) + `.ico` (win, for `build.rs`). **Release
       blocker.** Scripts generate icns/ico from the png but will faithfully
       reproduce garbage.
-- [ ] `scripts/build-macos.sh` dry-run → `Ivory.app` (bundle id
-      `com.github.ganten7.ivory`), ad-hoc codesign, zip + dmg.
-- [ ] `scripts/build-cross.sh` → linux x86_64/aarch64 tar.gz + windows zip.
+- [x] `scripts/build-macos.sh` — **verified 2026-07-29**: builds `Ivory.app`
+      (bundle id `com.github.ganten7.ivory`, v2.0.0), ad-hoc codesigns, bundles
+      LICENSE+OFL+THIRD-PARTY-LICENSES+fonts, zip + dmg; the packaged app
+      launches. (dist/ is gitignored.)
+- [x] Windows cross-build — **verified**: `cargo xwin` produces `ivory.exe`
+      (7.5MB) from this Mac. `build-cross.sh` Windows stage works.
+- [ ] Linux cross-build — **BLOCKED**: `midir` links ALSA; `alsa-sys` can't
+      cross-compile from macOS without a sysroot. Build on Linux (CI w/
+      `libasound2-dev`) or provide a sysroot. Details + options in
+      `docs/RELEASE.md` → "Cross-build blocker"; `build-cross.sh` Linux stage is
+      now non-fatal (still emits the Windows zip).
 - [ ] Push to **Codeberg** (source of truth per [[repo-topology-codeberg]];
       username `ganten1998`, ssh needs `IdentityAgent=none` in this shell, see
       [[codeberg-access]]). The GitHub `ganten7/ivory` still holds the Python
