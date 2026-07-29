@@ -79,20 +79,31 @@ impl ChordDetector {
 
         let original = active_notes_in.clone();
 
-        // Possibly trim to max_notes_for_chord most-common pitch-classes.
-        let mut active_notes: HashSet<u8> = if n > self.max_notes_for_chord {
-            let pcs: Vec<u8> = active_notes_in.iter().map(|&x| x % 12).collect();
-            let mut counts: HashMap<u8, usize> = HashMap::new();
-            for pc in &pcs { *counts.entry(*pc).or_insert(0) += 1; }
-            let mut sorted: Vec<(u8, usize)> = counts.into_iter().collect();
-            sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-            let keep: HashSet<u8> = sorted.into_iter().take(7).map(|(pc, _)| pc).collect();
-            active_notes_in.iter().copied().filter(|n| keep.contains(&(n % 12))).collect()
-        } else {
-            active_notes_in.clone()
-        };
+        // D13: no pitch-class reduction. Doublings never change the PC set, so
+        // ≤7 unique PCs use every PC; the old Counter.most_common(7) lottery is gone.
+        let active_notes: HashSet<u8> = active_notes_in.clone();
 
         let pcs_all = pitch_classes(&active_notes);
+
+        // D17: eight or more unique pitch classes never name a chord. Within an
+        // octave, defer to a scale reading (8-PC diminished/altered scales still
+        // resolve). All twelve tones with no octave-local organization → chromatic.
+        // 8–11 PCs spread with no scale → nothing.
+        if pcs_all.len() >= 8 {
+            let (omin, omax) = (
+                original.iter().min().copied().unwrap_or(0) as i32,
+                original.iter().max().copied().unwrap_or(0) as i32,
+            );
+            if omax - omin < 12 {
+                if let Some(scale) = self.detect_scale(&original) {
+                    return Some(scale);
+                }
+            }
+            if pcs_all.len() == 12 {
+                return Some("Chromatic Scale".to_string());
+            }
+            return self.detect_scale(&original);
+        }
 
         // Pre-check: should we attempt scale detection for clustered notes?
         let span_early = active_notes.iter().max().copied().unwrap_or(0) as i32
@@ -169,16 +180,25 @@ impl ChordDetector {
             }
         }
 
-        // Case 3b: 3-note minor triad first inversion (bass = m3) → Xm/bass
-        // Fixes: {Eb,G,C} → "Cm/Eb" (not "Eb6")
-        if pcs_all.len() == 3 {
+        // D1: a pure 4-note [0,4,7,9] set is the {R6, relative-(R+9)m7} ambiguity.
+        // When the bass is the MAJOR THIRD of the 6-root, Python names it R6/bass
+        // (not the relative-minor inversion, e.g. E-G-A-C → C6/E, not Am7/E). Every
+        // other bass — the 6-root (→ R6), the 6th/m7-root (→ (R+9)m7), or the 5th
+        // (→ the shipped bass-rooted 6/9) — already resolves correctly in scoring,
+        // so only the third-in-bass case is special-cased here.
+        if pcs_all.len() == 4 {
             let lowest = active_notes.iter().min().copied().unwrap_or(0);
             let lpc = lowest % 12;
-            let potential_root = (lpc + 9) % 12; // root is bass + M6 (= bass - m3)
-            let minor_ivs: HashSet<u8> = pcs_all.iter()
-                .map(|&pc| pc_interval(potential_root, pc)).collect();
-            if minor_ivs == [0u8, 3, 7].iter().copied().collect::<HashSet<_>>() {
-                return Some(format!("{}m/{}", self.get_note_name(potential_root), self.get_note_name(lpc)));
+            for &r in &pcs_all {
+                let ivs: Vec<u8> = pcs_all.iter().map(|&pc| pc_interval(r, pc))
+                    .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+                if ivs == [0u8, 4, 7, 9] {
+                    if lpc == (r + 4) % 12 {
+                        return Some(format!("{}6/{}", self.get_note_name(r),
+                            self.get_note_name(lpc)));
+                    }
+                    break;
+                }
             }
         }
 
@@ -289,10 +309,20 @@ impl ChordDetector {
             let is_aug = self.match_chord_type(bm, "augmented")
                 || self.match_chord_type(bm, "augmented7");
 
+            // D12: only re-root a diminished TRIAD to the bass when the bass
+            // actually forms a diminished triad ([0,3,6] from it). Otherwise the
+            // bass is merely a chord tone (e.g. C-Eb-A: bass C is the b3 of A°, not
+            // a °-root) and the minor6_no5 reading from the bass is correct.
+            let bass_is_dim_root = {
+                let ivs: HashSet<u8> = pcs_all.iter().map(|&pc| pc_interval(lowest_pc, pc)).collect();
+                ivs.is_superset(&[0u8, 3, 6].iter().copied().collect())
+            };
             if (is_triadic_dim || is_dim7 || is_aug) && best_root_pc != lowest_pc {
                 if is_triadic_dim {
-                    best_match = Some(format!("{}dim", self.get_note_name(lowest_pc)));
-                    best_root_pc = lowest_pc;
+                    if bass_is_dim_root {
+                        best_match = Some(format!("{}dim", self.get_note_name(lowest_pc)));
+                        best_root_pc = lowest_pc;
+                    }
                 } else {
                     // re-detect from lowest
                     let ivs: Vec<u8> = pcs_all.iter()
@@ -314,40 +344,40 @@ impl ChordDetector {
             }
         }
 
-        // ── ROOTLESS TRITONE-IMPLIED ROOT DETECTION ─────────────────────────
-        // For rootless dominant voicings (root not in notes), detect via M3+m7 tritone pair.
-        // Example: {E,Bb,D} → C9 (E=M3, Bb=m7, D=9 of C; root C is absent)
-        // Skip if main loop already found a perfect-match triad with root in bass.
-        let best_is_rooted_triad = if let Some(ref bm) = best_match {
-            best_root_pc == lowest_pc
-                && (self.match_chord_type(bm, "major") || self.match_chord_type(bm, "minor")
-                    || self.match_chord_type(bm, "diminished") || self.match_chord_type(bm, "augmented"))
-        } else { false };
-        if !best_is_rooted_triad && pcs_all.len() >= 2 && pcs_all.len() <= 5 {
-            'tritone: for i in 0..pcs_all.len() {
-                for j in (i+1)..pcs_all.len() {
-                    let a = pcs_all[i];
-                    let b = pcs_all[j];
-                    if pc_interval(a, b) != 6 { continue; }
-                    let implied_root = ((a as i32 - 4).rem_euclid(12)) as u8;
-                    if pcs_set.contains(&implied_root) { continue; } // root present, skip
-                    let ivs_implied: Vec<u8> = pcs_all.iter()
-                        .map(|&pc| pc_interval(implied_root, pc))
-                        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-                    if let Some((cname, cscore)) = self.match_chord_pattern(
-                        &ivs_implied, implied_root, &active_notes,
-                        highest_note, highest_pc, lowest_pc, has_global_dominant_quality,
-                    ) {
-                        if self.debug_mode {
-                            self.debug_candidates.push((cname.clone(), cscore));
-                        }
-                        if cscore > best_score {
-                            best_score = cscore;
-                            best_match = Some(cname);
-                            best_root_pc = implied_root;
-                        }
-                    }
-                    break 'tritone;
+        // ── ROOTLESS DOMINANT RESOLUTION (D9) ────────────────────────────────
+        // A voicing like E-Bb-D reads on its bass as an E7(#11) shell, but E has no
+        // major third of its own — it is really the M3 of an absent C dominant
+        // (C-E-…-Bb-D). When the current best reading is such a false-dominant shell
+        // (bass has m7 + tritone but NO M3 and NO 11), and the note a major third
+        // below is absent yet forms a genuine dominant (its own M3 and m7 present),
+        // re-root there and name from the tensions: E-Bb-D → C9, E-Bb-D-F# → C7(#11).
+        //
+        // A genuinely rooted dominant (root with real M3 + m7, e.g. whole-tone
+        // D7#11) is left untouched, and an m7b5(11) shell (11 present, e.g.
+        // E-A-Bb-D → Em7b5(11)) is excluded by the "no 11" test.
+        if best_match.is_some() {
+            let r = best_root_pc;
+            let has_m3 = pcs_set.contains(&((r + 4) % 12));
+            let has_m7 = pcs_set.contains(&((r + 10) % 12));
+            let has_tritone = pcs_set.contains(&((r + 6) % 12));
+            let has_eleventh = pcs_set.contains(&((r + 5) % 12));
+            let has_thirteenth = pcs_set.contains(&((r + 9) % 12));
+            // A bare #11 shell (m7 + tritone, no 3rd). The 11 or 13 being present
+            // marks a full m7b5(11) or 13(#11) rooted here — keep those.
+            let is_false_dom_shell =
+                has_m7 && has_tritone && !has_m3 && !has_eleventh && !has_thirteenth;
+            if is_false_dom_shell {
+                let implied = (r + 12 - 4) % 12;
+                if !pcs_set.contains(&implied)
+                    && pcs_set.contains(&((implied + 4) % 12))
+                    && pcs_set.contains(&((implied + 10) % 12))
+                {
+                    let iv: HashSet<u8> =
+                        pcs_all.iter().map(|&pc| pc_interval(implied, pc)).collect();
+                    let name = self.name_rootless_dominant(implied, &iv);
+                    if self.debug_mode { self.debug_candidates.push((name.clone(), best_score)); }
+                    best_match = Some(name);
+                    best_root_pc = implied;
                 }
             }
         }
@@ -468,12 +498,33 @@ impl ChordDetector {
         let upper = notes[1];
         let semitones = (upper - lower) as usize;
         let lower_name = self.get_note_name(lower % 12);
-        let iname = if semitones < INTERVAL_NAMES.len() {
-            INTERVAL_NAMES[semitones]
+        // K1: named intervals up to 21 semitones; beyond that, "{n} semitones".
+        if semitones < INTERVAL_NAMES.len() {
+            Some(format!("{} ({})", lower_name, INTERVAL_NAMES[semitones]))
         } else {
-            "?"
-        };
-        Some(format!("{} ({})", lower_name, iname))
+            Some(format!("{} ({} semitones)", lower_name, semitones))
+        }
+    }
+
+    /// Name an absent-root dominant from the tensions present above `root`.
+    /// Any altered tension (b9/#9/#11/b13) drives a `7(...)` name; otherwise a
+    /// bare 9 or 13 names the chord; failing those, plain `7`.
+    fn name_rootless_dominant(&self, root: u8, iv: &HashSet<u8>) -> String {
+        let r = self.get_note_name(root);
+        let mut alts: Vec<&str> = Vec::new();
+        if iv.contains(&1) { alts.push("b9"); }
+        if iv.contains(&3) { alts.push("#9"); }
+        if iv.contains(&6) { alts.push("#11"); }
+        if iv.contains(&8) { alts.push("b13"); }
+        if !alts.is_empty() {
+            format!("{}7({})", r, alts.join(","))
+        } else if iv.contains(&2) {
+            format!("{}9", r)
+        } else if iv.contains(&9) {
+            format!("{}13", r)
+        } else {
+            format!("{}7", r)
+        }
     }
 
     pub fn is_clustered(&self, active_notes: &HashSet<u8>) -> bool {
@@ -564,7 +615,6 @@ impl ChordDetector {
             "4"         => "sus4",
             "7sus4"     => "7sus4",
             "7sus2"     => "7sus2",
-            "7sus13"    => "7sus13",
             "sus13"     => "sus13",
             "Δ7"        => "major7",
             "Δ7#5"      => "major7#5",
@@ -742,6 +792,11 @@ impl ChordDetector {
             if ["7b9#11","7#9#11","7#9#11_shell","7b9#11_shell","7b9#11_no3"]
                 .contains(&chord_type) && !essential_missing.is_empty() { continue; }
 
+            // A "13" chord must contain its 13th (interval 9). Without it, a 13-named
+            // pattern would match a subset (e.g. a whole-tone [0,2,4,6,10] as 13#11
+            // missing the 13th) and mislabel it — the correct name is 7(#11)/9(#11).
+            if chord_type.starts_with("13") && !intervals_set.contains(&9) { continue; }
+
             if !essential.is_empty() && essential_matched.is_empty() { continue; }
             if matched_count < 2 { continue; }
 
@@ -826,6 +881,9 @@ impl ChordDetector {
                 || chord_type == "dominant7" || chord_type == "diminished7"
                 || chord_type == "diminished_major7" || chord_type == "half_diminished7"
                 || chord_type == "augmented7" || chord_type == "minor_major7"
+                // Extended tertian chords invert too (C9 over its 3rd → C9/E).
+                || matches!(chord_type, "dominant9"|"dominant11"|"dominant13"|"13#11"
+                    |"major9"|"minor9"|"major11"|"minor11"|"major13"|"minor13")
                 || (chord_type.starts_with('7') && (chord_type.contains("b9") || chord_type.contains("#9")
                     || chord_type.contains("#11") || chord_type.contains("b13") || chord_type == "altered"));
             let is_sixth_chord = matches!(chord_type, "6"|"6_no5"|"minor6"|"minor6_no5"
@@ -904,6 +962,12 @@ impl ChordDetector {
             bonus += 100.0;
         }
 
+        // D12: C Eb A → Cm6 (not the A° reading re-rooted to the bass). The
+        // minor6_no5 [0,3,9] from the bass is the coherent, test-intended name.
+        if chord_type == "minor6_no5" && root_pc == lowest_pc && intervals == [0, 3, 9] {
+            bonus += 100.0;
+        }
+
         // add9 slash vs 9sus span heuristic
         if chord_type == "add9" && missing_count == 0 && extra_count == 0 && root_pc != lowest_pc {
             let ivs_bass: Vec<u8> = active_notes.iter()
@@ -954,13 +1018,17 @@ impl ChordDetector {
             }
         }
 
-        // Major extended with #11
+        // Major extended with #11 — only when the major-7 root is itself in the bass.
+        // From a non-bass root this shell must not out-bonus a bass-rooted reading
+        // (E-A-Bb-D is Em7b5(11), not BbΔ7(#11)).
         if matches!(chord_type, "major7#11"|"major7#11_no5"|"major9#11"|"major13#11")
-            && intervals_set.contains(&6)
+            && intervals_set.contains(&6) && root_pc == lowest_pc
         {
             bonus += if missing_count == 0 && extra_count == 0 { 250.0 } else if missing_count <= 1 { 150.0 } else { 0.0 };
         }
-        if chord_type == "major7#11_no5" && intervals == [0, 4, 6, 11] { bonus += 300.0; }
+        if chord_type == "major7#11_no5" && intervals == [0, 4, 6, 11] && root_pc == lowest_pc {
+            bonus += 300.0;
+        }
 
         // 6/9 chords
         if matches!(chord_type, "6_9"|"6_9_no5") {
@@ -988,6 +1056,12 @@ impl ChordDetector {
         }
 
         // m3 + M6 present with 4 unique pcs → boost m6 interpretations
+        // D5: the blanket +380 (spec §9.13's "distorter") must not crown a spurious
+        // mΔ7/6-family reading over a root-position dominant. Suppress it when the
+        // BASS itself is a dominant root (M3 + m7 above the bass present) — that set
+        // is a 7(b9)/7(#9) voicing, e.g. C-Db-E-Bb → C7(b9), not Bbdim/C.
+        let bass_has_dominant =
+            pcs_set.contains(&((lowest_pc + 4) % 12)) && pcs_set.contains(&((lowest_pc + 10) % 12));
         if intervals_set.contains(&3) && intervals_set.contains(&9) && unique_pcs == 4 {
             if matches!(chord_type, "minor6"|"minor6_no5"|"minor6_9"|"minor6_9_no5") {
                 if bonus == 0.0 {
@@ -995,7 +1069,7 @@ impl ChordDetector {
                              else if missing_count <= 1 && extra_count <= 2 { 410.0 }
                              else { 0.0 };
                 }
-            } else if bonus == 0.0 { bonus += 380.0; }
+            } else if bonus == 0.0 && !bass_has_dominant { bonus += 380.0; }
         }
 
         // 13th shells beat major7#11 from other roots
@@ -1015,9 +1089,13 @@ impl ChordDetector {
             }
         }
 
-        // Dom 7#11 / 13#11 voicings
-        if matches!(chord_type, "7#11_no5"|"7#11_no3_no5"|"13#11_no3_no5"|"13#11_no9_no5"|"13#11_no5")
+        // Dom 7#11 / 13#11 voicings. A "13#11" name requires the actual 13th
+        // (interval 9) present — otherwise [0,2,4,6,10] is a 7(#11), not a 13(#11).
+        let claims_13 = chord_type.starts_with("13");
+        if matches!(chord_type, "7#11_no5"|"7#11_no3_no5"|"9#11_no5"
+                                 |"13#11_no3_no5"|"13#11_no9_no5"|"13#11_no5")
             && root_pc == lowest_pc && intervals_set.contains(&10) && intervals_set.contains(&6)
+            && (!claims_13 || intervals_set.contains(&9))
         {
             bonus += if missing_count == 0 && extra_count == 0 { 250.0 }
                      else if missing_count <= 1 && extra_count == 0 { 180.0 }
@@ -1028,36 +1106,65 @@ impl ChordDetector {
         if matches!(chord_type, "minor11"|"minor11_no5"|"minor11_no9"|"minor11_shell")
             && missing_count == 0 && extra_count == 0 && root_pc == lowest_pc { bonus += 8000.0; }
 
-        // 9sus / 13sus: give large bonus when root is in bass and perfect match
-        if matches!(chord_type, "9sus"|"9sus_with5"|"13sus"|"13sus_with5")
+        // D3: 6–7 note tertian stacks name from a coherent bass root. A perfect
+        // major/minor 11/13-family match with root in bass beats the same PC set
+        // read as a #11 extension from a third above (CΔ13 set → CΔ13, not FΔ13#11).
+        if matches!(chord_type,
+            "major13"|"major11"|"minor13"|"major9"|"13#11"|"dominant13"|"dominant11")
+            && missing_count == 0 && extra_count == 0 && root_pc == lowest_pc { bonus += 8000.0; }
+
+        // 13sus: large bonus when root is in bass and perfect match. The 13th (9)
+        // rules out the add9-slash reading, so no span gate (D8).
+        if matches!(chord_type, "13sus"|"13sus_with5")
             && missing_count == 0 && extra_count == 0 && root_pc == lowest_pc
         {
             bonus += 6400.0;
         }
 
-        // 7sus4 / 7sus2: large bonus when root is in bass and perfect match
-        if matches!(chord_type, "7sus4"|"7sus2")
+        // 9sus: K5 span rule. Compact [0,2,5,10]-from-bass reads as (bass+10)add9/
+        // bass (that bonus is +6200); only a spread voicing (≥12 span) names 9sus.
+        if matches!(chord_type, "9sus"|"9sus_with5")
+            && missing_count == 0 && extra_count == 0 && root_pc == lowest_pc
+        {
+            let span = active_notes.iter().max().copied().unwrap_or(0) as i32
+                - active_notes.iter().min().copied().unwrap_or(0) as i32;
+            if span >= 12 { bonus += 6400.0; }
+        }
+
+        // 7sus4: large bonus when root is in bass and perfect match (D2/D20). Note:
+        // 7sus2 [0,2,7,10] is intentionally NOT boosted — that voicing is the
+        // Bb6/C-vs-Gm/C shape (K11), resolved by the S2k second-note logic below.
+        if chord_type == "7sus4"
             && missing_count == 0 && extra_count == 0 && root_pc == lowest_pc
         {
             bonus += 8000.0;
         }
 
-        // Altered dominant WITH 5th, root in bass, perfect match: beat partial-match shells
+        // Altered dominant, root in bass, no foreign notes: beat plain dominant7 and
+        // partial-match shells. D4/D5: allow a missing (optional) 5th so no-5th
+        // voicings still name their alteration — C-Db-E-Bb → C7(b9), C-E-Bb-Eb →
+        // C7(#9) — rather than collapsing to a bare C7 that drops the b9/#9.
+        // "missing ⊆ {5th}": every pattern tone present except perhaps the perfect
+        // 5th. (All these patterns contain interval 7, so a single missing tone with
+        // 7 absent from the input must be that 5th.)
+        let only_fifth_missing =
+            missing_count == 0 || (missing_count == 1 && !intervals_set.contains(&7));
         if matches!(chord_type, "7b9"|"7#9"|"7#11"|"7b13"|"7b9#11"|"7#9#11"|
                                  "7b9b13"|"7#9b13"|"7#11b13"|"9b13")
-            && root_pc == lowest_pc && missing_count == 0 && extra_count == 0
+            && root_pc == lowest_pc && extra_count == 0 && only_fifth_missing
         {
-            bonus += 100.0;
+            bonus += 120.0;
         }
 
-        // Penalize no5/shell patterns from non-bass root when bass has full dominant voicing
-        // (M3 + m7 + 5th all present from bass). Prevents EΔ7(#11)/Gb7(b9,#11)/Bb7(#11)
-        // winning over C7(#9)/C7(#11)/C7(b13) when C is the bass with all chord tones.
+        // D4: penalize no5/shell readings from a NON-bass root when the bass is a
+        // dominant root (M3 + m7 above the bass present), with or without the 5th.
+        // Prevents EΔ7(#11)/Gb7(b9,#11)/Bb7(#11) winning over C7(#9)/C7(#11)/C7(b13)
+        // when C is the bass carrying the M3 and m7 — covers both the full voicing
+        // (C-E-G-Bb-Eb → C7(#9)) and the no-5th shell (C-E-Bb-Eb → C7(#9)).
         if root_pc != lowest_pc {
             let b_m3 = (lowest_pc + 4) % 12;
             let b_m7 = (lowest_pc + 10) % 12;
-            let b_5  = (lowest_pc + 7) % 12;
-            if pcs_set.contains(&b_m3) && pcs_set.contains(&b_m7) && pcs_set.contains(&b_5) {
+            if pcs_set.contains(&b_m3) && pcs_set.contains(&b_m7) {
                 let is_shell_or_no5 = chord_type.contains("no5") || chord_type.contains("shell");
                 if is_shell_or_no5 {
                     bonus -= 600.0;
@@ -1080,8 +1187,11 @@ impl ChordDetector {
             bonus += 250.0;
         }
 
-        // dominant9 root in bass
-        if chord_type == "dominant9" && root_pc == lowest_pc && missing_count <= 1 && extra_count == 0 {
+        // dominant9 root in bass — but only a real dominant (m7 present); without the
+        // b7 the voicing is an add9 (C-D-E-G → C(add9), not C9).
+        if chord_type == "dominant9" && root_pc == lowest_pc && missing_count <= 1
+            && extra_count == 0 && intervals_set.contains(&10)
+        {
             bonus += 200.0;
         }
 
@@ -1148,8 +1258,9 @@ fn format_chord_name(root: &str, chord_type: &str) -> String {
         "dominant9"          => format!("{}9", root),
         "dominant11"         => format!("{}11", root),
         "dominant13"         => format!("{}13", root),
+        "13#11"              => format!("{}13(#11)", root),
         "13_shell"|"13_no5_no11"|"13_no5" => format!("{}13", root),
-        "7#11_no5"|"7#11_no3_no5" => format!("{}7(#11)", root),
+        "7#11_no5"|"7#11_no3_no5"|"9#11_no5" => format!("{}7(#11)", root),
         "13#11_no3_no5"|"13#11_no9_no5"|"13#11_no5" => format!("{}13(#11)", root),
         "major9"             => format!("{}Δ9", root),
         "minor9"             => format!("{}m9", root),
@@ -1233,7 +1344,9 @@ mod tests {
 
     // ── Sus chords ───────────────────────────────────────────────────────────
     #[test] fn t_7sus4()  { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,65,67,70])), Some("C7sus4".into())); }
-    #[test] fn t_9sus()   { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,62,65,70])), Some("C9(sus)".into())); }
+    // K5: compact [0,2,5,10] reads as the b7-add9 slash; only a spread voicing names
+    // 9sus (see acceptance v101/v102). Updated notes to a spread voicing.
+    #[test] fn t_9sus()   { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,62,65,82])), Some("C9(sus)".into())); }
 
     // ── Altered dominants ────────────────────────────────────────────────────
     #[test] fn t_7b9()    { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,64,67,70,61])), Some("C7(b9)".into())); }
@@ -1244,7 +1357,9 @@ mod tests {
     // ── Inversions ───────────────────────────────────────────────────────────
     #[test] fn t_inv1()   { assert_eq!(ChordDetector::new().detect_chord(&notes(&[52,55,60])), Some("C/E".into())); }
     #[test] fn t_inv2()   { assert_eq!(ChordDetector::new().detect_chord(&notes(&[55,60,64])), Some("C/G".into())); }
-    #[test] fn t_minor_inv(){ assert_eq!(ChordDetector::new().detect_chord(&notes(&[51,55,60])), Some("Cm/Eb".into())); }
+    // Parity (acceptance v022): the shipped Python reading of Eb-G-C is Eb6, not the
+    // old Rust core's Cm/Eb (Case-3b divergence, removed). Bass Eb, [0,4,9] from Eb.
+    #[test] fn t_eb6_not_cm_inv(){ assert_eq!(ChordDetector::new().detect_chord(&notes(&[63,67,72])), Some("Eb6".into())); }
 
     // ── Rootless voicings ────────────────────────────────────────────────────
     #[test] fn t_rootless_dom9()  { assert_eq!(ChordDetector::new().detect_chord(&notes(&[64,70,74])), Some("C9".into())); }

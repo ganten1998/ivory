@@ -27,7 +27,7 @@ pub static CHORD_PATTERNS: &[(&str, &[u8])] = &[
     ("9sus_with5", &[0, 2, 5, 7, 10]),
     ("13sus",      &[0, 2, 5, 9, 10]),
     ("13sus_with5",&[0, 2, 5, 7, 9, 10]),
-    ("7sus13",     &[0, 2, 5, 9, 10]),
+    // D14: `7sus13` deleted — exact duplicate of `13sus` (earlier → always won ties).
     ("sus13",      &[0, 2, 5, 9]),
 
     // ── 7th chords (half-dim before other m7) ───────────────────────────────
@@ -40,8 +40,9 @@ pub static CHORD_PATTERNS: &[(&str, &[u8])] = &[
     ("dominant7",     &[0, 4, 7, 10]),
     ("diminished7",   &[0, 3, 6, 9]),
     ("diminished_major7", &[0, 3, 6, 11]),
-    ("7b13_no5",      &[0, 4, 8, 10]),   // BEFORE aug7 for priority
-    ("augmented7",    &[0, 4, 8, 10]),
+    ("7b13_no5",      &[0, 4, 8, 10]),
+    // D14: `augmented7` deleted — identical [0,4,8,10] to `7b13_no5` (which wins by
+    // order); #5-vs-b13 is not recoverable from pitch classes. Zero behavior change.
     ("minor_major7",  &[0, 3, 7, 11]),
     ("minor_major9",  &[0, 2, 3, 7, 11]),
 
@@ -63,6 +64,7 @@ pub static CHORD_PATTERNS: &[(&str, &[u8])] = &[
     ("minor13",       &[0, 2, 3, 5, 7, 9, 10]),
     ("dominant11",    &[0, 2, 4, 5, 7, 10]),
     ("dominant13",    &[0, 2, 4, 5, 7, 9, 10]),
+    ("13#11",         &[0, 2, 4, 6, 7, 9, 10]),  // full dominant 13(#11)
     // 13th shells (BEFORE 6th chords)
     ("13_shell",      &[0, 4, 9, 10]),
     ("13_no5_no11",   &[0, 2, 4, 9, 10]),
@@ -74,6 +76,7 @@ pub static CHORD_PATTERNS: &[(&str, &[u8])] = &[
     ("13#11_no3_no5", &[0, 2, 6, 9, 10]),
     ("13#11_no9_no5", &[0, 4, 6, 9, 10]),
     ("13#11_no5",     &[0, 2, 4, 6, 9, 10]),
+    ("9#11_no5",      &[0, 2, 4, 6, 10]),   // dom 9(#11), no 5th → "7(#11)"
 
     // ── Altered dominants – with 5th ─────────────────────────────────────────
     ("7b9",       &[0, 1, 4, 7, 10]),
@@ -167,6 +170,7 @@ pub fn essential_for(chord_type: &str) -> &'static [u8] {
         "minor13"        => &[3, 10],
         "dominant11"     => &[4, 10],
         "dominant13"     => &[4, 10],
+        "13#11"          => &[4, 10],
         "13_shell"       => &[4, 10],
         "13_no5_no11"    => &[4, 10],
         "13_no5"         => &[4, 10],
@@ -176,6 +180,7 @@ pub fn essential_for(chord_type: &str) -> &'static [u8] {
         "13#11_no3_no5"=> &[6, 10],
         "13#11_no9_no5"=> &[4, 10],
         "13#11_no5"    => &[4, 10],
+        "9#11_no5"     => &[4, 10],
 
         "7sus4"      => &[5, 10],
         "7sus2"      => &[2, 10],
@@ -183,7 +188,6 @@ pub fn essential_for(chord_type: &str) -> &'static [u8] {
         "9sus_with5" => &[2, 5, 10],
         "13sus"      => &[2, 10],
         "13sus_with5"=> &[2, 10],
-        "7sus13"     => &[2, 10],
         "sus13"      => &[2, 9],
 
         "7b9"  => &[4, 10],
@@ -274,13 +278,13 @@ pub fn optional_for(chord_type: &str) -> &'static [u8] {
         "minor13"     => &[0, 7],
         "dominant11"  => &[0, 7],
         "dominant13"  => &[0, 5, 7],
+        "13#11"       => &[0, 7],
         "13_shell"    => &[0, 7],
         "13_no5_no11" => &[0, 7],
         "13_no5"      => &[0, 7],
 
         "7sus4"      => &[0, 7],
         "7sus2"      => &[0, 7],
-        "7sus13"     => &[0, 5, 7],
         "sus13"      => &[0, 5, 7],
 
         "7b9"  => &[0, 7],
@@ -315,6 +319,7 @@ pub fn optional_for(chord_type: &str) -> &'static [u8] {
         "13#11_no3_no5"=> &[0],
         "13#11_no9_no5"=> &[0],
         "13#11_no5"    => &[0],
+        "9#11_no5"     => &[0, 7],
 
         "6"          => &[0, 7],
         "6_no5"      => &[0],
