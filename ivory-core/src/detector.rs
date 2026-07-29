@@ -1103,8 +1103,18 @@ impl ChordDetector {
         }
 
         // minor11 chords beat scale interpretations (only when root is in bass)
+        // D20: the m11 "beat the scale" bonus is suppressed only when the bass roots
+        // a competing resolved chord — the relative-major 6/9 (bass = root+3) or the
+        // 9sus whose root is the m11's 11th (bass = root+5). Other basses (root, the
+        // 9th at root+2, 5th, b7) keep the m11 reading, so inversions like a Gm11
+        // drop-2 with the 9th (A) in the bass stay Gm11 rather than flipping to the
+        // relative BbΔ(6/9).
         if matches!(chord_type, "minor11"|"minor11_no5"|"minor11_no9"|"minor11_shell")
-            && missing_count == 0 && extra_count == 0 && root_pc == lowest_pc { bonus += 8000.0; }
+            && missing_count == 0 && extra_count == 0
+        {
+            let bass_iv = pc_interval(root_pc, lowest_pc);
+            if bass_iv != 3 && bass_iv != 5 { bonus += 8000.0; }
+        }
 
         // D3: 6–7 note tertian stacks name from a coherent bass root. A perfect
         // major/minor 11/13-family match with root in bass beats the same PC set
