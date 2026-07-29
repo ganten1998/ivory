@@ -95,6 +95,8 @@ pub fn draw(
     };
 
     // 2. White keys, left to right (int truncation per key, like Qt fillRect).
+    // Fill every white key FIRST, then draw the separators on top — otherwise each
+    // key's fill overpaints the previous key's separator line and they vanish.
     let mut idx = 0usize;
     for note in NOTE_START..=NOTE_END {
         if !is_white(note) {
@@ -115,16 +117,15 @@ pub fn draw(
             egui::vec2(white_key_w.trunc() as f32, h.trunc() as f32),
         );
         painter.rect_filled(key_rect, 0.0, fill);
-
-        // Separator after every white key except the last.
-        if idx + 1 < WHITE_KEYS {
-            let lx = left + ((x + white_key_w).trunc() as f32) + 0.5;
-            painter.line_segment(
-                [Pos2::new(lx, top), Pos2::new(lx, top + h as f32)],
-                Stroke::new(1.0, separator),
-            );
-        }
         idx += 1;
+    }
+    // 1px separators between adjacent white keys (drawn after all fills).
+    for sep in 1..WHITE_KEYS {
+        let lx = left + (sep as f64 * white_key_w).trunc() as f32 + 0.5;
+        painter.line_segment(
+            [Pos2::new(lx, top), Pos2::new(lx, top + h.trunc() as f32)],
+            Stroke::new(1.0, separator),
+        );
     }
 
     // 3. Black keys on top.
