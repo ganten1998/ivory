@@ -255,11 +255,17 @@ About box (D-UI-6). Full research in `docs/spec/font-licensing.md`.
       `libasound2-dev`) or provide a sysroot. Details + options in
       `docs/RELEASE.md` → "Cross-build blocker"; `build-cross.sh` Linux stage is
       now non-fatal (still emits the Windows zip).
-- [ ] Push to **Codeberg** (source of truth per [[repo-topology-codeberg]];
-      username `ganten1998`, ssh needs `IdentityAgent=none` in this shell, see
-      [[codeberg-access]]). The GitHub `ganten7/ivory` still holds the Python
-      v1.0.0.
-- [ ] `rm -rf ~/Dropbox/Projects/Apps/ivory-rust` (only after 2.0 verifies).
+- [x] Pushed to **Codeberg** (2026-07-29): `ganten1998/ivory` (already PRIVATE)
+      was "taken over" — Rust 2.0 force-pushed to `main` + `master`; the Python
+      app is preserved on the `python-legacy` branch and the immutable
+      `v1.0.0`/`v1.1` tags. `git config core.sshCommand "ssh -o IdentityAgent=none"`
+      is set locally so pushes work in this shell ([[codeberg-access]]). NOTE:
+      default branch is still `master` (now Rust); flip to `main` in Codeberg
+      Settings → Branches for tidiness (then `master` can be deleted). A stray
+      `cursor/ai-stream-connection-error-b1a2` branch predates this and is
+      harmless.
+- [x] `ivory-rust` retired to Trash (recoverable); its guide PDF preserved at
+      `docs/reference/Ivory-Rust-Guide.pdf`.
 - [ ] Business decisions in `docs/RELEASE.md`: keep MIT? Developer-ID signing +
       notarization ($99/yr — macOS 15+ has no right-click-Open bypass, a real
       blocker for selling to strangers); Windows SmartScreen; the "Ivory" name
