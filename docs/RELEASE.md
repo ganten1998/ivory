@@ -5,12 +5,13 @@ is in `DESIGN.md`; historical CI war stories are in `spec/product-docs.md` §3.
 
 ## Hard gates before any public release
 
-1. **Placeholder icon.** `assets/ivory.png` is the historical 543-byte,
-   128x128 placeholder. Every icon artifact (`.icns`, `.ico`, Linux PNG) is
-   generated from it, and both build scripts print a warning while it is in
-   place. Replace it with real artwork at **1024x1024 or larger**, then rerun
-   `scripts/build-macos.sh` / `scripts/build-cross.sh` (the `.ico` is
-   regenerated automatically; `build.rs` embeds it into `ivory.exe`).
+1. **Icon.** `assets/ivory.png` is the historical 543-byte, 128x128 art. The
+   owner has **accepted it as-is for now** (2026-07-29), so this is no longer a
+   hard gate — but it is small, so icons scale up soft. If a crisper icon is
+   ever wanted, drop a **1024x1024+** PNG at that path and rerun
+   `scripts/build-macos.sh` / `scripts/build-cross.sh` (the `.ico`/`.icns` are
+   regenerated automatically; `build.rs` embeds the `.ico` into `ivory.exe`).
+   The scripts print a size warning while the small art is in place — expected.
 2. **Trademark decision.** "Ivory" collides with **Synthogy Ivory**, a
    well-known commercial piano VST — the same musicians-with-MIDI-keyboards
    market this app targets. Distributing a free hobby tool under the name is
@@ -126,9 +127,14 @@ Prime TTFs; on Windows the fonts are embedded in the exe only).
 4. **Build macOS**: `scripts/build-macos.sh` (host arm64) and/or
    `ARCH=universal scripts/build-macos.sh`. Heed any placeholder-icon warning
    (gate #1).
-5. **Build Linux + Windows**: `scripts/build-cross.sh`
-   (needs `zig`, `cargo-zigbuild`, `cargo-xwin`, and the three rustup targets
-   — the script header lists the install commands).
+5. **Build Windows** (from mac): `scripts/build-cross.sh` (needs `zig`,
+   `cargo-zigbuild`, `cargo-xwin`, the rustup targets — header lists them). It
+   emits the Windows zip; its Linux stage is expected to fail on the ALSA
+   cross-build (non-fatal).
+   **Build Linux natively** on a Linux host (the owner's Void machine):
+   `scripts/build-linux-native.sh` — installs are in that script's header
+   (`alsa-lib-devel` + X11/Wayland/GL `-dev` packages). This is the recommended
+   Linux path; run it once per arch (x86_64, aarch64) on matching hardware.
 6. **Smoke-test locally**: `open dist/Ivory.app`; unzip the Windows artifact
    under CrossOver if available; `tar -tzf` the Linux archives.
 7. **Checksums**: `cd dist && shasum -a 256 Ivory-* ivory-* > SHA256SUMS`.
