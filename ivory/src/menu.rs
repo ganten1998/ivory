@@ -35,10 +35,12 @@ pub enum MenuAction {
     ToggleChordDetection,
     DetachChordWindow,
     AttachChordWindow,
-    // TEACH-HOOK(D-UI-5): stubs — a later agent wires these to the overrides
-    // layer. They are present in the menu but permanently disabled for now.
     TeachChordName,
     ManageTaughtChords,
+    /// D-UI-9: correct the current reading, training the learned re-ranker.
+    CorrectChordName,
+    /// D-UI-9: master switch for the learned re-ranker (weights are kept).
+    ToggleChordLearning,
     ShowAbout,
     ResetSettings,
 }
@@ -52,10 +54,11 @@ pub struct MenuView {
     pub prefer_flats: bool,
     pub detection_enabled: bool,
     pub detached: bool,
-    /// TEACH-HOOK(D-UI-5): once wired, "Teach Chord Name..." is greyed only
-    /// when no notes are held; until then both teach items stay disabled.
-    #[allow(dead_code)]
+    /// "Teach Chord Name..." and "Correct Chord Name..." are greyed when no
+    /// notes are held — both act on the voicing you are playing.
     pub notes_held: bool,
+    /// D-UI-9: whether the learned re-ranker is currently influencing readings.
+    pub learning_on: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -214,6 +217,27 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         action: MenuAction::ManageTaughtChords,
         enabled: true,
     });
+    // D-UI-9: the learned re-ranker. "Correct Chord Name..." needs a voicing to
+    // act on; the toggle renames itself like every other toggle here (Qt parity
+    // — no checkmarks anywhere). Forgetting what was learned lives in "Manage
+    // Taught Chords...", one step away from the button that trains.
+    e.push(Entry::Separator);
+    e.push(Entry::Item {
+        label: "Correct Chord Name...".to_owned(),
+        action: MenuAction::CorrectChordName,
+        // Needs both a voicing AND a visible reading: with detection off,
+        // detection_tick() nulls current_chord, so the dialog would show
+        // "Now reads: (none)" and the result would land somewhere invisible.
+        enabled: view.notes_held && view.detection_enabled,
+    });
+    e.push(item(
+        if view.learning_on {
+            "Disable Chord Learning"
+        } else {
+            "Enable Chord Learning"
+        },
+        MenuAction::ToggleChordLearning,
+    ));
     e.push(Entry::Separator);
     e.push(item("About", MenuAction::ShowAbout));
     e.push(item("Reset Settings to Default", MenuAction::ResetSettings));
@@ -502,4 +526,90 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         *state_opt = None;
     }
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view() -> MenuView {
+        MenuView {
+            dark_mode: false,
+            borderless: false,
+            keytoggle: false,
+            prefer_flats: true,
+            detection_enabled: true,
+            detached: false,
+            notes_held: false,
+            learning_on: false,
+        }
+    }
+
+    fn rows(v: MenuView) -> Vec<(String, MenuAction, bool)> {
+        build_entries(v)
+            .into_iter()
+            .filter_map(|e| match e {
+                Entry::Item {
+                    label,
+                    action,
+                    enabled,
+                } => Some((label, action, enabled)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn find(v: MenuView, action: MenuAction) -> Option<(String, bool)> {
+        rows(v)
+            .into_iter()
+            .find(|(_, a, _)| *a == action)
+            .map(|(l, _, e)| (l, e))
+    }
+
+    /// D-UI-9: correcting acts on the held voicing AND needs a visible reading,
+    /// so it greys out with no notes down or with detection off.
+    #[test]
+    fn correct_item_needs_notes_and_detection() {
+        let mut v = view();
+        let label = "Correct Chord Name...".to_owned();
+        assert_eq!(find(v, MenuAction::CorrectChordName), Some((label.clone(), false)));
+        v.notes_held = true;
+        assert_eq!(find(v, MenuAction::CorrectChordName), Some((label.clone(), true)));
+        // Detection off nulls current_chord — nothing to correct against.
+        v.detection_enabled = false;
+        assert_eq!(find(v, MenuAction::CorrectChordName), Some((label, false)));
+        // Teaching still works with detection off: it pins a name outright.
+        assert_eq!(
+            find(v, MenuAction::TeachChordName).map(|(_, e)| e),
+            Some(true)
+        );
+    }
+
+    /// Qt parity: toggles rename themselves rather than showing a checkmark.
+    #[test]
+    fn learning_toggle_renames_itself() {
+        let mut v = view();
+        assert_eq!(
+            find(v, MenuAction::ToggleChordLearning),
+            Some(("Enable Chord Learning".to_owned(), true))
+        );
+        v.learning_on = true;
+        assert_eq!(
+            find(v, MenuAction::ToggleChordLearning),
+            Some(("Disable Chord Learning".to_owned(), true))
+        );
+    }
+
+    /// The learning block sits with the teach block, after it, and the menu
+    /// still ends with About / Reset.
+    #[test]
+    fn learning_block_sits_after_the_teach_block() {
+        let r = rows(view());
+        let pos = |a: MenuAction| r.iter().position(|(_, x, _)| *x == a).unwrap();
+        assert!(pos(MenuAction::TeachChordName) < pos(MenuAction::ManageTaughtChords));
+        assert!(pos(MenuAction::ManageTaughtChords) < pos(MenuAction::CorrectChordName));
+        assert!(pos(MenuAction::CorrectChordName) < pos(MenuAction::ToggleChordLearning));
+        assert!(pos(MenuAction::ToggleChordLearning) < pos(MenuAction::ShowAbout));
+        assert_eq!(r.last().map(|(_, a, _)| *a), Some(MenuAction::ResetSettings));
+    }
 }

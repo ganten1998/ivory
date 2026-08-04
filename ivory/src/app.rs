@@ -7,13 +7,13 @@
 //! runs after keytoggle clicks and note-preference changes).
 
 use crate::chord_strip;
-use crate::dialogs::{self, Dialog, DialogAction};
+use crate::dialogs::{self, Dialog, DialogAction, LearningStatus};
 use crate::menu::{self, ColorTarget, MenuAction, MenuState, MenuView};
 use crate::midi;
 use crate::piano;
 use crate::settings::{Rgb, Settings};
 use egui::{Pos2, Rect, Vec2, ViewportCommand};
-use ivory_core::{ChordDetector, OverrideStore};
+use ivory_core::{ChordDetector, OverrideStore, TrainOutcome};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -214,6 +214,7 @@ impl IvoryApp {
             detection_enabled: self.settings.chord_detection_enabled,
             detached: self.settings.chord_window_detached,
             notes_held: !self.display_notes().is_empty(),
+            learning_on: self.detector.learning_mode(),
         }
     }
 
@@ -381,6 +382,12 @@ impl IvoryApp {
             MenuAction::AttachChordWindow => self.reattach_chord_window(),
             MenuAction::TeachChordName => self.open_teach_dialog(),
             MenuAction::ManageTaughtChords => self.open_manage_dialog(),
+            MenuAction::CorrectChordName => self.open_correct_dialog(),
+            MenuAction::ToggleChordLearning => {
+                let on = !self.detector.learning_mode();
+                self.detector.set_learning_mode(on);
+                self.detection_tick(true); // readings change immediately
+            }
             MenuAction::ShowAbout => self.dialog = Some(Dialog::About),
             MenuAction::ResetSettings => self.reset_settings(ctx),
         }
@@ -442,14 +449,203 @@ impl IvoryApp {
         });
     }
 
-    /// Open "Manage Taught Chords…" listing all stored overrides.
+    /// Open "Manage Taught Chords…" listing all stored overrides, plus the
+    /// learned-re-ranker footer (D-UI-9).
     fn open_manage_dialog(&mut self) {
         let rows = self
             .detector
             .overrides()
             .map(|s| s.list(self.settings.prefer_flats))
             .unwrap_or_default();
-        self.dialog = Some(Dialog::ManageTaught { rows });
+        self.dialog = Some(Dialog::ManageTaught {
+            rows,
+            learning: self.learning_status(),
+        });
+    }
+
+    fn learning_status(&self) -> LearningStatus {
+        match self.detector.overrides() {
+            Some(s) => LearningStatus {
+                on: s.learning_mode(),
+                corrections: s.corrections(),
+                has_learned: s.has_learned(),
+                weights: s.weights_report(),
+            },
+            None => LearningStatus::default(),
+        }
+    }
+
+    /// Open "Correct Chord Name…" (D-UI-9) for the held voicing. The list is
+    /// exactly what the re-ranker can be trained toward — offering anything
+    /// else would let a correction silently do nothing.
+    fn open_correct_dialog(&mut self) {
+        let display = self.display_notes();
+        if display.is_empty() {
+            // The menu froze `enabled` when it opened; the notes may have been
+            // released since. Say so rather than being a dead click.
+            self.dialog = Some(Dialog::LearnResult {
+                title: "Correct Chord Name",
+                message: "No notes are being held any more.\n\n\
+                          Hold the chord you want to correct, then open the\n\
+                          menu again."
+                    .to_owned(),
+            });
+            return;
+        }
+        let candidates = self.detector.trainable_candidates(&display);
+        let (bass_pc, ivs) = OverrideStore::interval_set_from_bass(&display);
+        let note_names = ivs
+            .iter()
+            .map(|&iv| self.detector.get_note_name((bass_pc + iv) % 12))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let current_label = self
+            .current_chord
+            .clone()
+            .unwrap_or_else(|| "(none)".to_owned());
+
+        if candidates.len() < 2 {
+            // Nothing to re-rank. Distinguish the two very different reasons,
+            // or the user is left staring at a name they cannot change.
+            let pinned = self
+                .detector
+                .overrides()
+                .and_then(|s| s.lookup(&display, self.settings.prefer_flats))
+                .is_some();
+            let message = if pinned {
+                format!(
+                    "This voicing has a taught name pinned to it, so Ivory is\n\
+                     not weighing any alternatives.\n\n\
+                     Notes: {note_names}\nReads: {current_label}\n\n\
+                     Remove it in \"Manage Taught Chords...\" first if you want\n\
+                     Ivory to choose the name again."
+                )
+            } else if candidates.len() == 1 {
+                // It WAS weighed — there simply was no rival. Saying "named by
+                // a fixed rule" here would be the wrong explanation.
+                format!(
+                    "Only one chord name fits these notes, so there is nothing\n\
+                     to weigh it against.\n\n\
+                     Notes: {note_names}\nReads: {current_label}\n\n\
+                     Add or change a note to give Ivory a choice, or use\n\
+                     \"Teach Chord Name...\" to pin a name of your own."
+                )
+            } else {
+                // NOT only intervals and scales: several chord shapes (m7b5 vs
+                // m6, dim7 upper structures, a 6-chord with its third in the
+                // bass) are resolved by dedicated branches before scoring ever
+                // runs, and they land here too.
+                format!(
+                    "Ivory named this voicing with a fixed rule rather than by\n\
+                     weighing alternatives, so there is nothing to re-rank.\n\n\
+                     Notes: {note_names}\nReads: {current_label}\n\n\
+                     That is how intervals, scales and a few special chord\n\
+                     shapes are named. To pin the name you want, use \"Teach\n\
+                     Chord Name...\"."
+                )
+            };
+            self.dialog = Some(Dialog::LearnResult {
+                title: "Correct Chord Name",
+                message,
+            });
+            return;
+        }
+
+        let mut notes: Vec<u8> = display.iter().copied().collect();
+        notes.sort_unstable();
+        self.dialog = Some(Dialog::CorrectChord {
+            notes,
+            note_names,
+            current_label,
+            candidates,
+            selected: None,
+        });
+    }
+
+    /// Turn a training attempt into something a musician can act on.
+    fn train_and_report(&mut self, notes: Vec<u8>, name: String) {
+        let set: HashSet<u8> = notes.iter().copied().collect();
+        // A successful correction switches Chord Learning on. Say so rather
+        // than letting the menu item quietly change under the user.
+        let was_on = self.detector.learning_mode();
+        let outcome = self.detector.train_on_correction(&set, &name);
+        let turned_on = !was_on && self.detector.learning_mode();
+        let corrections = self
+            .detector
+            .overrides()
+            .map(|s| s.corrections())
+            .unwrap_or(0);
+        let message = match outcome {
+            TrainOutcome::Learned { now_reads, .. } => {
+                let tail = if now_reads == name {
+                    String::new()
+                } else {
+                    format!(
+                        "\n\nIt shows as \"{now_reads}\" because the bass note is\n\
+                         added automatically."
+                    )
+                };
+                // Correcting re-arms the master switch, which brings back EVERY
+                // earlier correction, not just this one. Saying only "now ON"
+                // would hide that from someone who deliberately switched it off.
+                let switched = if turned_on {
+                    "\n\nChord Learning is switched back ON, so every earlier\n\
+                     correction is active again too — not just this one."
+                        .to_owned()
+                } else {
+                    String::new()
+                };
+                format!(
+                    "Learned. This voicing now reads {now_reads}.{tail}\n\n\
+                     Corrections so far: {corrections}. Similar voicings may\n\
+                     read differently now — \"Forget Learning\" in Manage\n\
+                     Taught Chords undoes all of it.{switched}"
+                )
+            }
+            TrainOutcome::AlreadyCorrect { displays_as } => {
+                if displays_as == name {
+                    format!("{name} is already Ivory's choice here, so nothing was changed.")
+                } else {
+                    format!(
+                        "{name} already wins for this voicing, so nothing was\n\
+                         changed. It shows as \"{displays_as}\" because the bass\n\
+                         note is added after the name is chosen.\n\n\
+                         To pin a different display name, use \"Teach Chord\n\
+                         Name...\"."
+                    )
+                }
+            }
+            TrainOutcome::OutrankedByRule { wants, displays_as } => format!(
+                "{wants} is already Ivory's top-scoring reading — but the name\n\
+                 you see, \"{displays_as}\", comes from a separate rule that runs\n\
+                 afterwards and overrides it.\n\n\
+                 Chord learning only reorders competing chord names, so it\n\
+                 cannot reach this one. Nothing was changed. Use \"Teach Chord\n\
+                 Name...\" to pin {wants} outright."
+            ),
+            TrainOutcome::Stubborn { still_reads, .. } => format!(
+                "Ivory could not be nudged that far.\n\n\
+                 {name} scores too far behind {still_reads} for a safe nudge\n\
+                 to close the gap, so nothing was changed.\n\n\
+                 To force this name anyway, use \"Teach Chord Name...\" — it\n\
+                 pins the name outright."
+            ),
+            TrainOutcome::NotTrainable => format!(
+                "{name} is not one of the readings Ivory weighed for this\n\
+                 voicing, so there is nothing to re-rank.\n\n\
+                 Use \"Teach Chord Name...\" to pin it instead."
+            ),
+            TrainOutcome::NoStore => {
+                "Chord learning is unavailable — the settings folder could not\n\
+                 be opened."
+                    .to_owned()
+            }
+        };
+        self.dialog = Some(Dialog::LearnResult {
+            title: "Chord Learning",
+            message,
+        });
+        self.detection_tick(true);
     }
 
     fn apply_dialog_action(&mut self, ctx: &egui::Context, action: DialogAction) {
@@ -469,6 +665,11 @@ impl IvoryApp {
                 if let Some(store) = self.detector.overrides_mut() {
                     store.delete(&intervals);
                 }
+                self.detection_tick(true);
+            }
+            DialogAction::TrainCorrection { notes, name } => self.train_and_report(notes, name),
+            DialogAction::ForgetLearning => {
+                self.detector.reset_learning();
                 self.detection_tick(true);
             }
             DialogAction::ConnectPort(name) => {

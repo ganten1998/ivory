@@ -40,7 +40,34 @@ pub enum Dialog {
     },
     ManageTaught {
         rows: Vec<OverrideInfo>,
+        /// D-UI-9 footer: learned-re-ranker state, refreshed on open.
+        learning: LearningStatus,
     },
+    // D-UI-9 learned re-ranker.
+    /// Pick a different reading for the held voicing and train toward it.
+    CorrectChord {
+        notes: Vec<u8>,
+        note_names: String,
+        current_label: String,
+        /// The names the re-ranker can actually be trained toward, best first.
+        candidates: Vec<(String, f64)>,
+        selected: Option<usize>,
+    },
+    /// Plain themed report of what a correction achieved.
+    LearnResult {
+        title: &'static str,
+        message: String,
+    },
+}
+
+/// Snapshot of learned-re-ranker state for display.
+#[derive(Clone, Default)]
+pub struct LearningStatus {
+    pub on: bool,
+    pub corrections: u32,
+    pub has_learned: bool,
+    /// One row per perceptron feature: (label, weight).
+    pub weights: Vec<(&'static str, f64)>,
 }
 
 pub enum DialogAction {
@@ -57,6 +84,13 @@ pub enum DialogAction {
     DeleteOverride {
         intervals: Vec<u8>,
     },
+    /// D-UI-9: train the re-ranker to read `notes` as `name`.
+    TrainCorrection {
+        notes: Vec<u8>,
+        name: String,
+    },
+    /// D-UI-9: discard all learned weights.
+    ForgetLearning,
 }
 
 fn dialog_vp_id() -> ViewportId {
@@ -334,7 +368,9 @@ pub fn show(
                             let bottom_h = 62.0;
                             ui.add_space((ui.available_height() - bottom_h).max(0.0));
                             ui.label(
-                                RichText::new("Version 2.0.0").font(bold(8.0)).color(t.text),
+                                RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION")))
+                                    .font(bold(8.0))
+                                    .color(t.text),
                             );
                             // D-UI-6: one extra 8pt credit line under the version.
                             ui.label(
@@ -479,14 +515,184 @@ pub fn show(
             )
         }
 
-        Dialog::ManageTaught { rows } => {
+        Dialog::CorrectChord {
+            notes,
+            note_names,
+            current_label,
+            candidates,
+            selected,
+        } => {
+            let t = theme(dark_mode);
+            let notes = notes.clone();
+            show_dialog_viewport(
+                ctx,
+                "Correct Chord Name",
+                Vec2::new(470.0, 370.0),
+                Vec2::new(400.0, 290.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!("Notes: {note_names}"))
+                                    .font(bold(12.0))
+                                    .color(t.text),
+                            );
+                            ui.label(
+                                RichText::new(format!("Now reads: {current_label}"))
+                                    .font(bold(12.0))
+                                    .color(t.text),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("Which reading would you rather see?")
+                                    .font(bold(11.0))
+                                    .color(t.text),
+                            );
+                            ui.add_space(2.0);
+                            // Explain the list's limits up front — these are the
+                            // only names the re-ranker can be trained toward.
+                            // 4 explanatory lines at 9pt + spacing + buttons.
+                            let bottom_h = 90.0;
+                            let list_h = (ui.available_height() - bottom_h).max(40.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(list_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for (i, (name, score)) in candidates.iter().enumerate() {
+                                        let is_current = current_label == name
+                                            || current_label
+                                                .strip_prefix(name.as_str())
+                                                .is_some_and(|r| r.starts_with('/'));
+                                        let text = if is_current {
+                                            format!("{name}   (current)")
+                                        } else {
+                                            name.clone()
+                                        };
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    *selected == Some(i),
+                                                    RichText::new(text)
+                                                        .font(bold(12.0))
+                                                        .color(t.text),
+                                                )
+                                                .clicked()
+                                            {
+                                                *selected = Some(i);
+                                            }
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        RichText::new(format!("{score:.0}"))
+                                                            .font(bold(10.0))
+                                                            .color(t.text.gamma_multiply(0.55)),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                    }
+                                });
+                            ui.add_space(4.0);
+                            // Measured, not hand-waved: see
+                            // ivory-core/tests/blast_radius.rs.
+                            ui.label(
+                                RichText::new(
+                                    "Ivory learns a general leaning, not this one chord.\n\
+                                     One correction changes about 1 chord in 10 overall,\n\
+                                     often in unrelated keys. \"Forget Learning\" in Manage\n\
+                                     Taught Chords undoes all of it exactly.",
+                                )
+                                .font(bold(9.0))
+                                .color(t.text.gamma_multiply(0.75)),
+                            );
+                            ui.add_space(4.0);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let pick = selected.and_then(|i| candidates.get(i));
+                                if ui
+                                    .add_enabled(
+                                        pick.is_some(),
+                                        Button::new(RichText::new("Learn").color(t.text)),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some((name, _)) = pick {
+                                        action = Some(DialogAction::TrainCorrection {
+                                            notes: notes.clone(),
+                                            name: name.clone(),
+                                        });
+                                    }
+                                    result.close = true;
+                                }
+                                if ui
+                                    .add(Button::new(RichText::new("Cancel").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
+        Dialog::LearnResult { title, message } => {
+            let t = theme(dark_mode);
+            let title = *title;
+            let message = message.clone();
+            // Size from the content. These messages range from one line to ten,
+            // and a fixed height pushed the OK button off the bottom edge of the
+            // longest one — where only Esc could still dismiss it. 12pt Courier
+            // Prime rows are ~13.5pt; the authored lines are under 60 chars, so
+            // the 446pt content width does not wrap them.
+            let lines = message.lines().count().max(1) as f32;
+            let height = (lines * 13.5 + 24.0 + 30.0 + 16.0).clamp(150.0, 460.0);
+            show_dialog_viewport(
+                ctx,
+                title,
+                Vec2::new(470.0, height),
+                Vec2::new(400.0, height.min(200.0)),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(message.as_str())
+                                    .font(bold(12.0))
+                                    .color(t.text),
+                            );
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(Button::new(RichText::new("OK").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
+        Dialog::ManageTaught { rows, learning } => {
             let t = theme(dark_mode);
             let mut to_delete: Option<Vec<u8>> = None;
+            let mut forget = false;
+            // Snapshot for the closure; the live binding is updated afterwards.
+            let learning_view = learning.clone();
             let r = show_dialog_viewport(
                 ctx,
                 "Manage Taught Chords",
-                Vec2::new(460.0, 360.0),
-                Vec2::new(360.0, 240.0),
+                Vec2::new(460.0, 460.0),
+                Vec2::new(360.0, 320.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
@@ -501,7 +707,25 @@ pub fn show(
                                         .color(t.text),
                                 );
                             }
-                            let bottom_h = 34.0;
+                            // List, then the D-UI-9 learning footer, then the
+                            // buttons. Reserve the footer's REAL height (it grows
+                            // one 9pt line per non-zero weight, up to seven) —
+                            // a fixed guess clips the buttons off the bottom
+                            // once training fills every feature in.
+                            const FOOTER_LINE_H: f32 = 13.0;
+                            let weight_rows = learning_view
+                                .weights
+                                .iter()
+                                .filter(|(_, w)| *w != 0.0)
+                                .count() as f32;
+                            let footer_h = 8.0 // separator
+                                + 16.0 // status line
+                                + if learning_view.has_learned {
+                                    FOOTER_LINE_H * (1.0 + weight_rows)
+                                } else {
+                                    FOOTER_LINE_H * 2.0 // the two-line hint
+                                };
+                            let bottom_h = 34.0 + footer_h + 6.0;
                             let list_h = (ui.available_height() - bottom_h).max(40.0);
                             egui::ScrollArea::vertical()
                                 .max_height(list_h)
@@ -529,12 +753,71 @@ pub fn show(
                                     }
                                 });
                             ui.add_space(6.0);
+                            ui.separator();
+                            ui.label(
+                                RichText::new(format!(
+                                    "Chord learning: {}  ({} correction{})",
+                                    if learning_view.on { "ON" } else { "off" },
+                                    learning_view.corrections,
+                                    if learning_view.corrections == 1 { "" } else { "s" },
+                                ))
+                                .font(bold(11.0))
+                                .color(t.text),
+                            );
+                            if learning_view.has_learned {
+                                ui.label(
+                                    RichText::new("Learned leanings:")
+                                        .font(bold(9.0))
+                                        .color(t.text.gamma_multiply(0.75)),
+                                );
+                                for (label, w) in learning_view.weights.iter() {
+                                    if *w == 0.0 {
+                                        continue;
+                                    }
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "   {label}: {}{:.0}",
+                                            if *w > 0.0 { "+" } else { "" },
+                                            w
+                                        ))
+                                        .font(bold(9.0))
+                                        .color(t.text.gamma_multiply(0.75)),
+                                    );
+                                }
+                            } else {
+                                // Forget leaves the switch armed but the weights
+                                // empty. Say outright that readings are stock, or
+                                // "ON (0 corrections)" reads as a failed undo.
+                                ui.label(
+                                    RichText::new(if learning_view.on {
+                                        "Nothing learned — chord names are stock.\n\
+                                         Use \"Correct Chord Name...\" to teach a leaning."
+                                    } else {
+                                        "Nothing learned yet. Play a chord, then use\n\
+                                         \"Correct Chord Name...\" in the menu."
+                                    })
+                                    .font(bold(9.0))
+                                    .color(t.text.gamma_multiply(0.75)),
+                                );
+                            }
+                            ui.add_space(6.0);
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui
                                     .add(Button::new(RichText::new("Close").color(t.text)))
                                     .clicked()
                                 {
                                     result.close = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        learning_view.has_learned,
+                                        Button::new(
+                                            RichText::new("Forget Learning").color(t.text),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    forget = true;
                                 }
                             });
                         });
@@ -545,6 +828,14 @@ pub fn show(
                 // and tell the app to persist it.
                 rows.retain(|r| r.intervals != intervals);
                 action = Some(DialogAction::DeleteOverride { intervals });
+            }
+            if forget {
+                // Same immediate-feedback pattern as Delete: clear the footer
+                // locally so the dialog updates now, and let the app persist.
+                learning.has_learned = false;
+                learning.corrections = 0;
+                learning.weights.clear();
+                action = Some(DialogAction::ForgetLearning);
             }
             r
         }
