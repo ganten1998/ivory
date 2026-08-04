@@ -124,6 +124,12 @@ struct WireFile {
     learning_mode: bool,
     #[serde(default)]
     weights: serde_json::Value,
+    /// How many corrections have been folded into `weights`. Display-only; a
+    /// `#[serde(default)]` addition, so schema version 1 files written before
+    /// it existed still load (and files carrying it still load in builds
+    /// without the `learning` feature).
+    #[serde(default)]
+    corrections: u32,
 }
 
 // ── store ──────────────────────────────────────────────────────────────────
@@ -137,6 +143,8 @@ pub struct OverrideStore {
     /// under the `learning` feature the perceptron owns them instead.
     #[cfg_attr(feature = "learning", allow(dead_code))]
     weights_raw: serde_json::Value,
+    /// Round-tripped in every build; only the `learning` feature increments it.
+    corrections: u32,
     #[cfg(feature = "learning")]
     perceptron: learning::Perceptron,
 }
@@ -161,6 +169,7 @@ impl OverrideStore {
             map: BTreeMap::new(),
             learning_mode: false,
             weights_raw: serde_json::Value::Object(Default::default()),
+            corrections: 0,
             #[cfg(feature = "learning")]
             perceptron: learning::Perceptron::default(),
         };
@@ -201,6 +210,7 @@ impl OverrideStore {
             map,
             learning_mode: wire.learning_mode,
             weights_raw: wire.weights,
+            corrections: wire.corrections,
             #[cfg(feature = "learning")]
             perceptron,
         }
@@ -239,9 +249,24 @@ impl OverrideStore {
             overrides,
             learning_mode: self.learning_mode,
             weights,
+            corrections: self.corrections,
         };
         if let Ok(text) = serde_json::to_string_pretty(&wire) {
-            let _ = std::fs::write(&self.path, text);
+            // Write-then-rename. This file now carries BOTH the taught chords
+            // and the learned weights, and it is rewritten on every accepted
+            // correction — a torn write would take someone's taught names with
+            // it. Rename is atomic within a filesystem; the temp file sits
+            // beside the target so that always holds. Errors stay silent
+            // (parity with settings.rs), but a failed write can no longer
+            // destroy the previous good file.
+            let tmp = self.path.with_extension("json.tmp");
+            if std::fs::write(&tmp, text).is_ok() {
+                if std::fs::rename(&tmp, &self.path).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            } else {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
 
@@ -358,6 +383,25 @@ impl OverrideStore {
     pub fn set_learning_mode(&mut self, on: bool) {
         self.learning_mode = on;
         self.save();
+    }
+
+    /// How many corrections have been folded into the learned weights. Always
+    /// available (round-tripped even without the `learning` feature) so the GUI
+    /// can report state without a cfg split.
+    pub fn corrections(&self) -> u32 {
+        self.corrections
+    }
+
+    /// True when there is learned state a user could meaningfully forget.
+    pub fn has_learned(&self) -> bool {
+        #[cfg(feature = "learning")]
+        {
+            !self.perceptron.is_zero()
+        }
+        #[cfg(not(feature = "learning"))]
+        {
+            self.corrections > 0
+        }
     }
 }
 
@@ -476,6 +520,14 @@ mod learning {
         pub fn is_zero(&self) -> bool {
             self.weights.iter().all(|&w| w == 0.0)
         }
+
+        pub fn weights_slice(&self) -> &[f64; N_FEATURES] {
+            &self.weights
+        }
+
+        pub fn set_weights(&mut self, w: [f64; N_FEATURES]) {
+            self.weights = w;
+        }
     }
 
     impl OverrideStore {
@@ -493,13 +545,69 @@ mod learning {
         pub fn train(&mut self, correct: &CandidateFeatures, wrong: &CandidateFeatures) {
             self.perceptron.update(correct, wrong);
             self.learning_mode = true;
+            self.corrections = self.corrections.saturating_add(1);
             self.save();
         }
 
-        /// Forget all learned weights (learning mode is left untouched). Persists.
+        /// Like `train` but without persisting or counting — for the bounded
+        /// step loop in `ChordDetector::train_on_correction`, which saves once
+        /// at the end and counts the whole correction as one. Learning mode is
+        /// switched on in memory so each step's effect is visible to the very
+        /// next scoring pass (the loop needs to see the ranking move).
+        pub(crate) fn train_step_unsaved(
+            &mut self,
+            correct: &CandidateFeatures,
+            wrong: &CandidateFeatures,
+        ) {
+            self.learning_mode = true;
+            self.perceptron.update(correct, wrong);
+        }
+
+        /// (weights, learning_mode) before a training attempt.
+        pub(crate) fn learning_snapshot(&self) -> ([f64; N_FEATURES], bool) {
+            (*self.perceptron.weights_slice(), self.learning_mode)
+        }
+
+        /// Undo an abandoned training attempt. Nothing was persisted along the
+        /// way, so restoring memory is enough — a correction that could not be
+        /// made must leave no trace to confuse the next one.
+        pub(crate) fn restore_learning(&mut self, snap: ([f64; N_FEATURES], bool)) {
+            self.perceptron.set_weights(snap.0);
+            self.learning_mode = snap.1;
+        }
+
+        /// Commit a completed correction: enable learning, count it once, save.
+        pub(crate) fn commit_correction(&mut self) {
+            self.learning_mode = true;
+            self.corrections = self.corrections.saturating_add(1);
+            self.save();
+        }
+
+        /// Forget all learned weights and the correction count (learning mode
+        /// is left untouched). Persists.
         pub fn reset_learning(&mut self) {
             self.perceptron.reset();
+            self.corrections = 0;
             self.save();
+        }
+
+        /// Human-readable weight dump for the diagnostics dialog: one row per
+        /// feature, in `vector()` order.
+        pub fn weights_report(&self) -> Vec<(&'static str, f64)> {
+            const LABELS: [&str; N_FEATURES] = [
+                "baseline",
+                "inversion (root->bass)",
+                "voicing span",
+                "note count",
+                "clustered",
+                "root in bass",
+                "chord family",
+            ];
+            LABELS
+                .iter()
+                .copied()
+                .zip(self.perceptron.weights_slice().iter().copied())
+                .collect()
         }
 
         #[cfg(test)]
@@ -608,6 +716,24 @@ mod tests {
         s.teach(&notes(&[60, 64, 67]), "Second", false);
         assert_eq!(s.len(), 1);
         assert_eq!(s.lookup(&notes(&[60, 64, 67]), true), Some("Second".into()));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The write-then-rename save must leave no debris and must not clobber a
+    /// good file with a partial one.
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file() {
+        let p = tmp("atomic");
+        let mut s = OverrideStore::load_from(&p);
+        s.teach(&notes(&[60, 64, 67]), "Cmaj", true);
+        let tmp_path = p.with_extension("json.tmp");
+        assert!(!tmp_path.exists(), "temp file left behind at {tmp_path:?}");
+        assert!(p.exists());
+        // Second save over an existing file also lands cleanly.
+        s.teach(&notes(&[60, 63, 67]), "Cmin", true);
+        assert!(!tmp_path.exists());
+        let reloaded = OverrideStore::load_from(&p);
+        assert_eq!(reloaded.len(), 2);
         let _ = std::fs::remove_file(&p);
     }
 

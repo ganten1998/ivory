@@ -17,6 +17,16 @@ fn pitch_classes(notes: &HashSet<u8>) -> Vec<u8> {
     pcs
 }
 
+/// Does the displayed chord label represent the candidate `correct`? True for
+/// the name itself and for its slash form, which the post-scoring step appends
+/// when the bass is not the root ("Am7" is shown by "Am7" and by "Am7/C").
+#[cfg(feature = "learning")]
+fn label_reflects(label: Option<&str>, correct: &str) -> bool {
+    label.is_some_and(|l| {
+        l == correct || (l.starts_with(correct) && l[correct.len()..].starts_with('/'))
+    })
+}
+
 /// Is `name` a basic chord (just note + optional accidental + optional 'm')?
 /// Equivalent to the Python regex `^[A-G][b#]?m?$`.
 fn is_basic_chord(name: &str) -> bool {
@@ -29,6 +39,33 @@ fn is_basic_chord(name: &str) -> bool {
     let _ = first; // used implicitly
     let rest: &str = &s[1..];
     matches!(rest, "" | "b" | "#" | "m" | "bm" | "#m")
+}
+
+/// What a call to [`ChordDetector::train_on_correction`] actually achieved.
+/// Every variant is reportable to the user — the re-ranker must never train
+/// into a silent void.
+#[cfg(feature = "learning")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrainOutcome {
+    /// The corrected name now ranks first; `now_reads` is what the strip shows
+    /// (post-processing may add a slash bass).
+    Learned { steps: u32, now_reads: String },
+    /// The correction could not overtake the winner within the step budget —
+    /// the score gap is beyond what a bounded nudge can close. The attempt is
+    /// rolled back, so nothing changed.
+    Stubborn { steps: u32, still_reads: String },
+    /// The chosen name already ranked first. `displays_as` differs from the
+    /// chosen name when post-processing renames it.
+    AlreadyCorrect { displays_as: String },
+    /// The chosen name tops the scoring, but the displayed reading comes from
+    /// a rule that runs *after* scoring and overrides it — scale detection, or
+    /// rootless-dominant renaming. Re-ranking cannot reach that; only an exact
+    /// override can. Distinct from `Stubborn`: there is no score gap at all.
+    OutrankedByRule { wants: String, displays_as: String },
+    /// The chosen name was not one of the scored candidates for this voicing.
+    NotTrainable,
+    /// No override store is attached (should not happen in the GUI).
+    NoStore,
 }
 
 // ── ChordDetector ────────────────────────────────────────────────────────────
@@ -47,6 +84,13 @@ pub struct ChordDetector {
     /// `train_on_correction` is collecting features.
     #[cfg(feature = "learning")]
     learn_capture: Option<Vec<(String, crate::overrides::CandidateFeatures)>>,
+    /// Set when the last `detect_chord` returned a scale name from the check
+    /// that runs *after* the scoring loop, discarding the winner outright. The
+    /// candidates were scored but are unreachable, so nothing is trainable —
+    /// without this, the picker offers readings that can never be selected and
+    /// every attempt burns the full step budget before blaming a score gap.
+    #[cfg(feature = "learning")]
+    label_from_scale: bool,
 }
 
 impl Default for ChordDetector {
@@ -66,6 +110,8 @@ impl ChordDetector {
             overrides: None,
             #[cfg(feature = "learning")]
             learn_capture: None,
+            #[cfg(feature = "learning")]
+            label_from_scale: false,
         }
     }
 
@@ -102,36 +148,178 @@ impl ChordDetector {
             .and_then(|s| s.lookup(notes, self.prefer_flats))
     }
 
-    /// Learned re-ranker: nudge the store's weights so this voicing scores
-    /// `correct_label` above the reading it currently produces. Requires an
-    /// attached store; does nothing if the correct label is not among the
-    /// scored candidates (the re-ranker only reorders existing candidates).
+    /// The names the re-ranker can actually be trained toward for `notes`, best
+    /// score first. These are the raw scored candidates — the post-scoring
+    /// steps (slash notation, rootless-dominant renaming, dim/aug re-rooting)
+    /// rewrite the winner afterwards, so the displayed label is often NOT in
+    /// this list. The GUI offers exactly this list so a correction can never
+    /// land on an untrainable name.
     #[cfg(feature = "learning")]
-    pub fn train_on_correction(&mut self, notes: &HashSet<u8>, correct_label: &str) {
-        if self.overrides.is_none() {
-            return;
-        }
-        // Collect every scored candidate's (name, features) for this voicing.
+    pub fn trainable_candidates(&mut self, notes: &HashSet<u8>) -> Vec<(String, f64)> {
+        let (_, ranked) = self.capture_ranked(notes);
+        ranked
+    }
+
+    /// Run detection with candidate capture on, returning the final label and
+    /// the captured candidates ranked by score (best first, deduped by name).
+    #[cfg(feature = "learning")]
+    fn capture_ranked(
+        &mut self,
+        notes: &HashSet<u8>,
+    ) -> (Option<String>, Vec<(String, f64)>) {
         self.learn_capture = Some(Vec::new());
-        let winner = self.detect_chord(notes);
+        let prev_debug = self.debug_mode;
+        // debug_candidates carries the scores; learn_capture carries features.
+        self.debug_mode = true;
+        self.debug_candidates.clear();
+        let label = self.detect_chord(notes);
+        self.debug_mode = prev_debug;
+        let captured = self.learn_capture.take().unwrap_or_default();
+        let scores = std::mem::take(&mut self.debug_candidates);
+
+        let mut best: HashMap<String, f64> = HashMap::new();
+        for (name, score) in scores {
+            let e = best.entry(name).or_insert(f64::NEG_INFINITY);
+            if score > *e {
+                *e = score;
+            }
+        }
+        // Only names that were genuinely captured with features are trainable.
+        let mut ranked: Vec<(String, f64)> = captured
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|name| best.get(&name).map(|&s| (name, s)))
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        if self.label_from_scale {
+            // The late scale check threw the scoring result away. These
+            // candidates were computed but are unreachable — reporting them as
+            // trainable would offer the user choices that cannot ever apply.
+            return (label, Vec::new());
+        }
+        (label, ranked)
+    }
+
+    /// Learned re-ranker: nudge the store's weights until this voicing ranks
+    /// `correct_label` top, bounded by `MAX_TRAIN_STEPS`.
+    ///
+    /// The re-ranker only reorders the *scored* candidates, so `correct_label`
+    /// must be one of `trainable_candidates()`. The candidate it trains
+    /// against is the one behind the currently displayed label — its base name
+    /// with any `/bass` stripped, when that is genuinely a captured candidate
+    /// and not the target itself — falling back to the top-scored candidate
+    /// when post-processing renamed the winner past recognition (a rootless
+    /// dominant, say, where the label shares no text with any candidate).
+    #[cfg(feature = "learning")]
+    pub fn train_on_correction(
+        &mut self,
+        notes: &HashSet<u8>,
+        correct_label: &str,
+    ) -> TrainOutcome {
+        /// Weight updates are clamped, so a large score gap can be unclosable;
+        /// stop rather than saturate the weights against an impossible target.
+        const MAX_TRAIN_STEPS: u32 = 25;
+
+        if self.overrides.is_none() {
+            return TrainOutcome::NoStore;
+        }
+        self.learn_capture = Some(Vec::new());
+        let _ = self.detect_chord(notes);
         let captured = self.learn_capture.take().unwrap_or_default();
 
-        let correct = captured.iter().find(|(name, _)| name == correct_label);
-        let (Some((_, correct_f)), Some(winner)) = (correct, winner) else {
-            return;
+        let Some(correct_f) = captured
+            .iter()
+            .find(|(name, _)| name == correct_label)
+            .map(|(_, f)| *f)
+        else {
+            return TrainOutcome::NotTrainable;
         };
-        // Train against whatever currently wins (if it is already correct,
-        // nothing to do).
-        if winner == correct_label {
-            return;
-        }
-        let wrong_f = match captured.iter().find(|(name, _)| *name == winner) {
-            Some((_, f)) => *f,
-            None => return,
-        };
-        let correct_f = *correct_f;
-        if let Some(store) = self.overrides.as_mut() {
-            store.train(&correct_f, &wrong_f);
+
+        let snapshot = self
+            .overrides
+            .as_ref()
+            .map(|s| s.learning_snapshot())
+            .expect("store presence checked above");
+
+        let mut steps = 0;
+        loop {
+            let (label, ranked) = self.capture_ranked(notes);
+            // Success is judged on the DISPLAYED label, not on the raw ranking:
+            // winning the scoring loop is necessary but not sufficient (the D21
+            // completeness preference can still swap in a note-complete reading
+            // that scores within 12 points, and the slash step then appends the
+            // bass). "Am7" is satisfied by "Am7" and by "Am7/C".
+            if label_reflects(label.as_deref(), correct_label) {
+                if steps > 0 {
+                    if let Some(store) = self.overrides.as_mut() {
+                        store.commit_correction();
+                    }
+                    return TrainOutcome::Learned {
+                        steps,
+                        now_reads: label.unwrap_or_else(|| correct_label.to_owned()),
+                    };
+                }
+                return TrainOutcome::AlreadyCorrect {
+                    displays_as: label.unwrap_or_else(|| correct_label.to_owned()),
+                };
+            }
+            if steps >= MAX_TRAIN_STEPS {
+                // The gap is beyond a bounded nudge. Roll back: a correction
+                // that did not land must not silently reshape every other
+                // chord's ranking as a consolation prize.
+                if let Some(store) = self.overrides.as_mut() {
+                    store.restore_learning(snapshot);
+                }
+                // Report the reading as it stands *after* the rollback.
+                let still_reads = self
+                    .detect_chord(notes)
+                    .unwrap_or_else(|| "(none)".to_owned());
+                return TrainOutcome::Stubborn {
+                    steps,
+                    still_reads,
+                };
+            }
+            // Push down whatever is beating the user's choice right now: the
+            // candidate the displayed label came from (its base name, before
+            // any slash bass), falling back to the top-scored candidate when
+            // post-processing renamed it past recognition.
+            let base = label.as_deref().and_then(|l| l.split('/').next());
+            let wrong_name = base
+                .filter(|b| captured.iter().any(|(n, _)| n == b) && *b != correct_label)
+                .map(|b| b.to_owned())
+                .or_else(|| ranked.first().map(|(n, _)| n.clone()));
+            let Some(wrong_f) = wrong_name
+                .filter(|n| n != correct_label)
+                .and_then(|name| captured.iter().find(|(n, _)| *n == name))
+                .map(|(_, f)| *f)
+            else {
+                // Nothing left to push against: the pick already tops the
+                // ranking, yet the display still disagrees. That is not a score
+                // gap — a post-scoring rule (scale detection, rootless-dominant
+                // renaming) is overriding the winner, and no amount of
+                // re-ranking reaches it. Saying "scores too far behind" here
+                // would be a lie.
+                if let Some(store) = self.overrides.as_mut() {
+                    store.restore_learning(snapshot);
+                }
+                let displays_as = self
+                    .detect_chord(notes)
+                    .unwrap_or_else(|| "(none)".to_owned());
+                return TrainOutcome::OutrankedByRule {
+                    wants: correct_label.to_owned(),
+                    displays_as,
+                };
+            };
+            if let Some(store) = self.overrides.as_mut() {
+                store.train_step_unsaved(&correct_f, &wrong_f);
+            }
+            steps += 1;
         }
     }
 
@@ -143,6 +331,18 @@ impl ChordDetector {
         }
     }
 
+    /// Is the learned re-ranker currently allowed to influence detection?
+    pub fn learning_mode(&self) -> bool {
+        self.overrides.as_ref().is_some_and(|s| s.learning_mode())
+    }
+
+    /// Turn the learned re-ranker's influence on or off (weights are kept).
+    pub fn set_learning_mode(&mut self, on: bool) {
+        if let Some(store) = self.overrides.as_mut() {
+            store.set_learning_mode(on);
+        }
+    }
+
     pub fn get_note_name(&self, pitch_class: u8) -> &'static str {
         let idx = (pitch_class % 12) as usize;
         if self.prefer_flats { NOTE_NAMES_FLAT[idx] } else { NOTE_NAMES[idx] }
@@ -151,6 +351,10 @@ impl ChordDetector {
     // ── public API ───────────────────────────────────────────────────────────
 
     pub fn detect_chord(&mut self, active_notes_in: &HashSet<u8>) -> Option<String> {
+        #[cfg(feature = "learning")]
+        {
+            self.label_from_scale = false;
+        }
         if active_notes_in.is_empty() {
             return None;
         }
@@ -334,7 +538,15 @@ impl ChordDetector {
         });
 
         let mut best_match: Option<String> = None;
-        let mut best_score: f64 = 0.0;
+        // NEG_INFINITY, not 0.0: admission is decided by the UNADJUSTED score
+        // (`raw_score > 0.0`) so the learned re-ranker can only reorder
+        // candidates, never eliminate them. With a 0.0 floor here, a candidate
+        // whose learned nudge (bounded at -100) dragged it to <= 0 was rejected
+        // outright, and a voicing whose every candidate got floored produced
+        // best_match = None — i.e. the chord strip went blank on a chord the
+        // stock engine names fine. With zero weights this is bit-identical to
+        // the old code, since the first admitted candidate always beat 0.0.
+        let mut best_score: f64 = f64::NEG_INFINITY;
         let mut best_root_pc: u8 = 0;
         // Best reading that leaves NO sounded note unexplained, plus whether the
         // overall best dropped a note. Used to prefer a complete reading over a
@@ -365,6 +577,8 @@ impl ChordDetector {
                 // default build and the differential harness are unaffected.
                 #[allow(unused_mut)]
                 let mut score = score;
+                // Admission is judged on this, ranking on the adjusted `score`.
+                let raw_score = score;
                 #[cfg(feature = "learning")]
                 {
                     let feats = crate::overrides::CandidateFeatures {
@@ -385,10 +599,13 @@ impl ChordDetector {
                 if self.debug_mode {
                     self.debug_candidates.push((chord_name.clone(), score));
                 }
-                if complete && score > best_complete.as_ref().map_or(0.0, |c| c.1) {
+                if complete
+                    && raw_score > 0.0
+                    && score > best_complete.as_ref().map_or(f64::NEG_INFINITY, |c| c.1)
+                {
                     best_complete = Some((chord_name.clone(), score, root_pc));
                 }
-                if score > best_score {
+                if raw_score > 0.0 && score > best_score {
                     best_score = score;
                     best_match = Some(chord_name);
                     best_root_pc = root_pc;
@@ -605,6 +822,12 @@ impl ChordDetector {
                 - original.iter().min().copied().unwrap_or(0) as i32;
             if span < 12 {
                 if let Some(scale) = self.detect_scale(&original) {
+                    // This discards every scored candidate. Mark it so the teach
+                    // layer does not offer readings that can never win.
+                    #[cfg(feature = "learning")]
+                    {
+                        self.label_from_scale = true;
+                    }
                     return Some(scale);
                 }
             }
