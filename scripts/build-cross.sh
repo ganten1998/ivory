@@ -30,9 +30,9 @@ TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
 gen_ico() {
   local out="assets/ivory.ico" tmp px
   if [ "$(stat -f%z "$ICON_SRC")" -lt 4096 ]; then
-    echo "WARNING: $ICON_SRC is the 543-byte placeholder art. Icons built from"
-    echo "         it will be blurry/unshippable. Replace with real >=1024px"
-    echo "         artwork before releasing (see docs/RELEASE.md)."
+    echo "NOTE: $ICON_SRC is the original 128x128 piano-keys icon (identical to"
+    echo "      the Python app's). Frames above 128px are upscaled and look"
+    echo "      soft; the artwork itself is intentional."
   fi
   if command -v magick >/dev/null 2>&1; then
     magick "$ICON_SRC" -define icon:auto-resize=256,128,64,48,32,16 "$out"
@@ -82,15 +82,28 @@ gen_ico
 package_linux() { # $1 = rust target, $2 = artifact arch name
   local target="$1" arch="$2"
   local stage="dist/ivory-${VERSION}-linux-${arch}"
-  cargo zigbuild --release --target "${target}.${GLIBC}" -p ivory
-  rm -rf "$stage"; mkdir -p "$stage/fonts"
-  cp "target/${target}/release/ivory" "$stage/"
-  cp assets/ivory.desktop "$stage/"
-  cp assets/ivory.png "$stage/"
+  # NOTE: this function is invoked as `package_linux ... || handler`, which
+  # DISABLES `set -e` inside the whole body (bash: errexit is suppressed in a
+  # command that is the left operand of ||). Every failure must therefore be
+  # checked by hand — otherwise a failed cargo build sails on and tar cheerfully
+  # ships an archive containing licences and fonts but no program. That is
+  # exactly what happened before 2.1.0.
+  rm -rf "$stage" "${stage}.tar.gz"
+  cargo zigbuild --release --target "${target}.${GLIBC}" -p ivory || return 1
+  if [ ! -f "target/${target}/release/ivory" ]; then
+    echo "!! no binary at target/${target}/release/ivory"
+    return 1
+  fi
+  mkdir -p "$stage/fonts" || return 1
+  cp "target/${target}/release/ivory" "$stage/" || { rm -rf "$stage"; return 1; }
+  cp assets/ivory.desktop "$stage/" || { rm -rf "$stage"; return 1; }
+  cp assets/ivory.png "$stage/" || { rm -rf "$stage"; return 1; }
   cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
-     assets/fonts/OFL.txt "$stage/fonts/"
-  cp LICENSE THIRD-PARTY-LICENSES "$stage/"
-  tar -C dist -czf "${stage}.tar.gz" "ivory-${VERSION}-linux-${arch}"
+     assets/fonts/OFL.txt "$stage/fonts/" || { rm -rf "$stage"; return 1; }
+  cp LICENSE THIRD-PARTY-LICENSES "$stage/" || { rm -rf "$stage"; return 1; }
+  tar -C dist -czf "${stage}.tar.gz" "ivory-${VERSION}-linux-${arch}" || {
+    rm -rf "$stage" "${stage}.tar.gz"; return 1;
+  }
   rm -rf "$stage"
   echo "==> ${stage}.tar.gz"
 }
@@ -115,7 +128,11 @@ mkdir -p "$WINSTAGE"
 cp target/x86_64-pc-windows-msvc/release/ivory.exe "$WINSTAGE/"
 cp LICENSE THIRD-PARTY-LICENSES "$WINSTAGE/"
 cp assets/fonts/OFL.txt "$WINSTAGE/"
-(cd "$WINSTAGE" && zip -q "$ROOT/$WINZIP" ivory.exe LICENSE THIRD-PARTY-LICENSES OFL.txt)
+# Tester-facing instructions travel with the build (SmartScreen steps, what the
+# two teach features are, how to undo learning).
+cp docs/CHORD-LEARNING-TESTING.md "$WINSTAGE/READ-ME-FIRST.md"
+(cd "$WINSTAGE" && zip -q "$ROOT/$WINZIP" ivory.exe LICENSE THIRD-PARTY-LICENSES \
+    OFL.txt READ-ME-FIRST.md)
 rm -rf "$WINSTAGE"
 echo "==> $WINZIP"
 

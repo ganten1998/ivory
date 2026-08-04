@@ -5,9 +5,13 @@ is in `DESIGN.md`; historical CI war stories are in `spec/product-docs.md` §3.
 
 ## Hard gates before any public release
 
-1. **Icon.** `assets/ivory.png` is the historical 543-byte, 128x128 art. The
-   owner has **accepted it as-is for now** (2026-07-29), so this is no longer a
-   hard gate — but it is small, so icons scale up soft. If a crisper icon is
+1. **Icon.** `assets/ivory.png` is the historical 543-byte, 128x128 art —
+   verified 2026-08-04 to be **byte-identical to the Python app's**
+   `icons/ivory.png` (sha256 `0dc37a25…`), i.e. the original piano-keys icon,
+   which the owner wants kept. It was mislabelled a "placeholder" in earlier
+   docs. Not a hard gate — but it is small, so icons scale up soft (a
+   nearest-neighbour 8× re-render to 1024px would keep the art exactly and
+   sharpen every frame). If a crisper icon is
    ever wanted, drop a **1024x1024+** PNG at that path and rerun
    `scripts/build-macos.sh` / `scripts/build-cross.sh` (the `.ico`/`.icns` are
    regenerated automatically; `build.rs` embeds the `.ico` into `ivory.exe`).
@@ -74,6 +78,14 @@ Linux:
 `scripts/build-cross.sh` still produces the Windows zip; its Linux stage will
 fail loudly until one of the above is in place.
 
+**Fixed 2026-08-04:** that stage used to fail *silently*. `package_linux` is
+called as `package_linux … || handler`, and bash suppresses `set -e` inside the
+left operand of `||`, so the failed `cargo zigbuild` fell through to `tar` and
+emitted an 85 KB `ivory-<v>-linux-<arch>.tar.gz` containing fonts and licences
+but **no binary** — an artifact that looks releasable. Each step is now checked
+explicitly and a failure leaves no archive behind. If you ever see a Linux
+tarball under ~1 MB, it is empty: check it with `tar -tzvf` before uploading.
+
 ## Licensing & pay-what-you-can
 
 - **MIT retention.** The Python releases (through 1.1.0) are public under MIT,
@@ -125,7 +137,7 @@ Prime TTFs; on Windows the fonts are embedded in the exe only).
    changed.
 3. **Test**: `cargo test --workspace` (all three layers green).
 4. **Build macOS**: `scripts/build-macos.sh` (host arm64) and/or
-   `ARCH=universal scripts/build-macos.sh`. Heed any placeholder-icon warning
+   `ARCH=universal scripts/build-macos.sh`. The small-icon NOTE is expected
    (gate #1).
 5. **Build Windows** (from mac): `scripts/build-cross.sh` (needs `zig`,
    `cargo-zigbuild`, `cargo-xwin`, the rustup targets — header lists them). It

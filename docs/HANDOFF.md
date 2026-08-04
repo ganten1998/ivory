@@ -1,6 +1,7 @@
 # Ivory 2.0 — Handoff / Resume Document
 
-**Last updated:** 2026-07-29. This file is the single source of truth for
+**Last updated:** 2026-08-04 (v2.1.0 — Chord Learning went user-facing; see §2a).
+This file is the single source of truth for
 picking the project up cold. Read it top-to-bottom before touching anything.
 Pair it with `docs/DESIGN.md` (architecture), `docs/DIVERGENCES.md` (the chord
 policy) and `docs/spec/` (the machine-verified extraction of the Python app).
@@ -63,6 +64,85 @@ teach agent) completed:
   #5/#11; fixed via a completeness preference + a maj7#11 perfect-inversion
   boost. One residual non-blocking slash-simplify note-drop is documented in
   DIVERGENCES.md D21 and `tests/golden/UNEXPLAINED.md` (top note).
+
+## 2a. v2.1.0 — Chord Learning is now a real GUI option (2026-08-04)
+
+Built for a first hands-on test by a non-owner on macOS **and** Windows.
+
+- **Menu** (D-UI-9): `Correct Chord Name...` (greyed with no notes held) and
+  `Enable/Disable Chord Learning`, right after the D-UI-5 teach pair.
+  `Manage Taught Chords...` grew a footer: learning on/off, correction count,
+  the non-zero learned weights, and `Forget Learning`.
+- **Correction dialog** lists only `trainable_candidates()` with their scores
+  and marks the current winner, so a correction can never land on a name the
+  re-ranker is unable to reach. Every attempt reports its outcome.
+- **Measured blast radius** (`ivory-core/tests/blast_radius.rs`, `#[ignore]`d —
+  run it with `--release -- --ignored --nocapture`): ONE correction
+  (`C-E-G-A → Am7`, 5 steps) changes **1,182 of the 13,133 corpus voicings
+  (9.0%)**, many in unrelated keys, because chord identity enters the feature
+  vector only as `hash % 97`. `Forget Learning` restored all 13,133 exactly.
+  That number is the honest answer to "is the re-ranker worth keeping" — it is
+  a taste dial with a very wide blast radius, not a per-chord memory. It is
+  quoted in the correction dialog and in the tester README rather than hidden.
+- **Six real bugs fixed on the way** (all silent, four found by an adversarial
+  review panel, two by a design panel):
+  1. `train_on_correction` matched the winning candidate by the *final*
+     label. Post-scoring renames (slash bass, rootless dominant) mean that
+     label usually is not a candidate — e.g. E-G-C displays `C/E` while the
+     candidates are `C`, `Em`, `G4` — so training silently did nothing on
+     exactly the ambiguous voicings worth correcting. It now trains against
+     the candidate behind the displayed label, judges success on the
+     displayed label (the D21 completeness rule needs a >12-point margin,
+     not merely first place), and rolls back if it cannot get there.
+  2. **The re-ranker could make a chord nameless.** Candidate admission used
+     `score > 0.0` applied *after* the learned adjustment (bounded at −100), so
+     a few ordinary corrections could drag every candidate for a voicing to
+     ≤ 0, leaving `best_match = None` — the chord strip went blank on chords
+     the stock engine names fine (e.g. B-B-A♯ = `BΔ7(#11)`). Admission now uses
+     the **unadjusted** score and only ranking uses the adjusted one, so the
+     re-ranker can reorder but never eliminate. Regression-tested
+     (`training_never_makes_a_chord_nameless`, verified to fail before the fix).
+  3. **Scale readings offered 7 impossible choices.** The late scale check runs
+     *after* the scoring loop and discards the winner outright, so for e.g.
+     C Ionian the picker listed 7 candidates of which six burned the full
+     25-step budget and then blamed a score gap that did not exist. A
+     `label_from_scale` flag now makes `trainable_candidates()` return empty,
+     so the GUI says "named by a fixed rule" instead.
+  4. `scripts/build-cross.sh` shipped **binary-less Linux tarballs**: the
+     function is called as `package_linux ... || handler`, which suppresses
+     `set -e` for its whole body, so a failed ALSA build fell through to
+     `tar` and produced an 85 KB archive of fonts and licences. Every step is
+     now checked by hand; failure leaves no artifact.
+  5. `scripts/build-macos.sh` packaged `"$APP"` alone with ditto/hdiutil, so
+     the tester README never left the build machine while the Windows zip got
+     it. Both now package a staged folder (app + `READ-ME-FIRST.md`).
+  6. `OverrideStore::save()` was a plain `fs::write` on a file that now holds
+     taught chords AND learned weights and is rewritten on every correction —
+     now write-then-rename, so a torn write cannot destroy taught names.
+  Also corrected: several outcome messages were confidently wrong (a phantom
+  slash-bass explanation on root-position chords, "scores too far behind" when
+  the pick had actually won, "intervals and scales" blamed for chords resolved
+  by special-case branches, and a correction silently re-arming every earlier
+  correction without saying so). `Correct Chord Name...` is now also gated on
+  `detection_enabled`, and is no longer a dead click if the notes were released
+  while the menu was open.
+- **Feature flag**: `ivory` always enables `ivory-core/learning`, so both
+  packaging scripts ship it with no changes. `ivory-core` keeps the gate, so
+  `cargo test -p ivory-core` still exercises the stock engine.
+- **Safety invariants** (all test-asserted): exact overrides still short-circuit
+  before scoring and beat the re-ranker; learning off or zero weights ⇒
+  adjustment exactly 0.0 ⇒ bit-identical to stock; `Forget Learning` restores
+  stock readings; learning state lives only in overrides.json.
+- **Tests**: `ivory-core/tests/learning.rs` (10, the user-facing contract),
+  `blast_radius.rs` (ignored measurement), plus 3 menu tests and an
+  atomic-save test. Whole workspace green: GUI 14 + engine 59 + acceptance 3 +
+  differential + learning 10. `cargo test -p ivory-core` (stock, no feature)
+  is also still green at 55 + 3 + differential — the differential guard passing
+  is the proof that none of this moved stock detection.
+- **Not yet verified by a human**: the new dialogs have not been clicked
+  through on-device (the owner was mid-call; synthetic clicks do not drive
+  egui reliably on macOS anyway), and no build has ever been run on real
+  Windows. That is exactly what the friend test covers.
 
 ### Remaining work (task 8 — FINALIZE only)
 Everything above is committed. What's left is packaging + release + cleanup:
@@ -240,10 +320,14 @@ About box (D-UI-6). Full research in `docs/spec/font-licensing.md`.
 
 ## 7. Finalization checklist (task 8)
 
-- [ ] Real icon art — `assets/ivory.png` is a 543-byte placeholder. Needs a
-      proper PNG → `.icns` (mac) + `.ico` (win, for `build.rs`). **Release
-      blocker.** Scripts generate icns/ico from the png but will faithfully
-      reproduce garbage.
+- [x] Icon — **NOT a placeholder** (corrected 2026-08-04). `assets/ivory.png`
+      is byte-identical (sha256 `0dc37a25…`) to the Python app's
+      `~/Dropbox/Archive/Ivory/icons/ivory.png`: the original piano-keys art,
+      which the owner wants kept. It is only 128×128, so Dock/Finder sizes
+      above that are upscaled and look soft. Optional polish, not a blocker:
+      a nearest-neighbour 8× re-render to 1024px would keep the exact art and
+      sharpen every frame. The build scripts now say this instead of shouting
+      "unshippable placeholder".
 - [x] `scripts/build-macos.sh` — **verified 2026-07-29**: builds `Ivory.app`
       (bundle id `com.github.ganten7.ivory`, v2.0.0), ad-hoc codesigns, bundles
       LICENSE+OFL+THIRD-PARTY-LICENSES+fonts, zip + dmg; the packaged app
@@ -295,6 +379,18 @@ About box (D-UI-6). Full research in `docs/spec/font-licensing.md`.
   rather than via a subagent that would re-derive all context.
 - **Don't edit files a running workflow owns.** Check `git status` before
   editing; the verify workflow was mid-write on detector/lib/overrides/menu.
+- **The displayed chord name is not a candidate name.** Slash notation,
+  rootless-dominant renaming and dim/aug re-rooting all rewrite the winner
+  *after* scoring. Any code that reasons about "the reading that won" must go
+  through the candidate capture, never string-match the final label — that
+  assumption is what made the re-ranker silently untrainable (2.1.0 fix).
+- **`set -e` does not apply inside a function invoked as `f || handler`.**
+  bash suppresses errexit for the entire left operand of `||`, function body
+  included. `scripts/build-cross.sh` shipped empty Linux tarballs for a week
+  because of it. Check each step explicitly in any such function.
+- **Verify claims about assets before repeating them.** "543-byte placeholder
+  icon" was in this document for a week; the file was the original artwork all
+  along. One `shasum` against the Python app settled it.
 
 ---
 

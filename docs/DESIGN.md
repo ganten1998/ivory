@@ -93,12 +93,21 @@ ivory/
   voicing. Consulted *before* detection scoring. Persisted to
   `~/.config/ivory/overrides.json` (schema versioned; also carries
   `learning_mode` — Python never touches this file).
-- **Learned re-ranker (cargo feature `learning`, OFF in release builds)**:
+- **Learned re-ranker (cargo feature `learning`; since 2.1.0 always enabled
+  by the `ivory` GUI crate, and OFF at runtime until the user turns it on)**:
   online perceptron re-scorer over candidate features (pattern class,
   root-vs-bass interval, span, note count, cluster flag, inversion);
-  corrections are training examples; bounded adjustment; never overrides
-  exact matches; resettable. No ML crates. The differential harness always
-  constructs the detector with zero weights.
+  corrections are training examples; bounded adjustment (±100 against raw
+  scores in the hundreds-to-thousands, so it only ever flips near-ties);
+  never overrides exact matches; resettable. No ML crates. The differential
+  harness always constructs the detector with zero weights, and zero weights
+  or `learning_mode: false` make the adjustment exactly 0.0 — detection is
+  then bit-identical to stock (asserted by tests).
+  `train_on_correction` takes up to 25 bounded perceptron steps toward the
+  user's pick, judges success on the **displayed label** (winning the score
+  loop is not sufficient: the D21 completeness rule can still swap in a
+  note-complete reading within 12 points, and the slash step then appends the
+  bass), and rolls the attempt back entirely if it cannot get there.
 - **UI**: per D-UI-5 — `Teach Chord Name...` (notes + current label +
   input + "apply in all keys"; greyed when nothing held) and `Manage
   Taught Chords...` (list + delete), placed inside the detection block

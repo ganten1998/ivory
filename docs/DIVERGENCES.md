@@ -177,7 +177,27 @@ renderings of every affected row.
   overrides.json (Python rewrites settings.json with a fixed key set, so
   additive settings keys are lost on a Python downgrade — tolerable for
   the font path, not for learning state).
-- **D-UI-6**: About dialog shows "Version 2.0.0" and adds one 8pt
+- **D-UI-9** (2.1.0): the learned re-ranker becomes a user-facing option.
+  Two further context-menu items directly after the D-UI-5 pair, preceded
+  by their own separator: `Correct Chord Name...` (greyed when no notes
+  held, like the teach item) and `Enable/Disable Chord Learning` (a
+  self-renaming toggle — Qt parity, no checkmarks). Forgetting lives in
+  `Manage Taught Chords...`, which grows a footer showing learning state,
+  correction count, the non-zero learned weights, and a `Forget Learning`
+  button. The correction dialog offers **only the scored candidates**
+  (`ChordDetector::trainable_candidates`), because the re-ranker can only
+  reorder those — the displayed label is frequently a post-scoring rename
+  (slash bass, rootless dominant) that was never a candidate and can never
+  be trained toward. Every attempt reports its outcome
+  (`TrainOutcome::{Learned, Stubborn, AlreadyCorrect, NotTrainable}`); a
+  correction that cannot be made is rolled back rather than left as a
+  partial nudge. Learning state stays in overrides.json (never
+  settings.json). The `learning` cargo feature is now always enabled by the
+  `ivory` GUI crate, so every packaged binary ships the option; the engine
+  crate keeps the feature gate so `cargo test -p ivory-core` still
+  exercises the stock path.
+- **D-UI-6**: About dialog shows "Version &lt;crate version&gt;" (read from
+  `CARGO_PKG_VERSION` since 2.1.0 — it was hardcoded "2.0.0") and adds one 8pt
   left-aligned credit line under the version: "Courier Prime © The Courier
   Prime Project Authors, SIL OFL 1.1". Every other About string, size,
   color, and layout is parity.

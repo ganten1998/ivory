@@ -27,12 +27,14 @@ VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
 ICON_SRC="assets/ivory.png"
 
 warn_placeholder_icon() {
-  # The historical icon is a 543-byte 128x128 placeholder. Gate is in
-  # docs/RELEASE.md — shout every build until real art lands.
+  # assets/ivory.png is the ORIGINAL piano-keys icon, byte-identical to the
+  # Python app's icons/ivory.png (verified 2026-08-04) — not placeholder art.
+  # It is only 128x128, so Dock/Finder sizes above that are upscaled.
   if [ -f "$ICON_SRC" ] && [ "$(stat -f%z "$ICON_SRC")" -lt 4096 ]; then
-    echo "WARNING: $ICON_SRC is the 543-byte placeholder art. Icons built from"
-    echo "         it will be blurry/unshippable. Replace with real >=1024px"
-    echo "         artwork before releasing (see docs/RELEASE.md)."
+    echo "NOTE: $ICON_SRC is the original 128x128 icon; sizes above 128 are"
+    echo "      upscaled and will look soft in the Dock. A nearest-neighbour"
+    echo "      1024px re-render of the same art would fix that (see"
+    echo "      docs/RELEASE.md); the artwork itself is intentional."
   fi
 }
 
@@ -142,6 +144,9 @@ make_icns "$APP/Contents/Resources/AppIcon.icns"
 cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
    assets/fonts/OFL.txt LICENSE THIRD-PARTY-LICENSES \
    "$APP/Contents/Resources/"
+# Tester-facing instructions ride alongside the .app (inside the bundle it would
+# be invisible), so the zip/dmg hand-off explains itself.
+cp docs/CHORD-LEARNING-TESTING.md "dist/READ-ME-FIRST.md"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -175,12 +180,23 @@ codesign --force --deep -s - "$APP"
 touch "$APP" "$APP/Contents/Info.plist"
 
 # ── Package ──────────────────────────────────────────────────────────────────
+# Stage the app together with the tester instructions. ditto/hdiutil take a
+# single source, so packaging "$APP" directly (as this did before 2.1.0) left
+# READ-ME-FIRST.md sitting on the build machine while the comment claimed the
+# hand-off explained itself. Windows testers got it; macOS testers did not.
+STAGE="dist/Ivory-${VERSION}-macos-${ARCH_NAME}"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+ditto "$APP" "$STAGE/Ivory.app"
+cp docs/CHORD-LEARNING-TESTING.md "$STAGE/READ-ME-FIRST.md"
+
 echo "==> Packaging $ZIP"
-ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$ZIP"
 
 echo "==> Packaging $DMG (best-effort)"
-hdiutil create -volname "Ivory" -srcfolder "$APP" -ov -format UDZO "$DMG" \
+hdiutil create -volname "Ivory" -srcfolder "$STAGE" -ov -format UDZO "$DMG" \
   || echo "warn: DMG creation failed; the zip is the primary artifact"
+rm -rf "$STAGE"
 
 du -h "$APP/Contents/MacOS/ivory" "$ZIP" 2>/dev/null | sed 's/^/    /'
 [ -f "$DMG" ] && du -h "$DMG" | sed 's/^/    /'
