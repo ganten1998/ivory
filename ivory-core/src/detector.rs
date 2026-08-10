@@ -461,7 +461,7 @@ impl ChordDetector {
             let lpc = lowest % 12;
             let remaining: Vec<u8> = pcs_all.iter().copied().filter(|&pc| pc != lpc).collect();
             if remaining.len() == 4 {
-                'dim7_search: for &dim_root in &remaining {
+                for &dim_root in &remaining {
                     let dim_ivs: Vec<u8> = remaining.iter()
                         .map(|&pc| pc_interval(dim_root, pc))
                         .collect::<std::collections::BTreeSet<_>>()
@@ -475,8 +475,6 @@ impl ChordDetector {
                         } else {
                             return Some(format!("{}dim7/{}", self.get_note_name(dim_root), self.get_note_name(lpc)));
                         }
-                        #[allow(unreachable_code)]
-                        break 'dim7_search;
                     }
                 }
             }
@@ -508,7 +506,7 @@ impl ChordDetector {
         if pcs_all.len() == 4 {
             let lowest = active_notes.iter().min().copied().unwrap_or(0);
             let lpc = lowest % 12;
-            'halfdim: for &potential_root in &pcs_all {
+            for &potential_root in &pcs_all {
                 let ivs: Vec<u8> = pcs_all.iter()
                     .map(|&pc| pc_interval(potential_root, pc))
                     .collect::<std::collections::BTreeSet<_>>()
@@ -525,8 +523,6 @@ impl ChordDetector {
                             return Some(format!("{}m6/{}", m6_name, self.get_note_name(lpc)));
                         }
                     }
-                    #[allow(unreachable_code)]
-                    break 'halfdim;
                 }
             }
         }
@@ -676,8 +672,9 @@ impl ChordDetector {
         if let Some(ref bm) = best_match {
             let is_triadic_dim = self.match_chord_type(bm, "diminished");
             let is_dim7 = self.match_chord_type(bm, "diminished7");
-            let is_aug = self.match_chord_type(bm, "augmented")
-                || self.match_chord_type(bm, "augmented7");
+            // No chord NAME maps to the "augmented7" type (match_chord_type has no
+            // arm for it, and the pattern was deleted), so testing it is always false.
+            let is_aug = self.match_chord_type(bm, "augmented");
 
             // D12: only re-root a diminished TRIAD to the bass when the bass
             // actually forms a diminished triad ([0,3,6] from it). Otherwise the
@@ -704,7 +701,7 @@ impl ChordDetector {
                         highest_note, highest_pc, lowest_pc, has_global_dominant_quality,
                     ) {
                         let ok = if is_dim7 { self.match_chord_type(&cname, "diminished7") }
-                                 else { self.match_chord_type(&cname, "augmented") || self.match_chord_type(&cname, "augmented7") };
+                                 else { self.match_chord_type(&cname, "augmented") };
                         if ok {
                             best_match = Some(cname);
                             best_root_pc = lowest_pc;
@@ -786,8 +783,7 @@ impl ChordDetector {
                         || (is_altered && [1u8, 3, 6, 8].contains(&bass_interval))
                 };
                 let is_dim7 = self.match_chord_type(bm, "diminished7");
-                let is_aug_chord = self.match_chord_type(bm, "augmented")
-                    || self.match_chord_type(bm, "augmented7");
+                let is_aug_chord = self.match_chord_type(bm, "augmented");
                 let skip_slash = skip_due_to_ext || is_dim7 || is_aug_chord;
 
                 if !skip_slash {
@@ -1293,12 +1289,14 @@ impl ChordDetector {
             let is_seventh = chord_type == "major7" || chord_type == "minor7"
                 || chord_type == "dominant7" || chord_type == "diminished7"
                 || chord_type == "diminished_major7" || chord_type == "half_diminished7"
-                || chord_type == "augmented7" || chord_type == "minor_major7"
+                || chord_type == "minor_major7"
                 // Extended tertian chords invert too (C9 over its 3rd → C9/E).
                 || matches!(chord_type, "dominant9"|"dominant11"|"dominant13"|"13#11"
                     |"major9"|"minor9"|"major11"|"minor11"|"major13"|"minor13")
+                // "altered" is intentionally NOT here: it does not start with '7', so
+                // the old `|| chord_type == "altered"` inside this group was dead.
                 || (chord_type.starts_with('7') && (chord_type.contains("b9") || chord_type.contains("#9")
-                    || chord_type.contains("#11") || chord_type.contains("b13") || chord_type == "altered"));
+                    || chord_type.contains("#11") || chord_type.contains("b13")));
             let is_sixth_chord = matches!(chord_type, "6"|"6_no5"|"minor6"|"minor6_no5"
                 |"6_9"|"6_9_no5"|"6_9_no3"|"minor6_9"|"6add4"|"6add4_no5");
 
@@ -1320,7 +1318,8 @@ impl ChordDetector {
                 + rootless_bonus + root_in_bass_bonus + char_bonus + dominant_adj + special
                 + inversion_bonus - extra_penalty - missing_penalty;
 
-            if score > best_score && matched_count >= 2 && score > 10.0 {
+            // matched_count >= 2 already guaranteed by the `matched_count < 2` continue above.
+            if score > best_score && score > 10.0 {
                 best_score = score;
 
                 let final_type = chord_type;
@@ -1509,12 +1508,12 @@ impl ChordDetector {
         }
 
         // Dom 7#11 / 13#11 voicings. A "13#11" name requires the actual 13th
-        // (interval 9) present — otherwise [0,2,4,6,10] is a 7(#11), not a 13(#11).
-        let claims_13 = chord_type.starts_with("13");
+        // (interval 9) — but match_chord_pattern already `continue`d any 13-prefixed
+        // type lacking interval 9, so every 13* type reaching here has it. The old
+        // `(!claims_13 || contains(&9))` guard was therefore always true.
         if matches!(chord_type, "7#11_no5"|"7#11_no3_no5"|"9#11_no5"
                                  |"13#11_no3_no5"|"13#11_no9_no5"|"13#11_no5")
             && root_pc == lowest_pc && intervals_set.contains(&10) && intervals_set.contains(&6)
-            && (!claims_13 || intervals_set.contains(&9))
         {
             bonus += if missing_count == 0 && extra_count == 0 { 250.0 }
                      else if missing_count <= 1 && extra_count == 0 { 180.0 }
@@ -1661,11 +1660,8 @@ impl ChordDetector {
 
         // Bb6 exact pattern from Bb root
         if intervals == [0, 2, 4, 7, 9] && chord_type == "6" { bonus += 200.0; }
-
-        // dominant9 with root in bass beats BbΔ7#11
-        if chord_type == "dominant9" && root_pc == lowest_pc && missing_count <= 1 && extra_count == 0 {
-            bonus += 0.0; // already handled above
-        }
+        // (dominant9-root-in-bass was already scored above; the old trailing
+        // `bonus += 0.0` block here did nothing and is removed.)
 
         bonus
     }
@@ -1685,7 +1681,8 @@ fn format_chord_name(root: &str, chord_type: &str) -> String {
         "7sus2"              => format!("{}7sus2", root),
         "9sus" | "9sus_with5"=> format!("{}9(sus)", root),
         "13sus"|"13sus_with5"=> format!("{}13(sus)", root),
-        "7sus13"             => format!("{}7sus13", root),
+        // "7sus13" pattern was deleted (dup of 13sus); the `other` catch-all below
+        // would render it identically anyway, so no explicit arm is needed.
         "sus13"              => format!("{}sus13", root),
         "major7"             => format!("{}Δ7", root),
         "major7#5"           => format!("{}Δ7#5", root),

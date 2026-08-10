@@ -149,7 +149,6 @@ pub fn essential_for(chord_type: &str) -> &'static [u8] {
         "half_diminished7"  => &[3, 10],
         "half_diminished11" => &[6, 10],
         "half_diminished11_no3" => &[6, 10],
-        "augmented7"      => &[4, 10],
         "minor_major7"    => &[3, 11],
         "minor_major9"    => &[3, 11],
 
@@ -258,7 +257,6 @@ pub fn optional_for(chord_type: &str) -> &'static [u8] {
         "diminished7"     => &[0],
         "diminished_major7" => &[0],
         "half_diminished7"  => &[0],
-        "augmented7"        => &[0],
         "minor_major7"      => &[0, 7],
         "minor_major9"      => &[0, 2, 7],
 
