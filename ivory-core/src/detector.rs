@@ -76,6 +76,10 @@ pub struct ChordDetector {
     pub max_notes_for_chord: usize,
     debug_mode: bool,
     debug_candidates: Vec<(String, f64)>,
+    /// True only while `detect_chord_simple` scores a slash-reduced note set. It
+    /// lifts the D23 tritone gate on the #11-shell bonus so slash upper structures
+    /// name exactly as they did pre-fix (the primary pass keeps the gate).
+    simplify_pass: bool,
     /// Teach-layer store, consulted before scoring. `None` => stock behavior,
     /// byte-identical to a detector that never had a store (the 42 unit tests
     /// and the differential harness both run with no store).
@@ -107,6 +111,7 @@ impl ChordDetector {
             max_notes_for_chord: 7,
             debug_mode: false,
             debug_candidates: Vec::new(),
+            simplify_pass: false,
             overrides: None,
             #[cfg(feature = "learning")]
             learn_capture: None,
@@ -754,6 +759,22 @@ impl ChordDetector {
                 let root_in_notes = active_notes.iter().any(|&n| n % 12 == best_root_pc);
                 if !root_in_notes { /* skip slash for rootless */ } else {
                 let bass_interval = pc_interval(best_root_pc, lowest_pc);
+                // A MAJOR add9 with its 3rd in the bass names as sus2/bass, rooted on
+                // the add9's OWN root: dropping the 3rd-in-bass leaves root-2-5, a clean
+                // sus2. Transposition-invariant (C-E-G-D / E bass → C2/E) — emitted here
+                // rather than via slash-simplify, which would re-root to the lowest upper
+                // voice and misread G4/E. A minor add9's 3rd is a minor third up (interval
+                // 3), so it never trips this and stays Xm(add9)/bass.
+                let is_major_add9 = bm.contains("(add9)") && !bm.contains("m(add9)");
+                if is_major_add9 && bass_interval == 4
+                    && pcs_set.contains(&((best_root_pc + 7) % 12))
+                {
+                    best_match = Some(format!(
+                        "{}2/{}",
+                        self.get_note_name(best_root_pc),
+                        self.get_note_name(lowest_pc)
+                    ));
+                } else {
                 let is_extended = (bm.contains('9') || bm.contains("11") || bm.contains("13") || bm.contains("6/9"))
                     && !bm.contains("add9");
                 let is_altered = bm.contains("b9") || bm.contains("#9") || bm.contains("b13") || bm.contains("#11");
@@ -812,6 +833,7 @@ impl ChordDetector {
                     let bass_name = self.get_note_name(lowest_pc);
                     best_match = Some(format!("{}/{}", final_chord, bass_name));
                 }
+                } // end major-add9-3rd-in-bass else
                 } // end root_in_notes else
             }
         }
@@ -820,7 +842,13 @@ impl ChordDetector {
         if should_check_scale_later {
             let span = original.iter().max().copied().unwrap_or(0) as i32
                 - original.iter().min().copied().unwrap_or(0) as i32;
-            if span < 12 {
+            // A scale run played root-to-root spans exactly an octave (span == 12,
+            // the root doubled on top) or wider, so a bare `span < 12` gate dropped
+            // the scale reading the instant the octave was added — the same PC set
+            // then scored as maj13 (C-D-E-F-G-A-B-C → CΔ13 instead of C Ionian).
+            // A stepwise voicing is `is_clustered`; a spread tertian chord (v067's
+            // CΔ13 stack, thirds apart) is not, so it still names as a chord.
+            if span < 12 || self.is_clustered(&original) {
                 if let Some(scale) = self.detect_scale(&original) {
                     // This discards every scored candidate. Mark it so the teach
                     // layer does not offer readings that can never win.
@@ -1042,6 +1070,10 @@ impl ChordDetector {
         let has_gdq = pcs.iter().any(|&r| pcs_set.contains(&((r + 4) % 12)) && pcs_set.contains(&((r + 10) % 12)));
         let mut best: Option<String> = None;
         let mut best_score = 0.0_f64;
+        // Score this reduced set with the pre-fix #11-shell bonus (D23 gate lifted),
+        // so slash upper structures keep naming as before.
+        let prev_simplify = self.simplify_pass;
+        self.simplify_pass = true;
         for &root_pc in &pcs {
             let intervals: Vec<u8> = pcs.iter()
                 .map(|&pc| pc_interval(root_pc, pc))
@@ -1053,6 +1085,7 @@ impl ChordDetector {
                 if score > best_score { best_score = score; best = Some(name); }
             }
         }
+        self.simplify_pass = prev_simplify;
         best
     }
 
@@ -1217,10 +1250,18 @@ impl ChordDetector {
             // 7. Root in bass bonus
             let root_in_bass_bonus = if root_pc == lowest_pc && intervals_set.contains(&0) { 15.0 } else { 0.0 };
 
-            // 8. Characteristic bonus
+            // 8. Characteristic bonus. The +50 shell identity bonus is gated on the
+            // tritone (interval 6) actually sounding in the PRIMARY pass: every one of
+            // these shells is a #11 chord defined by that tritone, so awarding it to a
+            // subset that lacks the #11 let a bare {0,2,4} match "7#11_shell" from a
+            // third above and outrank the true reading (C-D-E → D7(#11) not C(add9)).
+            // The gate is lifted during `simplify_pass` (the slash-reduction helper),
+            // where the pre-fix behavior is kept so augmented/whole-tone slash upper
+            // structures name exactly as before — no note-dropping churn there (D23).
             let char_bonus = if intervals_set.contains(&6) || intervals_set.contains(&8) { 10.0 } else { 0.0 }
                 + if ["7#11_shell","7#11_no3","7#9#11_shell","7b9#11_shell","7b9#11_no3"]
-                    .contains(&chord_type) { 50.0 } else { 0.0 };
+                    .contains(&chord_type) && (intervals_set.contains(&6) || self.simplify_pass)
+                { 50.0 } else { 0.0 };
 
             // 9. Dominant quality adjustment
             let has_major_third = intervals_set.contains(&4);
@@ -1499,6 +1540,19 @@ impl ChordDetector {
         if matches!(chord_type,
             "major13"|"major11"|"minor13"|"major9"|"13#11"|"dominant13"|"dominant11")
             && missing_count == 0 && extra_count == 0 && root_pc == lowest_pc { bonus += 8000.0; }
+
+        // A bass-rooted maj7 shell that also carries the 6/13 — root + M3 + M7 + M6
+        // in the bass, nothing foreign — is a genuine XΔ13, even with the 5th/9th/11th
+        // absent. Prefer it over reading the 13th as the root of a minor(add9):
+        // B-D#-G#-A# (from B: {0,4,9,11}) → BΔ13, not the complete-but-rootless
+        // G#m(add9)/B. Gated on root-in-bass + all three characteristic tones so it
+        // cannot crown an incomplete maj13 over an unrelated chord.
+        if matches!(chord_type, "major13"|"major13#11")
+            && root_pc == lowest_pc && extra_count == 0
+            && intervals_set.contains(&4) && intervals_set.contains(&11) && intervals_set.contains(&9)
+        {
+            bonus += 120.0;
+        }
 
         // 13sus: large bonus when root is in bass and perfect match. The 13th (9)
         // rules out the add9-slash reading, so no span gate (D8).

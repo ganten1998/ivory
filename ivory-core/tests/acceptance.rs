@@ -178,12 +178,20 @@ const FLAT_ROWS: &[Row] = &[
     (&[60, 62, 65, 69, 82], Some("C13(sus)"), "v107 parity (13sus spread)"),
     // §13 vectors 108–114: add9 family (K4)
     (&[60, 62, 64, 67], Some("C(add9)"), "v108 K4"),
-    (&[64, 67, 72, 74], Some("C(add9)/E"), "v109 parity"),
+    // D24: a MAJOR add9 with its 3rd in the bass names as sus2/bass (owner pref
+    // 2026-08-10). E-G-C-D is the {0,3,8,10}-from-bass voicing of the owner's
+    // C-Ab-Bb-Eb → Ab2/C, transposed to E; "transferable to every key" makes the
+    // flip from the old C(add9)/E parity mandatory. See DIVERGENCES.md D24.
+    (&[64, 67, 72, 74], Some("C2/E"), "v109 D24 (add9 3rd-in-bass → sus2/bass)"),
     (&[62, 64, 67, 72], Some("C(add9)/D"), "v110 parity"),
     (&[62, 64, 67, 84], Some("D9(sus)"), "v111 parity (span ≥ 12 → 9sus)"),
     (&[60, 62, 63, 67], Some("Cm(add9)"), "v112 parity"),
     (&[55, 60, 62, 63], Some("Cm(add9)/G"), "v113 parity"),
-    (&[63, 67, 72, 74], Some("Cm(add9)/Eb"), "v114 parity"),
+    // D25: a bass-rooted maj7 shell carrying the 6/13 (root+M3+M7+M6 from the bass)
+    // is a genuine XΔ13, not the 13th read as a rootless minor-add9 (owner pref
+    // 2026-08-10). Eb-G-C-D is the {0,4,9,11}-from-bass voicing of the owner's
+    // B-Ab-Bb-Eb → BΔ13, transposed to Eb. See DIVERGENCES.md D25.
+    (&[63, 67, 72, 74], Some("EbΔ13"), "v114 D25 (bass-rooted maj13 shell)"),
     // §13 vectors 115–125: early exits & special cases (K11, D5)
     (&[60, 70, 73, 79], Some("Bbm6/C"), "v115 K11 (E1)"),
     (&[60, 70, 73, 77, 79], Some("Bbm6/C"), "v116 K11 (E1b)"),
@@ -192,8 +200,8 @@ const FLAT_ROWS: &[Row] = &[
     (&[60, 62, 65, 67, 70], Some("G Minor Pentatonic"), "v119 K6 (compact → scale)"),
     (&[64, 69, 70, 74], Some("Em7b5(11)"), "v120 parity"),
     (&[60, 65, 66, 70], Some("Cm7b5(11)"), "v121 parity"),
-    (&[55, 58, 63, 65], Some("Eb(add9)/G"), "v122 parity"),
-    (&[55, 58, 63, 65, 67], Some("Eb(add9)/G"), "v123 parity"),
+    (&[55, 58, 63, 65], Some("Eb2/G"), "v122 D24 (add9 3rd-in-bass → sus2/bass)"),
+    (&[55, 58, 63, 65, 67], Some("Eb2/G"), "v123 D24 (add9 3rd-in-bass → sus2/bass)"),
     (&[53, 63, 67, 70], Some("F9(sus)"), "v124 parity (Eb/F)"),
     (&[55, 71, 77, 80], Some("G7(b9)"), "v125 D5 (was Fdim/G)"),
     // §13 vectors 126–139: scales (K6/K7/K8, D17-keep)
@@ -215,13 +223,36 @@ const FLAT_ROWS: &[Row] = &[
         Some("C Half-Whole Diminished"),
         "v139 D17-keep (8-PC scale)",
     ),
-    // v140 intentionally not asserted — see TODO(classifier) at the bottom.
+    // D22 (owner pref 2026-08-10): a scale played root-to-root includes the octave,
+    // so a stepwise (`is_clustered`) voicing keeps its scale reading at span >= 12
+    // instead of flipping to maj13 the instant the octave is added. Vector #140 —
+    // the compact C-major scale + octave — resolves to C Ionian (was left open in
+    // TODO(classifier); the owner pinned it). A spread tertian stack (v067's CΔ13,
+    // v133's C6/9) is NOT clustered, so it still names as a chord. See DIVERGENCES D22.
+    (&[60, 62, 64, 65, 67, 69, 71, 72], Some("C Ionian"), "v140 D22 (scale + octave)"),
+    (&[60, 62, 63, 65, 67, 68, 70, 72], Some("C Aeolian"), "x-D22 minor scale + octave"),
+    (&[60, 62, 64, 67, 69, 72], Some("C Major Pentatonic"), "x-D22 maj pent + octave"),
+    (&[60, 63, 65, 67, 70, 72], Some("C Minor Pentatonic"), "x-D22 min pent + octave"),
+    (&[60, 63, 65, 66, 67, 70, 72], Some("C Minor Blues"), "x-D22 min blues + octave"),
+    (&[60, 62, 63, 64, 67, 69, 72], Some("C Major Blues"), "x-D22 maj blues + octave"),
     (&[60, 61, 62, 63, 64], Some("DbmΔ7/C"), "v141 parity (chromatic cluster)"),
     // v142 asserted in not_a_chord_rows (D17).
     (&[60, 64, 67, 72, 76, 79], Some("C"), "v143 parity (doubled octaves)"),
     (&[52, 55, 60, 64], Some("C/E"), "v144 parity (doubled 3rd)"),
     (&[60, 64, 65, 67], Some("Cadd11"), "v145 parity"),
     (&[60, 64, 65, 67, 69], Some("C6add4"), "v146 parity"),
+    // ── Owner report 2026-08-10 (D23/D24/D25), as intervals for every key ───
+    // D23: a bare {0,2,4} is C(add9)-no-5, NOT a #11 shell from a third above —
+    // the #11 identity bonus now requires the tritone to actually sound.
+    (&[60, 62, 64], Some("C(add9)"), "x-D23 CDE root pos"),
+    (&[67, 69, 71], Some("G(add9)"), "x-D23 GAB transposition"),
+    (&[62, 64, 66], Some("D(add9)"), "x-D23 DEF# transposition"),
+    // D24: MAJOR add9 with the 3rd in the bass → sus2/bass, on the add9's own root.
+    (&[60, 68, 70, 75], Some("Ab2/C"), "x-D24 owner C-Ab-Bb-Eb"),
+    (&[53, 61, 63, 68], Some("Db2/F"), "x-D24 F-Db-Eb-Ab transposition"),
+    // D25: bass-rooted maj7 shell with the 6/13 → XΔ13, not rootless minor(add9).
+    (&[59, 68, 70, 75], Some("BΔ13"), "x-D25 owner B-Ab-Bb-Eb"),
+    (&[64, 68, 73, 75], Some("EΔ13"), "x-D25 E-G#-C#-D# transposition"),
     // ── Extra rows from DIVERGENCES.md examples ─────────────────────────────
     // D1: bass = shared 3rd/5th of {A,C,E,G} keeps Python's shipped answers.
     (&[64, 67, 69, 72], Some("C6/E"), "x-D1-keep E bass"),
@@ -376,10 +407,10 @@ fn not_a_chord_rows() {
 // the engine surgeon should not treat any particular answer here as the
 // contract.
 //
-// - §13 vector #140, {60,62,64,65,67,69,71,72} (compact C-major-scale voicing,
-//   span == 12 kills the scale check; shipped `FΔ13#11`): D3's scope is
-//   "7-PC tertian stacks" — whether it also covers this non-tertian voicing of
-//   the CΔ13 PC set (→ `CΔ13`) or parity keeps `FΔ13#11` is unresolved.
+// - [RESOLVED 2026-08-10 → D22] §13 vector #140 {60,62,64,65,67,69,71,72}: the
+//   octave-doubled C-major scale now reads `C Ionian` (asserted above as v140).
+//   A stepwise voicing keeps its scale reading past span == 12; only a spread
+//   (non-clustered) tertian stack of the same PC set names as a chord.
 // - D5 voicings other than its named examples, e.g. {60,64,70,73}
 //   (C-E-Bb-Db with Db on top): the constrained +380 pins only the two named
 //   flips ({60,61,64,70} → C7(b9), {55,71,77,80} → G7(b9)); what the bonus

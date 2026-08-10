@@ -152,6 +152,40 @@ are post-review.
   left as a documented limitation (reviewer-rated non-blocking; Python is also
   wrong; the slash logic is parity-critical).
 
+- **D22** (owner report 2026-08-10): a scale played root-to-root includes the
+  octave, so scale detection is no longer killed at span == 12. The late scale
+  check now fires when the voicing is stepwise (`is_clustered`) OR within an
+  octave, instead of a hard `span < 12` gate. A stepwise run that adds its top
+  octave (or spans past it) keeps its scale reading — C-D-E-F-G-A-B-**C** →
+  `C Ionian`, not `CΔ13`; likewise the natural minor, both pentatonics, and both
+  blues scales. A spread tertian stack is NOT clustered, so a real `CΔ13` (v067)
+  or `C6/9` (v133) still names as a chord. Resolves the old TODO(classifier)
+  entry for §13 vector #140. (446 flat+sharp corpus rows move chord→scale.)
+- **D23** (owner report 2026-08-10): the +50 #11-shell identity bonus
+  (`7#11_shell`, `7#11_no3`, `7#9#11_shell`, `7b9#11_shell`, `7b9#11_no3`) is
+  gated on the defining tritone (interval 6) actually sounding. Without it a
+  bare {0,2,4} matched `7#11_shell` from a third above and beat the true reading
+  — C-D-E → `D7(#11)` — so it now reads `C(add9)`. The gate is lifted inside the
+  slash-reduction helper (`detect_chord_simple`, `simplify_pass`), so slash
+  upper structures — augmented/whole-tone tetrads like `C7(#11)/Gb`,
+  `B7(#11)/F` — name exactly as before (no note-dropping churn). (372 top-level
+  corpus rows corrected; slash sub-structures unchanged.)
+- **D24** (owner report 2026-08-10): a MAJOR add9 with its 3rd in the bass names
+  as sus2/bass, rooted on the add9's OWN root (dropping the 3rd-in-bass leaves
+  root-2-5). C-E-G-D over E → `C2/E`; the owner's C-Ab-Bb-Eb → `Ab2/C`. Emitted
+  directly in the slash step so the sus2 keeps the chord root instead of
+  re-rooting to the lowest upper voice (which read `G4/E`). A minor add9's 3rd
+  is a minor third up (interval 3), so it never trips this and stays
+  `Xm(add9)/bass`. Flips former "parity" rows v109/v122/v123 (same voicing shape
+  in other keys). (36 corpus rows.)
+- **D25** (owner report 2026-08-10): a bass-rooted maj7 shell that also carries
+  the 6/13 — root + M3 + M7 + M6 in the bass, nothing foreign — is a genuine
+  XΔ13, preferred over reading the 13th as the root of a rootless minor(add9).
+  B-D#-G#-A# (from B: {0,4,9,11}) → `BΔ13`, not `G#m(add9)/B`. Gated on
+  root-in-bass + all three characteristic tones (4, 11, 9) + extra_count == 0,
+  so it cannot crown an incomplete maj13 over an unrelated chord. Flips former
+  "parity" row v114 (same shape in Eb). (52 corpus rows.)
+
 Naming preference note: all examples above are written in flats
 (prefer_flats=true, the default); every rule is pitch-class-relational and
 applies identically under sharps. The classification file covers both
