@@ -19,6 +19,14 @@ fn intervals_from(root: u8, pcs: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// 12-bit pitch-class-set mask (bit i set ⇔ interval i present). Every interval in
+/// the chord/essential/optional tables is 0..=11, so this is a total encoding and
+/// set algebra (∩ = &, ∖ = & !, |·| = count_ones) is exact and allocation-free.
+#[inline]
+fn mask_of(intervals: &[u8]) -> u16 {
+    intervals.iter().fold(0u16, |m, &i| m | (1u16 << i))
+}
+
 /// Sorted unique pitch-classes from a set of MIDI notes.
 fn pitch_classes(notes: &HashSet<u8>) -> Vec<u8> {
     let mut pcs: Vec<u8> = notes.iter().map(|&n| n % 12).collect::<HashSet<_>>().into_iter().collect();
@@ -1153,43 +1161,46 @@ impl ChordDetector {
         // are fixed): compute these once rather than per pattern.
         let highest_interval = pc_interval(root_pc, highest_pc);
         let bass_iv = pc_interval(root_pc, lowest_pc);
+        // Bitmask twin of intervals_set, hoisted for the per-pattern set algebra below.
+        let intervals_mask = mask_of(intervals);
 
         for &(chord_type, pattern) in CHORD_PATTERNS {
-            let pattern_set: HashSet<u8> = pattern.iter().copied().collect();
-            let matched: HashSet<u8> = pattern_set.intersection(&intervals_set).copied().collect();
-            let matched_count = matched.len();
-            let extra: HashSet<u8> = intervals_set.difference(&pattern_set).copied().collect();
-            let extra_count = extra.len();
-            let missing: HashSet<u8> = pattern_set.difference(&intervals_set).copied().collect();
-            let missing_count = missing.len();
+            // 12-bit pitch-class-set algebra (bit i ⇔ interval i). Replaces ~10
+            // per-pattern HashSet allocations with branchless bitops.
+            let pattern_mask = mask_of(pattern);
+            let matched_mask = pattern_mask & intervals_mask;
+            let matched_count = matched_mask.count_ones() as usize;
+            let extra_count = (intervals_mask & !pattern_mask).count_ones() as usize;
+            let missing_mask = pattern_mask & !intervals_mask;
+            let missing_count = missing_mask.count_ones() as usize;
 
-            let essential: HashSet<u8> = essential_for(chord_type).iter().copied().collect();
-            let optional: HashSet<u8> = optional_for(chord_type).iter().copied().collect();
-            let essential_matched: HashSet<u8> = essential.intersection(&matched).copied().collect();
-            let essential_missing: HashSet<u8> = essential.difference(&matched).copied().collect();
+            let essential_mask = mask_of(essential_for(chord_type));
+            let optional_mask = mask_of(optional_for(chord_type));
+            let essential_matched_mask = essential_mask & matched_mask;
+            let essential_missing_mask = essential_mask & !matched_mask;
 
             // Skip certain chord types when essential intervals are all required
             if ["7b9#11","7#9#11","7#9#11_shell","7b9#11_shell","7b9#11_no3"]
-                .contains(&chord_type) && !essential_missing.is_empty() { continue; }
+                .contains(&chord_type) && essential_missing_mask != 0 { continue; }
 
             // A "13" chord must contain its 13th (interval 9). Without it, a 13-named
             // pattern would match a subset (e.g. a whole-tone [0,2,4,6,10] as 13#11
             // missing the 13th) and mislabel it — the correct name is 7(#11)/9(#11).
             if chord_type.starts_with("13") && !intervals_set.contains(&9) { continue; }
 
-            if !essential.is_empty() && essential_matched.is_empty() { continue; }
+            if essential_mask != 0 && essential_matched_mask == 0 { continue; }
             if matched_count < 2 { continue; }
 
             // 1. Essential score (up to 60)
-            let essential_score = if !essential.is_empty() {
-                (essential_matched.len() as f64 / essential.len() as f64) * 60.0
+            let essential_score = if essential_mask != 0 {
+                (essential_matched_mask.count_ones() as f64 / essential_mask.count_ones() as f64) * 60.0
             } else { 30.0 };
 
             // 2. Percentage match (up to 40)
             let pct_match = (matched_count as f64 / input_pc_count as f64) * 40.0;
 
             // 3. Highest note bonus (highest_interval hoisted above the loop)
-            let highest_bonus = if pattern_set.contains(&highest_interval) { 10.0 } else { 0.0 };
+            let highest_bonus = if pattern_mask & (1u16 << highest_interval) != 0 { 10.0 } else { 0.0 };
 
             // 4. Completeness bonus
             let completeness_bonus = if missing_count == 0 && extra_count == 0 {
@@ -1207,19 +1218,17 @@ impl ChordDetector {
 
             // 5. Penalties
             let extra_penalty = extra_count as f64 * 3.0;
-            let optional_missing: HashSet<u8> = optional.intersection(&missing).copied().collect();
-            let required_missing: HashSet<u8> = missing.iter()
-                .copied()
-                .filter(|x| !optional.contains(x) && !essential.contains(x))
-                .collect();
+            let optional_missing_count = (optional_mask & missing_mask).count_ones() as usize;
+            let required_missing_count =
+                (missing_mask & !optional_mask & !essential_mask).count_ones() as usize;
             let missing_penalty =
-                essential_missing.len() as f64 * 40.0
-                + optional_missing.len() as f64 * 1.0
-                + required_missing.len() as f64 * 8.0;
+                essential_missing_mask.count_ones() as f64 * 40.0
+                + optional_missing_count as f64 * 1.0
+                + required_missing_count as f64 * 8.0;
 
             // 6. Rootless voicing bonus
-            let rootless_bonus = if missing.contains(&0)
-                && essential_matched.len() == essential.len() && essential.len() >= 2
+            let rootless_bonus = if (missing_mask & 1) != 0
+                && essential_matched_mask == essential_mask && essential_mask.count_ones() >= 2
             { 15.0 } else { 0.0 };
 
             // 7. Root in bass bonus
@@ -1279,7 +1288,7 @@ impl ChordDetector {
 
             let inversion_bonus = if is_triad && [3u8, 4, 7].contains(&bass_iv) {
                 35.0
-            } else if is_seventh && pattern_set.contains(&bass_iv) && bass_iv != 0 {
+            } else if is_seventh && (pattern_mask & (1u16 << bass_iv)) != 0 && bass_iv != 0 {
                 40.0
             } else if is_sixth_chord && bass_iv == 0 {
                 // Check if could be minor triad inversion
