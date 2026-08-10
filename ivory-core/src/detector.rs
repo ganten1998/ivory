@@ -10,6 +10,15 @@ fn pc_interval(from: u8, to: u8) -> u8 {
     ((to as i32 - from as i32).rem_euclid(12)) as u8
 }
 
+/// Sorted-unique intervals (each 0..=11) of `pcs` measured up from `root`.
+fn intervals_from(root: u8, pcs: &[u8]) -> Vec<u8> {
+    pcs.iter()
+        .map(|&pc| pc_interval(root, pc))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// Sorted unique pitch-classes from a set of MIDI notes.
 fn pitch_classes(notes: &HashSet<u8>) -> Vec<u8> {
     let mut pcs: Vec<u8> = notes.iter().map(|&n| n % 12).collect::<HashSet<_>>().into_iter().collect();
@@ -379,50 +388,50 @@ impl ChordDetector {
             return self.detect_interval(active_notes_in);
         }
 
-        let original = active_notes_in.clone();
-
         // D13: no pitch-class reduction. Doublings never change the PC set, so
         // ≤7 unique PCs use every PC; the old Counter.most_common(7) lottery is gone.
+        // (One clone — the input is never mutated, so a second `original` copy the
+        // scale paths used was redundant.)
         let active_notes: HashSet<u8> = active_notes_in.clone();
 
         let pcs_all = pitch_classes(&active_notes);
+
+        // Bass/top extrema of the (immutable) input, computed once and reused below
+        // instead of re-deriving min/max in each block.
+        let lowest_note = active_notes.iter().min().copied().unwrap_or(0);
+        let highest_note = active_notes.iter().max().copied().unwrap_or(0);
+        let lowest_pc = lowest_note % 12;
+        let highest_pc = highest_note % 12;
 
         // D17: eight or more unique pitch classes never name a chord. Within an
         // octave, defer to a scale reading (8-PC diminished/altered scales still
         // resolve). All twelve tones with no octave-local organization → chromatic.
         // 8–11 PCs spread with no scale → nothing.
         if pcs_all.len() >= 8 {
-            let (omin, omax) = (
-                original.iter().min().copied().unwrap_or(0) as i32,
-                original.iter().max().copied().unwrap_or(0) as i32,
-            );
-            if omax - omin < 12 {
-                if let Some(scale) = self.detect_scale(&original) {
+            if (highest_note - lowest_note) < 12 {
+                if let Some(scale) = self.detect_scale(&active_notes) {
                     return Some(scale);
                 }
             }
             if pcs_all.len() == 12 {
                 return Some("Chromatic Scale".to_string());
             }
-            return self.detect_scale(&original);
+            return self.detect_scale(&active_notes);
         }
 
         // Pre-check: should we attempt scale detection for clustered notes?
-        let span_early = active_notes.iter().max().copied().unwrap_or(0) as i32
-            - active_notes.iter().min().copied().unwrap_or(0) as i32;
+        let span_early = (highest_note - lowest_note) as i32;
         let should_check_scale_later = pcs_all.len() >= 5
             && (span_early < 12 || self.is_clustered(&active_notes));
 
         // For 7 unique pitch classes, quick scale fallback if no dominant quality.
         if pcs_all.len() == 7 {
-            let lowest_note = active_notes.iter().min().copied().unwrap_or(0);
-            let lowest_pc = lowest_note % 12;
             let intervals_from_lowest: HashSet<u8> =
                 pcs_all.iter().map(|&pc| pc_interval(lowest_pc, pc)).collect();
             let has_third = intervals_from_lowest.contains(&3) || intervals_from_lowest.contains(&4);
             let has_seventh = intervals_from_lowest.contains(&10) || intervals_from_lowest.contains(&11);
             if !(has_third && has_seventh) {
-                if let Some(scale) = self.detect_scale(&original) {
+                if let Some(scale) = self.detect_scale(&active_notes) {
                     let root_name = self.get_note_name(lowest_pc);
                     if scale.starts_with(root_name) {
                         return Some(scale);
@@ -437,7 +446,7 @@ impl ChordDetector {
         if pcs_all.len() == 4 {
             let lowest = active_notes.iter().min().copied().unwrap_or(0);
             let lpc = lowest % 12;
-            let ivs: Vec<u8> = pcs_all.iter().map(|&pc| pc_interval(lpc, pc)).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+            let ivs: Vec<u8> = intervals_from(lpc, &pcs_all);
             if ivs == [0, 1, 7, 10] {
                 let root_pc = (lpc + 10) % 12;
                 return Some(format!("{}m6/{}", self.get_note_name(root_pc), self.get_note_name(lpc)));
@@ -448,7 +457,7 @@ impl ChordDetector {
         if pcs_all.len() == 5 {
             let lowest = active_notes.iter().min().copied().unwrap_or(0);
             let lpc = lowest % 12;
-            let ivs: Vec<u8> = pcs_all.iter().map(|&pc| pc_interval(lpc, pc)).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+            let ivs: Vec<u8> = intervals_from(lpc, &pcs_all);
             if ivs == [0, 1, 5, 7, 10] {
                 let root_pc = (lpc + 10) % 12;
                 return Some(format!("{}m6/{}", self.get_note_name(root_pc), self.get_note_name(lpc)));
@@ -462,10 +471,7 @@ impl ChordDetector {
             let remaining: Vec<u8> = pcs_all.iter().copied().filter(|&pc| pc != lpc).collect();
             if remaining.len() == 4 {
                 for &dim_root in &remaining {
-                    let dim_ivs: Vec<u8> = remaining.iter()
-                        .map(|&pc| pc_interval(dim_root, pc))
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .into_iter().collect();
+                    let dim_ivs: Vec<u8> = intervals_from(dim_root, &remaining);
                     if dim_ivs == [0, 3, 6, 9] {
                         let ivs_from_bass: HashSet<u8> = remaining.iter()
                             .map(|&pc| pc_interval(lpc, pc)).collect();
@@ -490,8 +496,7 @@ impl ChordDetector {
             let lowest = active_notes.iter().min().copied().unwrap_or(0);
             let lpc = lowest % 12;
             for &r in &pcs_all {
-                let ivs: Vec<u8> = pcs_all.iter().map(|&pc| pc_interval(r, pc))
-                    .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+                let ivs: Vec<u8> = intervals_from(r, &pcs_all);
                 if ivs == [0u8, 4, 7, 9] {
                     if lpc == (r + 4) % 12 {
                         return Some(format!("{}6/{}", self.get_note_name(r),
@@ -507,10 +512,7 @@ impl ChordDetector {
             let lowest = active_notes.iter().min().copied().unwrap_or(0);
             let lpc = lowest % 12;
             for &potential_root in &pcs_all {
-                let ivs: Vec<u8> = pcs_all.iter()
-                    .map(|&pc| pc_interval(potential_root, pc))
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter().collect();
+                let ivs: Vec<u8> = intervals_from(potential_root, &pcs_all);
                 if ivs == [0, 3, 6, 10] {
                     if potential_root == lpc {
                         return Some(format!("{}m7b5", self.get_note_name(potential_root)));
@@ -528,10 +530,7 @@ impl ChordDetector {
         }
 
         // ── MAIN SCORING LOOP ────────────────────────────────────────────────
-        let highest_note = active_notes.iter().max().copied().unwrap_or(0);
-        let highest_pc = highest_note % 12;
-        let lowest_note = active_notes.iter().min().copied().unwrap_or(0);
-        let lowest_pc = lowest_note % 12;
+        // (lowest_note/highest_note/lowest_pc/highest_pc hoisted above.)
         let pcs_set: HashSet<u8> = pcs_all.iter().copied().collect();
 
         let has_global_dominant_quality = pcs_all.iter().any(|&root| {
@@ -556,18 +555,14 @@ impl ChordDetector {
         let mut best_is_complete = true;
 
         #[cfg(feature = "learning")]
-        let learn_span = (active_notes.iter().max().copied().unwrap_or(0)
-            - active_notes.iter().min().copied().unwrap_or(0)) as u8;
+        let learn_span = (highest_note - lowest_note) as u8;
         #[cfg(feature = "learning")]
         let learn_clustered = self.is_clustered(&active_notes);
         #[cfg(feature = "learning")]
         let learn_note_count = active_notes.len() as u8;
 
         for &root_pc in &pcs_all {
-            let intervals: Vec<u8> = pcs_all.iter()
-                .map(|&pc| pc_interval(root_pc, pc))
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter().collect();
+            let intervals: Vec<u8> = intervals_from(root_pc, &pcs_all);
 
             if let Some((chord_name, score, complete)) = self.match_chord_pattern(
                 &intervals, root_pc, &active_notes,
@@ -641,17 +636,11 @@ impl ChordDetector {
                 } else {
                     pcs_all.clone()
                 };
-                let dim_ivs: Vec<u8> = remaining.iter()
-                    .map(|&pc| pc_interval(m3, pc))
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter().collect();
+                let dim_ivs: Vec<u8> = intervals_from(m3, &remaining);
                 if remaining.len() == 4 && dim_ivs == [0, 3, 6, 9] {
                     let b7 = (potential_root + 10) % 12;
                     if remaining.contains(&b7) {
-                        let intervals_from_root: Vec<u8> = pcs_all.iter()
-                            .map(|&pc| pc_interval(potential_root, pc))
-                            .collect::<std::collections::BTreeSet<_>>()
-                            .into_iter().collect();
+                        let intervals_from_root: Vec<u8> = intervals_from(potential_root, &pcs_all);
                         if let Some((cname, cscore, _)) = self.match_chord_pattern(
                             &intervals_from_root, potential_root, &active_notes,
                             highest_note, highest_pc, lowest_pc, has_global_dominant_quality,
@@ -692,10 +681,7 @@ impl ChordDetector {
                     }
                 } else {
                     // re-detect from lowest
-                    let ivs: Vec<u8> = pcs_all.iter()
-                        .map(|&pc| pc_interval(lowest_pc, pc))
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .into_iter().collect();
+                    let ivs: Vec<u8> = intervals_from(lowest_pc, &pcs_all);
                     if let Some((cname, _, _)) = self.match_chord_pattern(
                         &ivs, lowest_pc, &active_notes,
                         highest_note, highest_pc, lowest_pc, has_global_dominant_quality,
@@ -843,7 +829,7 @@ impl ChordDetector {
         // second conjunct over the same immutable set, so it is already known true
         // here — no need to re-test it.
         if should_check_scale_later {
-            if let Some(scale) = self.detect_scale(&original) {
+            if let Some(scale) = self.detect_scale(&active_notes) {
                 // This discards every scored candidate. Mark it so the teach layer
                 // does not offer readings that can never win.
                 #[cfg(feature = "learning")]
@@ -1069,10 +1055,7 @@ impl ChordDetector {
         let prev_simplify = self.simplify_pass;
         self.simplify_pass = true;
         for &root_pc in &pcs {
-            let intervals: Vec<u8> = pcs.iter()
-                .map(|&pc| pc_interval(root_pc, pc))
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter().collect();
+            let intervals: Vec<u8> = intervals_from(root_pc, &pcs);
             if let Some((name, score, _)) = self.match_chord_pattern(
                 &intervals, root_pc, active_notes, highest, highest_pc, lowest_pc, has_gdq,
             ) {
@@ -1094,10 +1077,7 @@ impl ChordDetector {
         highest_pc: u8,
     ) -> bool {
         // Special voicing check: [0,2,5,7,10] or [0,2,7,10] — Bb6/C vs Gm7/C decision
-        let ivs_from_lowest: Vec<u8> = pcs_all.iter()
-            .map(|&pc| pc_interval(lowest_pc, pc))
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter().collect();
+        let ivs_from_lowest: Vec<u8> = intervals_from(lowest_pc, &pcs_all);
         if ivs_from_lowest == [0, 2, 5, 7, 10] || ivs_from_lowest == [0, 2, 7, 10] {
             return false; // handled specially in match_chord_pattern
         }
@@ -1167,10 +1147,12 @@ impl ChordDetector {
             .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
         let pcs_set: HashSet<u8> = pcs_all.iter().copied().collect();
 
-        let intervals_from_lowest: Vec<u8> = pcs_all.iter()
-            .map(|&pc| pc_interval(lowest_pc, pc))
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter().collect();
+        let intervals_from_lowest: Vec<u8> = intervals_from(lowest_pc, &pcs_all);
+
+        // Loop-invariant across the pattern iteration (root_pc/highest_pc/lowest_pc
+        // are fixed): compute these once rather than per pattern.
+        let highest_interval = pc_interval(root_pc, highest_pc);
+        let bass_iv = pc_interval(root_pc, lowest_pc);
 
         for &(chord_type, pattern) in CHORD_PATTERNS {
             let pattern_set: HashSet<u8> = pattern.iter().copied().collect();
@@ -1206,8 +1188,7 @@ impl ChordDetector {
             // 2. Percentage match (up to 40)
             let pct_match = (matched_count as f64 / input_pc_count as f64) * 40.0;
 
-            // 3. Highest note bonus
-            let highest_interval = pc_interval(root_pc, highest_pc);
+            // 3. Highest note bonus (highest_interval hoisted above the loop)
             let highest_bonus = if pattern_set.contains(&highest_interval) { 10.0 } else { 0.0 };
 
             // 4. Completeness bonus
@@ -1280,8 +1261,7 @@ impl ChordDetector {
                 has_global_dominant_quality,
             );
 
-            // 11. Inversion bonus
-            let bass_iv = pc_interval(root_pc, lowest_pc);
+            // 11. Inversion bonus (bass_iv hoisted above the loop)
             let is_triad = matches!(chord_type, "major"|"minor"|"diminished"|"augmented");
             let is_seventh = chord_type == "major7" || chord_type == "minor7"
                 || chord_type == "dominant7" || chord_type == "diminished7"
