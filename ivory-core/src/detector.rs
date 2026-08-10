@@ -959,18 +959,19 @@ impl ChordDetector {
                 if scale_name == "Whole Tone" && pcs.len() < 6 { continue; }
                 let pat_set: HashSet<u8> = pattern.iter().copied().collect();
                 if !pat_set.is_subset(&intervals) { continue; }
-                let extra = intervals.len() - pat_set.intersection(&intervals).count();
-                let score: i64 = if extra == 0 {
-                    let base = 5000 + pat_set.len() as i64;
-                    let mode_bonus: i64 = if MAJOR_MODES.contains(&scale_name)
-                        || MELODIC_MINOR_MODES.contains(&scale_name)
-                        || HARMONIC_MINOR_MODES.contains(&scale_name) { 1000 } else { 0 };
-                    base + mode_bonus
-                } else {
-                    (pat_set.len() as i64) * 10 - (extra as i64) * 5
-                };
+                // D26 (owner report 2026-08-10): a scale must account for EVERY
+                // sounded pitch class. An input with more unique PCs than the
+                // pattern has tones is a larger scale or a chord, never this one —
+                // a 6-tone C-D-E-F-G-A is NOT the 5-tone C Major Pentatonic. So a
+                // pattern only matches its EXACT pitch-class set (was: any subset,
+                // which let every superset inherit the smaller scale's name).
+                if intervals.len() != pat_set.len() { continue; }
+                let base = 5000 + pat_set.len() as i64;
+                let mode_bonus: i64 = if MAJOR_MODES.contains(&scale_name)
+                    || MELODIC_MINOR_MODES.contains(&scale_name)
+                    || HARMONIC_MINOR_MODES.contains(&scale_name) { 1000 } else { 0 };
                 let root_bonus: i64 = if root_pc == lowest_pc { 500 } else { 0 };
-                let total = score + root_bonus;
+                let total = base + mode_bonus + root_bonus;
                 if total > best_score {
                     best_score = total;
                     best_match = Some(format!("{} {}", self.get_note_name(root_pc), scale_name));

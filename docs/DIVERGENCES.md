@@ -186,6 +186,20 @@ are post-review.
   so it cannot crown an incomplete maj13 over an unrelated chord. Flips former
   "parity" row v114 (same shape in Eb). (52 corpus rows.)
 
+- **D26** (owner report 2026-08-10): a scale must account for EVERY sounded
+  pitch class. `detect_scale` previously matched a pattern as a `is_subset` of
+  the played notes, so every superset inherited the smaller scale's name — a
+  6-tone `C-D-E-F-G-A` read as the 5-tone `C Major Pentatonic`. It now requires
+  an EXACT pitch-class match (`intervals.len() == pat_set.len()`), so a set with
+  more unique PCs than the pattern has tones is never that scale. `C-D-E-F-G-A`
+  → `Dm11`, `C-D-Eb-F-G-Bb` → `Cm11`; genuine 5-tone pentatonics and exact
+  6-tone scales (whole-tone, blues) are unchanged. Consequences: the 12-PC
+  chromatic set is `Chromatic Scale` (not the 8-tone `C Whole-Half Diminished`
+  it contained — old v-row flipped), and an 8-PC "altered scale + natural 5th"
+  is `None` (not `C Altered`; old v098 flipped) per D17. 905 corpus note-sets
+  move subset-scale → chord/None/Chromatic; a classifier confirmed 0 touched a
+  chord reading and 0 exact-match scale was lost.
+
 Naming preference note: all examples above are written in flats
 (prefer_flats=true, the default); every rule is pitch-class-relational and
 applies identically under sharps. The classification file covers both

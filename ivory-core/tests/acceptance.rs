@@ -165,7 +165,11 @@ const FLAT_ROWS: &[Row] = &[
     (&[60, 70, 74, 78, 81], Some("C13(#11)"), "v096 parity"),
     (&[60, 64, 67, 70, 74, 78, 81], Some("C13(#11)"), "v097 parity (7-PC 13#11)"),
     // §13 vector 98: 8-PC scale still detects (D17 keeps scale path)
-    (&[60, 61, 63, 64, 66, 67, 68, 70], Some("C Altered"), "v098 D17-keep (8-PC scale)"),
+    // D26: this 8-PC set is the 7-tone altered scale PLUS the natural 5th, so it is
+    // NOT "C Altered" (a scale must contain every sounded tone). No exact 8-tone
+    // scale matches it, so per D17 (8+ PC, no scale) it resolves to None — same
+    // principle that stops a 6-tone set reading as a 5-tone pentatonic.
+    (&[60, 61, 63, 64, 66, 67, 68, 70], None, "v098 D26 (8 PCs ⊋ altered scale → None)"),
     // §13 vectors 99–107: sus family (D20/D7/D8, K5/K11/K12)
     (&[60, 65, 67, 70], Some("C7sus4"), "v099 D20 (was Bbm11)"),
     (&[60, 62, 67, 70], Some("Gm/C"), "v100 K11 (kept identity)"),
@@ -235,6 +239,14 @@ const FLAT_ROWS: &[Row] = &[
     (&[60, 63, 65, 67, 70, 72], Some("C Minor Pentatonic"), "x-D22 min pent + octave"),
     (&[60, 63, 65, 66, 67, 70, 72], Some("C Minor Blues"), "x-D22 min blues + octave"),
     (&[60, 62, 63, 64, 67, 69, 72], Some("C Major Blues"), "x-D22 maj blues + octave"),
+    // D26 (owner report 2026-08-10): a scale must account for every sounded tone, so
+    // a 6+ unique-PC set is NEVER a 5-tone pentatonic (nor any smaller scale). These
+    // fall through to chord detection; the genuine 5-tone pentatonics (v131/v134) and
+    // exact 6-tone scales (v135 whole-tone, v137 blues) still name as scales.
+    (&[60, 62, 64, 65, 67, 69], Some("Dm11"), "x-D26 CDEFGA not C maj pent"),
+    (&[55, 57, 59, 60, 62, 64], Some("Am11"), "x-D26 GABCDE transposition"),
+    (&[60, 62, 63, 65, 67, 70], Some("Cm11"), "x-D26 6-tone not C min pent"),
+    (&[60, 62, 64, 65, 67, 71], Some("CΔ11"), "x-D26 CDEFGB (already a chord)"),
     (&[60, 61, 62, 63, 64], Some("DbmΔ7/C"), "v141 parity (chromatic cluster)"),
     // v142 asserted in not_a_chord_rows (D17).
     (&[60, 64, 67, 72, 76, 79], Some("C"), "v143 parity (doubled octaves)"),
@@ -279,12 +291,15 @@ const FLAT_ROWS: &[Row] = &[
     // are still chords (no reduction lottery).
     (&[48, 52, 55, 60, 64, 67, 72, 76, 79], Some("C"), "x-D13 9 notes 3 PCs"),
     (&[48, 60, 64, 67, 70, 72, 76, 79, 82], Some("C7"), "x-D13 9 notes 4 PCs"),
-    // D17: compact 12-PC chromatic keeps its shipped scale reading; spread
-    // chromatic (all 12 PCs, nowhere clustered) renders the rootless label.
+    // D26 (owner report 2026-08-10): all twelve PCs is the Chromatic Scale, not an
+    // 8-tone diminished scale it happens to contain. The old `C Whole-Half
+    // Diminished` here was the subset-match bug (a 12-tone input can't be an 8-tone
+    // scale) — detect_scale now requires an exact PC match, so this falls through to
+    // the 12-PC → "Chromatic Scale" rule.
     (
         &[60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71],
-        Some("C Whole-Half Diminished"),
-        "x-D17-keep compact chromatic",
+        Some("Chromatic Scale"),
+        "x-D26 compact chromatic (was subset-match Whole-Half Dim)",
     ),
     (
         &[48, 50, 52, 54, 56, 58, 61, 63, 65, 67, 69, 71],
