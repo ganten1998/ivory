@@ -676,16 +676,16 @@ impl ChordDetector {
             // arm for it, and the pattern was deleted), so testing it is always false.
             let is_aug = self.match_chord_type(bm, "augmented");
 
-            // D12: only re-root a diminished TRIAD to the bass when the bass
-            // actually forms a diminished triad ([0,3,6] from it). Otherwise the
-            // bass is merely a chord tone (e.g. C-Eb-A: bass C is the b3 of A°, not
-            // a °-root) and the minor6_no5 reading from the bass is correct.
-            let bass_is_dim_root = {
-                let ivs: HashSet<u8> = pcs_all.iter().map(|&pc| pc_interval(lowest_pc, pc)).collect();
-                ivs.is_superset(&[0u8, 3, 6].iter().copied().collect())
-            };
             if (is_triadic_dim || is_dim7 || is_aug) && best_root_pc != lowest_pc {
                 if is_triadic_dim {
+                    // D12: only re-root a diminished TRIAD to the bass when the bass
+                    // actually forms a diminished triad ([0,3,6] from it). Otherwise
+                    // the bass is merely a chord tone (C-Eb-A: bass C is the b3 of A°,
+                    // not a °-root) and the minor6_no5 reading from the bass is right.
+                    let bass_is_dim_root = {
+                        let ivs: HashSet<u8> = pcs_all.iter().map(|&pc| pc_interval(lowest_pc, pc)).collect();
+                        ivs.is_superset(&[0u8, 3, 6].iter().copied().collect())
+                    };
                     if bass_is_dim_root {
                         best_match = Some(format!("{}dim", self.get_note_name(lowest_pc)));
                         best_root_pc = lowest_pc;
@@ -835,25 +835,22 @@ impl ChordDetector {
         }
 
         // ── SCALE CHECK for clustered notes ──────────────────────────────────
+        // D22: a scale run played root-to-root spans an octave (span >= 12, the root
+        // doubled on top), so scale detection must survive past a bare `span < 12`
+        // gate — a stepwise voicing is `is_clustered`, while a spread tertian chord
+        // (v067's CΔ13 stack, thirds apart) is not and still names as a chord. That
+        // `span < 12 || is_clustered` test is exactly should_check_scale_later's own
+        // second conjunct over the same immutable set, so it is already known true
+        // here — no need to re-test it.
         if should_check_scale_later {
-            let span = original.iter().max().copied().unwrap_or(0) as i32
-                - original.iter().min().copied().unwrap_or(0) as i32;
-            // A scale run played root-to-root spans exactly an octave (span == 12,
-            // the root doubled on top) or wider, so a bare `span < 12` gate dropped
-            // the scale reading the instant the octave was added — the same PC set
-            // then scored as maj13 (C-D-E-F-G-A-B-C → CΔ13 instead of C Ionian).
-            // A stepwise voicing is `is_clustered`; a spread tertian chord (v067's
-            // CΔ13 stack, thirds apart) is not, so it still names as a chord.
-            if span < 12 || self.is_clustered(&original) {
-                if let Some(scale) = self.detect_scale(&original) {
-                    // This discards every scored candidate. Mark it so the teach
-                    // layer does not offer readings that can never win.
-                    #[cfg(feature = "learning")]
-                    {
-                        self.label_from_scale = true;
-                    }
-                    return Some(scale);
+            if let Some(scale) = self.detect_scale(&original) {
+                // This discards every scored candidate. Mark it so the teach layer
+                // does not offer readings that can never win.
+                #[cfg(feature = "learning")]
+                {
+                    self.label_from_scale = true;
                 }
+                return Some(scale);
             }
         }
 
@@ -1353,7 +1350,9 @@ impl ChordDetector {
         extra_count: usize,
         has_global_dominant_quality: bool,
     ) -> f64 {
-        let unique_pcs = active_notes.iter().map(|&n| n % 12).collect::<HashSet<_>>().len();
+        // pcs_set (param) is already the deduped n%12 set, so its len is the unique
+        // pitch-class count — no need to rebuild the HashSet here.
+        let unique_pcs = pcs_set.len();
         let mut bonus = 0.0_f64;
 
         // Exact pattern boosts for altered dominants
