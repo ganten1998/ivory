@@ -10,6 +10,7 @@ mod menu;
 mod midi;
 mod piano;
 mod settings;
+mod theme;
 
 use settings::Settings;
 

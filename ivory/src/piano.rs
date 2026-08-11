@@ -49,11 +49,7 @@ fn idle_colors(s: &Settings) -> (Color32, Color32) {
 }
 
 pub fn bg_color(dark_mode: bool) -> Color32 {
-    if dark_mode {
-        Color32::from_rgb(0x1a, 0x1a, 0x1a)
-    } else {
-        Color32::from_rgb(0xE8, 0xE8, 0xE8)
-    }
+    crate::theme::palette(dark_mode).piano_bg
 }
 
 /// Draw the piano into `rect`. `display_notes` must already include manual
@@ -83,16 +79,14 @@ pub fn draw(
     let white_active = s.white_key_active_color.to_color32();
     let black_active = s.black_key_active_color.to_color32();
 
-    let separator = if s.dark_mode {
-        Color32::from_rgb(153, 153, 153)
-    } else {
-        Color32::from_rgb(92, 63, 31)
-    };
-    let outline = if s.dark_mode {
-        Color32::from_rgb(204, 204, 204)
-    } else {
-        Color32::from_rgb(139, 115, 85)
-    };
+    let pal = crate::theme::palette(s.dark_mode);
+    let separator = pal.key_separator;
+    let outline = pal.black_key_outline;
+    // Phosphor themes (Centennial) halo their held keys. Collected here and
+    // drawn in one pass at the end so a halo never lands under a later key
+    // fill — the same paint-order trap that once ate the key separators.
+    let glow = crate::theme::active().glow;
+    let mut lit: Vec<Rect> = Vec::new();
 
     // 2. White keys, left to right (int truncation per key, like Qt fillRect).
     // Fill every white key FIRST, then draw the separators on top — otherwise each
@@ -117,6 +111,9 @@ pub fn draw(
             egui::vec2(white_key_w.trunc() as f32, h.trunc() as f32),
         );
         painter.rect_filled(key_rect, 0.0, fill);
+        if glow.is_some() && display_notes.contains(&note) {
+            lit.push(key_rect);
+        }
         idx += 1;
     }
     // 1px separators between adjacent white keys (drawn after all fills).
@@ -161,6 +158,32 @@ pub fn draw(
             Pos2::new(left + bx + bw + 0.5, top + bh + 0.5),
         );
         painter.rect_stroke(stroke_rect, 0.0, Stroke::new(1.0, outline), StrokeKind::Middle);
+        if glow.is_some() && display_notes.contains(&note) {
+            lit.push(key_rect);
+        }
+    }
+
+    // 4. Phosphor bloom. Concentric STROKES, not filled expanded rects: a fill
+    // would wash the key core out to white and destroy the glow-in-the-dark
+    // read. While the pedal is down the halo takes the sustain color, so the
+    // whole keyboard goes gold — the DX7 Centennial's plating, and pedalling
+    // is a control.
+    if let Some(g) = glow {
+        let halo = if sustain_down { sustain } else { g.color };
+        // Bands are specified at 100% window size; scale with the keyboard.
+        let scale = (w / 1300.0).clamp(0.5, 2.0) as f32;
+        for rect in &lit {
+            for (outset, gain) in g.bands.iter().copied() {
+                let r = rect.expand(outset * scale);
+                let a = (gain * 255.0).round().clamp(0.0, 255.0) as u8;
+                painter.rect_stroke(
+                    r,
+                    0.0,
+                    Stroke::new((outset * scale).max(1.0), halo.gamma_multiply(a as f32 / 255.0)),
+                    StrokeKind::Middle,
+                );
+            }
+        }
     }
 }
 

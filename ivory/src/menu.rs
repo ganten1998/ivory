@@ -35,6 +35,8 @@ pub enum MenuAction {
     ToggleChordDetection,
     /// Cycle the built-in UI typeface (Courier Prime <-> Terminess).
     CycleFont,
+    /// Cycle the named color theme.
+    CycleTheme,
     DetachChordWindow,
     AttachChordWindow,
     TeachChordName,
@@ -64,6 +66,8 @@ pub struct MenuView {
     /// Label of the typeface that will be active after the next Font click.
     /// `None` hides the row entirely (only Courier Prime is available here).
     pub next_font: Option<&'static str>,
+    /// Label for the theme the next Theme click will apply.
+    pub next_theme: &'static str,
 }
 
 #[derive(Clone, Copy)]
@@ -75,21 +79,8 @@ pub struct MenuColors {
 }
 
 pub fn colors(dark_mode: bool) -> MenuColors {
-    if dark_mode {
-        MenuColors {
-            bg: Color32::from_rgb(0x00, 0x00, 0x00),
-            text: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            sel: Color32::from_rgb(0x1a, 0x1a, 0x1a),
-            sep: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-        }
-    } else {
-        MenuColors {
-            bg: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            text: Color32::from_rgb(0x00, 0x00, 0x00),
-            sel: Color32::from_rgb(0xd4, 0xc8, 0xb0),
-            sep: Color32::from_rgb(0x00, 0x00, 0x00),
-        }
-    }
+    let p = crate::theme::palette(dark_mode);
+    MenuColors { bg: p.menu_bg, text: p.menu_text, sel: p.menu_sel, sep: p.menu_sep }
 }
 
 const MENU_FONT_SIZE: f32 = 13.0;
@@ -177,6 +168,7 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     if let Some(next) = view.next_font {
         e.push(item(next, MenuAction::CycleFont));
     }
+    e.push(item(view.next_theme, MenuAction::CycleTheme));
     e.push(Entry::Separator);
     e.push(item(
         if view.keytoggle {
@@ -551,6 +543,7 @@ mod tests {
             notes_held: false,
             learning_on: false,
             next_font: None,
+            next_theme: "Theme: Classic",
         }
     }
 

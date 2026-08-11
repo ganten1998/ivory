@@ -33,6 +33,9 @@ struct NoteData {
 pub struct IvoryApp {
     settings: Settings,
     detector: ChordDetector,
+    /// Supporter license, loaded once. Status is DERIVED from it every time it
+    /// is consulted — never cached as a boolean, so there is nothing to flip.
+    license: ivory_core::license::LicenseStore,
 
     midi_tx: mpsc::Sender<midi::MidiEvent>,
     midi_rx: mpsc::Receiver<midi::MidiEvent>,
@@ -80,6 +83,15 @@ impl IvoryApp {
         // behaves exactly like the stock engine until something is taught.
         detector.set_overrides(Some(OverrideStore::load()));
 
+        // Resolve the stored theme against the license. `resolve` cannot fail:
+        // an unknown or locked id yields Classic, and the stored preference is
+        // left untouched so it returns if a license is installed later.
+        let license = ivory_core::license::LicenseStore::load();
+        crate::theme::set_active(crate::theme::resolve(
+            &settings.theme,
+            license.is_supporter(),
+        ));
+
         let (midi_tx, midi_rx) = mpsc::channel();
         // Startup connection (spec §10): explicit -p port, else auto-connect
         // priority chain. Any failure => run without MIDI, no dialog.
@@ -101,6 +113,7 @@ impl IvoryApp {
         Self {
             settings,
             detector,
+            license,
             midi_tx,
             midi_rx,
             midi_conn,
@@ -219,6 +232,13 @@ impl IvoryApp {
             detached: self.settings.chord_window_detached,
             notes_held: !self.display_notes().is_empty(),
             learning_on: self.detector.learning_mode(),
+            next_theme: {
+                use crate::theme;
+                let cur = theme::active().id;
+                let i = theme::THEMES.iter().position(|t| t.id == cur).unwrap_or(0);
+                let next = &theme::THEMES[(i + 1) % theme::THEMES.len()];
+                next.menu_label()
+            },
             next_font: {
                 use crate::fonts::FontChoice;
                 let cur = FontChoice::from_key(&self.settings.font_choice);
@@ -368,6 +388,22 @@ impl IvoryApp {
             }
             MenuAction::ToggleDarkMode => {
                 self.settings.dark_mode = !self.settings.dark_mode;
+                self.settings.save();
+            }
+            MenuAction::CycleTheme => {
+                use crate::theme;
+                let cur = theme::active().id;
+                let i = theme::THEMES.iter().position(|t| t.id == cur).unwrap_or(0);
+                let next = &theme::THEMES[(i + 1) % theme::THEMES.len()];
+                let licensed = self.license.is_supporter();
+                // Supporter themes may be TRIED without a license — they just
+                // are not persisted. Generous, creates the want, and adds no
+                // DRM surface: nothing is hidden, nothing nags.
+                theme::set_active(next);
+                theme::stamp_keys(next, &mut self.settings);
+                if next.tier == theme::Tier::Free || licensed {
+                    self.settings.theme = next.id.to_owned();
+                }
                 self.settings.save();
             }
             MenuAction::CycleFont => {

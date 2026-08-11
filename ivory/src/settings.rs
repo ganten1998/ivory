@@ -83,6 +83,9 @@ pub struct Settings {
     /// Built-in UI typeface key (see fonts::FontChoice). Additive key; unknown
     /// values fall back to Courier Prime.
     pub font_choice: String,
+    /// Named color theme id (see theme::THEMES). Stored VERBATIM and never
+    /// rewritten on failure, so a supporter theme survives running unlicensed.
+    pub theme: String,
     /// Unknown keys from the file, preserved verbatim on save (file order).
     pub extra: Map<String, Value>,
 }
@@ -105,6 +108,7 @@ impl Default for Settings {
             keytoggle_enabled: false,
             custom_font_path: None,
             font_choice: crate::fonts::FontChoice::default().key().to_owned(),
+            theme: crate::theme::CLASSIC.id.to_owned(),
             extra: Map::new(),
         }
     }
@@ -198,6 +202,11 @@ impl Settings {
                 s.font_choice = f.to_owned();
             }
         }
+        if let Some(v) = map.remove("theme") {
+            if let Some(t) = v.as_str() {
+                s.theme = t.to_owned();
+            }
+        }
 
         s.extra = map; // whatever is left, preserved in file order
         s
@@ -251,6 +260,7 @@ impl Settings {
             map.insert("custom_font_path".into(), Value::String(p.clone()));
         }
         map.insert("font_choice".into(), Value::String(self.font_choice.clone()));
+        map.insert("theme".into(), Value::String(self.theme.clone()));
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
