@@ -175,9 +175,14 @@ fn main() {
         .with_resizable(false)
         .with_decorations(!settings.borderless_mode);
 
-    match eframe::icon_data::from_png_bytes(
-        &include_bytes!("../../assets/ivory.png")[..],
-    ) {
+    // macOS wants a rounded-squircle icon with padding around the art; every other
+    // platform expects the plain full-bleed square. Both are the same artwork.
+    #[cfg(target_os = "macos")]
+    let icon_png: &[u8] = &include_bytes!("../../assets/ivory-macos.png")[..];
+    #[cfg(not(target_os = "macos"))]
+    let icon_png: &[u8] = &include_bytes!("../../assets/ivory.png")[..];
+
+    match eframe::icon_data::from_png_bytes(icon_png) {
         Ok(icon) => viewport = viewport.with_icon(icon),
         Err(err) => eprintln!("could not decode assets/ivory.png as the app icon: {err}"),
     }

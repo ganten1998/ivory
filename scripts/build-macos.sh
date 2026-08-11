@@ -29,7 +29,11 @@ VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
 # there and notarization rejects it. Artifact FILENAMES keep the full string;
 # only the bundle gets the numeric core. No-op on a plain release version.
 VERSION_NUM="${VERSION%%-*}"; VERSION_NUM="${VERSION_NUM%%+*}"
-ICON_SRC="assets/ivory.png"
+# macOS icons are rounded squircles with padding, not full-bleed squares — using
+# the raw square art makes Ivory look oversized next to every other Dock icon.
+# assets/ivory-macos.png is the same artwork pre-composited into that shape.
+# (build-cross.sh keeps assets/ivory.png: Windows/Linux want the square.)
+ICON_SRC="assets/ivory-macos.png"
 
 warn_placeholder_icon() {
   # assets/ivory.png is the ORIGINAL piano-keys icon, byte-identical to the
