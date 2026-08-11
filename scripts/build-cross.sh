@@ -79,6 +79,78 @@ mkdir -p dist
 # Windows icon must exist BEFORE cargo builds so build.rs embeds it.
 gen_ico
 
+# sign_windows_exe <path/to/ivory.exe> — Authenticode-sign via Azure Artifact
+# Signing (formerly Trusted Signing) using jsign, which unlike Microsoft's
+# signtool runs on macOS/Linux. No certificate ever touches this machine: jsign
+# sends the file hash to Azure, Microsoft's HSM signs it and returns the
+# signature.
+#
+# Unconfigured => the exe ships UNSIGNED (today's behavior) and the build says
+# so once. PARTIALLY configured => hard failure, because silently shipping an
+# unsigned binary while believing it is signed is the worst outcome here.
+#
+# Setup (see docs/RELEASE.md § Windows):
+#   brew install jsign            # needs a JRE
+#   brew install azure-cli        # only for the default token path
+#   export TRUSTED_SIGNING_ENDPOINT=https://eus.codesigning.azure.net
+#   export TRUSTED_SIGNING_ACCOUNT=<your-account>
+#   export TRUSTED_SIGNING_PROFILE=<your-certificate-profile>
+#   # token: taken from `az account get-access-token` unless you set
+#   # TRUSTED_SIGNING_TOKEN yourself (e.g. from a CI federated credential).
+sign_windows_exe() {
+  local exe="$1"
+  local set_count=0
+  for v in "${TRUSTED_SIGNING_ENDPOINT:-}" "${TRUSTED_SIGNING_ACCOUNT:-}" \
+           "${TRUSTED_SIGNING_PROFILE:-}"; do
+    [ -n "$v" ] && set_count=$((set_count + 1))
+  done
+
+  if [ "$set_count" = 0 ]; then
+    echo "    (unsigned: TRUSTED_SIGNING_* not set — Windows will show SmartScreen)"
+    return 0
+  fi
+  if [ "$set_count" != 3 ]; then
+    echo "TRUSTED_SIGNING_* is only partially set — refusing to ship a silently" >&2
+    echo "unsigned exe. Set ENDPOINT, ACCOUNT and PROFILE, or none of them." >&2
+    return 1
+  fi
+
+  command -v jsign >/dev/null 2>&1 || {
+    echo "jsign not found (brew install jsign) but TRUSTED_SIGNING_* is set." >&2
+    return 1
+  }
+
+  local token="${TRUSTED_SIGNING_TOKEN:-}"
+  if [ -z "$token" ]; then
+    command -v az >/dev/null 2>&1 || {
+      echo "Need an access token: install azure-cli, or set TRUSTED_SIGNING_TOKEN." >&2
+      return 1
+    }
+    token="$(az account get-access-token \
+      --resource https://codesigning.azure.net \
+      --query accessToken -o tsv)" || {
+      echo "az could not get a token — run 'az login' first." >&2; return 1; }
+  fi
+
+  echo "==> Signing $(basename "$exe") via Azure Artifact Signing"
+  # RFC-3161 timestamp so the signature outlives the short-lived certificate.
+  jsign --storetype TRUSTEDSIGNING \
+        --keystore "$TRUSTED_SIGNING_ENDPOINT" \
+        --storepass "$token" \
+        --alias "${TRUSTED_SIGNING_ACCOUNT}/${TRUSTED_SIGNING_PROFILE}" \
+        --tsaurl http://timestamp.acs.microsoft.com \
+        --name "Ivory" \
+        "$exe" || { echo "jsign failed — exe NOT signed" >&2; return 1; }
+
+  # Best-effort local check; real proof is a first launch on Windows.
+  if command -v osslsigncode >/dev/null 2>&1; then
+    osslsigncode verify "$exe" 2>&1 | grep -iE "signature|signer|timestamp" \
+      | head -4 | sed 's/^/    /' || true
+  else
+    echo "    (install osslsigncode to verify the signature here)"
+  fi
+}
+
 package_linux() { # $1 = rust target, $2 = artifact arch name
   local target="$1" arch="$2"
   local stage="dist/ivory-${VERSION}-linux-${arch}"
@@ -133,6 +205,7 @@ WINZIP="${WINSTAGE}.zip"
 rm -rf "$WINSTAGE" "$WINZIP"
 mkdir -p "$WINSTAGE"
 cp target/x86_64-pc-windows-msvc/release/ivory.exe "$WINSTAGE/"
+sign_windows_exe "$WINSTAGE/ivory.exe"
 cp LICENSE THIRD-PARTY-LICENSES "$WINSTAGE/"
 cp assets/fonts/OFL.txt "$WINSTAGE/"
 # Licences for the four fonts eframe's `default_fonts` embeds in ivory.exe.

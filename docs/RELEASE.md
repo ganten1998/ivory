@@ -100,9 +100,37 @@ repo; it is external, it moves, re-confirm before spending money.**
   Microsoft Learn docs BEFORE planning around it.
 
 Recommendation unchanged: ship unsigned initially, keep the SmartScreen steps
-in the README and in `READ-ME-FIRST.md`, and revisit if download volume grows.
-If signing does become worth it, price Artifact Signing first — the hardware
-mandate makes a retail cert materially more annoying than it was in 2022.
+in the README and in the shipped `README.txt`, and revisit if download volume
+grows. If signing does become worth it, price Artifact Signing first — the
+hardware mandate makes a retail cert materially more annoying than it was in
+2022.
+
+**The plumbing is already in place** (`sign_windows_exe` in
+`scripts/build-cross.sh`). It uses **jsign**, not `signtool`: signtool is
+Windows-only, and Ivory's Windows binary is cross-built from macOS, so signtool
+would force a Windows VM or CI runner into the release path. jsign runs on
+macOS/Linux and talks to Artifact Signing directly — the build machine never
+holds a certificate; it sends the file hash and Microsoft's HSM returns the
+signature.
+
+To turn it on:
+
+```sh
+brew install jsign          # needs a JRE
+brew install azure-cli      # only for the default token path; then: az login
+export TRUSTED_SIGNING_ENDPOINT=https://eus.codesigning.azure.net   # your region
+export TRUSTED_SIGNING_ACCOUNT=<account>
+export TRUSTED_SIGNING_PROFILE=<certificate-profile>
+scripts/build-cross.sh      # or scripts/release.sh
+```
+
+With none of those set the exe ships unsigned exactly as before, and the build
+says so once. With *some* of them set the build **fails** rather than quietly
+producing an unsigned binary you believe is signed. A token may be supplied
+directly as `TRUSTED_SIGNING_TOKEN` (e.g. a CI federated credential) instead of
+via `az`. Signatures are RFC-3161 timestamped so they outlive the short-lived
+certificate. `osslsigncode`, if installed, prints a local verification — but the
+real proof is a first launch on a real Windows machine.
 
 ### Linux
 
