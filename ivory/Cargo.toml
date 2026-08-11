@@ -3,6 +3,7 @@ name = "ivory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 build = "build.rs"
 
 [dependencies]
@@ -35,3 +36,6 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_UI_
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
+
+[lints]
+workspace = true

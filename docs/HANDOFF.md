@@ -1,6 +1,7 @@
 # Ivory 2.0 — Handoff / Resume Document
 
-**Last updated:** 2026-08-04 (v2.1.0 — Chord Learning went user-facing; see §2a).
+**Last updated:** 2026-08-11 (docs reconciled against the code; newest engine
+work is D22–D26 plus the Tier A/B refactor pass — see §2b).
 This file is the single source of truth for
 picking the project up cold. Read it top-to-bottom before touching anything.
 Pair it with `docs/DESIGN.md` (architecture), `docs/DIVERGENCES.md` (the chord
@@ -24,14 +25,14 @@ priority order (from the owner's brief):
    packaged for macOS + Linux + Windows.
 5. **Clean and lean** — two crates, minimal deps. Retire the old `ivory-rust`.
 
-**Repo:** `~/Dropbox/Projects/Apps/ivory` (git, branch `main`, local only — no
-remote yet; Codeberg push is a remaining task, see §7). The old abandoned
-attempt `~/Dropbox/Projects/Apps/ivory-rust` was mined for its engine and is to
-be **trashed once 2.0 verifies** (do NOT push it anywhere).
+**Repo:** `~/Dropbox/Projects/Apps/ivory` (git, branch `main`; `origin` =
+`git@codeberg.org:ganten1998/ivory.git`, pushed 2026-07-29 — see §7). The old
+abandoned attempt `~/Dropbox/Projects/Apps/ivory-rust` was mined for its engine
+and has since been **trashed** (§7; do NOT push it anywhere).
 
 ---
 
-## 2. Current status (2026-07-29)
+## 2. Status at 2026-07-29 (historical — see §2a and §2b for what came after)
 
 ### Done and committed
 | Commit | What |
@@ -39,15 +40,18 @@ be **trashed once 2.0 verifies** (do NOT push it anywhere).
 | `cf71ba6` | Scaffold: workspace, engine base copied from ivory-rust, specs, fonts, golden corpus |
 | `c9e15a0` | Design + divergence policy (after a 3-lens adversarial critique) |
 | `c8be947` | GUI parity port (9 modules), packaging scripts, engine acceptance contract |
-| `5dbe50f` | **Engine surgery: all 20 D-rules land; acceptance + 42 unit tests green** |
+| `5dbe50f` | **Engine surgery: all 20 D-rules then defined land; acceptance + 42 unit tests green** |
 | `290a73d` | Refine D20 (fixed 44 m11-inversion regressions) |
 | `0d0926e` | Fix invisible white-key separators (bug the owner caught on-device) |
 | `da487fa` | This HANDOFF doc |
 | `60bc651` | **Verify phase: teach layer + differential classification + D21 note-drop fixes** |
 
-**Engine + teach + verify are all DONE and green.** `cargo test --workspace` →
-GUI 11 + engine 54 unit + 3 acceptance + differential(fast); `--features
-learning` → 58 + 3. The verify workflow (classifier + adversarial reviewer +
+**Engine + teach + verify are all DONE and green.** At this commit the counts
+were GUI 11 + engine 54 unit + 3 acceptance + differential(fast), and
+`--features learning` → 58 + 3. **As of 2026-08-11 they are:** `cargo test
+--workspace` → GUI 14 + engine 59 unit + 3 acceptance + 10 learning +
+differential(fast); `cargo test -p ivory-core` (stock, no `learning`) → 55 + 3
++ differential(fast). The verify workflow (classifier + adversarial reviewer +
 teach agent) completed:
 - **Teach layer done**: `overrides.rs` (exact overrides + feature-gated
   `learning` perceptron, off by default, zero-weights no-op), wired into the
@@ -58,7 +62,9 @@ teach agent) completed:
   `classify.py`, `UNEXPLAINED.md`, `README.md`, and
   `ivory-core/tests/differential.rs` (self-consistency guard — regenerate the
   baseline + re-run `classify.py` after ANY engine change; procedure in
-  `tests/golden/README.md`). Corpus mismatch vs raw Python is now 5057.
+  `tests/golden/README.md`). Corpus mismatch vs raw Python was 5057 at this
+  commit; after D22–D26 it is **5540** (verified 2026-08-11 via `diffcorpus`),
+  and `classified-divergences.json` has not been regenerated since.
 - **Adversarial review done**: no misfire found in the 7 broad scoring changes.
 - **D21 note-drop fixes**: the classifier caught 28 drop-2 voicings dropping a
   #5/#11; fixed via a completeness preference + a maj7#11 perfect-inversion
@@ -78,9 +84,11 @@ Built for a first hands-on test by a non-owner on macOS **and** Windows.
   re-ranker is unable to reach. Every attempt reports its outcome.
 - **Measured blast radius** (`ivory-core/tests/blast_radius.rs`, `#[ignore]`d —
   run it with `--release -- --ignored --nocapture`): ONE correction
-  (`C-E-G-A → Am7`, 5 steps) changes **1,182 of the 13,133 corpus voicings
-  (9.0%)**, many in unrelated keys, because chord identity enters the feature
-  vector only as `hash % 97`. `Forget Learning` restored all 13,133 exactly.
+  (`C-E-G-A → Am7`, 5 steps) changed **1,182 of the 13,133 corpus voicings
+  (9.0%)** when measured at 2.1.0 — **re-measured 2026-08-11 after D22–D26 it
+  is 1,279 (9.7%)** — many in unrelated keys, because chord identity enters the
+  feature vector only as `hash % 97`. `Forget Learning` restored all 13,133
+  exactly, both times.
   That number is the honest answer to "is the re-ranker worth keeping" — it is
   a taste dial with a very wide blast radius, not a per-chord memory. It is
   quoted in the correction dialog and in the tester README rather than hidden.
@@ -144,14 +152,47 @@ Built for a first hands-on test by a non-owner on macOS **and** Windows.
   egui reliably on macOS anyway), and no build has ever been run on real
   Windows. That is exactly what the friend test covers.
 
+## 2b. 2026-08-10/11 — engine bug-fix round, refactor pass, doc reconciliation
+
+Commits after §2a, none of which were reflected above:
+
+| Commit | What |
+|---|---|
+| `849a71e` | GUI: Chord Learning becomes a real menu option (D-UI-9) |
+| `ecfe669` | Engine: re-ranker made trainable, and unable to erase a chord |
+| `8257a5a` | Packaging + docs for 2.1.0; two artifacts were quietly broken |
+| `bbf7866` | **D22–D25** — chord-logic fixes from an owner bug report |
+| `6d607a7` | **D26** — a scale must account for every sounded pitch class |
+| `4310295` `b526a18` `1c98f66` `656edb8` | Tier A refactors: dead code from D-rule deletions, hot-path dedup/hoist, inert `optional_for` |
+| `7aa34ab` | Tier B perf: u16 bitmask set-algebra in `match_chord_pattern` |
+
+What that changes for anyone picking this up:
+- The D-range is now **D1–D26** (25 rules; D16 withdrawn — see DIVERGENCES K10).
+- `tests/golden/rust-golden.json` was regenerated for D22–D25 and again for
+  D26. **`classified-divergences.json` was NOT** — it is a 2026-07-29 snapshot
+  of 5,057 rows, while the live Rust-vs-Python mismatch is **5,540**. Re-run
+  `tests/golden/classify.py` before quoting its per-rule table.
+- Whole workspace green at GUI 14 + engine 59 unit + 3 acceptance + 10 learning
+  + differential(fast). The full 13,133-row differential is `#[ignore]`d — see §5.
+- One-correction blast radius re-measured after D22–D26: **1,279 of 13,133
+  (9.7%)**, up from the 1,182 (9.0%) quoted in §2a.
+
 ### Remaining work (task 8 — FINALIZE only)
-Everything above is committed. What's left is packaging + release + cleanup:
-- Real icon art (current `assets/ivory.png` is a 543-byte placeholder — **blocks
-  release**), then packaging dry-run (`scripts/build-macos.sh`, `build-cross.sh`).
-- Push to Codeberg (see §7), then trash `~/Dropbox/Projects/Apps/ivory-rust`.
-- Optional polish: 7 cosmetic unused-variable warnings in `ivory-core` (inherited
-  from the base); reconcile `docs/DESIGN.md`/`DIVERGENCES.md` prose with the
-  final implemented mechanisms if desired (HANDOFF §4 is already accurate).
+Everything above is committed. Packaging works; what is left is business +
+platform coverage:
+- **Not the icon.** `assets/ivory.png` is the ORIGINAL art, byte-identical to
+  the Python app's — it blocks nothing. See §7 and `docs/RELEASE.md` gate 1.
+  (This bullet used to say "543-byte placeholder — blocks release"; that was
+  wrong for a week. See §8.)
+- **Not Codeberg or `ivory-rust`.** Both done — see §7.
+- macOS and Windows artifacts build (§7). **Linux has never been built**: run
+  `scripts/build-linux-native.sh` on a Linux host, once per arch.
+- Business decisions in `docs/RELEASE.md` (MIT retention, Developer ID signing
+  + notarization, Windows signing, the Synthogy name collision) are the real
+  gate on a public release.
+- Optional polish: 6 cosmetic warnings in `ivory-core` — 5 unused variables
+  (`pcs_set`, `best_root_pc`, `highest_pc`, `highest_note`, `matched_count`)
+  and one non-snake-case `has_M3`. The `ivory` crate emits none.
 
 ---
 
@@ -159,7 +200,7 @@ Everything above is committed. What's left is packaging + release + cleanup:
 
 ```
 ivory/
-├── Cargo.toml              workspace (ivory-core, ivory); version 2.0.0, MIT
+├── Cargo.toml              workspace (ivory-core, ivory); version 2.1.0, MIT
 ├── ivory-core/             ── PURE ENGINE, no GUI deps, exhaustively tested ──
 │   ├── src/
 │   │   ├── lib.rs          public API re-exports
@@ -176,9 +217,9 @@ ivory/
 ├── ivory/                  ── GUI binary (eframe/egui 0.35, midir 0.11) ──
 │   └── src/                main, app, piano, chord_strip, menu, dialogs, midi,
 │                           settings, fonts  (see docs/DESIGN.md for each)
-├── assets/                 CourierPrime-{Regular,Bold}.ttf, OFL.txt, ivory.png(placeholder)
+├── assets/                 ivory.png (128×128 original art), ivory.ico, ivory.desktop, fonts/
 ├── tests/golden/           corpus.json (13,133 rows), gen_corpus.py, + classifier outputs
-├── scripts/                build-macos.sh, build-cross.sh, gen-third-party-licenses.sh
+├── scripts/                build-macos.sh, build-cross.sh, build-linux-native.sh, gen-third-party-licenses.sh
 └── docs/                   DESIGN.md, DIVERGENCES.md, HANDOFF.md(this), RELEASE.md,
                             spec/ (extracted Python spec), reference/ (old ivory-rust GUI)
 ```
@@ -210,9 +251,12 @@ adjustment + **a single overwritable special-bonus slot** (values −1000…1000
 win ties (strict `>`).** The special-bonus slot OVERWRITES (`=`), so rule order
 in `special_bonus` matters.
 
-### The 20 fixes (D1-D20) — full rationale in `docs/DIVERGENCES.md`
-Kept-identity behaviors are K1-K13; deliberate fixes are D1-D20. The load-
-bearing / non-obvious ones:
+### The 25 fixes (D1–D26, no D16) — full rationale in `docs/DIVERGENCES.md`
+Kept-identity behaviors are K1-K13; deliberate fixes span **D1–D26**. D16 was
+withdrawn during review (it regressed vectors #44–#47; the behavior it proposed
+is kept under K10), so the range holds 25 rules. D21 came from the differential
+classifier; **D22–D26 landed 2026-08-10** from an owner bug report (see §2b).
+The load-bearing / non-obvious ones:
 - **D1** third-in-bass of a `[0,4,7,9]` set → `R6/bass` (only that case is
   special-cased; other basses resolve naturally).
 - **D9 (the subtle one)** — *genuine-dominant-root principle*: a voicing like
@@ -261,11 +305,14 @@ cd ~/Dropbox/Archive/Ivory && python3 -c \
 ### The golden corpus & differential guard
 `tests/golden/corpus.json` = 13,133 note-sets run through the reference Python
 detector (flat + sharp), regenerable with `tests/golden/gen_corpus.py`. Baseline
-mismatch vs raw Python was 3621 before surgery, ~5195 after — the increase is
+mismatch vs raw Python was 3621 before surgery, 5057 after the D1–D21 surgery,
+and **5540 today** after D22–D26 (verified 2026-08-11) — the increase is
 dominated by the 1001 rows with ≥8 PCs (D17, intended) plus bug-fixes where Rust
 is *more* correct (e.g. a `pattern:7b13`-generated row: Python says `Eb7(#11)`,
-Rust correctly says `F7(b13)`). The classifier freezes the post-audit output as
-`rust-golden.json` and asserts every remaining divergence maps to a D-rule.
+Rust correctly says `F7(b13)`). `diffcorpus --json` freezes the post-audit
+output as `rust-golden.json`, and `differential.rs` is what asserts against it;
+`classify.py` maps each remaining divergence to a D-rule but is a **manual**
+step and has not been re-run since 2026-07-29.
 
 ---
 
@@ -275,10 +322,13 @@ Rust correctly says `F7(b13)`). The classifier freezes the post-audit output as
 cd ~/Dropbox/Projects/Apps/ivory
 
 # tests
-cargo test -p ivory-core                       # engine: 42 unit + acceptance
+cargo test -p ivory-core                       # stock engine: 55 unit + 3 acceptance + differential(fast)
 cargo test -p ivory-core --features learning   # + the perceptron (teach layer)
 cargo test -p ivory                            # GUI unit tests (settings, geometry, fonts, midi)
-cargo test                                     # everything
+cargo test                                     # everything EXCEPT the #[ignore]d suites
+# the two #[ignore]d suites, run explicitly:
+cargo test -p ivory-core --test differential -- --ignored          # full 13,133-row sweep (~16s)
+cargo test -p ivory-core --features learning --test blast_radius --release -- --ignored --nocapture
 
 # run the app (needs no MIDI device to launch)
 cargo run -p ivory                             # GUI
@@ -316,6 +366,17 @@ chord labels need no fallback font. Compliance: ship `OFL.txt` + `LICENSE`
 (MIT) + `THIRD-PARTY-LICENSES` in every artifact; credit Courier Prime in the
 About box (D-UI-6). Full research in `docs/spec/font-licensing.md`.
 
+**Amendment (Rust stack, 2026-08).** `docs/spec/font-licensing.md` predates the
+egui rewrite and covers Courier Prime only. `eframe`'s `default_fonts` feature
+embeds four MORE fonts through `epaint_default_fonts`: Ubuntu Light (Ubuntu
+Font Licence 1.0), Noto Emoji (OFL 1.1), Hack (MIT + Bitstream Vera),
+emoji-icon-font (MIT). Verified byte-for-byte present in the stripped release
+binary. Their texts live in `assets/font-licenses/` and ship as
+`font-licenses/` in every artifact. Courier Prime covers only 383 codepoints,
+so the egui defaults are load-bearing: `⏵` (U+23F5, the submenu arrow in
+`menu.rs`) exists ONLY in emoji-icon-font, and user-typed taught chord names
+rely on Ubuntu Light. Do not disable `default_fonts`.
+
 ---
 
 ## 7. Finalization checklist (task 8)
@@ -328,17 +389,22 @@ About box (D-UI-6). Full research in `docs/spec/font-licensing.md`.
       a nearest-neighbour 8× re-render to 1024px would keep the exact art and
       sharpen every frame. The build scripts now say this instead of shouting
       "unshippable placeholder".
-- [x] `scripts/build-macos.sh` — **verified 2026-07-29**: builds `Ivory.app`
-      (bundle id `com.github.ganten7.ivory`, v2.0.0), ad-hoc codesigns, bundles
-      LICENSE+OFL+THIRD-PARTY-LICENSES+fonts, zip + dmg; the packaged app
-      launches. (dist/ is gitignored.)
+- [x] `scripts/build-macos.sh` — **verified 2026-07-29 (v2.0.0), re-run
+      2026-08-10 for v2.1.0**: builds `Ivory.app` (bundle id
+      `com.github.ganten7.ivory`; the Info.plist version is interpolated from
+      the root `Cargo.toml`, so it tracks the workspace automatically), ad-hoc
+      codesigns, bundles LICENSE+OFL+THIRD-PARTY-LICENSES+fonts, stages the app
+      together with READ-ME-FIRST.md, zip + dmg; the packaged app launches.
+      (dist/ is gitignored.)
 - [x] Windows cross-build — **verified**: `cargo xwin` produces `ivory.exe`
       (7.5MB) from this Mac. `build-cross.sh` Windows stage works.
-- [ ] Linux cross-build — **BLOCKED**: `midir` links ALSA; `alsa-sys` can't
-      cross-compile from macOS without a sysroot. Build on Linux (CI w/
-      `libasound2-dev`) or provide a sysroot. Details + options in
-      `docs/RELEASE.md` → "Cross-build blocker"; `build-cross.sh` Linux stage is
-      now non-fatal (still emits the Windows zip).
+- [ ] Linux build — cross-building is **BLOCKED**: `midir` links ALSA and
+      `alsa-sys` can't cross-compile from macOS without a sysroot. Details +
+      options in `docs/RELEASE.md` → "Cross-build blocker"; `build-cross.sh`
+      Linux stage is now non-fatal (still emits the Windows zip). The
+      sanctioned path is **`scripts/build-linux-native.sh` on a Linux host**
+      (the owner's Void machine), run once per arch — it has not been run yet:
+      `dist/` holds no Linux artifact.
 - [x] Pushed to **Codeberg** (2026-07-29): `ganten1998/ivory` (already PRIVATE)
       was "taken over" — Rust 2.0 force-pushed to `main` + `master`; the Python
       app is preserved on the `python-legacy` branch and the immutable

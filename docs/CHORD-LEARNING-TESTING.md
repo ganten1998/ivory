@@ -1,4 +1,9 @@
-# Ivory 2.1.0 — Chord Learning test build
+# Ivory — Chord Learning beta-test notes (INTERNAL)
+
+> Historical. This was the 2.1.0 beta hand-off, shipped inside every artifact as
+> `READ-ME-FIRST.md`. The public in-artifact readme is now
+> `docs/ARTIFACT-README.md`. This file is kept for the measured blast-radius
+> numbers and the teach-vs-correct distinction — **do not package it**.
 
 Thanks for trying this. Ivory watches your MIDI keyboard, draws the notes, and
 names the chord you are playing. **Chord Learning** is the new, experimental
@@ -18,6 +23,13 @@ ad-hoc signed but not notarized, so the first launch is blocked: double-click it
 accept the warning, then go to **System Settings → Privacy & Security**, scroll
 to Security, and click **Open Anyway** next to Ivory. (The old right-click →
 Open trick no longer works on macOS 15 and later.)
+
+**Linux** — untar anywhere and run `./ivory` (`chmod +x ivory` first if your
+unpacker dropped the executable bit). It needs ALSA plus X11 or Wayland. To get
+it into your application menu: copy `ivory` somewhere on your `PATH` (e.g.
+`~/.local/bin/`), `ivory.png` to
+`~/.local/share/icons/hicolor/128x128/apps/ivory.png`, and `ivory.desktop` to
+`~/.local/share/applications/`.
 
 Everything is in the **right-click menu** — that is the entire interface.
 
@@ -55,7 +67,8 @@ moves. (Voice it with E at the bottom instead and Ivory names it by a fixed
 rule, so it will tell you there is nothing to re-rank — that is expected.)
 
 **How far one correction reaches, measured:** against a 13,133-voicing test
-corpus, that single `C6 → Am7` correction changes **1,182 readings (9%)**, many
+corpus, that single `C6 → Am7` correction changes **1,279 readings (about 1 in
+10)**, many
 of them in unrelated keys. So if chords you were happy with start reading oddly
 after a correction, that is the feature working as designed, not a glitch —
 and it is precisely what we want your opinion on. **Forget Learning** restored

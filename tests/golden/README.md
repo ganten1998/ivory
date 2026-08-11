@@ -22,8 +22,17 @@ The engine-side self-consistency guard lives in
 
 ## Divergence summary
 
-5,195 of 13,133 rows differ (identical count for flat and sharp — every
-divergence is pitch-class-relational). Per-rule breakdown from `classify.py`:
+> **STALE SNAPSHOT — 2026-07-29.** Two caveats before you use these numbers.
+> (1) The table below sums to 5,195, but the `classified-divergences.json`
+> committed beside it holds **5,057** records — the JSON came from a later
+> `classify.py` run than the table. (2) The live mismatch after D22–D26 is
+> **5,540 of 13,133** (verified 2026-08-11 with `cargo run -p ivory-core
+> --example diffcorpus --release`), and D22–D26 have no rows here at all,
+> because `classify.py` has not been re-run since 2026-07-29. Re-run it
+> (step 3 under Regenerate) before citing any of this.
+
+Per-rule breakdown from the 2026-07-29 `classify.py` run (identical count for
+flat and sharp — every divergence is pitch-class-relational):
 
 | rule | rows | what it corrects |
 |---|---|---|

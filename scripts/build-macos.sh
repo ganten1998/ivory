@@ -24,6 +24,11 @@ TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
 [ -n "$TOOLCHAIN_BIN" ] && export PATH="$TOOLCHAIN_BIN:$HOME/.cargo/bin:$PATH"
 
 VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+# Info.plist's version keys accept at most three period-separated integers, so a
+# semver pre-release or build suffix ("2.2.0-beta.1", "2.2.0+ci7") is invalid
+# there and notarization rejects it. Artifact FILENAMES keep the full string;
+# only the bundle gets the numeric core. No-op on a plain release version.
+VERSION_NUM="${VERSION%%-*}"; VERSION_NUM="${VERSION_NUM%%+*}"
 ICON_SRC="assets/ivory.png"
 
 warn_placeholder_icon() {
@@ -144,9 +149,11 @@ make_icns "$APP/Contents/Resources/AppIcon.icns"
 cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
    assets/fonts/OFL.txt LICENSE THIRD-PARTY-LICENSES \
    "$APP/Contents/Resources/"
-# Tester-facing instructions ride alongside the .app (inside the bundle it would
-# be invisible), so the zip/dmg hand-off explains itself.
-cp docs/CHORD-LEARNING-TESTING.md "dist/READ-ME-FIRST.md"
+# eframe's `default_fonts` feature statically embeds FOUR more fonts in the
+# binary (Ubuntu-Light, Noto Emoji, Hack, emoji-icon-font — verified present in
+# the stripped release binary). Their licences must accompany every copy too.
+mkdir -p "$APP/Contents/Resources/font-licenses"
+cp assets/font-licenses/*.txt "$APP/Contents/Resources/font-licenses/"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -158,11 +165,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleExecutable</key>        <string>ivory</string>
     <key>CFBundleIconFile</key>          <string>AppIcon</string>
     <key>CFBundleIconName</key>          <string>AppIcon</string>
-    <key>CFBundleIdentifier</key>        <string>com.github.ganten7.ivory</string>
+    <key>CFBundleIdentifier</key>        <string>org.codeberg.ganten1998.ivory</string>
     <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
     <key>CFBundlePackageType</key>       <string>APPL</string>
-    <key>CFBundleShortVersionString</key> <string>${VERSION}</string>
-    <key>CFBundleVersion</key>           <string>${VERSION}</string>
+    <key>CFBundleShortVersionString</key> <string>${VERSION_NUM}</string>
+    <key>CFBundleVersion</key>           <string>${VERSION_NUM}</string>
     <key>LSMinimumSystemVersion</key>    <string>11.0</string>
     <key>NSHighResolutionCapable</key>   <true/>
     <key>LSApplicationCategoryType</key> <string>public.app-category.music</string>
@@ -175,6 +182,7 @@ PLIST
 # (macOS 15+ has no right-click-Open bypass — see docs/RELEASE.md), but an
 # unsigned binary is strictly worse (killed outright on Apple Silicon).
 codesign --force --deep -s - "$APP"
+codesign --verify --strict "$APP"
 
 # Bump bundle mtime so Icon Services notices a fresh app and reloads the icon.
 touch "$APP" "$APP/Contents/Info.plist"
@@ -188,10 +196,26 @@ STAGE="dist/Ivory-${VERSION}-macos-${ARCH_NAME}"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 ditto "$APP" "$STAGE/Ivory.app"
-cp docs/CHORD-LEARNING-TESTING.md "$STAGE/READ-ME-FIRST.md"
+# User-facing instructions ride alongside the .app (inside the bundle they would
+# be invisible), so the zip/dmg hand-off explains itself. Shipped as .txt, not
+# .md: every platform opens .txt on double-click; .md often has no handler.
+cp docs/ARTIFACT-README.md "$STAGE/README.txt"
 
 echo "==> Packaging $ZIP"
 ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$ZIP"
+# ditto writes an AppleDouble stub for every entry (macOS 14+ stamps an
+# unremovable com.apple.provenance xattr, and this tree lives in Dropbox, which
+# adds more), which Windows/Linux users see as junk. KEEP --sequesterRsrc:
+# without it those stubs land INLINE as "._ivory" beside the real files, which
+# is worse; xattr -cr does not help either (provenance survives it). Delete the
+# sequestered copy instead — verified the signature still validates after both
+# `ditto -x -k` and `unzip`. zip -d exits 12 when nothing matches, hence || true.
+zip -q -d "$ZIP" '__MACOSX*' >/dev/null 2>&1 || true
+
+# The DMG gets an /Applications alias so the README's "drag Ivory.app into your
+# Applications folder" has a visible target. Added AFTER the zip is written so
+# the zip does not carry a stray symlink (it would be meaningless there).
+ln -s /Applications "$STAGE/Applications"
 
 echo "==> Packaging $DMG (best-effort)"
 hdiutil create -volname "Ivory" -srcfolder "$STAGE" -ov -format UDZO "$DMG" \

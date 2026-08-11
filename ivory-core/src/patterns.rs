@@ -1,4 +1,4 @@
-/// All static data tables ported from chord_detector.py
+//! All static data tables ported from chord_detector.py
 
 pub static NOTE_NAMES: &[&str] = &["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 pub static NOTE_NAMES_FLAT: &[&str] = &["C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"];

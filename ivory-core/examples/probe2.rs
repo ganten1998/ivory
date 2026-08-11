@@ -1,3 +1,10 @@
+//! Candidate-score probe driven by stdin, so debugging a case needs no rebuild:
+//!
+//!   echo 'v060 E Bb D F#|64,70,74,78' | cargo run -p ivory-core --example probe2 --release -- -v
+//!
+//! One `label|midi,midi,...` line per case; `#` comments and blank lines skipped.
+//! `-v` also dumps the top-6 candidate scores (`probe.rs` is the same idea with
+//! the cases hard-coded in the source).
 use ivory_core::detector::ChordDetector;
 use std::collections::HashSet;
 use std::io::BufRead;

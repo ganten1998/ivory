@@ -161,12 +161,13 @@ fn apply_theme(style: &mut egui::Style, t: &DialogTheme) {
 /// Stock egui styling for the MIDI dialogs, which Qt showed with the platform
 /// default look, NOT the app theme (spec §7.1).
 fn stock_style(ctx: &egui::Context) -> egui::Style {
-    let mut style = egui::Style::default();
-    style.visuals = match ctx.input(|i| i.raw.system_theme) {
-        Some(egui::Theme::Dark) => egui::Visuals::dark(),
-        _ => egui::Visuals::light(),
-    };
-    style
+    egui::Style {
+        visuals: match ctx.input(|i| i.raw.system_theme) {
+            Some(egui::Theme::Dark) => egui::Visuals::dark(),
+            _ => egui::Visuals::light(),
+        },
+        ..Default::default()
+    }
 }
 
 struct VpResult {
@@ -210,9 +211,7 @@ pub fn show(
     dialog_opt: &mut Option<Dialog>,
     dark_mode: bool,
 ) -> Option<DialogAction> {
-    let Some(dialog) = dialog_opt.as_mut() else {
-        return None;
-    };
+    let dialog = dialog_opt.as_mut()?;
     let mut action = None;
 
     let result = match dialog {

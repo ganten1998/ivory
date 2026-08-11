@@ -100,7 +100,14 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   cp assets/ivory.png "$stage/" || { rm -rf "$stage"; return 1; }
   cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
      assets/fonts/OFL.txt "$stage/fonts/" || { rm -rf "$stage"; return 1; }
+  # Licences for the four fonts eframe's `default_fonts` embeds in the binary.
+  # (errexit is off in this function — every command needs its own handler.)
+  mkdir -p "$stage/font-licenses" || { rm -rf "$stage"; return 1; }
+  cp assets/font-licenses/*.txt "$stage/font-licenses/" || { rm -rf "$stage"; return 1; }
   cp LICENSE THIRD-PARTY-LICENSES "$stage/" || { rm -rf "$stage"; return 1; }
+  # The same user-facing readme the macOS and Windows artifacts carry.
+  cp docs/ARTIFACT-README.md "$stage/README.txt" \
+    || { rm -rf "$stage"; return 1; }
   tar -C dist -czf "${stage}.tar.gz" "ivory-${VERSION}-linux-${arch}" || {
     rm -rf "$stage" "${stage}.tar.gz"; return 1;
   }
@@ -128,11 +135,17 @@ mkdir -p "$WINSTAGE"
 cp target/x86_64-pc-windows-msvc/release/ivory.exe "$WINSTAGE/"
 cp LICENSE THIRD-PARTY-LICENSES "$WINSTAGE/"
 cp assets/fonts/OFL.txt "$WINSTAGE/"
-# Tester-facing instructions travel with the build (SmartScreen steps, what the
-# two teach features are, how to undo learning).
-cp docs/CHORD-LEARNING-TESTING.md "$WINSTAGE/READ-ME-FIRST.md"
-(cd "$WINSTAGE" && zip -q "$ROOT/$WINZIP" ivory.exe LICENSE THIRD-PARTY-LICENSES \
-    OFL.txt READ-ME-FIRST.md)
+# Licences for the four fonts eframe's `default_fonts` embeds in ivory.exe.
+mkdir -p "$WINSTAGE/font-licenses"
+cp assets/font-licenses/*.txt "$WINSTAGE/font-licenses/"
+# User-facing instructions travel with the build (SmartScreen steps, connecting a
+# keyboard, the teach/correct features, where settings live). Shipped as .txt, not
+# .md: Windows has no default handler for .md.
+cp docs/ARTIFACT-README.md "$WINSTAGE/README.txt"
+# Archive whatever was staged above. A hand-maintained file list silently drops
+# anything newly added — that is how the readme went missing from the macOS
+# artifacts before 2.1.0.
+(cd "$WINSTAGE" && zip -qr "$ROOT/$WINZIP" . -x '.DS_Store' '._*')
 rm -rf "$WINSTAGE"
 echo "==> $WINZIP"
 

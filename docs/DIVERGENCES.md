@@ -10,10 +10,17 @@ engine lands, the differential harness diffs the Rust engine against
 `tests/golden/corpus.json` (13,133 note sets, flat + sharp renderings). Each
 mismatch is classified once — scripted heuristics plus hand audit — and
 committed as `tests/golden/classified-divergences.json` mapping note-set →
-D-rule ID (covering both naming preferences). CI asserts the live mismatch
-set equals the classified set exactly; any new, vanished, or reclassified
-mismatch fails the build. After the audit, outputs freeze as
-`tests/golden/rust-golden.json` — the permanent regression baseline.
+D-rule ID (covering both naming preferences). **What actually enforces this
+today** (corrected 2026-08-11 — there is no CI yet; see `docs/RELEASE.md` § CI):
+`ivory-core/tests/differential.rs` pins the engine to
+`tests/golden/rust-golden.json`, the frozen post-audit baseline, so any
+behavior change turns it red and forces a deliberate regeneration.
+`classified-divergences.json` is a point-in-time audit artifact, **not** an
+assertion — no test reads it, and it is re-derived by hand with
+`tests/golden/classify.py`. It was last generated **2026-07-29 (5,057 rows)**
+and is stale: after D22–D26 the live mismatch is **5,540 rows** (`cargo run -p
+ivory-core --example diffcorpus --release`). Re-run `classify.py` before
+trusting any per-rule breakdown.
 
 This policy was adversarially reviewed by a three-lens critic panel
 (music-theory lens executed the Python to verify claims); all decisions below
@@ -115,6 +122,9 @@ are post-review.
   exist even in principle.
 - **D15** (B21): the 7-PC early scale fallback matches the scale root by
   pitch class, not string `startswith` (which confused A with Ab/A#).
+- **D16** — **withdrawn.** The draft rule regressed acceptance vectors #44–#47;
+  the shipped behavior it would have changed is kept as-is under K10. The ID is
+  retired, never reused: the range D1–D26 therefore contains 25 rules.
 - **D17** (edge, corrected per review): ≥8 unique pitch classes never name
   a chord — the scale check runs against the original notes (8-PC
   diminished scales still detect; compact 12-PC already yields
@@ -214,8 +224,17 @@ renderings of every affected row.
 - **D-UI-3**: no busy-loop rendering; repaint scheduled on MIDI/timer
   events at Python cadences (50ms GUI / 100ms detection). Keytoggle clicks
   trigger an immediate off-cadence detection + repaint (as Python did).
-- **D-UI-4**: MIDI picker shows a dead current connection as
-  "(disconnected)"; no auto-reconnect (parity).
+- **D-UI-4** (corrected 2026-08-11 — the previous wording described a feature
+  that was never built): there is **no liveness indicator and no
+  auto-reconnect**. `Select MIDI Input...` calls `midi::list_port_names()` at
+  open time (`app.rs`), so the list is always a fresh enumeration of the ports
+  that exist right now; the dialog prints `Current: <port name>` taken from the
+  live `MidiConnection` — the name it was opened with, never a status — and
+  pre-selects nothing. If the port dies, events simply stop arriving
+  (`ivory/src/midi.rs`: "No reconnect logic (parity): if the port dies, events
+  just stop") and the app keeps drawing its last state until the user re-picks.
+  Picking a port drops the old connection before opening the new one, and a
+  failed open raises the `MIDI Error` dialog.
 - **D-UI-5**: teach-layer additions, precisely scoped: two context-menu
   items inside the chord-detection block, immediately after the
   Detach/Attach entry, preceded by their own separator — `Teach Chord

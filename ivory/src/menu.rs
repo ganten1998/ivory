@@ -386,9 +386,7 @@ fn menu_button(ui: &mut egui::Ui, label: &str, enabled: bool, row_h: f32) -> egu
 /// Render the open menu (and submenu). Returns a chosen action, if any;
 /// `state_opt` is set to None when the menu closes for any reason.
 pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<MenuAction> {
-    let Some(state) = state_opt.as_mut() else {
-        return None;
-    };
+    let state = state_opt.as_mut()?;
     let c = colors(state.dark_mode);
     let mut action: Option<MenuAction> = None;
     let mut close = false;
@@ -517,7 +515,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
     }
     let grace = state.opened_at.elapsed() > std::time::Duration::from_millis(250);
     let all_unfocused =
-        menu_focused == Some(false) && submenu_focused.map_or(true, |f| !f);
+        menu_focused == Some(false) && submenu_focused.is_none_or(|f| !f);
     if state.saw_focus && grace && all_unfocused {
         close = true;
     }

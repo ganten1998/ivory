@@ -1,0 +1,49 @@
+Font licences — Ivory
+=====================
+
+Ivory's executable statically embeds six font files. This folder holds the
+licence texts for the four that arrive with eframe/egui's `default_fonts`
+feature (the `epaint_default_fonts` crate). Courier Prime, Ivory's own UI
+typeface, is covered by OFL.txt, which ships next to the Courier Prime TTFs.
+
+The SIL Open Font License and the Ubuntu Font Licence both require the
+copyright notice to accompany the licence text. The upstream files as shipped
+by `epaint_default_fonts` carry no copyright line, so the notices are
+reproduced here verbatim from each font's own `name` table.
+
+
+Ubuntu Light  ->  Ubuntu-Font-Licence-1.0.txt
+---------------------------------------------
+    Copyright 2011 Canonical Ltd.
+    Licensed under the Ubuntu Font Licence 1.0
+    Ubuntu and Canonical are registered trademarks of Canonical Ltd.
+    Designed by Dalton Maag Ltd.  https://design.ubuntu.com/font
+
+
+Noto Emoji Regular  ->  NotoEmoji-OFL-1.1.txt
+---------------------------------------------
+    Copyright 2013 Google Inc. All Rights Reserved.
+    Licensed under the SIL Open Font License, Version 1.1.
+    Noto is a trademark of Google Inc.
+    https://fonts.google.com/noto/specimen/Noto+Emoji
+
+
+Hack Regular  ->  Hack-LICENSE.txt
+----------------------------------
+    Copyright (c) 2018 Source Foundry Authors      -- MIT License
+    Copyright (c) 2003 by Bitstream, Inc.          -- Bitstream Vera License
+    (The work in the DejaVu project was committed to the public domain.)
+    "Bitstream" and "Vera" are Reserved Font Names.
+    https://github.com/source-foundry/Hack
+
+
+emoji-icon-font  ->  emoji-icon-font-MIT.txt
+--------------------------------------------
+    Copyright (c) 2014 John Slegers  -- MIT License
+    https://github.com/jslegers/emoji-icon-font
+
+
+None of these fonts has been modified, subset, or renamed, and none is sold
+standalone. Ivory's own MIT grant (see LICENSE) covers Ivory's source and
+compiled code only; it does not relicense the fonts above, which remain
+entirely under their own terms.

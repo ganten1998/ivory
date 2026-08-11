@@ -263,11 +263,12 @@ impl ChordDetector {
             return TrainOutcome::NotTrainable;
         };
 
-        let snapshot = self
-            .overrides
-            .as_ref()
-            .map(|s| s.learning_snapshot())
-            .expect("store presence checked above");
+        // `overrides` was checked non-None above and nothing since can clear it,
+        // but return the same no-store outcome rather than carry a panic path
+        // into the shipped binary.
+        let Some(snapshot) = self.overrides.as_ref().map(|s| s.learning_snapshot()) else {
+            return TrainOutcome::NoStore;
+        };
 
         let mut steps = 0;
         loop {
@@ -574,7 +575,7 @@ impl ChordDetector {
 
             if let Some((chord_name, score, complete)) = self.match_chord_pattern(
                 &intervals, root_pc, &active_notes,
-                highest_note, highest_pc, lowest_pc, has_global_dominant_quality,
+                highest_pc, lowest_pc, has_global_dominant_quality,
             ) {
                 // Feature-gated learned re-ranker. With no store, learning off,
                 // or zero (untrained) weights this adds exactly 0.0, so the
@@ -651,7 +652,7 @@ impl ChordDetector {
                         let intervals_from_root: Vec<u8> = intervals_from(potential_root, &pcs_all);
                         if let Some((cname, cscore, _)) = self.match_chord_pattern(
                             &intervals_from_root, potential_root, &active_notes,
-                            highest_note, highest_pc, lowest_pc, has_global_dominant_quality,
+                            highest_pc, lowest_pc, has_global_dominant_quality,
                         ) {
                             if cname.contains("7(b9)") || (cname.contains('7') && cscore > best_score) {
                                 best_match = Some(cname);
@@ -692,7 +693,7 @@ impl ChordDetector {
                     let ivs: Vec<u8> = intervals_from(lowest_pc, &pcs_all);
                     if let Some((cname, _, _)) = self.match_chord_pattern(
                         &ivs, lowest_pc, &active_notes,
-                        highest_note, highest_pc, lowest_pc, has_global_dominant_quality,
+                        highest_pc, lowest_pc, has_global_dominant_quality,
                     ) {
                         let ok = if is_dim7 { self.match_chord_type(&cname, "diminished7") }
                                  else { self.match_chord_type(&cname, "augmented") };
@@ -783,8 +784,7 @@ impl ChordDetector {
                 if !skip_slash {
                     // Possibly simplify the chord above the bass
                     let should_simplify = self.should_simplify_slash(
-                        bm, &active_notes, &pcs_all, best_root_pc, lowest_pc, bass_interval,
-                        highest_pc,
+                        bm, &active_notes, &pcs_all, lowest_pc, bass_interval,
                     );
                     let final_chord = if should_simplify {
                         let notes_no_bass: HashSet<u8> = active_notes.iter()
@@ -932,7 +932,6 @@ impl ChordDetector {
         let span = active_notes.iter().max().copied().unwrap_or(0) as i32
             - active_notes.iter().min().copied().unwrap_or(0) as i32;
         let within_octave = span < 12;
-        let pcs_set: HashSet<u8> = pcs.iter().copied().collect();
 
         let mut best_match: Option<String> = None;
         let mut best_score: i64 = 0;
@@ -1065,7 +1064,7 @@ impl ChordDetector {
         for &root_pc in &pcs {
             let intervals: Vec<u8> = intervals_from(root_pc, &pcs);
             if let Some((name, score, _)) = self.match_chord_pattern(
-                &intervals, root_pc, active_notes, highest, highest_pc, lowest_pc, has_gdq,
+                &intervals, root_pc, active_notes, highest_pc, lowest_pc, has_gdq,
             ) {
                 if score > best_score { best_score = score; best = Some(name); }
             }
@@ -1079,13 +1078,11 @@ impl ChordDetector {
         best_match: &str,
         active_notes: &HashSet<u8>,
         pcs_all: &[u8],
-        best_root_pc: u8,
         lowest_pc: u8,
         bass_interval: u8,
-        highest_pc: u8,
     ) -> bool {
         // Special voicing check: [0,2,5,7,10] or [0,2,7,10] — Bb6/C vs Gm7/C decision
-        let ivs_from_lowest: Vec<u8> = intervals_from(lowest_pc, &pcs_all);
+        let ivs_from_lowest: Vec<u8> = intervals_from(lowest_pc, pcs_all);
         if ivs_from_lowest == [0, 2, 5, 7, 10] || ivs_from_lowest == [0, 2, 7, 10] {
             return false; // handled specially in match_chord_pattern
         }
@@ -1141,7 +1138,6 @@ impl ChordDetector {
         intervals: &[u8],
         root_pc: u8,
         active_notes: &HashSet<u8>,
-        highest_note: u8,
         highest_pc: u8,
         lowest_pc: u8,
         has_global_dominant_quality: bool,
@@ -1266,7 +1262,7 @@ impl ChordDetector {
             let special = self.special_bonus(
                 chord_type, intervals, &intervals_set, &intervals_from_lowest,
                 root_pc, lowest_pc, active_notes, &pcs_set,
-                matched_count, missing_count, extra_count,
+                missing_count, extra_count,
                 has_global_dominant_quality,
             );
 
@@ -1334,7 +1330,6 @@ impl ChordDetector {
         lowest_pc: u8,
         active_notes: &HashSet<u8>,
         pcs_set: &HashSet<u8>,
-        matched_count: usize,
         missing_count: usize,
         extra_count: usize,
         has_global_dominant_quality: bool,
@@ -1381,9 +1376,9 @@ impl ChordDetector {
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter().collect::<Vec<_>>();
             if ivs_bass == [0, 2, 5, 10] {
-                let has_m3 = intervals.contains(&3); let has_M3 = intervals.contains(&4);
+                let has_m3 = intervals.contains(&3); let has_maj3 = intervals.contains(&4);
                 let has_p5 = intervals.contains(&7);
-                let triad_complete = intervals.contains(&0) && (has_m3 || has_M3) && has_p5;
+                let triad_complete = intervals.contains(&0) && (has_m3 || has_maj3) && has_p5;
                 if triad_complete {
                     let bass_iv_from_root = ((lowest_pc as i32 - root_pc as i32 + 12) % 12) as u8;
                     let bass_is_triad = [0u8, 3, 4, 7].contains(&bass_iv_from_root);
@@ -1731,6 +1726,9 @@ fn format_chord_name(root: &str, chord_type: &str) -> String {
 }
 
 #[cfg(test)]
+// Interval test names mirror the notation they assert (M2 vs m2, M3 vs m3):
+// the capital is the major/minor distinction, not a style slip.
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
 

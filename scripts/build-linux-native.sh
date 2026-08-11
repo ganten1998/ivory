@@ -43,8 +43,12 @@ cp assets/ivory.desktop "$STAGE/"
 cp assets/ivory.png "$STAGE/"
 cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
    assets/fonts/OFL.txt "$STAGE/fonts/"
+# Licences for the four fonts eframe's `default_fonts` embeds in the binary.
+mkdir -p "$STAGE/font-licenses"
+cp assets/font-licenses/*.txt "$STAGE/font-licenses/"
 cp LICENSE THIRD-PARTY-LICENSES "$STAGE/"
-mkdir -p dist
+# The same user-facing readme the macOS and Windows artifacts carry.
+cp docs/ARTIFACT-README.md "$STAGE/README.txt"
 tar -C dist -czf "${STAGE}.tar.gz" "ivory-${VERSION}-linux-${ARCH}"
 rm -rf "$STAGE"
 echo "==> ${STAGE}.tar.gz"

@@ -5,9 +5,36 @@ resolver = "2"
 [workspace.package]
 version = "2.1.0"
 edition = "2021"
+rust-version = "1.92"
 license = "MIT"
 
 [profile.release]
 opt-level = 3
 lto = true
 strip = true
+
+# Shared lint policy. Deliberately narrow: every lint here is verified clean on
+# 2.1.0, so `cargo build` stays warning-free. Broad groups (clippy::all,
+# clippy::pedantic) are NOT enabled — the scoring ladder in detector.rs trips
+# ~14 style lints whose "fixes" would churn frozen, differential-locked code.
+# Verified-red and intentionally omitted: unreachable_pub (72), let_underscore_drop
+# (36), trivial_numeric_casts (3), clippy::uninlined_format_args (81),
+# clippy::indexing_slicing (41), clippy::unwrap_used (33), clippy::print_stdout (21),
+# clippy::expect_used (15), clippy::exit (6), clippy::mem_forget (3).
+[workspace.lints.rust]
+future_incompatible = "warn"
+nonstandard_style = "warn"
+rust_2018_idioms = "warn"
+unused = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+semicolon_if_nothing_returned = "warn"
+lossy_float_literal = "warn"
+verbose_file_reads = "warn"

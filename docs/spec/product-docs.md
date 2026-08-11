@@ -111,7 +111,7 @@ Post-step verifies `dist/ivory.exe` exists and is a PE (a past broken release sh
 - Rewrite note: embed Courier Prime on all platforms for consistent metrics and clean licensing.
 
 **Icons** (`icons/`):
-- Single file `icons/ivory.png`, **543 bytes** — i.e. a tiny placeholder, not production art. Referenced by: README header image, PyInstaller `--icon=icons/ivory.png` (README manual recipes), macOS `--add-data "icons:icons"`, .deb hicolor icons (workflow: only 128x128 copy; build_deb.sh: resized 16–256 px from this one source), `Icon=ivory` in the .desktop file.
+- Single file `icons/ivory.png`, **543 bytes**, 128×128 RGBA. (This entry originally read "i.e. a tiny placeholder, not production art" — **wrong**, corrected 2026-08-11: it IS the shipped piano-keys artwork, merely very small. sha256 `0dc37a25…`; the Rust repo's `assets/ivory.png` is byte-identical.) Referenced by: README header image, PyInstaller `--icon=icons/ivory.png` (README manual recipes), macOS `--add-data "icons:icons"`, .deb hicolor icons (workflow: only 128x128 copy; build_deb.sh: resized 16–256 px from this one source), `Icon=ivory` in the .desktop file.
 - No .icns, no .ico, no SVG. A rewrite needs real icon art at ≥256px (ideally 1024 for macOS).
 
 ---
@@ -143,7 +143,7 @@ Caveats when reusing: purge GTK3/GNOME/gtk3 mentions, the py2app mention, and "A
 
 - **Price/model**: free and open source, MIT, no monetization anywhere in the docs. GitHub Releases is the only actual channel shipped (v1.0.0: .deb only at launch; Windows/macOS artifacts added by later CI fixes).
 - **Channels prepared but never used**: Flathub (AppData ready), Snapcraft (yaml snippet ready), Microsoft Store, Mac App Store (both listings drafted). AppStream metadata exists in the shipped .deb per IVORY_PROJECT_COMPLETE.md.
-- **Blockers for real store distribution**: no signing (macOS Developer ID + notarization; MAS sandbox), no Windows code signing (SmartScreen/Defender friction already documented), placeholder 543-byte icon, no screenshots, PySide6-vs-workflow mismatch, PyInstaller-onefile AV false positives.
+- **Blockers for real store distribution**: no signing (macOS Developer ID + notarization; MAS sandbox), no Windows code signing (SmartScreen/Defender friction already documented), the 543-byte 128×128 icon (real art, but too small to scale cleanly), no screenshots, PySide6-vs-workflow mismatch, PyInstaller-onefile AV false positives.
 - **Support surface documented**: MIDI-device-not-found triage (both platforms), Gatekeeper bypass, VC++ redistributable, run-from-source fallback (`pip install -r requirements_pyqt5.txt && python ivory.py`).
 - **Naming collision risk** (not in docs, worth flagging): "Ivory" clashes with Synthogy Ivory (a well-known commercial piano VST) — a rename or qualifier may be needed if selling.
 - Repo housekeeping for a rewrite team: the canonical current source is the **uncommitted working tree** (PySide6 `ivory.py`, `chord_detector.py`, build_deb.sh, fonts/); git HEAD is the older PyQt5 state. `ivory_pyqt5.py` and `hook-PyQt5.QtBluetooth.py` are historical. `Ivory Info/01_Special_Cases_and_Resolutions.md` and `02_Code_and_Logic_Summary.md` are the chord-engine spec/test corpus — the single most valuable asset to carry into a rewrite.
