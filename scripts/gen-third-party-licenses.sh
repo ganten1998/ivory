@@ -33,6 +33,11 @@ in every Ivory distribution, at the paths given below.
       (https://github.com/quoteunquoteapps/CourierPrime)
       SIL Open Font License 1.1  ->  OFL.txt
 
+  Terminess Nerd Font Mono Regular + Bold  --  optional UI typeface
+      Copyright (C) 2020 Dimitar Toshkov Zhekov
+      Copyright (C) 2023 Tilman Blumenbach
+      SIL Open Font License 1.1  ->  font-licenses/Terminess-OFL-1.1.txt
+
 The remaining four arrive with eframe/egui's `default_fonts` feature (crate
 epaint_default_fonts 0.35.0) and act as glyph fallback. Their license texts
 ship in the font-licenses/ folder of every artifact:

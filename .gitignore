@@ -5,3 +5,6 @@
 
 # python classifier cache
 tests/golden/__pycache__/
+
+# Keygen build output (the tool is a separate workspace under tools/)
+tools/*/target/

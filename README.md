@@ -113,6 +113,11 @@ Courier Prime Project Authors, licensed under the
 (`OFL.txt`) ships alongside the fonts. Ivory does **not** bundle or
 redistribute Courier New.
 
+**Terminess Nerd Font Mono** is bundled as an optional UI typeface, selectable
+from the context menu — Copyright (C) 2020 Dimitar Toshkov Zhekov and (C) 2023
+Tilman Blumenbach, also under the SIL Open Font License 1.1. Its license text
+ships as `font-licenses/Terminess-OFL-1.1.txt`.
+
 Four more fonts come in automatically with eframe/egui's `default_fonts`
 feature (the `epaint_default_fonts` crate) and serve as glyph fallback for
 anything Courier Prime doesn't cover — the context menu's submenu arrow (⏵),

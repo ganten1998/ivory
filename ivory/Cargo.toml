@@ -12,7 +12,10 @@ build = "build.rs"
 # user turns Chord Learning on AND has trained weights. Keeping it a feature of
 # ivory-core alone means `cargo test -p ivory-core` still exercises the stock
 # engine path, while every packaged binary ships the option.
-ivory-core = { path = "../ivory-core", features = ["learning"] }
+# `license` MUST be listed here: without it ivory-core compiles the no-op
+# verification stub and the shipped app silently rejects every valid key while
+# every test still passes. `tests/license_feature.rs` guards this.
+ivory-core = { path = "../ivory-core", features = ["learning", "license"] }
 # Same crate eframe already links; direct dep so modules can `use egui::...`.
 egui = { version = "0.35", default-features = false }
 eframe = { version = "0.35", default-features = false, features = [

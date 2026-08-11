@@ -9,12 +9,20 @@
 //! Courier New is never shipped (licensing).
 
 use egui::epaint::text::{FontData, FontDefinitions, FontFamily};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 pub static COURIER_PRIME_REGULAR: &[u8] =
     include_bytes!("../../assets/fonts/CourierPrime-Regular.ttf");
 pub static COURIER_PRIME_BOLD: &[u8] = include_bytes!("../../assets/fonts/CourierPrime-Bold.ttf");
+
+/// Terminess Nerd Font Mono (SIL OFL 1.1, (C) 2020 Dimitar Toshkov Zhekov,
+/// (C) 2023 Tilman Blumenbach). Bundled so the option works on every machine
+/// rather than only where it happens to be installed; its licence ships in
+/// font-licenses/ in every artifact, as the OFL requires.
+pub static TERMINESS_REGULAR: &[u8] =
+    include_bytes!("../../assets/fonts/TerminessNerdFontMono-Regular.ttf");
+pub static TERMINESS_BOLD: &[u8] =
+    include_bytes!("../../assets/fonts/TerminessNerdFontMono-Bold.ttf");
 
 pub const FAMILY_COURIER: &str = "courier";
 pub const FAMILY_COURIER_BOLD: &str = "courier-bold";
@@ -29,11 +37,10 @@ pub fn courier_bold() -> FontFamily {
 
 /// A built-in UI typeface the user can pick from the menu.
 ///
-/// Courier Prime is bundled and always available. Terminess is loaded from the
-/// user's installed fonts rather than bundled: the Nerd Font faces are ~2.6 MB
-/// EACH (they carry thousands of icon glyphs Ivory never draws), which would
-/// roughly double the binary for a second font. If it is not installed the app
-/// silently stays on Courier Prime — a missing optional font is never an error.
+/// Both are bundled, so the choice always works offline and on a fresh machine.
+/// Terminess costs ~5 MB of binary (2.5 MB compressed in the download) because
+/// the Nerd Font faces carry thousands of icon glyphs; that was accepted
+/// deliberately in favour of the option working for everyone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FontChoice {
     #[default]
@@ -66,49 +73,11 @@ impl FontChoice {
 
     pub const ALL: [FontChoice; 2] = [FontChoice::Courier, FontChoice::Terminess];
 
-    /// Is this choice actually usable on this machine right now?
+    /// Both faces are compiled in, so every choice is always usable. Kept as a
+    /// method because the menu asks per-entry and a future font may not be.
     pub fn is_available(self) -> bool {
-        match self {
-            FontChoice::Courier => true,
-            FontChoice::Terminess => terminess_faces().is_some(),
-        }
+        true
     }
-}
-
-/// Locate installed Terminess regular+bold, in the usual per-platform font
-/// directories. Returns `None` unless BOTH faces are found, so picking it can
-/// never silently cost the bold weight the menus and About rely on.
-fn terminess_faces() -> Option<(PathBuf, PathBuf)> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(home) = dirs_home() {
-        dirs.push(home.join("Library").join("Fonts")); // macOS
-        dirs.push(home.join(".local").join("share").join("fonts")); // Linux
-        dirs.push(home.join(".fonts")); // Linux (legacy)
-    }
-    dirs.push(PathBuf::from("/Library/Fonts"));
-    dirs.push(PathBuf::from("/usr/share/fonts"));
-    dirs.push(PathBuf::from("/usr/local/share/fonts"));
-    dirs.push(PathBuf::from("C:\\Windows\\Fonts"));
-
-    // Mono first: it is the fixed-advance variant, which is what a piano app
-    // with a chord strip wants. "Propo"/proportional variants are not offered.
-    let stems = ["TerminessNerdFontMono", "TerminessNerdFont", "Terminess"];
-    for dir in &dirs {
-        for stem in &stems {
-            let reg = dir.join(format!("{stem}-Regular.ttf"));
-            let bold = dir.join(format!("{stem}-Bold.ttf"));
-            if reg.is_file() && bold.is_file() {
-                return Some((reg, bold));
-            }
-        }
-    }
-    None
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
 }
 
 /// Install the font families on the context. Call at startup and again if the
@@ -140,20 +109,18 @@ pub fn install(ctx: &egui::Context, choice: FontChoice, custom_font_path: Option
     // Courier Prime stays in the chain underneath as glyph fallback, so a face
     // lacking a symbol Ivory draws (°, ø, Δ) still renders it correctly.
     if choice == FontChoice::Terminess {
-        if let Some((reg_path, bold_path)) = terminess_faces() {
-            if let (Ok(r), Ok(b)) = (std::fs::read(&reg_path), std::fs::read(&bold_path)) {
-                defs.font_data.insert(
-                    "Terminess-Regular".to_owned(),
-                    Arc::new(FontData::from_owned(r)),
-                );
-                defs.font_data
-                    .insert("Terminess-Bold".to_owned(), Arc::new(FontData::from_owned(b)));
-                regular.insert(0, "Terminess-Regular".to_owned());
-                // Real bold face, so picking Terminess does not flatten the
-                // menus and About to a single weight.
-                bold.insert(0, "Terminess-Bold".to_owned());
-            }
-        }
+        defs.font_data.insert(
+            "Terminess-Regular".to_owned(),
+            Arc::new(FontData::from_static(TERMINESS_REGULAR)),
+        );
+        defs.font_data.insert(
+            "Terminess-Bold".to_owned(),
+            Arc::new(FontData::from_static(TERMINESS_BOLD)),
+        );
+        regular.insert(0, "Terminess-Regular".to_owned());
+        // Real bold face, so picking Terminess does not flatten the menus and
+        // About to a single weight.
+        bold.insert(0, "Terminess-Bold".to_owned());
     }
 
     // Optional user font at top priority in both families; errors ignored.

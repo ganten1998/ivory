@@ -1,0 +1,24 @@
+# DELIBERATELY OUTSIDE the main workspace (note the empty [workspace] table).
+#
+# This is the structural guarantee that the SIGNING key material and its crypto
+# dependencies can never reach a shipped Ivory binary:
+#   - `cargo build -p ivory-keygen` from the repo root cannot resolve it,
+#   - its dependencies never enter the workspace Cargo.lock,
+#   - so they never appear in THIRD-PARTY-LICENSES or any release artifact.
+# It is a promise enforced by cargo, not by discipline.
+[workspace]
+
+[package]
+name = "ivory-keygen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The SAME canonical payload serializer and wire encoder the app verifies with.
+# Sharing this is the whole point: an encoder/decoder that drift apart is the
+# number one way these systems fail in production.
+ivory-core = { path = "../../ivory-core", features = ["license"] }
+# `random` is required here (seed generation) and is exactly what the shipped
+# app must NOT have — another reason this crate is quarantined.
+ed25519-compact = { version = "2.3", features = ["random"] }
