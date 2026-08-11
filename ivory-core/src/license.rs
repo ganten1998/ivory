@@ -1,0 +1,530 @@
+//! Supporter licenses: offline Ed25519 verification.
+//!
+//! Ivory is free. A license unlocks *additive* extras (themes and the like) —
+//! it never gates anything that works without one. Everything here therefore
+//! **fails open**: a missing, corrupt, truncated, mistyped, unknown-version or
+//! unreadable license yields the free app, never an error the user must clear.
+//!
+//! No network, no clock, no entropy source. `ed25519-compact` is built with
+//! `default-features = false`, which drops `random`/`std`, so verification
+//! cannot open a socket or read the system RNG even by accident — README's
+//! "makes no network connections" stays literally true.
+//!
+//! Wire format is one line-wrapped Crockford-base32 block that doubles as the
+//! emailed file, the pasteable string, and `~/.config/ivory/license.key`:
+//!
+//! ```text
+//! payload || signature(64)  ->  CRC-32 prefix  ->  Crockford base32  ->  groups of 5
+//! ```
+//!
+//! The CRC is checked *before* the signature so a typo reports "that looks
+//! mistyped" instead of the indistinguishable "invalid license".
+
+use std::path::PathBuf;
+
+/// Payload format this build understands. A newer license is ignored, not an
+/// error — an old build must never claim a future key is *invalid*.
+pub const FORMAT_VERSION: u8 = 1;
+
+/// Supporter tier. Reserved 2..=255 so a future tier can be added without
+/// invalidating issued keys.
+pub const TIER_SUPPORTER: u8 = 1;
+
+/// Public halves of the signing keyring. A signature from ANY entry is valid,
+/// which is what makes key rotation survivable: mint with k2, ship both, and
+/// every k1 license keeps working forever.
+///
+/// PLACEHOLDER until `ivory-keygen genesis` is run. All-zero is the Ed25519
+/// identity point, which `ed25519-compact` rejects as a weak public key, so a
+/// build that reaches production with these values simply never validates
+/// anything — it cannot accidentally accept a forgery.
+pub const PUBLIC_KEYS: &[[u8; 32]] = &[[0u8; 32], [0u8; 32]];
+
+/// Why a license string was not accepted. Only ever used to phrase a message —
+/// every variant resolves to "run free".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LicenseError {
+    /// Nothing to check (empty or whitespace only).
+    Empty,
+    /// Not decodable as the license alphabet at all.
+    Malformed,
+    /// Decoded, but the checksum disagrees — almost always a typo or a
+    /// truncated copy-paste. Worth telling the user apart from a bad key.
+    Checksum,
+    /// Structurally fine but too short/long to hold a payload + signature.
+    Truncated,
+    /// A newer format version than this build knows. NOT the user's fault.
+    FutureVersion(u8),
+    /// Decoded and intact, but not signed by a key in the ring.
+    BadSignature,
+}
+
+impl LicenseError {
+    /// One line, addressed to a human who just pasted something.
+    pub fn message(self) -> &'static str {
+        match self {
+            LicenseError::Empty => "No key entered.",
+            LicenseError::Malformed => "That does not look like an Ivory supporter key.",
+            LicenseError::Checksum => {
+                "That key looks mistyped — check for a missing or altered character."
+            }
+            LicenseError::Truncated => "That key looks incomplete — some of it may be missing.",
+            LicenseError::FutureVersion(_) => {
+                "That key was made for a newer version of Ivory. Updating should accept it."
+            }
+            LicenseError::BadSignature => "That key could not be verified.",
+        }
+    }
+}
+
+/// A verified supporter license.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct License {
+    pub tier: u8,
+    /// Days since 2020-01-01. Display only — nothing expires.
+    pub issued_days: u16,
+    /// 0 = valid for every future version. Non-zero caps the major version.
+    pub max_major: u8,
+    /// Opaque 40-bit sale code. Meaningless without the owner's private ledger.
+    pub order_id: [u8; 5],
+    /// Buyer-chosen display name, shown in About. Optional by design: it is a
+    /// thank-you, not an identifier, and it is the only anti-sharing measure.
+    pub name: Option<String>,
+}
+
+const HEADER_LEN: usize = 11;
+const SIG_LEN: usize = 64;
+const CRC_LEN: usize = 4;
+const MAX_NAME: usize = 32;
+
+impl License {
+    /// Canonical signed preimage. **Frozen**: change this and every issued key
+    /// stops verifying. `tests/license_fixtures.rs` pins it.
+    pub fn payload_bytes(&self) -> Vec<u8> {
+        let name = self.name.as_deref().unwrap_or("");
+        let name_bytes = name.as_bytes();
+        let n = name_bytes.len().min(MAX_NAME);
+        let mut out = Vec::with_capacity(HEADER_LEN + n);
+        out.push(FORMAT_VERSION);
+        out.push(self.tier);
+        out.extend_from_slice(&self.issued_days.to_be_bytes());
+        out.push(self.max_major);
+        out.extend_from_slice(&self.order_id);
+        out.push(n as u8);
+        out.extend_from_slice(&name_bytes[..n]);
+        out
+    }
+
+    fn from_payload(p: &[u8]) -> Result<Self, LicenseError> {
+        if p.len() < HEADER_LEN {
+            return Err(LicenseError::Truncated);
+        }
+        if p[0] != FORMAT_VERSION {
+            return Err(LicenseError::FutureVersion(p[0]));
+        }
+        let n = p[10] as usize;
+        if p.len() < HEADER_LEN + n || n > MAX_NAME {
+            return Err(LicenseError::Truncated);
+        }
+        // A non-UTF-8 or empty name degrades to "no name" rather than failing:
+        // the signature already proved the key genuine, and a decoration must
+        // never be the reason a paying supporter is turned away.
+        let name = std::str::from_utf8(&p[HEADER_LEN..HEADER_LEN + n])
+            .ok()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        Ok(License {
+            tier: p[1],
+            issued_days: u16::from_be_bytes([p[2], p[3]]),
+            max_major: p[4],
+            order_id: [p[5], p[6], p[7], p[8], p[9]],
+            name,
+        })
+    }
+}
+
+// ── Crockford base32 ─────────────────────────────────────────────────────────
+// Chosen over base64 because a license gets read aloud, retyped and pasted out
+// of mail clients: no case sensitivity, no +/ to mangle, and O/0 plus I/L/1 are
+// explicitly interchangeable so the classic transcription errors just work.
+
+const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+fn b32_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(5) * 8);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &b in data {
+        acc = (acc << 8) | b as u32;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(ALPHABET[((acc >> bits) & 31) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((acc << (5 - bits)) & 31) as usize] as char);
+    }
+    out
+}
+
+fn b32_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 5 / 8);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.chars() {
+        if c.is_whitespace() || c == '-' {
+            continue;
+        }
+        let v = match c.to_ascii_uppercase() {
+            // Crockford's forgiving aliases: the errors humans actually make.
+            'O' => 0,
+            'I' | 'L' => 1,
+            c => {
+                let idx = ALPHABET.iter().position(|&a| a as char == c)?;
+                idx as u32
+            }
+        };
+        acc = (acc << 5) | v;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
+// ── CRC-32 (IEEE), table-free ────────────────────────────────────────────────
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+// ── Wire encoding ────────────────────────────────────────────────────────────
+
+/// Render a license key: `CRC || payload || signature` in Crockford base32,
+/// grouped in fives and wrapped, so it survives email and can be read aloud.
+pub fn encode_key(payload: &[u8], signature: &[u8; SIG_LEN]) -> String {
+    let mut body = Vec::with_capacity(CRC_LEN + payload.len() + SIG_LEN);
+    body.extend_from_slice(&[0u8; CRC_LEN]); // placeholder, filled below
+    body.extend_from_slice(payload);
+    body.extend_from_slice(signature);
+    let sum = crc32(&body[CRC_LEN..]);
+    body[..CRC_LEN].copy_from_slice(&sum.to_be_bytes());
+
+    let raw = b32_encode(&body);
+    let groups: Vec<String> = raw
+        .as_bytes()
+        .chunks(5)
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect();
+    groups
+        .chunks(6)
+        .map(|line| line.join("-"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Decode and integrity-check, without verifying the signature.
+fn decode_key(s: &str) -> Result<(Vec<u8>, [u8; SIG_LEN]), LicenseError> {
+    if s.trim().is_empty() {
+        return Err(LicenseError::Empty);
+    }
+    let body = b32_decode(s).ok_or(LicenseError::Malformed)?;
+    if body.len() < CRC_LEN + HEADER_LEN + SIG_LEN {
+        return Err(LicenseError::Truncated);
+    }
+    let want = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    if crc32(&body[CRC_LEN..]) != want {
+        return Err(LicenseError::Checksum);
+    }
+    let rest = &body[CRC_LEN..];
+    let split = rest.len() - SIG_LEN;
+    let mut sig = [0u8; SIG_LEN];
+    sig.copy_from_slice(&rest[split..]);
+    Ok((rest[..split].to_vec(), sig))
+}
+
+/// Verify a pasted key against the shipped keyring.
+///
+/// Accepts a signature from ANY ring entry (rotation support). Never panics,
+/// never allocates unboundedly, never touches the network or the clock.
+pub fn verify_key(s: &str) -> Result<License, LicenseError> {
+    let (payload, sig) = decode_key(s)?;
+    // Parse first so a future-version key reports that, rather than the
+    // misleading "could not be verified" it would get from an unknown layout.
+    let license = License::from_payload(&payload)?;
+    if verify_signature(&payload, &sig) {
+        Ok(license)
+    } else {
+        Err(LicenseError::BadSignature)
+    }
+}
+
+#[cfg(feature = "license")]
+fn verify_signature(payload: &[u8], sig: &[u8; SIG_LEN]) -> bool {
+    use ed25519_compact::{PublicKey, Signature};
+    let Ok(signature) = Signature::from_slice(sig) else {
+        return false;
+    };
+    PUBLIC_KEYS.iter().any(|raw| {
+        PublicKey::from_slice(raw)
+            .map(|pk| pk.verify(payload, &signature).is_ok())
+            .unwrap_or(false)
+    })
+}
+
+/// Without the `license` feature nothing verifies — the crate still compiles and
+/// the app is simply always in its free state. Keeps `cargo test -p ivory-core`
+/// (which runs with no features, per docs/RELEASE.md) building.
+#[cfg(not(feature = "license"))]
+fn verify_signature(_payload: &[u8], _sig: &[u8; SIG_LEN]) -> bool {
+    false
+}
+
+// ── On-disk store ────────────────────────────────────────────────────────────
+
+/// The user's license file. Deliberately its OWN file, not a settings key:
+/// D-UI-5 records that a Python downgrade rewrites settings.json with a fixed
+/// key set, which would silently eat a supporter's key.
+#[derive(Clone, Debug)]
+pub struct LicenseStore {
+    path: PathBuf,
+    /// Raw text exactly as the user supplied it. Never rewritten, never
+    /// normalized — if a future release fixes a parse bug it must be able to
+    /// start honoring a file this build could not read.
+    raw: Option<String>,
+    license: Option<License>,
+}
+
+impl LicenseStore {
+    /// `~/.config/ivory/license.key` on every platform (matches settings.rs).
+    pub fn default_path() -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        home.join(".config").join("ivory").join("license.key")
+    }
+
+    pub fn load() -> Self {
+        Self::load_from(Self::default_path())
+    }
+
+    /// Never panics; every failure yields an unlicensed (free) store.
+    pub fn load_from(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Self { path, raw: None, license: None };
+        };
+        let license = verify_key(&raw).ok();
+        Self { path, raw: Some(raw), license }
+    }
+
+    /// Is a valid supporter license installed? Derived every time — never
+    /// cached to disk, so there is no boolean to flip and none to corrupt.
+    pub fn is_supporter(&self) -> bool {
+        self.license
+            .as_ref()
+            .is_some_and(|l| l.tier >= TIER_SUPPORTER)
+    }
+
+    pub fn license(&self) -> Option<&License> {
+        self.license.as_ref()
+    }
+
+    /// The name to thank in About, if the buyer chose one.
+    pub fn display_name(&self) -> Option<&str> {
+        self.license.as_ref().and_then(|l| l.name.as_deref())
+    }
+
+    pub fn raw(&self) -> Option<&str> {
+        self.raw.as_deref()
+    }
+
+    /// Validate and install a pasted key. On success the text is persisted
+    /// atomically; on failure NOTHING on disk changes and the previous license
+    /// (if any) is untouched.
+    pub fn install(&mut self, key_text: &str) -> Result<&License, LicenseError> {
+        let license = verify_key(key_text)?;
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // Write-then-rename, mirroring OverrideStore::save.
+        let tmp = self.path.with_extension("key.tmp");
+        if std::fs::write(&tmp, key_text).is_ok() {
+            if std::fs::rename(&tmp, &self.path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        self.raw = Some(key_text.to_owned());
+        self.license = Some(license);
+        Ok(self.license.as_ref().expect("just assigned"))
+    }
+
+    /// Forget the installed license (removes the file). Used by a future
+    /// "remove license" affordance; never called automatically.
+    pub fn remove(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        self.raw = None;
+        self.license = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> License {
+        License {
+            tier: TIER_SUPPORTER,
+            issued_days: 2415,
+            max_major: 0,
+            order_id: [0xDE, 0xAD, 0xBE, 0xEF, 0x01],
+            name: Some("Ada L".into()),
+        }
+    }
+
+    #[test]
+    fn payload_round_trips() {
+        let l = sample();
+        let p = l.payload_bytes();
+        assert_eq!(License::from_payload(&p).unwrap(), l);
+    }
+
+    #[test]
+    fn payload_layout_is_frozen() {
+        // Guards the signed preimage. If this fails, every issued key just died.
+        let p = sample().payload_bytes();
+        assert_eq!(p[0], 1, "format version");
+        assert_eq!(p[1], 1, "tier");
+        assert_eq!(&p[2..4], &2415u16.to_be_bytes(), "issued days");
+        assert_eq!(p[4], 0, "max_major");
+        assert_eq!(&p[5..10], &[0xDE, 0xAD, 0xBE, 0xEF, 0x01], "order id");
+        assert_eq!(p[10], 5, "name length");
+        assert_eq!(&p[11..], b"Ada L");
+    }
+
+    #[test]
+    fn nameless_payload_is_eleven_bytes() {
+        let l = License { name: None, ..sample() };
+        assert_eq!(l.payload_bytes().len(), HEADER_LEN);
+        assert_eq!(License::from_payload(&l.payload_bytes()).unwrap().name, None);
+    }
+
+    #[test]
+    fn overlong_name_is_truncated_not_rejected() {
+        let l = License { name: Some("x".repeat(80)), ..sample() };
+        let p = l.payload_bytes();
+        assert_eq!(p[10] as usize, MAX_NAME);
+        assert_eq!(License::from_payload(&p).unwrap().name.unwrap().len(), MAX_NAME);
+    }
+
+    #[test]
+    fn base32_round_trips_arbitrary_bytes() {
+        for len in 0..40usize {
+            let data: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37)).collect();
+            let dec = b32_decode(&b32_encode(&data)).unwrap();
+            assert_eq!(&dec[..data.len()], &data[..], "len {len}");
+        }
+    }
+
+    #[test]
+    fn crockford_aliases_and_case_are_forgiving() {
+        let key = encode_key(&sample().payload_bytes(), &[7u8; SIG_LEN]);
+        let mangled = key
+            .to_lowercase()
+            .replace('0', "O")
+            .replace('1', "l")
+            .replace('\n', " ");
+        // Same bytes recovered => a retyped key still reaches signature check.
+        assert_eq!(decode_key(&key).unwrap().0, decode_key(&mangled).unwrap().0);
+    }
+
+    #[test]
+    fn typo_reports_checksum_not_bad_signature() {
+        let key = encode_key(&sample().payload_bytes(), &[7u8; SIG_LEN]);
+        // Flip one payload character to a different valid symbol.
+        let mut chars: Vec<char> = key.chars().collect();
+        let pos = chars.iter().position(|c| c.is_ascii_alphanumeric()).unwrap() + 10;
+        chars[pos] = if chars[pos] == 'Z' { 'Y' } else { 'Z' };
+        let typo: String = chars.into_iter().collect();
+        assert_eq!(verify_key(&typo).unwrap_err(), LicenseError::Checksum);
+    }
+
+    #[test]
+    fn empty_and_garbage_are_distinguished() {
+        assert_eq!(verify_key("   \n ").unwrap_err(), LicenseError::Empty);
+        assert_eq!(verify_key("!!!!").unwrap_err(), LicenseError::Malformed);
+    }
+
+    #[test]
+    fn truncated_key_is_reported_as_truncated() {
+        assert_eq!(verify_key("ABCDE-FGHJK").unwrap_err(), LicenseError::Truncated);
+    }
+
+    #[test]
+    fn intact_but_unsigned_key_fails_signature_last() {
+        // Correct CRC, correct layout, signature that no ring key made.
+        let key = encode_key(&sample().payload_bytes(), &[7u8; SIG_LEN]);
+        assert_eq!(verify_key(&key).unwrap_err(), LicenseError::BadSignature);
+    }
+
+    #[test]
+    fn future_version_is_not_the_users_fault() {
+        let mut p = sample().payload_bytes();
+        p[0] = 9;
+        let key = encode_key(&p, &[7u8; SIG_LEN]);
+        assert_eq!(verify_key(&key).unwrap_err(), LicenseError::FutureVersion(9));
+    }
+
+    #[test]
+    fn placeholder_keyring_never_validates() {
+        // The shipped placeholder is the identity point; it must be impossible
+        // for a pre-genesis build to accept anything.
+        assert!(PUBLIC_KEYS.iter().all(|k| k == &[0u8; 32]));
+        let key = encode_key(&sample().payload_bytes(), &[0u8; SIG_LEN]);
+        assert!(verify_key(&key).is_err());
+    }
+
+    #[test]
+    fn missing_file_is_free_not_an_error() {
+        let s = LicenseStore::load_from("/nonexistent/ivory/license.key");
+        assert!(!s.is_supporter());
+        assert!(s.license().is_none());
+        assert!(s.raw().is_none());
+    }
+
+    #[test]
+    fn corrupt_file_keeps_raw_and_stays_free() {
+        let dir = std::env::temp_dir().join(format!("ivory-lic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("license.key");
+        std::fs::write(&p, "not a key at all").unwrap();
+        let s = LicenseStore::load_from(&p);
+        assert!(!s.is_supporter());
+        // The user's file is preserved verbatim for a future build to re-read.
+        assert_eq!(s.raw(), Some("not a key at all"));
+        assert!(p.exists(), "a file we could not parse must never be deleted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn install_rejects_bad_key_without_touching_disk() {
+        let dir = std::env::temp_dir().join(format!("ivory-lic2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("license.key");
+        let mut s = LicenseStore::load_from(&p);
+        assert!(s.install("garbage").is_err());
+        assert!(!p.exists(), "a rejected key must not be written");
+        assert!(!s.is_supporter());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

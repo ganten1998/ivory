@@ -33,6 +33,8 @@ pub enum MenuAction {
     ToggleKeytoggle,
     ToggleNotePreference,
     ToggleChordDetection,
+    /// Cycle the built-in UI typeface (Courier Prime <-> Terminess).
+    CycleFont,
     DetachChordWindow,
     AttachChordWindow,
     TeachChordName,
@@ -59,6 +61,9 @@ pub struct MenuView {
     pub notes_held: bool,
     /// D-UI-9: whether the learned re-ranker is currently influencing readings.
     pub learning_on: bool,
+    /// Label of the typeface that will be active after the next Font click.
+    /// `None` hides the row entirely (only Courier Prime is available here).
+    pub next_font: Option<&'static str>,
 }
 
 #[derive(Clone, Copy)]
@@ -167,6 +172,11 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         if view.dark_mode { "Light Mode" } else { "Dark Mode" },
         MenuAction::ToggleDarkMode,
     ));
+    // Only offered when a second typeface is actually installed, matching how
+    // Detach appears conditionally rather than showing a dead row.
+    if let Some(next) = view.next_font {
+        e.push(item(next, MenuAction::CycleFont));
+    }
     e.push(Entry::Separator);
     e.push(item(
         if view.keytoggle {
@@ -540,6 +550,7 @@ mod tests {
             detached: false,
             notes_held: false,
             learning_on: false,
+            next_font: None,
         }
     }
 

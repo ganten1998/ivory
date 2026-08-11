@@ -80,6 +80,9 @@ pub struct Settings {
     /// Additive key (D-UI-5): optional path to a user font loaded at top
     /// priority in both font families. Absent from the file when None.
     pub custom_font_path: Option<String>,
+    /// Built-in UI typeface key (see fonts::FontChoice). Additive key; unknown
+    /// values fall back to Courier Prime.
+    pub font_choice: String,
     /// Unknown keys from the file, preserved verbatim on save (file order).
     pub extra: Map<String, Value>,
 }
@@ -101,6 +104,7 @@ impl Default for Settings {
             detached_chord_height: 50,
             keytoggle_enabled: false,
             custom_font_path: None,
+            font_choice: crate::fonts::FontChoice::default().key().to_owned(),
             extra: Map::new(),
         }
     }
@@ -188,6 +192,12 @@ impl Settings {
                 s.custom_font_path = Some(p.to_owned());
             }
         }
+        if let Some(v) = map.remove("font_choice") {
+            if let Some(f) = v.as_str() {
+                // Stored verbatim; an unknown key resolves to Courier at use.
+                s.font_choice = f.to_owned();
+            }
+        }
 
         s.extra = map; // whatever is left, preserved in file order
         s
@@ -240,6 +250,7 @@ impl Settings {
         if let Some(ref p) = self.custom_font_path {
             map.insert("custom_font_path".into(), Value::String(p.clone()));
         }
+        map.insert("font_choice".into(), Value::String(self.font_choice.clone()));
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }

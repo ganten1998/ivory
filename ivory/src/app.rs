@@ -66,7 +66,11 @@ pub struct IvoryApp {
 
 impl IvoryApp {
     pub fn new(cc: &eframe::CreationContext<'_>, settings: Settings, cli_port: Option<String>) -> Self {
-        crate::fonts::install(&cc.egui_ctx, settings.custom_font_path.as_deref());
+        crate::fonts::install(
+            &cc.egui_ctx,
+            crate::fonts::FontChoice::from_key(&settings.font_choice),
+            settings.custom_font_path.as_deref(),
+        );
         crate::fonts::apply_text_styles(&cc.egui_ctx);
 
         let mut detector = ChordDetector::new();
@@ -215,6 +219,16 @@ impl IvoryApp {
             detached: self.settings.chord_window_detached,
             notes_held: !self.display_notes().is_empty(),
             learning_on: self.detector.learning_mode(),
+            next_font: {
+                use crate::fonts::FontChoice;
+                let cur = FontChoice::from_key(&self.settings.font_choice);
+                // Show the row only if some OTHER installed face can be reached.
+                FontChoice::ALL
+                    .iter()
+                    .copied()
+                    .find(|f| *f != cur && f.is_available())
+                    .map(|f| f.label())
+            },
         }
     }
 
@@ -356,6 +370,24 @@ impl IvoryApp {
                 self.settings.dark_mode = !self.settings.dark_mode;
                 self.settings.save();
             }
+            MenuAction::CycleFont => {
+                use crate::fonts::FontChoice;
+                let cur = FontChoice::from_key(&self.settings.font_choice);
+                if let Some(next) = FontChoice::ALL
+                    .iter()
+                    .copied()
+                    .find(|f| *f != cur && f.is_available())
+                {
+                    self.settings.font_choice = next.key().to_owned();
+                    self.settings.save();
+                    crate::fonts::install(
+                        ctx,
+                        next,
+                        self.settings.custom_font_path.as_deref(),
+                    );
+                    crate::fonts::apply_text_styles(ctx);
+                }
+            }
             MenuAction::ToggleKeytoggle => {
                 self.settings.keytoggle_enabled = !self.settings.keytoggle_enabled;
                 if !self.settings.keytoggle_enabled {
@@ -411,7 +443,8 @@ impl IvoryApp {
         self.detector.set_note_preference(true);
         self.manual_notes.clear();
         if had_custom_font {
-            crate::fonts::install(ctx, None);
+            // Settings were reset: back to the bundled default font too.
+            crate::fonts::install(ctx, crate::fonts::FontChoice::default(), None);
         }
         self.settings.save();
     }
