@@ -160,15 +160,30 @@ fn main() {
     let settings = Settings::load();
     let size = app::initial_window_size(&settings);
 
+    // The app icon MUST be set here. eframe applies its own embedded default
+    // (the egui hexagon) whenever the viewport icon is None, and on macOS a
+    // runtime icon overrides the .app bundle's CFBundleIconFile — so without
+    // this the Dock showed the egui logo while Finder correctly showed Ivory's.
+    // A decode failure just means no runtime icon: on macOS the bundle icon then
+    // applies, so fall back silently rather than killing startup over artwork.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Ivory")
+        .with_app_id("ivory")
+        .with_inner_size(size)
+        .with_min_inner_size(size)
+        .with_max_inner_size(size)
+        .with_resizable(false)
+        .with_decorations(!settings.borderless_mode);
+
+    match eframe::icon_data::from_png_bytes(
+        &include_bytes!("../../assets/ivory.png")[..],
+    ) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(err) => eprintln!("could not decode assets/ivory.png as the app icon: {err}"),
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Ivory")
-            .with_app_id("ivory")
-            .with_inner_size(size)
-            .with_min_inner_size(size)
-            .with_max_inner_size(size)
-            .with_resizable(false)
-            .with_decorations(!settings.borderless_mode),
+        viewport,
         ..Default::default()
     };
 
