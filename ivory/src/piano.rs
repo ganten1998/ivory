@@ -49,7 +49,11 @@ fn idle_colors(s: &Settings) -> (Color32, Color32) {
 }
 
 pub fn bg_color(dark_mode: bool) -> Color32 {
-    crate::theme::palette(dark_mode).piano_bg
+    if dark_mode {
+        Color32::from_rgb(0x1a, 0x1a, 0x1a)
+    } else {
+        Color32::from_rgb(0xE8, 0xE8, 0xE8)
+    }
 }
 
 /// Draw the piano into `rect`. `display_notes` must already include manual
@@ -61,6 +65,7 @@ pub fn draw(
     display_notes: &HashSet<u8>,
     sustain_down: bool,
     s: &Settings,
+    glow: bool,
 ) {
     let w = rect.width() as f64;
     let h = rect.height() as f64;
@@ -74,19 +79,26 @@ pub fn draw(
     let black_key_w = white_key_w * 0.7;
     let black_key_h = h * 0.65;
 
+    // Held keys can carry a halo (supporter extra). It takes its color from
+    // whatever the user set as the active/sustain color, so it always agrees
+    // with their palette instead of imposing one.
+    let mut lit: Vec<(Rect, Color32)> = Vec::new();
+
     let (white_idle, black_idle) = idle_colors(s);
     let sustain = s.sustain_color.to_color32();
     let white_active = s.white_key_active_color.to_color32();
     let black_active = s.black_key_active_color.to_color32();
 
-    let pal = crate::theme::palette(s.dark_mode);
-    let separator = pal.key_separator;
-    let outline = pal.black_key_outline;
-    // Phosphor themes (Centennial) halo their held keys. Collected here and
-    // drawn in one pass at the end so a halo never lands under a later key
-    // fill — the same paint-order trap that once ate the key separators.
-    let glow = crate::theme::active().glow;
-    let mut lit: Vec<Rect> = Vec::new();
+    let separator = if s.dark_mode {
+        Color32::from_rgb(153, 153, 153)
+    } else {
+        Color32::from_rgb(92, 63, 31)
+    };
+    let outline = if s.dark_mode {
+        Color32::from_rgb(204, 204, 204)
+    } else {
+        Color32::from_rgb(139, 115, 85)
+    };
 
     // 2. White keys, left to right (int truncation per key, like Qt fillRect).
     // Fill every white key FIRST, then draw the separators on top — otherwise each
@@ -111,8 +123,8 @@ pub fn draw(
             egui::vec2(white_key_w.trunc() as f32, h.trunc() as f32),
         );
         painter.rect_filled(key_rect, 0.0, fill);
-        if glow.is_some() && display_notes.contains(&note) {
-            lit.push(key_rect);
+        if glow && display_notes.contains(&note) {
+            lit.push((key_rect, fill));
         }
         idx += 1;
     }
@@ -158,28 +170,31 @@ pub fn draw(
             Pos2::new(left + bx + bw + 0.5, top + bh + 0.5),
         );
         painter.rect_stroke(stroke_rect, 0.0, Stroke::new(1.0, outline), StrokeKind::Middle);
-        if glow.is_some() && display_notes.contains(&note) {
-            lit.push(key_rect);
+        if glow && display_notes.contains(&note) {
+            lit.push((key_rect, fill));
         }
     }
 
-    // 4. Phosphor bloom. Concentric STROKES, not filled expanded rects: a fill
-    // would wash the key core out to white and destroy the glow-in-the-dark
-    // read. While the pedal is down the halo takes the sustain color, so the
-    // whole keyboard goes gold — the DX7 Centennial's plating, and pedalling
-    // is a control.
-    if let Some(g) = glow {
-        let halo = if sustain_down { sustain } else { g.color };
-        // Bands are specified at 100% window size; scale with the keyboard.
-        let scale = (w / 1300.0).clamp(0.5, 2.0) as f32;
-        for rect in &lit {
-            for (outset, gain) in g.bands.iter().copied() {
-                let r = rect.expand(outset * scale);
-                let a = (gain * 255.0).round().clamp(0.0, 255.0) as u8;
+    // Halo pass, last: drawn during the key loops it would land under a later
+    // key fill — the same paint-order trap that once ate the separators.
+    // Many 1px strokes with an exponential falloff; a few thick bands read as a
+    // hard-edged selection box, which is exactly what a halo must not look like.
+    if glow && !lit.is_empty() {
+        let scale = ((w / 1300.0) as f32).clamp(0.5, 2.0);
+        let radius = (16.0 * scale).max(2.0);
+        let steps = radius.round() as i32;
+        for i in 0..steps {
+            let t = (i as f32 + 0.5) / steps as f32;
+            let alpha = 0.40 * (-2.6 * t).exp();
+            if alpha < 0.004 {
+                break;
+            }
+            let outset = t * radius;
+            for (rect, color) in &lit {
                 painter.rect_stroke(
-                    r,
-                    0.0,
-                    Stroke::new((outset * scale).max(1.0), halo.gamma_multiply(a as f32 / 255.0)),
+                    rect.expand(outset),
+                    outset.min(6.0),
+                    Stroke::new(1.0, color.gamma_multiply(alpha)),
                     StrokeKind::Middle,
                 );
             }

@@ -116,15 +116,22 @@ struct DialogTheme {
 }
 
 fn theme(dark: bool) -> DialogTheme {
-    // Colors come from the active named theme (see crate::theme). Classic
-    // reproduces the constants that used to live here byte-for-byte.
-    let p = crate::theme::palette(dark);
-    DialogTheme {
-        bg: p.dialog_bg,
-        text: p.dialog_text,
-        button_bg: p.dialog_button_bg,
-        button_hover: p.dialog_button_hover,
-        button_border: p.dialog_button_border,
+    if dark {
+        DialogTheme {
+            bg: Color32::from_rgb(0x00, 0x00, 0x00),
+            text: Color32::from_rgb(0xE8, 0xDC, 0xC0),
+            button_bg: Color32::from_rgb(0x1a, 0x1a, 0x1a),
+            button_hover: Color32::from_rgb(0x2a, 0x2a, 0x2a),
+            button_border: Color32::from_rgb(0xE8, 0xDC, 0xC0),
+        }
+    } else {
+        DialogTheme {
+            bg: Color32::from_rgb(0xE8, 0xDC, 0xC0),
+            text: Color32::from_rgb(0x00, 0x00, 0x00),
+            button_bg: Color32::from_rgb(0xd4, 0xc8, 0xb0),
+            button_hover: Color32::from_rgb(0xc0, 0xb4, 0x9c),
+            button_border: Color32::from_rgb(0x00, 0x00, 0x00),
+        }
     }
 }
 

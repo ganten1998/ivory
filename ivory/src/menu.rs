@@ -35,8 +35,8 @@ pub enum MenuAction {
     ToggleChordDetection,
     /// Cycle the built-in UI typeface (Courier Prime <-> Terminess).
     CycleFont,
-    /// Cycle the named color theme.
-    CycleTheme,
+    /// Supporter extra: halo under held keys, in the active key color.
+    ToggleKeyGlow,
     DetachChordWindow,
     AttachChordWindow,
     TeachChordName,
@@ -66,8 +66,9 @@ pub struct MenuView {
     /// Label of the typeface that will be active after the next Font click.
     /// `None` hides the row entirely (only Courier Prime is available here).
     pub next_font: Option<&'static str>,
-    /// Label for the theme the next Theme click will apply.
-    pub next_theme: &'static str,
+    /// A valid supporter license is installed. Gates the extras block.
+    pub supporter: bool,
+    pub glow_on: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -79,8 +80,21 @@ pub struct MenuColors {
 }
 
 pub fn colors(dark_mode: bool) -> MenuColors {
-    let p = crate::theme::palette(dark_mode);
-    MenuColors { bg: p.menu_bg, text: p.menu_text, sel: p.menu_sel, sep: p.menu_sep }
+    if dark_mode {
+        MenuColors {
+            bg: Color32::from_rgb(0x00, 0x00, 0x00),
+            text: Color32::from_rgb(0xE8, 0xDC, 0xC0),
+            sel: Color32::from_rgb(0x1a, 0x1a, 0x1a),
+            sep: Color32::from_rgb(0xE8, 0xDC, 0xC0),
+        }
+    } else {
+        MenuColors {
+            bg: Color32::from_rgb(0xE8, 0xDC, 0xC0),
+            text: Color32::from_rgb(0x00, 0x00, 0x00),
+            sel: Color32::from_rgb(0xd4, 0xc8, 0xb0),
+            sep: Color32::from_rgb(0x00, 0x00, 0x00),
+        }
+    }
 }
 
 const MENU_FONT_SIZE: f32 = 13.0;
@@ -168,7 +182,14 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     if let Some(next) = view.next_font {
         e.push(item(next, MenuAction::CycleFont));
     }
-    e.push(item(view.next_theme, MenuAction::CycleTheme));
+    // Supporter extras. Hidden rather than greyed for the free build: a locked
+    // row you cannot use is a nag, and the app is meant to feel complete.
+    if view.supporter {
+        e.push(item(
+            if view.glow_on { "Disable Key Glow" } else { "Enable Key Glow" },
+            MenuAction::ToggleKeyGlow,
+        ));
+    }
     e.push(Entry::Separator);
     e.push(item(
         if view.keytoggle {
@@ -543,7 +564,8 @@ mod tests {
             notes_held: false,
             learning_on: false,
             next_font: None,
-            next_theme: "Theme: Classic",
+            supporter: false,
+            glow_on: false,
         }
     }
 
