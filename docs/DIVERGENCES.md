@@ -30,7 +30,9 @@ are post-review.
 
 - K1 (B1): 2-note intervals render `"C (M3)"` (root-prefixed), `"{n}
   semitones"` beyond 21.
-- K2 (B2): half-diminished renders `m7b5`, never `ø7`.
+- K2 (B2): half-diminished rendered `m7b5`, never `ø7`. **SUPERSEDED by D27
+  (2026-08-11)** — it now renders `ø7`. Kept here because the K-numbering is
+  referenced throughout the review history; do not reuse the id.
 - K3 (B6/B10): parenthesized, comma-joined tensions: `CΔ7(#11)`,
   `G7(#9,b13)`.
 - K4: `Δ` glyph for major-7 family, `C(add9)`, `C6/9`, `/Bass` slash format.
@@ -209,6 +211,19 @@ are post-review.
   is `None` (not `C Altered`; old v098 flipped) per D17. 905 corpus note-sets
   move subset-scale → chord/None/Chromatic; a classifier confirmed 0 touched a
   chord reading and 0 exact-match scale was lost.
+
+- **D27** (owner preference 2026-08-11, presentation only): chord symbols use
+  standard jazz lead-sheet glyphs — `°` diminished, `ø` half-diminished, `+`
+  augmented. `Cdim`→`C°`, `Cdim7`→`C°7`, `CdimΔ7`→`C°Δ7`, `Cm7b5`→`Cø7`,
+  `Cm7b5(11)`→`Cø7(11)`, `Caug`→`C+`. **Supersedes K2.** Detection is
+  untouched: a classifier over the whole golden corpus confirmed 1,014 rows
+  changed symbol and **0 changed identity**. NOTE the engine makes decisions by
+  re-parsing rendered names, so the change had to land in lockstep in three
+  places — `format_chord_name`, `match_chord_type`'s quality map, and the
+  name-based `is_dominant`/slash-simplify guards, which excluded `"dim7"` and
+  `"m7"`; `°7`/`ø7` contain neither and would otherwise have been scored as
+  dominants. Pre-D27 spellings are still accepted by `match_chord_type` so a
+  chord taught under an older build still resolves.
 
 Naming preference note: all examples above are written in flats
 (prefer_flats=true, the default); every rule is pitch-class-relational and

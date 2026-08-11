@@ -488,7 +488,7 @@ impl ChordDetector {
                             && ivs_from_bass.contains(&10) && ivs_from_bass.contains(&1) {
                             return Some(format!("{}7(b9)", self.get_note_name(lpc)));
                         } else {
-                            return Some(format!("{}dim7/{}", self.get_note_name(dim_root), self.get_note_name(lpc)));
+                            return Some(format!("{}°7/{}", self.get_note_name(dim_root), self.get_note_name(lpc)));
                         }
                     }
                 }
@@ -524,7 +524,7 @@ impl ChordDetector {
                 let ivs: Vec<u8> = intervals_from(potential_root, &pcs_all);
                 if ivs == [0, 3, 6, 10] {
                     if potential_root == lpc {
-                        return Some(format!("{}m7b5", self.get_note_name(potential_root)));
+                        return Some(format!("{}ø7", self.get_note_name(potential_root)));
                     } else {
                         let m6_root = (potential_root + 3) % 12;
                         let m6_name = self.get_note_name(m6_root);
@@ -685,7 +685,7 @@ impl ChordDetector {
                         ivs.is_superset(&[0u8, 3, 6].iter().copied().collect())
                     };
                     if bass_is_dim_root {
-                        best_match = Some(format!("{}dim", self.get_note_name(lowest_pc)));
+                        best_match = Some(format!("{}°", self.get_note_name(lowest_pc)));
                         best_root_pc = lowest_pc;
                     }
                 } else {
@@ -995,6 +995,10 @@ impl ChordDetector {
         let mapped = match quality {
             ""          => "major",
             "m"         => "minor",
+            // D27 symbols, plus the pre-D27 spellings kept so a chord taught under
+            // an older build still resolves from overrides.json.
+            "°"         => "diminished",
+            "+"         => "augmented",
             "dim"       => "diminished",
             "aug"       => "augmented",
             "2"         => "sus2",
@@ -1008,10 +1012,12 @@ impl ChordDetector {
             "mΔ7"       => "minor_major7",
             "mΔ7(9)"    => "minor_major9",
             "7"         => "dominant7",
-            "dim7"      => "diminished7",
-            "dimΔ7"     => "diminished_major7",
-            "m7b5"      => "half_diminished7",  // ø7 also
+            "°7"        => "diminished7",
+            "°Δ7"       => "diminished_major7",
             "ø7"        => "half_diminished7",
+            "dim7"      => "diminished7",       // pre-D27 spellings
+            "dimΔ7"     => "diminished_major7",
+            "m7b5"      => "half_diminished7",
             "9"         => "dominant9",
             "11"        => "dominant11",
             "Δ9"        => "major9",
@@ -1105,8 +1111,13 @@ impl ChordDetector {
         if self.match_chord_type(best_match, "half_diminished7") {
             essential_intervals.extend([3u8, 6, 10]);
         }
+        // D27: these exclusions are name-based, so they must name the CURRENT
+        // symbols. `°7`/`ø7` no longer contain "dim7"/"m7", so without the two
+        // extra tests a diminished or half-diminished 7th would be scored as a
+        // dominant here.
         let is_dominant = (best_match.ends_with('7') || best_match.contains("7(") || best_match.ends_with("13"))
             && !best_match.contains('Δ') && !best_match.contains("dim7")
+            && !best_match.contains('°') && !best_match.contains('ø')
             && !best_match.contains("m7");
         if is_dominant { essential_intervals.insert(10); }
 
@@ -1116,8 +1127,10 @@ impl ChordDetector {
         if is_sus || is_add9 { return false; }
 
         // 7th chord with un-doubled bass → simplify
+        // Same D27 name-based caveat as is_dominant above.
         if best_match.contains('7') && !best_match.contains('Δ')
-            && !best_match.contains("m7") && !best_match.contains("dim7") {
+            && !best_match.contains("m7") && !best_match.contains("dim7")
+            && !best_match.contains('°') && !best_match.contains('ø') {
             let bass_count = active_notes.iter().filter(|&&n| n % 12 == lowest_pc).count();
             if bass_count == 1 { return true; } else { return false; }
         }
@@ -1656,8 +1669,10 @@ fn format_chord_name(root: &str, chord_type: &str) -> String {
     match chord_type {
         "major"              => root.to_string(),
         "minor"              => format!("{}m", root),
-        "diminished"         => format!("{}dim", root),
-        "augmented"          => format!("{}aug", root),
+        // D27: jazz lead-sheet symbols — ° for diminished, ø for half-diminished,
+        // + for augmented (was `dim`/`m7b5`/`aug`; supersedes K2).
+        "diminished"         => format!("{}°", root),
+        "augmented"          => format!("{}+", root),
         "sus2"               => format!("{}2", root),
         "sus4"               => format!("{}4", root),
         "7sus4"              => format!("{}7sus4", root),
@@ -1673,10 +1688,10 @@ fn format_chord_name(root: &str, chord_type: &str) -> String {
         "minor_major7"       => format!("{}mΔ7", root),
         "minor_major9"       => format!("{}mΔ7(9)", root),
         "dominant7"          => format!("{}7", root),
-        "diminished7"        => format!("{}dim7", root),
-        "diminished_major7"  => format!("{}dimΔ7", root),
-        "half_diminished7"   => format!("{}m7b5", root),
-        "half_diminished11" | "half_diminished11_no3" => format!("{}m7b5(11)", root),
+        "diminished7"        => format!("{}°7", root),
+        "diminished_major7"  => format!("{}°Δ7", root),
+        "half_diminished7"   => format!("{}ø7", root),
+        "half_diminished11" | "half_diminished11_no3" => format!("{}ø7(11)", root),
         "dominant9"          => format!("{}9", root),
         "dominant11"         => format!("{}11", root),
         "dominant13"         => format!("{}13", root),
@@ -1750,8 +1765,8 @@ mod tests {
     // ── Triads ───────────────────────────────────────────────────────────────
     #[test] fn t_major()  { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,64,67])), Some("C".into())); }
     #[test] fn t_minor()  { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,63,67])), Some("Cm".into())); }
-    #[test] fn t_dim()    { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,63,66])), Some("Cdim".into())); }
-    #[test] fn t_aug()    { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,64,68])), Some("Caug".into())); }
+    #[test] fn t_dim()    { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,63,66])), Some("C°".into())); }
+    #[test] fn t_aug()    { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,64,68])), Some("C+".into())); }
     #[test] fn t_sus2()   { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,62,67])), Some("C2".into())); }
     #[test] fn t_sus4()   { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,65,67])), Some("C4".into())); }
 
@@ -1759,8 +1774,8 @@ mod tests {
     #[test] fn t_dom7()   { assert_eq!(ChordDetector::new().detect_chord(&notes(&[67,71,74,77])), Some("G7".into())); }
     #[test] fn t_maj7()   { assert_eq!(ChordDetector::new().detect_chord(&notes(&[62,66,69,73])), Some("DΔ7".into())); }
     #[test] fn t_min7()   { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,63,67,70])), Some("Cm7".into())); }
-    #[test] fn t_dim7()   { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,63,66,69])), Some("Cdim7".into())); }
-    #[test] fn t_halfdim(){ assert_eq!(ChordDetector::new().detect_chord(&notes(&[55,58,61,65])), Some("Gm7b5".into())); }
+    #[test] fn t_dim7()   { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,63,66,69])), Some("C°7".into())); }
+    #[test] fn t_halfdim(){ assert_eq!(ChordDetector::new().detect_chord(&notes(&[55,58,61,65])), Some("Gø7".into())); }
 
     // ── Extended ─────────────────────────────────────────────────────────────
     #[test] fn t_dom9()   { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,64,67,70,74])), Some("C9".into())); }
@@ -1795,7 +1810,7 @@ mod tests {
     #[test] fn t_dorian()  { assert_eq!(ChordDetector::new().detect_chord(&notes(&[62,64,65,67,69,71,72])), Some("D Dorian".into())); }
 
     // ── Half-dim vs minor6 ───────────────────────────────────────────────────
-    #[test] fn t_halfdim_root_bass() { assert_eq!(ChordDetector::new().detect_chord(&notes(&[55,58,61,65])), Some("Gm7b5".into())); }
+    #[test] fn t_halfdim_root_bass() { assert_eq!(ChordDetector::new().detect_chord(&notes(&[55,58,61,65])), Some("Gø7".into())); }
     #[test] fn t_minor6_root_bass()  { assert_eq!(ChordDetector::new().detect_chord(&notes(&[58,61,65,67])), Some("Bbm6".into())); }
     #[test] fn t_minor6_slash()      { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,61,67,70])), Some("Bbm6/C".into())); }
 
