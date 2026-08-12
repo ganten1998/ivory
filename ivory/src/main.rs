@@ -78,6 +78,45 @@ fn parse_cli() -> CliArgs {
     CliArgs { port }
 }
 
+/// Minimal stderr logger. eframe probes for a desktop GL context first and only
+/// falls back to GLES if that fails — but the first failure is a `log::warn!`,
+/// so with no logger installed a startup crash reports the FALLBACK error and
+/// hides the actual cause. (Seen under CrossOver: "extension to create ES
+/// context with wgl is not present", which is the second failure, not the first.)
+///
+/// Quiet by default; `IVORY_LOG=debug ivory` turns it on. On Windows pair it
+/// with a console — the binary is windows-subsystem and reattaches to the
+/// parent, so running it from a shell shows this output.
+struct StderrLogger(log::LevelFilter);
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, m: &log::Metadata<'_>) -> bool {
+        m.level() <= self.0
+    }
+    fn log(&self, r: &log::Record<'_>) {
+        if self.enabled(r.metadata()) {
+            eprintln!("[{}] {}: {}", r.level(), r.target(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
+fn install_logger() {
+    let level = match std::env::var("IVORY_LOG").unwrap_or_default().to_lowercase().as_str() {
+        "trace" => log::LevelFilter::Trace,
+        "debug" => log::LevelFilter::Debug,
+        "info" => log::LevelFilter::Info,
+        "warn" => log::LevelFilter::Warn,
+        "error" => log::LevelFilter::Error,
+        "off" => log::LevelFilter::Off,
+        // Default: warnings only. Silent in normal use, but a GL probe failure
+        // leaves a trail if the user ever runs it from a terminal.
+        _ => log::LevelFilter::Warn,
+    };
+    let logger = Box::leak(Box::new(StderrLogger(level)));
+    let _ = log::set_logger(logger).map(|()| log::set_max_level(level));
+}
+
 /// Top-level error surface (spec §2.3): any panic shows a critical "Ivory
 /// Error" box with the message and a backtrace, then exits with code 1.
 fn install_panic_hook() {
@@ -143,6 +182,7 @@ fn main() {
     attach_console();
 
     let cli = parse_cli();
+    install_logger();
     install_panic_hook();
 
     if !acquire_single_instance() {

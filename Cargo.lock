@@ -1511,6 +1511,7 @@ dependencies = [
  "egui",
  "fd-lock",
  "ivory-core",
+ "log",
  "midir",
  "rfd",
  "serde",
