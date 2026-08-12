@@ -16,23 +16,11 @@ macOS
   Open the .dmg (or unzip the .zip) and drag Ivory.app into your Applications
   folder.
 
-  Ivory is ad-hoc signed but not notarized, so Gatekeeper blocks the very first
-  launch. Once:
+  That is all. Ivory is signed with a Developer ID certificate and notarized by
+  Apple, with the ticket stapled to the app, so it opens on a double-click with
+  no security prompt and without being online.
 
-    1. Double-click Ivory. macOS refuses and offers to move it to the Trash —
-       click "Done", not "Move to Trash".
-    2. Open System Settings > Privacy & Security, scroll down to the Security
-       section, and click "Open Anyway" next to the note about Ivory.
-    3. Confirm, and authenticate if you are asked to.
-
-  macOS 15 (Sequoia) removed the old right-click > Open shortcut, so this is
-  the way in. You only do it once; after that Ivory opens like any other app.
-
-  Prefer the terminal?
-
-    xattr -d com.apple.quarantine /Applications/Ivory.app
-
-  Requires macOS 11 (Big Sur) or later.
+  Requires macOS 11 (Big Sur) or later, on Apple Silicon.
 
 Windows
 
