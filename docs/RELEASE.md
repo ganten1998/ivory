@@ -257,11 +257,21 @@ zip/dmg.
 8. **Tag**: `git tag v<v> && git push --tags` (push to Codeberg — source of
    truth — and the GitHub mirror).
 9. **GitHub release** (public download channel):
-   `gh release create v<v> dist/*-<v>-* dist/SHA256SUMS
-   --title "Ivory <v>" --notes-file <notes>`. Release notes must include the
-   macOS Open-Anyway steps, the Windows SmartScreen note, and (for the first
-   public 2.x release) the settings one-way caveat. Mirror the release on Codeberg or link the GitHub
-   release from it.
+   `scripts/publish-github.sh --notes-file <notes>`.
+   It uploads every artifact **twice** — version-scoped, and again under the
+   version-less alias (`Ivory-macos-arm64.dmg`, `ivory-windows-x86_64.zip`, …)
+   plus a bare `SHA256SUMS`. Those aliases are what
+   `releases/latest/download/<name>` resolves by exact name, and that permalink
+   is the download link handed to customers on the Gumroad post-purchase page,
+   in the supporter-key email and in `README.md`. **A release published without
+   the aliases 404s for everyone who has already paid, silently** — nothing logs
+   it. The script re-checks every permalink after upload and exits non-zero if
+   one is dead, so do not treat a red run as cosmetic.
+   Release notes must include the Windows SmartScreen note and (for the first
+   public 2.x release) the settings one-way caveat. The old macOS "Open Anyway"
+   steps no longer apply: since 2.2.0 the build is Developer ID signed and
+   notarized, so telling buyers to expect a Gatekeeper block is now wrong.
+   Mirror the release on Codeberg or link the GitHub release from it.
 10. **Verify as a stranger**: download each artifact on a clean machine/VM
     (quarantine attribute present!) and confirm the documented first-launch
     paths actually work.
