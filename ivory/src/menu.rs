@@ -49,6 +49,8 @@ pub enum MenuAction {
     CorrectChordName,
     /// D-UI-9: master switch for the learned re-ranker (weights are kept).
     ToggleChordLearning,
+    /// Open the supporter-key dialog.
+    ShowSupporterKey,
     ShowAbout,
     ResetSettings,
 }
@@ -193,6 +195,11 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     }
     // Supporter extras. Hidden rather than greyed for the free build: a locked
     // row you cannot use is a nag, and the app is meant to feel complete.
+    e.push(Entry::Separator);
+    e.push(item(
+        if view.supporter { "Supporter Key..." } else { "Support Ivory..." },
+        MenuAction::ShowSupporterKey,
+    ));
     if view.supporter {
         e.push(item(
             if view.glow_on { "Disable Key Glow" } else { "Enable Key Glow" },

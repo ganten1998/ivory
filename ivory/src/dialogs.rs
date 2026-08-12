@@ -22,6 +22,15 @@ pub enum Dialog {
         message: String,
     },
     About,
+    /// Paste a supporter key. Stays open on failure so the message can explain
+    /// what went wrong without the user losing what they pasted.
+    SupporterKey {
+        input: String,
+        /// Feedback from the last attempt, if any.
+        message: Option<String>,
+        /// Name on the currently installed licence, when there is one.
+        installed_as: Option<String>,
+    },
     ColorPick {
         target: ColorTarget,
         color: Color32,
@@ -72,6 +81,11 @@ pub struct LearningStatus {
 
 pub enum DialogAction {
     ConnectPort(String),
+    /// Try to install a pasted supporter key. The app reports the outcome by
+    /// updating or closing the dialog.
+    InstallLicense {
+        key: String,
+    },
     ApplyColor(ColorTarget, Color32),
     /// Teach `name` for the held `notes`, transposition-invariant when
     /// `apply_all_keys` and the name begins with a note name.
@@ -424,6 +438,83 @@ pub fn show(
                                 }
                                 if ui
                                     .add(Button::new(RichText::new("Cancel").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
+        Dialog::SupporterKey {
+            input,
+            message,
+            installed_as,
+        } => {
+            let t = theme(dark_mode);
+            show_dialog_viewport(
+                ctx,
+                "Supporter Key",
+                Vec2::new(460.0, 290.0),
+                Vec2::new(400.0, 250.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.visuals_mut().extreme_bg_color = t.bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            if let Some(name) = installed_as.as_deref() {
+                                ui.label(
+                                    RichText::new(format!("Supporter: {name}"))
+                                        .font(bold(12.0))
+                                        .color(t.text),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new("Ivory is free. A supporter key")
+                                        .font(bold(12.0))
+                                        .color(t.text),
+                                );
+                                ui.label(
+                                    RichText::new("unlocks the extras — nothing else.")
+                                        .font(bold(12.0))
+                                        .color(t.text),
+                                );
+                            }
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("Paste your key:").font(bold(11.0)).color(t.text));
+                            let edit = egui::TextEdit::multiline(input)
+                                .font(bold(11.0))
+                                .text_color(t.text)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(5);
+                            ui.add(edit);
+                            if let Some(msg) = message.as_deref() {
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(msg).font(bold(11.0)).color(t.text));
+                            }
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let ok = !input.trim().is_empty();
+                                if ui
+                                    .add_enabled(
+                                        ok,
+                                        Button::new(RichText::new("Activate").color(t.text)),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::InstallLicense {
+                                        key: input.clone(),
+                                    });
+                                    // NOT closed here: the app decides, so a bad
+                                    // key can report why without losing the paste.
+                                }
+                                if ui
+                                    .add(Button::new(RichText::new("Close").color(t.text)))
                                     .clicked()
                                 {
                                     result.close = true;

@@ -453,6 +453,13 @@ impl IvoryApp {
                 self.detector.set_learning_mode(on);
                 self.detection_tick(true); // readings change immediately
             }
+            MenuAction::ShowSupporterKey => {
+                self.dialog = Some(Dialog::SupporterKey {
+                    input: String::new(),
+                    message: None,
+                    installed_as: self.license.display_name().map(str::to_owned),
+                })
+            }
             MenuAction::ShowAbout => self.dialog = Some(Dialog::About),
             MenuAction::ResetSettings => self.reset_settings(ctx),
         }
@@ -716,6 +723,32 @@ impl IvoryApp {
 
     fn apply_dialog_action(&mut self, ctx: &egui::Context, action: DialogAction) {
         match action {
+            DialogAction::InstallLicense { key } => {
+                // The dialog stays open on failure so the message can say what
+                // went wrong without the user losing what they pasted; a typo
+                // and a forged key report differently (the CRC is checked
+                // before the signature).
+                match self.license.install(&key) {
+                    Ok(license) => {
+                        let who = license
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| "supporter".to_owned());
+                        self.dialog = Some(Dialog::SupporterKey {
+                            input: String::new(),
+                            message: Some(format!("Thank you, {who}. Extras unlocked.")),
+                            installed_as: self.license.display_name().map(str::to_owned),
+                        });
+                    }
+                    Err(err) => {
+                        self.dialog = Some(Dialog::SupporterKey {
+                            input: key,
+                            message: Some(err.message().to_owned()),
+                            installed_as: self.license.display_name().map(str::to_owned),
+                        });
+                    }
+                }
+            }
             DialogAction::TeachSave {
                 notes,
                 name,
