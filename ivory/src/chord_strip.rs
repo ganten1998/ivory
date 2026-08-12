@@ -13,8 +13,22 @@ pub fn viewport_id() -> ViewportId {
 }
 
 /// Paint the strip into `rect`. `chord` of None leaves a solid black strip.
-pub fn draw(painter: &Painter, rect: Rect, chord: Option<&str>) {
+///
+/// With `segmented` set (a supporter extra) the label is rendered on a virtual
+/// 16-segment module instead of as text: a fixed grid of cells whose unlit
+/// segments stay faintly visible, so an idle strip shows the whole display
+/// rather than going blank.
+pub fn draw(painter: &Painter, rect: Rect, chord: Option<&str>, segmented: bool) {
     painter.rect_filled(rect, 0.0, Color32::BLACK);
+    if segmented {
+        // Scale names ("C Ionian") are words, not chord symbols, and do not
+        // belong on a 13-cell module — fall through to text for those.
+        let seg_text = chord.filter(|t| !t.contains(' '));
+        if seg_text.is_some() || chord.is_none() {
+            crate::segment::draw(painter, rect, seg_text, TEXT_COLOR, 0.11);
+            return;
+        }
+    }
     let Some(text) = chord else { return };
     if text.is_empty() {
         return;
@@ -68,6 +82,7 @@ pub fn show_detached_window(
     builder_size: egui::Vec2,
     borderless: bool,
     chord: Option<&str>,
+    segmented: bool,
 ) -> DetachedOutcome {
     let mut outcome = DetachedOutcome::default();
     let builder = ViewportBuilder::default()
@@ -79,7 +94,7 @@ pub fn show_detached_window(
 
     ctx.show_viewport_immediate(viewport_id(), builder, |ui, _class| {
         let rect = ui.max_rect();
-        draw(ui.painter(), rect, chord);
+        draw(ui.painter(), rect, chord, segmented);
 
         let (close, inner_rect, pressed, secondary, pointer) = ui.input(|i| {
             (

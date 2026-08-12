@@ -186,6 +186,20 @@ impl IvoryApp {
 
     /// Keys drawn as active: MIDI-held notes plus manual (keytoggle) notes.
     fn display_notes(&self) -> HashSet<u8> {
+        // Dev/marketing hook: pin a voicing with no keyboard attached, for
+        // store screenshots and for eyeballing display work (a glow or a
+        // segment readout can only be judged lit). Environment-gated, so a
+        // normal launch cannot reach it and it ships inert.
+        //   IVORY_DEMO_NOTES=60,64,67,71 /Applications/Ivory.app/Contents/MacOS/ivory
+        if let Ok(spec) = std::env::var("IVORY_DEMO_NOTES") {
+            let demo: HashSet<u8> = spec
+                .split(&[',', ' '][..])
+                .filter_map(|t| t.trim().parse::<u8>().ok())
+                .collect();
+            if !demo.is_empty() {
+                return demo;
+            }
+        }
         let mut set: HashSet<u8> = self.active_notes.keys().copied().collect();
         if self.settings.keytoggle_enabled {
             set.extend(self.manual_notes.iter().copied());
@@ -228,6 +242,7 @@ impl IvoryApp {
             learning_on: self.detector.learning_mode(),
             supporter: self.license.is_supporter(),
             glow_on: self.settings.glow_enabled,
+            segment_on: self.settings.segment_display,
             next_font: {
                 use crate::fonts::FontChoice;
                 let cur = FontChoice::from_key(&self.settings.font_choice);
@@ -377,6 +392,10 @@ impl IvoryApp {
             }
             MenuAction::ToggleDarkMode => {
                 self.settings.dark_mode = !self.settings.dark_mode;
+                self.settings.save();
+            }
+            MenuAction::ToggleSegmentDisplay => {
+                self.settings.segment_display = !self.settings.segment_display;
                 self.settings.save();
             }
             MenuAction::ToggleKeyGlow => {
@@ -820,7 +839,12 @@ impl eframe::App for IvoryApp {
         );
         if chord_h > 0.0 {
             let chord_rect = Rect::from_min_size(origin, Vec2::new(w, chord_h));
-            chord_strip::draw(ui.painter(), chord_rect, self.current_chord.as_deref());
+            chord_strip::draw(
+                ui.painter(),
+                chord_rect,
+                self.current_chord.as_deref(),
+                self.settings.segment_display && self.license.is_supporter(),
+            );
         }
         let display = self.display_notes();
         piano::draw(
@@ -842,6 +866,7 @@ impl eframe::App for IvoryApp {
                 self.detached_builder_size,
                 self.settings.borderless_mode,
                 self.current_chord.as_deref(),
+                self.settings.segment_display && self.license.is_supporter(),
             );
             if let Some(size) = outcome.inner_size {
                 self.detached_live_size = Some(size);

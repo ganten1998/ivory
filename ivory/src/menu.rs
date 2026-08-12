@@ -37,6 +37,8 @@ pub enum MenuAction {
     CycleFont,
     /// Supporter extra: halo under held keys, in the active key color.
     ToggleKeyGlow,
+    /// Supporter extra: 16-segment chord readout.
+    ToggleSegmentDisplay,
     DetachChordWindow,
     AttachChordWindow,
     TeachChordName,
@@ -69,6 +71,7 @@ pub struct MenuView {
     /// A valid supporter license is installed. Gates the extras block.
     pub supporter: bool,
     pub glow_on: bool,
+    pub segment_on: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -188,6 +191,10 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         e.push(item(
             if view.glow_on { "Disable Key Glow" } else { "Enable Key Glow" },
             MenuAction::ToggleKeyGlow,
+        ));
+        e.push(item(
+            if view.segment_on { "Disable Segment Display" } else { "Enable Segment Display" },
+            MenuAction::ToggleSegmentDisplay,
         ));
     }
     e.push(Entry::Separator);
@@ -566,6 +573,7 @@ mod tests {
             next_font: None,
             supporter: false,
             glow_on: false,
+            segment_on: false,
         }
     }
 
