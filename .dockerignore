@@ -1,0 +1,16 @@
+# The Docker build context is the REPO ROOT — tools/ivory-fulfil depends on
+# ivory-core by a relative path, so the context cannot be narrowed to that
+# subdirectory. Docker does NOT honour .gitignore, so without this file every
+# gitignored build artefact ships to the builder: tools/ivory-fulfil/target is
+# ~130 MB of macOS objects, and `COPY tools/ivory-fulfil` would drop them into
+# the Linux image on top of the build. Context goes 229 MB -> ~10 MB.
+**/target
+.git
+.DS_Store
+**/.DS_Store
+
+# Not referenced by tools/ivory-fulfil/Dockerfile.
+dist
+assets
+tests
+tools/ivory-keygen
