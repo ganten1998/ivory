@@ -83,8 +83,14 @@ pub struct Settings {
     /// Built-in UI typeface key (see fonts::FontChoice). Additive key; unknown
     /// values fall back to Courier Prime.
     pub font_choice: String,
-    /// Chord label colour. Defaults to a segmented-display green.
+    /// Chord label colour.
     pub chord_text_color: Rgb,
+    /// Show the welcome/support note at startup. Cleared by its own checkbox.
+    pub show_welcome: bool,
+    /// Supporter decoration: the pixel heart on the chord view.
+    pub show_heart: bool,
+    /// Index into chord_strip::HEART_COLORS. Wraps, so any stored value is safe.
+    pub heart_color: i64,
     /// Unknown keys from the file, preserved verbatim on save (file order).
     pub extra: Map<String, Value>,
 }
@@ -108,6 +114,9 @@ impl Default for Settings {
             custom_font_path: None,
             font_choice: crate::fonts::FontChoice::default().key().to_owned(),
             chord_text_color: Rgb { r: 0xE8, g: 0xDC, b: 0xC0 },
+            show_welcome: true,
+            show_heart: true,
+            heart_color: 0,
             extra: Map::new(),
         }
     }
@@ -206,6 +215,21 @@ impl Settings {
                 s.chord_text_color = c;
             }
         }
+        if let Some(v) = map.remove("show_welcome") {
+            if let Some(b) = v.as_bool() {
+                s.show_welcome = b;
+            }
+        }
+        if let Some(v) = map.remove("show_heart") {
+            if let Some(b) = v.as_bool() {
+                s.show_heart = b;
+            }
+        }
+        if let Some(v) = map.remove("heart_color") {
+            if let Some(n) = v.as_i64() {
+                s.heart_color = n;
+            }
+        }
 
         s.extra = map; // whatever is left, preserved in file order
         s
@@ -260,6 +284,9 @@ impl Settings {
         }
         map.insert("font_choice".into(), Value::String(self.font_choice.clone()));
         map.insert("chord_text_color".into(), Value::String(self.chord_text_color.to_hex()));
+        map.insert("show_welcome".into(), Value::Bool(self.show_welcome));
+        map.insert("show_heart".into(), Value::Bool(self.show_heart));
+        map.insert("heart_color".into(), Value::Number(self.heart_color.into()));
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }

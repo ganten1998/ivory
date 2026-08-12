@@ -104,6 +104,10 @@ impl IvoryApp {
             settings.detached_height_for_use(),
         );
 
+        let welcome = settings.show_welcome.then(|| Dialog::Welcome {
+            dont_show_again: false,
+        });
+
         Self {
             settings,
             detector,
@@ -123,7 +127,7 @@ impl IvoryApp {
             width_sync_deadline: None,
             startup_detach_at,
             menu_state: None,
-            dialog: None,
+            dialog: welcome,
             last_sent_size: None,
             decorations_sent: None,
             main_inner_origin: Pos2::ZERO,
@@ -241,6 +245,7 @@ impl IvoryApp {
             notes_held: !self.display_notes().is_empty(),
             learning_on: self.detector.learning_mode(),
             supporter: self.license.is_supporter(),
+            heart_on: self.settings.show_heart,
             next_font: {
                 use crate::fonts::FontChoice;
                 let cur = FontChoice::from_key(&self.settings.font_choice);
@@ -263,9 +268,27 @@ impl IvoryApp {
         ));
     }
 
+    /// Colour of the supporter heart, or None when it should not be drawn.
+    /// Derived every frame from the licence — never a cached flag.
+    fn heart_color(&self) -> Option<egui::Color32> {
+        if !(self.settings.show_heart && self.license.is_supporter()) {
+            return None;
+        }
+        let n = chord_strip::HEART_COLORS.len() as i64;
+        // rem_euclid so a hand-edited negative index still lands in range.
+        let idx = self.settings.heart_color.rem_euclid(n) as usize;
+        Some(chord_strip::HEART_COLORS[idx])
+    }
+
     // ── Main-window interaction ────────────────────────────────────────────
 
-    fn handle_main_interaction(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, piano_rect: Rect) {
+    fn handle_main_interaction(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        piano_rect: Rect,
+        chord_rect: Option<Rect>,
+    ) {
         let resp = ui.interact(
             ui.max_rect(),
             egui::Id::new("ivory-main-bg"),
@@ -300,6 +323,22 @@ impl IvoryApp {
 
         if primary_pressed && !ctrl_as_context {
             if let Some(pos) = pointer {
+                // The supporter heart cycles colour on click. Checked before the
+                // keytoggle hit-test because it sits in the chord strip, not the
+                // keyboard, so the two can never contend.
+                if self.heart_color().is_some() {
+                    if let Some(cr) = chord_rect {
+                        if chord_strip::heart_rect(cr).contains(pos) {
+                            self.settings.heart_color = self
+                                .settings
+                                .heart_color
+                                .wrapping_add(1)
+                                .rem_euclid(chord_strip::HEART_COLORS.len() as i64);
+                            self.settings.save();
+                            return;
+                        }
+                    }
+                }
                 // Keytoggle hit-test/toggle first (spec §4.5), then StartDrag
                 // (must be issued directly from the press handler).
                 if self.settings.keytoggle_enabled && piano_rect.contains(pos) {
@@ -442,6 +481,10 @@ impl IvoryApp {
                 let on = !self.detector.learning_mode();
                 self.detector.set_learning_mode(on);
                 self.detection_tick(true); // readings change immediately
+            }
+            MenuAction::ToggleHeart => {
+                self.settings.show_heart = !self.settings.show_heart;
+                self.settings.save();
             }
             MenuAction::ShowSupporterKey => {
                 self.dialog = Some(Dialog::SupporterKey {
@@ -713,6 +756,10 @@ impl IvoryApp {
 
     fn apply_dialog_action(&mut self, ctx: &egui::Context, action: DialogAction) {
         match action {
+            DialogAction::SetShowWelcome(show) => {
+                self.settings.show_welcome = show;
+                self.settings.save();
+            }
             DialogAction::InstallLicense { key } => {
                 // The dialog stays open on failure so the message can say what
                 // went wrong without the user losing what they pasted; a typo
@@ -726,7 +773,7 @@ impl IvoryApp {
                             .unwrap_or_else(|| "supporter".to_owned());
                         self.dialog = Some(Dialog::SupporterKey {
                             input: String::new(),
-                            message: Some(format!("Thank you, {who}. Extras unlocked.")),
+                            message: Some(format!("Thank you, {who}. That means a lot.")),
                             installed_as: self.license.display_name().map(str::to_owned),
                         });
                     }
@@ -862,13 +909,16 @@ impl eframe::App for IvoryApp {
             Pos2::new(origin.x, origin.y + chord_h),
             Vec2::new(w, piano_h),
         );
+        let mut chord_rect_for_hit: Option<Rect> = None;
         if chord_h > 0.0 {
             let chord_rect = Rect::from_min_size(origin, Vec2::new(w, chord_h));
+            chord_rect_for_hit = Some(chord_rect);
             chord_strip::draw(
                 ui.painter(),
                 chord_rect,
                 self.current_chord.as_deref(),
                 self.settings.chord_text_color.to_color32(),
+                self.heart_color(),
             );
         }
         let display = self.display_notes();
@@ -880,7 +930,7 @@ impl eframe::App for IvoryApp {
             &self.settings,
         );
 
-        self.handle_main_interaction(&ctx, ui, piano_rect);
+        self.handle_main_interaction(&ctx, ui, piano_rect, chord_rect_for_hit);
 
         // Detached chord window.
         if self.detach_window_visible {
@@ -890,6 +940,7 @@ impl eframe::App for IvoryApp {
                 self.settings.borderless_mode,
                 self.current_chord.as_deref(),
                 self.settings.chord_text_color.to_color32(),
+                self.heart_color(),
             );
             if let Some(size) = outcome.inner_size {
                 self.detached_live_size = Some(size);

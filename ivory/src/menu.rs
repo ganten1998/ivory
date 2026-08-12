@@ -47,6 +47,8 @@ pub enum MenuAction {
     ToggleChordLearning,
     /// Open the supporter-key dialog.
     ShowSupporterKey,
+    /// Supporter decoration: show/hide the pixel heart.
+    ToggleHeart,
     ShowAbout,
     ResetSettings,
 }
@@ -70,6 +72,7 @@ pub struct MenuView {
     pub next_font: Option<&'static str>,
     /// A valid supporter license is installed. Gates the extras block.
     pub supporter: bool,
+    pub heart_on: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -192,9 +195,12 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         if view.supporter { "Supporter Key..." } else { "Support Ivory..." },
         MenuAction::ShowSupporterKey,
     ));
-    // Supporter extras land here when there are any. There are none in this
-    // release — the glow experiments were withdrawn in favour of chord-view
-    // themes — so the block is intentionally empty rather than removed.
+    if view.supporter {
+        e.push(item(
+            if view.heart_on { "Hide Heart" } else { "Show Heart" },
+            MenuAction::ToggleHeart,
+        ));
+    }
     e.push(Entry::Separator);
     e.push(item(
         if view.keytoggle {
@@ -570,6 +576,7 @@ mod tests {
             learning_on: false,
             next_font: None,
             supporter: false,
+            heart_on: true,
         }
     }
 

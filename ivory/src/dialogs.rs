@@ -22,6 +22,12 @@ pub enum Dialog {
         message: String,
     },
     About,
+    /// Shown at startup until dismissed with its checkbox. Ivory is free; this
+    /// asks for support without gating anything, so it must never feel like a
+    /// paywall prompt.
+    Welcome {
+        dont_show_again: bool,
+    },
     /// Paste a supporter key. Stays open on failure so the message can explain
     /// what went wrong without the user losing what they pasted.
     SupporterKey {
@@ -81,6 +87,8 @@ pub struct LearningStatus {
 
 pub enum DialogAction {
     ConnectPort(String),
+    /// Persist the welcome dialog's "don't show again" choice.
+    SetShowWelcome(bool),
     /// Try to install a pasted supporter key. The app reports the outcome by
     /// updating or closing the dialog.
     InstallLicense {
@@ -448,6 +456,64 @@ pub fn show(
             )
         }
 
+        Dialog::Welcome { dont_show_again } => {
+            let t = theme(dark_mode);
+            show_dialog_viewport(
+                ctx,
+                "Welcome to Ivory",
+                Vec2::new(470.0, 300.0),
+                Vec2::new(410.0, 260.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.visuals_mut().extreme_bg_color = t.bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(14))
+                        .show(ui, |ui| {
+                            for line in [
+                                "Ivory is free, and it stays free.",
+                                "",
+                                "It is made for the love of it. There are no",
+                                "locked features, no trial, no account, and",
+                                "nothing is sent anywhere.",
+                                "",
+                                "If it earns a place in your setup, a donation",
+                                "is welcome and genuinely helps — but it buys",
+                                "you nothing you do not already have.",
+                                "",
+                                "Everything lives in the right-click menu.",
+                            ] {
+                                ui.label(RichText::new(line).font(bold(12.0)).color(t.text));
+                            }
+                            ui.add_space(8.0);
+                            let mut hide = *dont_show_again;
+                            if ui
+                                .checkbox(
+                                    &mut hide,
+                                    RichText::new("Don't show this again")
+                                        .font(bold(11.0))
+                                        .color(t.text),
+                                )
+                                .changed()
+                            {
+                                *dont_show_again = hide;
+                                action = Some(DialogAction::SetShowWelcome(!hide));
+                            }
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(Button::new(RichText::new("Start playing").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
         Dialog::SupporterKey {
             input,
             message,
@@ -475,12 +541,12 @@ pub fn show(
                                 );
                             } else {
                                 ui.label(
-                                    RichText::new("Ivory is free. A supporter key")
+                                    RichText::new("Ivory is free, and it stays free.")
                                         .font(bold(12.0))
                                         .color(t.text),
                                 );
                                 ui.label(
-                                    RichText::new("unlocks the extras — nothing else.")
+                                    RichText::new("A key is a thank-you, nothing more.")
                                         .font(bold(12.0))
                                         .color(t.text),
                                 );
