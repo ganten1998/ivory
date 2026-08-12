@@ -1,0 +1,40 @@
+# Fly.io config for the Gumroad fulfilment service.
+# Deploy from the REPO ROOT (the Dockerfile needs ivory-core):
+#   fly deploy -c tools/ivory-fulfil/fly.toml --dockerfile tools/ivory-fulfil/Dockerfile
+#
+# 'app' must be globally unique on Fly — change it if the name is taken.
+app = "ivory-fulfil"
+primary_region = "iad"
+
+[build]
+
+[env]
+  LEDGER_PATH = "/data/ledger.jsonl"
+  PORT = "8080"
+
+# The ledger is the record of every key ever issued. It MUST be on a volume;
+# without this it lives in the container and vanishes on every deploy, taking
+# idempotency (and your ability to re-send a key) with it.
+[[mounts]]
+  source = "ivory_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # NOT auto-stopped. A sleeping machine cold-starting on a purchase webhook is
+  # the one moment you cannot afford a timeout; ~$2/mo buys that away.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/health"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
