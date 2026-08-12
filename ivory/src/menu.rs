@@ -21,6 +21,8 @@ pub enum ColorTarget {
     BlackIdle,
     Active,
     Sustain,
+    /// The chord label. Free to change; the bloom around it is the extra.
+    ChordText,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -37,8 +39,8 @@ pub enum MenuAction {
     CycleFont,
     /// Supporter extra: halo under held keys, in the active key color.
     ToggleKeyGlow,
-    /// Supporter extra: 16-segment chord readout.
-    ToggleSegmentDisplay,
+    /// Supporter extra: bloom the chord label.
+    ToggleChordGlow,
     DetachChordWindow,
     AttachChordWindow,
     TeachChordName,
@@ -71,7 +73,7 @@ pub struct MenuView {
     /// A valid supporter license is installed. Gates the extras block.
     pub supporter: bool,
     pub glow_on: bool,
-    pub segment_on: bool,
+    pub chord_glow_on: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -175,6 +177,10 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         "Set Sustain Color...",
         MenuAction::PickColor(ColorTarget::Sustain),
     ));
+    e.push(item(
+        "Set Chord Color...",
+        MenuAction::PickColor(ColorTarget::ChordText),
+    ));
     e.push(Entry::Separator);
     e.push(item(
         if view.dark_mode { "Light Mode" } else { "Dark Mode" },
@@ -193,8 +199,8 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
             MenuAction::ToggleKeyGlow,
         ));
         e.push(item(
-            if view.segment_on { "Disable Segment Display" } else { "Enable Segment Display" },
-            MenuAction::ToggleSegmentDisplay,
+            if view.chord_glow_on { "Disable Chord Glow" } else { "Enable Chord Glow" },
+            MenuAction::ToggleChordGlow,
         ));
     }
     e.push(Entry::Separator);
@@ -573,7 +579,7 @@ mod tests {
             next_font: None,
             supporter: false,
             glow_on: false,
-            segment_on: false,
+            chord_glow_on: false,
         }
     }
 

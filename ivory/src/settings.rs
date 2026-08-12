@@ -86,8 +86,10 @@ pub struct Settings {
     /// Supporter extra: halo under held keys. Additive key; ignored without a
     /// license, so a config moved to an unlicensed machine simply draws no glow.
     pub glow_enabled: bool,
-    /// Supporter extra: render the chord readout on a virtual 16-segment module.
-    pub segment_display: bool,
+    /// Supporter extra: bloom the chord label.
+    pub chord_glow: bool,
+    /// Chord label colour. Defaults to a segmented-display green.
+    pub chord_text_color: Rgb,
     /// Unknown keys from the file, preserved verbatim on save (file order).
     pub extra: Map<String, Value>,
 }
@@ -111,7 +113,8 @@ impl Default for Settings {
             custom_font_path: None,
             font_choice: crate::fonts::FontChoice::default().key().to_owned(),
             glow_enabled: false,
-            segment_display: false,
+            chord_glow: false,
+            chord_text_color: Rgb { r: 0x2F, g: 0xE8, b: 0x6B },
             extra: Map::new(),
         }
     }
@@ -210,9 +213,14 @@ impl Settings {
                 s.glow_enabled = b;
             }
         }
-        if let Some(v) = map.remove("segment_display") {
+        if let Some(v) = map.remove("chord_glow") {
             if let Some(b) = v.as_bool() {
-                s.segment_display = b;
+                s.chord_glow = b;
+            }
+        }
+        if let Some(v) = map.remove("chord_text_color") {
+            if let Some(c) = v.as_str().and_then(Rgb::parse) {
+                s.chord_text_color = c;
             }
         }
 
@@ -269,7 +277,8 @@ impl Settings {
         }
         map.insert("font_choice".into(), Value::String(self.font_choice.clone()));
         map.insert("glow_enabled".into(), Value::Bool(self.glow_enabled));
-        map.insert("segment_display".into(), Value::Bool(self.segment_display));
+        map.insert("chord_glow".into(), Value::Bool(self.chord_glow));
+        map.insert("chord_text_color".into(), Value::String(self.chord_text_color.to_hex()));
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }

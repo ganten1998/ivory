@@ -9,7 +9,6 @@ mod fonts;
 mod menu;
 mod midi;
 mod piano;
-mod segment;
 mod settings;
 
 use settings::Settings;

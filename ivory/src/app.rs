@@ -242,7 +242,7 @@ impl IvoryApp {
             learning_on: self.detector.learning_mode(),
             supporter: self.license.is_supporter(),
             glow_on: self.settings.glow_enabled,
-            segment_on: self.settings.segment_display,
+            chord_glow_on: self.settings.chord_glow,
             next_font: {
                 use crate::fonts::FontChoice;
                 let cur = FontChoice::from_key(&self.settings.font_choice);
@@ -384,6 +384,7 @@ impl IvoryApp {
                     // Initial swatch = white active (spec §6.2 item 10).
                     ColorTarget::Active => self.settings.white_key_active_color,
                     ColorTarget::Sustain => self.settings.sustain_color,
+                    ColorTarget::ChordText => self.settings.chord_text_color,
                 };
                 self.dialog = Some(Dialog::ColorPick {
                     target,
@@ -394,8 +395,8 @@ impl IvoryApp {
                 self.settings.dark_mode = !self.settings.dark_mode;
                 self.settings.save();
             }
-            MenuAction::ToggleSegmentDisplay => {
-                self.settings.segment_display = !self.settings.segment_display;
+            MenuAction::ToggleChordGlow => {
+                self.settings.chord_glow = !self.settings.chord_glow;
                 self.settings.save();
             }
             MenuAction::ToggleKeyGlow => {
@@ -758,6 +759,7 @@ impl IvoryApp {
                         self.settings.black_key_active_color = rgb;
                     }
                     ColorTarget::Sustain => self.settings.sustain_color = rgb,
+                    ColorTarget::ChordText => self.settings.chord_text_color = rgb,
                 }
                 self.settings.save();
             }
@@ -843,7 +845,8 @@ impl eframe::App for IvoryApp {
                 ui.painter(),
                 chord_rect,
                 self.current_chord.as_deref(),
-                self.settings.segment_display && self.license.is_supporter(),
+                self.settings.chord_text_color.to_color32(),
+                self.settings.chord_glow && self.license.is_supporter(),
             );
         }
         let display = self.display_notes();
@@ -866,7 +869,8 @@ impl eframe::App for IvoryApp {
                 self.detached_builder_size,
                 self.settings.borderless_mode,
                 self.current_chord.as_deref(),
-                self.settings.segment_display && self.license.is_supporter(),
+                self.settings.chord_text_color.to_color32(),
+                self.settings.chord_glow && self.license.is_supporter(),
             );
             if let Some(size) = outcome.inner_size {
                 self.detached_live_size = Some(size);

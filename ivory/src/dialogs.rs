@@ -103,6 +103,7 @@ pub fn color_pick_title(target: ColorTarget) -> &'static str {
         ColorTarget::BlackIdle => "Choose Black Key Color",
         ColorTarget::Active => "Choose Active Key Color",
         ColorTarget::Sustain => "Choose Sustain Pedal Color",
+        ColorTarget::ChordText => "Choose Chord Color",
     }
 }
 
