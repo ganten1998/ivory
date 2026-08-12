@@ -21,9 +21,13 @@ pub fn viewport_id() -> ViewportId {
 pub fn draw(painter: &Painter, rect: Rect, chord: Option<&str>, segmented: bool) {
     painter.rect_filled(rect, 0.0, Color32::BLACK);
     if segmented {
-        // Scale names ("C Ionian") are words, not chord symbols, and do not
-        // belong on a 13-cell module — fall through to text for those.
-        let seg_text = chord.filter(|t| !t.contains(' '));
+        // Scale names ("C Ionian") are words, not chord symbols, and a label
+        // longer than the module would have to be truncated — silently dropping
+        // "#11" off a chord is worse than just setting it in type. Both fall
+        // through to the text path.
+        let seg_text = chord
+            .filter(|t| !t.contains(' '))
+            .filter(|t| t.chars().count() <= crate::segment::CELLS);
         if seg_text.is_some() || chord.is_none() {
             crate::segment::draw(painter, rect, seg_text, TEXT_COLOR, 0.11);
             return;

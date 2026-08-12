@@ -132,7 +132,7 @@ const SEGMENTS: [u16; 16] = [A1, A2, B, C, D1, D2, E, F, G1, G2, H, I, J, K, L, 
 
 /// Number of character cells. Fixed, like a real module — the display does not
 /// resize with the text, and the unused cells stay visible but unlit.
-pub const CELLS: usize = 11;
+pub const CELLS: usize = 8;
 
 /// Draw `text` right-aligned-to-centre across a fixed grid of cells.
 ///
@@ -152,7 +152,9 @@ pub fn draw(painter: &Painter, rect: Rect, text: Option<&str>, color: Color32, u
     const ASPECT: f32 = 1.55; // height / width
     let gap_frac = 0.30; // of a cell width
     let total_units = CELLS as f32 * (1.0 + gap_frac) - gap_frac;
-    let cell_h = rect.height() * 0.80;
+    // Vertical padding: a module sits INSIDE its panel with a visible margin
+    // above and below, it does not run to the edges of the strip.
+    let cell_h = rect.height() * 0.62;
     let cell_w = (cell_h / ASPECT).min(rect.width() * 0.92 / total_units.max(0.001));
     let cell_h = cell_w * ASPECT;
     let step = cell_w * (1.0 + gap_frac);
