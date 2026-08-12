@@ -160,18 +160,50 @@ fn sale_is_genuine(token: &str, sale_id: &str) -> bool {
     }
 }
 
-fn send_email(api_key: &str, from: &str, to: &str, name: &str, key: &str) -> Result<(), String> {
-    let body = format!(
+// Permanent download links. GitHub resolves `releases/latest/download/<name>`
+// by EXACT asset name against whatever release is currently latest, so these
+// stay correct across every future release — but ONLY for as long as
+// `scripts/publish-github.sh` keeps uploading the version-less alias assets.
+// Never pin these to a version: buyers keep this email for years, and a link
+// to 2.2.0 in 2029 is worse than no link at all.
+const DOWNLOAD_MACOS: &str =
+    "https://github.com/ganten1998/ivory/releases/latest/download/Ivory-macos-arm64.dmg";
+const DOWNLOAD_WINDOWS: &str =
+    "https://github.com/ganten1998/ivory/releases/latest/download/ivory-windows-x86_64.zip";
+const DOWNLOAD_LINUX: &str =
+    "https://github.com/ganten1998/ivory/releases/latest/download/ivory-linux-x86_64.tar.gz";
+
+/// Split out from `send_email` purely so it can be rendered and asserted on in
+/// a test. The one email a buyer ever receives is not a good place to discover
+/// a formatting mistake.
+fn email_body(key: &str) -> String {
+    format!(
         "Thank you for supporting Ivory.\n\n\
-         Ivory is free and stays free — this key is a thank-you, not an unlock.\n\n\
+         Ivory is free and stays free. This key is a thank-you, not an unlock.\n\n\
          Your supporter key:\n\n\
          {key}\n\n\
          To use it: open Ivory, right-click anywhere, choose \"Support Ivory...\",\n\
          paste the key and press Activate. Case, spaces, dashes and line breaks\n\
          do not matter.\n\n\
-         Keep this email — the key has no expiry and works on every machine you own.\n\n\
-         — Ivory\n"
-    );
+         Downloads. These links always give you the current version, so they are\n\
+         worth keeping alongside the key:\n\n\
+         \x20 macOS 11 or later (Apple Silicon)\n\
+         \x20 {macos}\n\n\
+         \x20 Windows 10 or later\n\
+         \x20 {windows}\n\n\
+         \x20 Linux x86_64\n\
+         \x20 {linux}\n\n\
+         Keep this email. The key has no expiry and works on every machine you own.\n\n\
+         Thanks again,\n\
+         Ivory\n",
+        macos = DOWNLOAD_MACOS,
+        windows = DOWNLOAD_WINDOWS,
+        linux = DOWNLOAD_LINUX,
+    )
+}
+
+fn send_email(api_key: &str, from: &str, to: &str, name: &str, key: &str) -> Result<(), String> {
+    let body = email_body(key);
     let payload = serde_json::json!({
         "from": from,
         "to": [to],
@@ -359,5 +391,38 @@ fn main() {
                 let _ = req.respond(tiny_http::Response::from_string("mail failed").with_status_code(500));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Eyeball the real thing: `cargo test -- --ignored --nocapture print_email`
+    #[test]
+    #[ignore]
+    fn print_email() {
+        println!("\n----- BEGIN -----\n{}\n----- END -----", email_body("IVRY-XXXX-XXXX-XXXX-XXXX"));
+    }
+
+    /// The download links are the whole reason a buyer keeps this email, and a
+    /// silent `format!` mistake would ship a broken URL to every customer.
+    #[test]
+    fn email_carries_key_and_all_three_downloads() {
+        let body = email_body("IVRY-TEST-KEY");
+        assert!(body.contains("IVRY-TEST-KEY"), "key missing from email");
+        for url in [DOWNLOAD_MACOS, DOWNLOAD_WINDOWS, DOWNLOAD_LINUX] {
+            assert!(body.contains(url), "download link missing: {url}");
+            assert!(
+                url.contains("/releases/latest/download/"),
+                "{url} is version-pinned; buyers keep this email for years"
+            );
+        }
+    }
+
+    /// The owner's standing rule for anything sent to a person: no em dashes.
+    #[test]
+    fn email_has_no_em_dashes() {
+        assert!(!email_body("K").contains('\u{2014}'));
     }
 }
