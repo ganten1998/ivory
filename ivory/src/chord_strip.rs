@@ -58,24 +58,55 @@ pub fn draw(painter: &Painter, rect: Rect, chord: Option<&str>, color: Color32, 
     // light spreads around it. Eight points per ring is enough that the ring
     // structure disappears at these sizes.
     if glow {
-        // Per-stamp alpha must be TINY: with RINGS*POINTS overlapping copies the
-        // opacities compound (1 - (1-a)^n), so a "modest" 0.3 per stamp renders
-        // a solid blob instead of a halo. These values put the accumulated peak
-        // near 0.25 right at the glyph edge.
-        const RINGS: usize = 3;
-        const POINTS: usize = 8;
-        let radius = (th as f32 * 0.11).clamp(1.5, 9.0);
+        // A halo is LIGHT, not a thicker glyph. Stamping the galley at offsets
+        // is a morphological dilation — it fattens the letterforms and reads as
+        // a blob, which is what the first two attempts did. Instead paint a
+        // smooth radial field BEHIND the text: concentric rings of a triangle
+        // mesh whose alpha decays outward, so the glyphs stay crisp and the
+        // light spreads. egui has no blur, but a gradient mesh is the real
+        // thing rather than an approximation of it.
+        let center = pos + egui::vec2(tw as f32 / 2.0, th as f32 / 2.0);
+        // Reach: comfortably past the text so the falloff has room to be smooth.
+        let rx = tw as f32 * 0.5 + th as f32 * 0.55;
+        let ry = th as f32 * 0.95;
+        const RINGS: usize = 7;
+        const SEGS: usize = 48;
+        const PEAK: f32 = 0.30; // alpha directly behind the glyphs
+
+        let mut mesh = egui::epaint::Mesh::default();
+        let alpha_at = |t: f32| -> Color32 {
+            // exp falloff, forced to exactly 0 on the outer ring so the field
+            // has no visible edge.
+            let a = PEAK * ((-2.6 * t).exp() - (-2.6f32).exp()) / (1.0 - (-2.6f32).exp());
+            color.gamma_multiply(a.max(0.0))
+        };
+        // Centre vertex, then RINGS rings of SEGS vertices each.
+        mesh.colored_vertex(center, alpha_at(0.0));
         for ring in 1..=RINGS {
             let t = ring as f32 / RINGS as f32;
-            let r = radius * t;
-            let alpha = 0.055 * (-2.5 * t).exp();
-            let tint = color.gamma_multiply(alpha);
-            for p in 0..POINTS {
-                let a = std::f32::consts::TAU * (p as f32 / POINTS as f32);
-                let off = egui::vec2(r * a.cos(), r * a.sin());
-                painter.galley(pos + off, galley.clone(), tint);
+            for seg in 0..SEGS {
+                let a = std::f32::consts::TAU * (seg as f32 / SEGS as f32);
+                let p = center + egui::vec2(rx * t * a.cos(), ry * t * a.sin());
+                mesh.colored_vertex(p, alpha_at(t));
             }
         }
+        // Fan for the innermost ring.
+        for seg in 0..SEGS {
+            let a = 1 + seg as u32;
+            let b = 1 + ((seg + 1) % SEGS) as u32;
+            mesh.add_triangle(0, a, b);
+        }
+        // Strips between successive rings.
+        for ring in 1..RINGS {
+            let inner = 1 + ((ring - 1) * SEGS) as u32;
+            let outer = 1 + (ring * SEGS) as u32;
+            for seg in 0..SEGS as u32 {
+                let next = (seg + 1) % SEGS as u32;
+                mesh.add_triangle(inner + seg, outer + seg, outer + next);
+                mesh.add_triangle(inner + seg, outer + next, inner + next);
+            }
+        }
+        painter.add(egui::Shape::mesh(mesh));
     }
 
     painter.galley(pos, galley, color);
