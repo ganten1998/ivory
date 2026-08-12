@@ -182,11 +182,69 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# ALWAYS ad-hoc codesign. Gatekeeper still blocks first launch for downloads
-# (macOS 15+ has no right-click-Open bypass — see docs/RELEASE.md), but an
-# unsigned binary is strictly worse (killed outright on Apple Silicon).
-codesign --force --deep -s - "$APP"
-codesign --verify --strict "$APP"
+# ── Sign ─────────────────────────────────────────────────────────────────────
+# A Developer ID signature PLUS notarization is what removes the Gatekeeper
+# prompt. Signing alone does not: an un-notarized app still sends the user to
+# System Settings > Privacy & Security to click "Open Anyway" (the
+# right-click-Open bypass is gone as of macOS 15). Most people read that as
+# "this app is broken" and give up.
+#
+# Override the identity with IVORY_SIGN_ID; otherwise the first installed
+# "Developer ID Application" certificate wins. With none installed the build
+# still succeeds ad-hoc — better than unsigned, which Apple Silicon kills
+# outright — but the artifact is NOT release-grade, and says so loudly.
+SIGN_ID="${IVORY_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
+  | grep "Developer ID Application" | head -1 \
+  | sed -E 's/.*\) ([0-9A-F]{40}) ".*/\1/' || true)}"
+
+if [ -n "$SIGN_ID" ]; then
+  echo "==> Signing with Developer ID ($SIGN_ID)"
+  # Sign inner-out rather than with --deep, which Apple deprecated: it applies
+  # the OUTER bundle's options to nested code, which is wrong the moment this
+  # bundle gains a helper. --options runtime (the hardened runtime) is a
+  # prerequisite for notarization; --timestamp makes the signature outlive the
+  # certificate's expiry, so old downloads keep working.
+  codesign --force --options runtime --timestamp -s "$SIGN_ID" "$APP/Contents/MacOS/ivory"
+  codesign --force --options runtime --timestamp -s "$SIGN_ID" "$APP"
+  codesign --verify --strict --verbose=2 "$APP"
+  SIGNED_RELEASE=1
+else
+  echo "warn: no Developer ID Application certificate found — signing ad-hoc."
+  echo "      This artifact WILL trip Gatekeeper. Do not publish it."
+  codesign --force --deep -s - "$APP"
+  codesign --verify --strict "$APP"
+  SIGNED_RELEASE=0
+fi
+
+# ── Notarize ─────────────────────────────────────────────────────────────────
+# Stapling attaches the ticket to the bundle itself, so a first launch works
+# even with no network. Notarization happens BEFORE packaging so the zip and
+# dmg below both carry the stapled app; stapling the archives instead does
+# nothing. Create the keychain profile once with:
+#   xcrun notarytool store-credentials "ivory-notary" \
+#     --apple-id <id> --team-id <team> --password <app-specific-password>
+NOTARY_PROFILE="${IVORY_NOTARY_PROFILE:-ivory-notary}"
+if [ "$SIGNED_RELEASE" = 1 ] \
+   && xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+  echo "==> Notarizing (waits on Apple; typically 1–5 minutes)"
+  NOTARY_DIR="$(mktemp -d)"
+  ditto -c -k --sequesterRsrc --keepParent "$APP" "$NOTARY_DIR/Ivory.zip"
+  if xcrun notarytool submit "$NOTARY_DIR/Ivory.zip" \
+       --keychain-profile "$NOTARY_PROFILE" --wait; then
+    xcrun stapler staple "$APP"
+    xcrun stapler validate "$APP"
+    # The only check that reflects what a downloader actually experiences.
+    spctl --assess --type execute --verbose=2 "$APP" || true
+  else
+    echo "warn: NOTARIZATION FAILED — this artifact will trip Gatekeeper."
+    echo "      Inspect with: xcrun notarytool log <submission-id> \\"
+    echo "                      --keychain-profile $NOTARY_PROFILE"
+  fi
+  rm -rf "$NOTARY_DIR"
+elif [ "$SIGNED_RELEASE" = 1 ]; then
+  echo "warn: signed but NOT notarized — no '$NOTARY_PROFILE' keychain profile."
+  echo "      Gatekeeper will still prompt. See the store-credentials line above."
+fi
 
 # Bump bundle mtime so Icon Services notices a fresh app and reloads the icon.
 touch "$APP" "$APP/Contents/Info.plist"

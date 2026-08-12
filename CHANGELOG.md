@@ -9,6 +9,36 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-08-12
+
+### Added
+
+- **Supporter keys.** Ivory stays free and complete; a supporter key is a thank
+  you, not a gate. Nothing is removed from the free app — chord detection,
+  Chord Learning, every font and setting all stay exactly as they are. Keys are
+  verified entirely offline: no network call, no account, no expiry, no machine
+  fingerprint, and no phoning home, ever. A missing, corrupt or mistyped key
+  simply leaves you with the free app rather than an error.
+- **Supporter heart** — a small pixel heart in the corner of the chord view for
+  supporters. Click it to cycle its colour; hide it from the menu if you would
+  rather not have it there.
+- **A welcome note** on first launch explaining what the app is and how it is
+  paid for, with a "don't show this again" checkbox.
+- **Terminess Nerd Font Mono** as a bundled font option, in regular and bold.
+  Courier Prime remains the default.
+
+### Changed
+
+- Chord-engine internals rewritten: pitch-class set algebra now runs on 12-bit
+  masks instead of hash sets, so chord detection — which runs on every MIDI
+  event — is allocation-free on its hot path and about 5–6× faster. Every name
+  the engine produces is byte-identical to the previous release across the full
+  13,133-voicing test corpus, in both the stock and Chord Learning builds.
+- Diminished, half-diminished and augmented chords now use standard lead-sheet
+  symbols: `C°`, `C°7`, `Cø7`, `C+` in place of the spelled-out forms.
+- `IVORY_LOG=debug` turns on diagnostic logging. Quiet by default; the app
+  writes nothing unless asked.
+
 ### Fixed
 
 - Scales and modes keep their reading when the run is closed off with its own
@@ -30,14 +60,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   merely contains — it reads `Dm11`. Genuine pentatonics and exact six-note
   scales are unchanged; all twelve pitch classes together read
   `Chromatic Scale`.
-
-### Changed
-
-- Chord-engine internals rewritten: pitch-class set algebra now runs on 12-bit
-  masks instead of hash sets, so chord detection — which runs on every MIDI
-  event — is allocation-free on its hot path and about 5–6× faster. Every name
-  the engine produces is byte-identical to the previous release across the full
-  13,133-voicing test corpus, in both the stock and Chord Learning builds.
+- The Dock showed a generic hexagon instead of Ivory's icon on macOS, and the
+  icon itself is now a properly rounded, padded squircle rather than a
+  full-bleed square.
 
 ## [2.1.0] - 2026-08-04
 
