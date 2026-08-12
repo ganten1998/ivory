@@ -83,11 +83,6 @@ pub struct Settings {
     /// Built-in UI typeface key (see fonts::FontChoice). Additive key; unknown
     /// values fall back to Courier Prime.
     pub font_choice: String,
-    /// Supporter extra: halo under held keys. Additive key; ignored without a
-    /// license, so a config moved to an unlicensed machine simply draws no glow.
-    pub glow_enabled: bool,
-    /// Supporter extra: bloom the chord label.
-    pub chord_glow: bool,
     /// Chord label colour. Defaults to a segmented-display green.
     pub chord_text_color: Rgb,
     /// Unknown keys from the file, preserved verbatim on save (file order).
@@ -112,9 +107,7 @@ impl Default for Settings {
             keytoggle_enabled: false,
             custom_font_path: None,
             font_choice: crate::fonts::FontChoice::default().key().to_owned(),
-            glow_enabled: false,
-            chord_glow: false,
-            chord_text_color: Rgb { r: 0x2F, g: 0xE8, b: 0x6B },
+            chord_text_color: Rgb { r: 0xE8, g: 0xDC, b: 0xC0 },
             extra: Map::new(),
         }
     }
@@ -208,16 +201,6 @@ impl Settings {
                 s.font_choice = f.to_owned();
             }
         }
-        if let Some(v) = map.remove("glow_enabled") {
-            if let Some(b) = v.as_bool() {
-                s.glow_enabled = b;
-            }
-        }
-        if let Some(v) = map.remove("chord_glow") {
-            if let Some(b) = v.as_bool() {
-                s.chord_glow = b;
-            }
-        }
         if let Some(v) = map.remove("chord_text_color") {
             if let Some(c) = v.as_str().and_then(Rgb::parse) {
                 s.chord_text_color = c;
@@ -276,8 +259,6 @@ impl Settings {
             map.insert("custom_font_path".into(), Value::String(p.clone()));
         }
         map.insert("font_choice".into(), Value::String(self.font_choice.clone()));
-        map.insert("glow_enabled".into(), Value::Bool(self.glow_enabled));
-        map.insert("chord_glow".into(), Value::Bool(self.chord_glow));
         map.insert("chord_text_color".into(), Value::String(self.chord_text_color.to_hex()));
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());

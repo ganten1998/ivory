@@ -65,7 +65,6 @@ pub fn draw(
     display_notes: &HashSet<u8>,
     sustain_down: bool,
     s: &Settings,
-    glow: bool,
 ) {
     let w = rect.width() as f64;
     let h = rect.height() as f64;
@@ -78,12 +77,6 @@ pub fn draw(
     let white_key_w = w / WHITE_KEYS as f64;
     let black_key_w = white_key_w * 0.7;
     let black_key_h = h * 0.65;
-
-    // Held keys can carry a halo (supporter extra). It takes its color from
-    // whatever the user set as the active/sustain color, so it always agrees
-    // with their palette instead of imposing one.
-    let mut lit_white: Vec<(Rect, Color32)> = Vec::new();
-    let mut lit_black: Vec<(Rect, Color32)> = Vec::new();
 
     let (white_idle, black_idle) = idle_colors(s);
     let sustain = s.sustain_color.to_color32();
@@ -124,15 +117,8 @@ pub fn draw(
             egui::vec2(white_key_w.trunc() as f32, h.trunc() as f32),
         );
         painter.rect_filled(key_rect, 0.0, fill);
-        if glow && display_notes.contains(&note) {
-            lit_white.push((key_rect, fill));
-        }
         idx += 1;
     }
-    // White-key halos go here — before the separators and the black keys, so
-    // the black keys occlude them exactly as they occlude the keys themselves.
-    draw_glow(painter, &lit_white, w);
-
     // 1px separators between adjacent white keys (drawn after all fills).
     for sep in 1..WHITE_KEYS {
         let lx = left + (sep as f64 * white_key_w).trunc() as f32 + 0.5;
@@ -175,46 +161,9 @@ pub fn draw(
             Pos2::new(left + bx + bw + 0.5, top + bh + 0.5),
         );
         painter.rect_stroke(stroke_rect, 0.0, Stroke::new(1.0, outline), StrokeKind::Middle);
-        if glow && display_notes.contains(&note) {
-            lit_black.push((key_rect, fill));
-        }
     }
 
-    // Black keys are the frontmost layer, so their halos are too.
-    draw_glow(painter, &lit_black, w);
 
-}
-
-/// Halo under held keys. Many 1px strokes with an exponential falloff — a few
-/// thick bands read as a hard-edged selection box, which is what a glow must
-/// not look like.
-///
-/// Called at two different depths on purpose. A white key sits BEHIND the black
-/// keys, so its halo has to be painted before them or it draws visible lines
-/// across the black keys in front of it; the black keys' own halos go last.
-fn draw_glow(painter: &Painter, lit: &[(Rect, Color32)], width: f64) {
-    if lit.is_empty() {
-        return;
-    }
-    let scale = ((width / 1300.0) as f32).clamp(0.5, 2.0);
-    let radius = (16.0 * scale).max(2.0);
-    let steps = radius.round() as i32;
-    for i in 0..steps {
-        let t = (i as f32 + 0.5) / steps as f32;
-        let alpha = 0.40 * (-2.6 * t).exp();
-        if alpha < 0.004 {
-            break;
-        }
-        let outset = t * radius;
-        for (rect, color) in lit {
-            painter.rect_stroke(
-                rect.expand(outset),
-                outset.min(6.0),
-                Stroke::new(1.0, color.gamma_multiply(alpha)),
-                StrokeKind::Middle,
-            );
-        }
-    }
 }
 
 /// Hit-test a point (widget-local) against the keys, matching the drawing math

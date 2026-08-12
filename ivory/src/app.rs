@@ -241,8 +241,6 @@ impl IvoryApp {
             notes_held: !self.display_notes().is_empty(),
             learning_on: self.detector.learning_mode(),
             supporter: self.license.is_supporter(),
-            glow_on: self.settings.glow_enabled,
-            chord_glow_on: self.settings.chord_glow,
             next_font: {
                 use crate::fonts::FontChoice;
                 let cur = FontChoice::from_key(&self.settings.font_choice);
@@ -393,14 +391,6 @@ impl IvoryApp {
             }
             MenuAction::ToggleDarkMode => {
                 self.settings.dark_mode = !self.settings.dark_mode;
-                self.settings.save();
-            }
-            MenuAction::ToggleChordGlow => {
-                self.settings.chord_glow = !self.settings.chord_glow;
-                self.settings.save();
-            }
-            MenuAction::ToggleKeyGlow => {
-                self.settings.glow_enabled = !self.settings.glow_enabled;
                 self.settings.save();
             }
             MenuAction::CycleFont => {
@@ -879,7 +869,6 @@ impl eframe::App for IvoryApp {
                 chord_rect,
                 self.current_chord.as_deref(),
                 self.settings.chord_text_color.to_color32(),
-                self.settings.chord_glow && self.license.is_supporter(),
             );
         }
         let display = self.display_notes();
@@ -889,8 +878,6 @@ impl eframe::App for IvoryApp {
             &display,
             self.sustain_down,
             &self.settings,
-            // Supporter extra, and derived — never a cached boolean.
-            self.settings.glow_enabled && self.license.is_supporter(),
         );
 
         self.handle_main_interaction(&ctx, ui, piano_rect);
@@ -903,7 +890,6 @@ impl eframe::App for IvoryApp {
                 self.settings.borderless_mode,
                 self.current_chord.as_deref(),
                 self.settings.chord_text_color.to_color32(),
-                self.settings.chord_glow && self.license.is_supporter(),
             );
             if let Some(size) = outcome.inner_size {
                 self.detached_live_size = Some(size);

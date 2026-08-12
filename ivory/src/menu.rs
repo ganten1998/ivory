@@ -37,10 +37,6 @@ pub enum MenuAction {
     ToggleChordDetection,
     /// Cycle the built-in UI typeface (Courier Prime <-> Terminess).
     CycleFont,
-    /// Supporter extra: halo under held keys, in the active key color.
-    ToggleKeyGlow,
-    /// Supporter extra: bloom the chord label.
-    ToggleChordGlow,
     DetachChordWindow,
     AttachChordWindow,
     TeachChordName,
@@ -74,8 +70,6 @@ pub struct MenuView {
     pub next_font: Option<&'static str>,
     /// A valid supporter license is installed. Gates the extras block.
     pub supporter: bool,
-    pub glow_on: bool,
-    pub chord_glow_on: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -193,23 +187,14 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     if let Some(next) = view.next_font {
         e.push(item(next, MenuAction::CycleFont));
     }
-    // Supporter extras. Hidden rather than greyed for the free build: a locked
-    // row you cannot use is a nag, and the app is meant to feel complete.
     e.push(Entry::Separator);
     e.push(item(
         if view.supporter { "Supporter Key..." } else { "Support Ivory..." },
         MenuAction::ShowSupporterKey,
     ));
-    if view.supporter {
-        e.push(item(
-            if view.glow_on { "Disable Key Glow" } else { "Enable Key Glow" },
-            MenuAction::ToggleKeyGlow,
-        ));
-        e.push(item(
-            if view.chord_glow_on { "Disable Chord Glow" } else { "Enable Chord Glow" },
-            MenuAction::ToggleChordGlow,
-        ));
-    }
+    // Supporter extras land here when there are any. There are none in this
+    // release — the glow experiments were withdrawn in favour of chord-view
+    // themes — so the block is intentionally empty rather than removed.
     e.push(Entry::Separator);
     e.push(item(
         if view.keytoggle {
@@ -585,8 +570,6 @@ mod tests {
             learning_on: false,
             next_font: None,
             supporter: false,
-            glow_on: false,
-            chord_glow_on: false,
         }
     }
 

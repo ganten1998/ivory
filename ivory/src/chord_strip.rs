@@ -18,11 +18,8 @@ pub fn viewport_id() -> ViewportId {
 
 /// Paint the strip into `rect`. `chord` of None leaves a solid black strip.
 ///
-/// `color` is the chord label colour (user-settable). With `glow` set — a
-/// supporter extra — the label is bloomed: the same galley is stamped around a
-/// ring at decaying alpha before the crisp text goes on top, which reads like a
-/// lit display rather than like flat type.
-pub fn draw(painter: &Painter, rect: Rect, chord: Option<&str>, color: Color32, glow: bool) {
+/// `color` is the chord label colour (user-settable, `Set Chord Color...`).
+pub fn draw(painter: &Painter, rect: Rect, chord: Option<&str>, color: Color32) {
     painter.rect_filled(rect, 0.0, Color32::BLACK);
     let Some(text) = chord else { return };
     if text.is_empty() {
@@ -57,58 +54,6 @@ pub fn draw(painter: &Painter, rect: Rect, chord: Option<&str>, color: Color32, 
     // is what a lit display actually looks like — the glyph stays sharp while
     // light spreads around it. Eight points per ring is enough that the ring
     // structure disappears at these sizes.
-    if glow {
-        // A halo is LIGHT, not a thicker glyph. Stamping the galley at offsets
-        // is a morphological dilation — it fattens the letterforms and reads as
-        // a blob, which is what the first two attempts did. Instead paint a
-        // smooth radial field BEHIND the text: concentric rings of a triangle
-        // mesh whose alpha decays outward, so the glyphs stay crisp and the
-        // light spreads. egui has no blur, but a gradient mesh is the real
-        // thing rather than an approximation of it.
-        let center = pos + egui::vec2(tw as f32 / 2.0, th as f32 / 2.0);
-        // Reach: comfortably past the text so the falloff has room to be smooth.
-        let rx = tw as f32 * 0.5 + th as f32 * 0.55;
-        let ry = th as f32 * 0.95;
-        const RINGS: usize = 7;
-        const SEGS: usize = 48;
-        const PEAK: f32 = 0.30; // alpha directly behind the glyphs
-
-        let mut mesh = egui::epaint::Mesh::default();
-        let alpha_at = |t: f32| -> Color32 {
-            // exp falloff, forced to exactly 0 on the outer ring so the field
-            // has no visible edge.
-            let a = PEAK * ((-2.6 * t).exp() - (-2.6f32).exp()) / (1.0 - (-2.6f32).exp());
-            color.gamma_multiply(a.max(0.0))
-        };
-        // Centre vertex, then RINGS rings of SEGS vertices each.
-        mesh.colored_vertex(center, alpha_at(0.0));
-        for ring in 1..=RINGS {
-            let t = ring as f32 / RINGS as f32;
-            for seg in 0..SEGS {
-                let a = std::f32::consts::TAU * (seg as f32 / SEGS as f32);
-                let p = center + egui::vec2(rx * t * a.cos(), ry * t * a.sin());
-                mesh.colored_vertex(p, alpha_at(t));
-            }
-        }
-        // Fan for the innermost ring.
-        for seg in 0..SEGS {
-            let a = 1 + seg as u32;
-            let b = 1 + ((seg + 1) % SEGS) as u32;
-            mesh.add_triangle(0, a, b);
-        }
-        // Strips between successive rings.
-        for ring in 1..RINGS {
-            let inner = 1 + ((ring - 1) * SEGS) as u32;
-            let outer = 1 + (ring * SEGS) as u32;
-            for seg in 0..SEGS as u32 {
-                let next = (seg + 1) % SEGS as u32;
-                mesh.add_triangle(inner + seg, outer + seg, outer + next);
-                mesh.add_triangle(inner + seg, outer + next, inner + next);
-            }
-        }
-        painter.add(egui::Shape::mesh(mesh));
-    }
-
     painter.galley(pos, galley, color);
 }
 
@@ -133,7 +78,6 @@ pub fn show_detached_window(
     borderless: bool,
     chord: Option<&str>,
     color: Color32,
-    glow: bool,
 ) -> DetachedOutcome {
     let mut outcome = DetachedOutcome::default();
     let builder = ViewportBuilder::default()
@@ -145,7 +89,7 @@ pub fn show_detached_window(
 
     ctx.show_viewport_immediate(viewport_id(), builder, |ui, _class| {
         let rect = ui.max_rect();
-        draw(ui.painter(), rect, chord, color, glow);
+        draw(ui.painter(), rect, chord, color);
 
         let (close, inner_rect, pressed, secondary, pointer) = ui.input(|i| {
             (
