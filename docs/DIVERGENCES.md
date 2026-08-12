@@ -294,3 +294,58 @@ renderings of every affected row.
   off, 100% size, flats, reattach, keytoggle cleared). It never touches
   overrides.json — taught chords are deleted only via "Manage Taught
   Chords...".
+
+### 2.3.0 — tester report, 2026-08-12 (Windows)
+
+Five deliberate breaks with the Python-era UI spec. All five come from one
+tester session on 2.2.0; the report and its screenshots are the rationale.
+
+- **D-UI-10**: the detached chord window is **no longer slaved to the piano's
+  width**. `ui-spec.md` §5.7 (§168, §171) specified an initial width equal to
+  the main window's plus a 100 ms debounced re-sync on every size change, and
+  `chord_strip::sync_width` implemented exactly that. Both are gone. A chord
+  readout has no reason to inherit the keyboard's 8.6667:1 proportions, and the
+  re-assert made D-UI-11 impossible: any restored width was overwritten within
+  100 ms of the next size change. New windows open at
+  `settings::DETACHED_DEFAULT` (460x150).
+- **D-UI-11**: window geometry is remembered. New optional settings keys
+  `window_x`/`window_y`, `detached_chord_x`/`detached_chord_y` and
+  `detached_chord_width`, written back on a 700 ms debounce so a drag is one
+  file write rather than one per frame, and absent from the file until
+  something is actually placed. `detached_chord_width` doubles as the marker
+  for the new geometry model: while it is absent the stored
+  `detached_chord_height` is **ignored**, because pre-2.3 builds overwrote that
+  key with the attached strip's height on every detach, so an inherited 50 is
+  not a size any user chose. A restored position is clamped to the monitor, and
+  a window restored entirely off-screen is recentred on the first frame that
+  knows the monitor size.
+  **Tiling window managers are detected and excluded.** Under AeroSpace, yabai
+  or i3 the size we ask for is simply overruled, and recording the result as a
+  user preference is worse than recording nothing, because the tiled geometry
+  then follows the user into sessions where nothing is tiling. That is exactly
+  how the 1377 above got written in the first place. Size alone cannot tell a
+  WM apart from a person dragging an edge, so timing does it: a mismatch within
+  `WM_GRACE` (600 ms) of the window appearing is the WM's, and that detachment
+  is not recorded; later mismatches are real resizes. The main window is not
+  user-resizable at all, so any settled disagreement with its target size means
+  something else is placing it and its position is left alone. Verified against
+  a real AeroSpace session, which tiled the detached window to 853x1377 and
+  wrote nothing.
+- **D-UI-12**: child windows open centred on the main window instead of
+  wherever the OS puts them, which on Windows is the top-left of the screen no
+  matter where the user has dragged the piano. `dialogs::Placement` carries the
+  main window's rect in, because a viewport can only see its own geometry.
+- **D-UI-13**: the chord label may use **two lines**. Spec §5 specified one
+  line at `max(12, int(0.6*h))` with a single-pass shrink to 95% width, so a
+  long name like `Eb Minor Pentatonic` rendered a fraction of the size of
+  `EbM4` in the same window. A two-line layout now competes with the shrunken
+  single line and the larger glyphs win. The search starts at the shrunken
+  size, so the result is **never smaller** than the old behaviour; that is a
+  property test, not an observation. Labels with no whitespace never wrap,
+  because egui would break them mid-token.
+- **D-UI-14**: "Apply in all keys" in Teach Chord Name starts checked, and the
+  last choice is remembered in `teach_apply_all_keys`. Naming a voicing
+  usually means naming the shape rather than that one key.
+
+Also from that report and **not** done: keyboard shortcuts, which the report
+asks for without saying for what.
