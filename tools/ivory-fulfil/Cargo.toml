@@ -1,0 +1,25 @@
+# Gumroad fulfilment service. Like ivory-keygen, DELIBERATELY outside the main
+# workspace (note the empty [workspace] table) so its dependencies can never
+# reach the shipped app or its THIRD-PARTY-LICENSES.
+[workspace]
+
+[package]
+name = "ivory-fulfil"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The SAME canonical payload serializer and wire encoder the app verifies with.
+# Reimplementing the encoder in another language is the classic way these
+# systems break; sharing this crate makes divergence impossible.
+ivory-core = { path = "../../ivory-core", features = ["license"] }
+ed25519-compact = { version = "2.3", features = ["random"] }
+tiny_http = "0.12"
+ureq = { version = "2", features = ["json", "tls"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
