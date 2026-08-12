@@ -91,9 +91,30 @@ pub struct Settings {
     pub show_heart: bool,
     /// Index into chord_strip::HEART_COLORS. Wraps, so any stored value is safe.
     pub heart_color: i64,
+    /// Remembered detached-window width. Its presence is also the marker that
+    /// the window has been placed under the current geometry model at least
+    /// once: while it is None the stored `detached_chord_height` is ignored,
+    /// because pre-2.3 builds overwrote that key with the attached strip's
+    /// height on every detach, so a stored 50 is not a size anyone chose.
+    pub detached_chord_width: Option<i64>,
+    /// Remembered detached-window position, in monitor coordinates.
+    pub detached_chord_x: Option<i64>,
+    pub detached_chord_y: Option<i64>,
+    /// Remembered main-window position, in monitor coordinates.
+    pub window_x: Option<i64>,
+    pub window_y: Option<i64>,
+    /// Initial state of "Apply in all keys" in Teach Chord Name. Remembers the
+    /// last choice; starts on, because naming one voicing usually means naming
+    /// the shape.
+    pub teach_apply_all_keys: bool,
     /// Unknown keys from the file, preserved verbatim on save (file order).
     pub extra: Map<String, Value>,
 }
+
+/// Default detached-window size when nothing has been remembered yet.
+/// Deliberately NOT the piano's 8.6667:1 strip: a chord readout in its own
+/// window wants to be legible, not to mirror the keyboard's proportions.
+pub const DETACHED_DEFAULT: egui::Vec2 = egui::Vec2::new(460.0, 150.0);
 
 impl Default for Settings {
     fn default() -> Self {
@@ -117,6 +138,12 @@ impl Default for Settings {
             show_welcome: true,
             show_heart: true,
             heart_color: 0,
+            detached_chord_width: None,
+            detached_chord_x: None,
+            detached_chord_y: None,
+            window_x: None,
+            window_y: None,
+            teach_apply_all_keys: true,
             extra: Map::new(),
         }
     }
@@ -231,6 +258,25 @@ impl Settings {
             }
         }
 
+        // Geometry keys are optional and stay absent until something is placed,
+        // so a hand-written file without them still gets computed defaults
+        // rather than a stored zero. Negative coordinates are legitimate on
+        // multi-monitor setups, so no sign check here; placement is clamped to
+        // the monitor at the point of use instead.
+        let take_opt_i64 = |map: &mut Map<String, Value>, key: &str, dst: &mut Option<i64>| {
+            if let Some(v) = map.remove(key) {
+                if let Some(n) = v.as_i64() {
+                    *dst = Some(n);
+                }
+            }
+        };
+        take_opt_i64(&mut map, "detached_chord_width", &mut s.detached_chord_width);
+        take_opt_i64(&mut map, "detached_chord_x", &mut s.detached_chord_x);
+        take_opt_i64(&mut map, "detached_chord_y", &mut s.detached_chord_y);
+        take_opt_i64(&mut map, "window_x", &mut s.window_x);
+        take_opt_i64(&mut map, "window_y", &mut s.window_y);
+        take_bool(&mut map, "teach_apply_all_keys", &mut s.teach_apply_all_keys);
+
         s.extra = map; // whatever is left, preserved in file order
         s
     }
@@ -287,6 +333,20 @@ impl Settings {
         map.insert("show_welcome".into(), Value::Bool(self.show_welcome));
         map.insert("show_heart".into(), Value::Bool(self.show_heart));
         map.insert("heart_color".into(), Value::Number(self.heart_color.into()));
+        let mut put_opt = |key: &str, v: Option<i64>| {
+            if let Some(n) = v {
+                map.insert(key.into(), Value::Number(n.into()));
+            }
+        };
+        put_opt("detached_chord_width", self.detached_chord_width);
+        put_opt("detached_chord_x", self.detached_chord_x);
+        put_opt("detached_chord_y", self.detached_chord_y);
+        put_opt("window_x", self.window_x);
+        put_opt("window_y", self.window_y);
+        map.insert(
+            "teach_apply_all_keys".into(),
+            Value::Bool(self.teach_apply_all_keys),
+        );
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -324,6 +384,46 @@ impl Settings {
             50.0
         }
     }
+
+    /// Size to open the detached chord window at: whatever the user last left
+    /// it, or `DETACHED_DEFAULT` if they have never sized it. A remembered
+    /// width is what distinguishes the two, see `detached_chord_width`.
+    pub fn detached_size_for_use(&self) -> egui::Vec2 {
+        match self.detached_chord_width {
+            Some(w) if w > 0 => egui::Vec2::new(w as f32, self.detached_height_for_use()),
+            _ => DETACHED_DEFAULT,
+        }
+    }
+
+    /// Remembered detached-window position, if both coordinates are stored.
+    pub fn detached_pos_for_use(&self) -> Option<egui::Pos2> {
+        match (self.detached_chord_x, self.detached_chord_y) {
+            (Some(x), Some(y)) => Some(egui::Pos2::new(x as f32, y as f32)),
+            _ => None,
+        }
+    }
+
+    /// Remembered main-window position, if both coordinates are stored.
+    pub fn window_pos_for_use(&self) -> Option<egui::Pos2> {
+        match (self.window_x, self.window_y) {
+            (Some(x), Some(y)) => Some(egui::Pos2::new(x as f32, y as f32)),
+            _ => None,
+        }
+    }
+}
+
+/// Keep a window fully on the monitor it is being placed on. A remembered
+/// position is worthless if the monitor it referred to is gone, which is the
+/// normal state of affairs for anyone who ever undocks a laptop.
+pub fn clamp_to_monitor(pos: egui::Pos2, size: egui::Vec2, monitor: Option<egui::Vec2>) -> egui::Pos2 {
+    let Some(m) = monitor else { return pos };
+    if m.x <= 0.0 || m.y <= 0.0 {
+        return pos;
+    }
+    egui::Pos2::new(
+        pos.x.clamp(0.0, (m.x - size.x).max(0.0)).round(),
+        pos.y.clamp(0.0, (m.y - size.y).max(0.0)).round(),
+    )
 }
 
 #[cfg(test)]
@@ -373,6 +473,99 @@ mod tests {
         assert_eq!(*keys.last().unwrap(), "future_key");
         // custom_font_path is absent when None
         assert!(!out.contains_key("custom_font_path"));
+    }
+
+    fn map_of(json: &str) -> Map<String, Value> {
+        match serde_json::from_str::<Value>(json).unwrap() {
+            Value::Object(m) => m,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn window_geometry_keys_are_absent_until_something_is_placed() {
+        // A fresh install must not gain a stored position of (0, 0), which
+        // would pin the window to the top-left corner forever.
+        let out = Settings::default().to_map();
+        for key in [
+            "window_x",
+            "window_y",
+            "detached_chord_x",
+            "detached_chord_y",
+            "detached_chord_width",
+        ] {
+            assert!(!out.contains_key(key), "{key} should be absent by default");
+        }
+        assert_eq!(out["teach_apply_all_keys"], Value::Bool(true));
+    }
+
+    #[test]
+    fn window_geometry_round_trips_including_negative_coordinates() {
+        // Negative coordinates are ordinary on a monitor left of the primary,
+        // so they must survive rather than being treated as invalid.
+        let s = Settings::from_map(map_of(
+            r#"{"window_x": -1920, "window_y": -40,
+                "detached_chord_x": 300, "detached_chord_y": 220,
+                "detached_chord_width": 640, "detached_chord_height": 180,
+                "teach_apply_all_keys": false}"#,
+        ));
+        assert_eq!(s.window_pos_for_use(), Some(egui::Pos2::new(-1920.0, -40.0)));
+        assert_eq!(s.detached_pos_for_use(), Some(egui::Pos2::new(300.0, 220.0)));
+        assert_eq!(s.detached_size_for_use(), egui::Vec2::new(640.0, 180.0));
+        assert!(!s.teach_apply_all_keys);
+
+        let back = Settings::from_map(s.to_map());
+        assert_eq!(back.window_pos_for_use(), s.window_pos_for_use());
+        assert_eq!(back.detached_size_for_use(), s.detached_size_for_use());
+        assert!(!back.teach_apply_all_keys);
+    }
+
+    #[test]
+    fn detached_size_ignores_a_legacy_height_with_no_remembered_width() {
+        // Pre-2.3 builds rewrote detached_chord_height to the attached strip's
+        // height on every detach, so a file carrying only that key describes a
+        // size nobody chose. It must not produce a 50px-tall sliver.
+        let s = Settings::from_map(map_of(r#"{"detached_chord_height": 50}"#));
+        assert_eq!(s.detached_chord_width, None);
+        assert_eq!(s.detached_size_for_use(), DETACHED_DEFAULT);
+        assert_eq!(s.detached_pos_for_use(), None);
+    }
+
+    #[test]
+    fn half_written_position_is_ignored_rather_than_half_applied() {
+        let s = Settings::from_map(map_of(r#"{"window_x": 100}"#));
+        assert_eq!(s.window_pos_for_use(), None);
+    }
+
+    #[test]
+    fn clamping_keeps_a_window_reachable_and_tolerates_no_monitor() {
+        let size = egui::Vec2::new(460.0, 150.0);
+        let mon = Some(egui::Vec2::new(1920.0, 1080.0));
+        // Off the right/bottom edge: pulled fully back on screen.
+        assert_eq!(
+            clamp_to_monitor(egui::Pos2::new(5000.0, 5000.0), size, mon),
+            egui::Pos2::new(1460.0, 930.0)
+        );
+        // Negative: pulled to the origin.
+        assert_eq!(
+            clamp_to_monitor(egui::Pos2::new(-800.0, -600.0), size, mon),
+            egui::Pos2::ZERO
+        );
+        // Already on screen: untouched.
+        assert_eq!(
+            clamp_to_monitor(egui::Pos2::new(100.0, 80.0), size, mon),
+            egui::Pos2::new(100.0, 80.0)
+        );
+        // Unknown monitor: never clamp to a guess.
+        assert_eq!(
+            clamp_to_monitor(egui::Pos2::new(-800.0, -600.0), size, None),
+            egui::Pos2::new(-800.0, -600.0)
+        );
+        // A window larger than the monitor still shows its top-left corner.
+        assert_eq!(
+            clamp_to_monitor(egui::Pos2::new(50.0, 50.0), egui::Vec2::new(4000.0, 4000.0), mon),
+            egui::Pos2::ZERO
+        );
     }
 
     #[test]

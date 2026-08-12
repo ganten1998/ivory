@@ -6,8 +6,8 @@
 use crate::fonts;
 use crate::menu::ColorTarget;
 use egui::{
-    Align, Button, Color32, CornerRadius, FontId, Layout, RichText, Stroke, Vec2, ViewportBuilder,
-    ViewportId,
+    Align, Button, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Stroke, Vec2,
+    ViewportBuilder, ViewportId,
 };
 use ivory_core::OverrideInfo;
 
@@ -197,8 +197,32 @@ struct VpResult {
     close: bool,
 }
 
+/// Where child windows open. A viewport can only see its own geometry, so the
+/// main window's rect has to be handed in from the app rather than read here.
+#[derive(Clone, Copy, Default)]
+pub struct Placement {
+    /// The main window's inner rect, in monitor coordinates.
+    pub parent: Option<Rect>,
+    pub monitor: Option<Vec2>,
+}
+
+impl Placement {
+    /// Centred on the parent, kept fully on the monitor. None when the parent
+    /// geometry is not known yet, in which case the OS places the window, which
+    /// on Windows means the top-left corner of the screen.
+    fn position_for(self, size: Vec2) -> Option<Pos2> {
+        let parent = self.parent?;
+        Some(crate::settings::clamp_to_monitor(
+            parent.center() - size * 0.5,
+            size,
+            self.monitor,
+        ))
+    }
+}
+
 fn show_dialog_viewport(
     ctx: &egui::Context,
+    placement: Placement,
     title: &str,
     size: Vec2,
     min_size: Vec2,
@@ -206,12 +230,17 @@ fn show_dialog_viewport(
 ) -> VpResult {
     let mut content = content;
     let mut result = VpResult { close: false };
-    let builder = ViewportBuilder::default()
+    let mut builder = ViewportBuilder::default()
         .with_title(title)
         .with_inner_size(size)
         .with_min_inner_size(min_size)
         .with_resizable(true)
         .with_decorations(true);
+    // Rounded and clamped, so a pixel of jitter in the reported parent rect
+    // cannot produce a new position every frame and drag the window around.
+    if let Some(p) = placement.position_for(size) {
+        builder = builder.with_position(p);
+    }
     ctx.show_viewport_immediate(dialog_vp_id(), builder, |ui, _class| {
         let (close_req, esc) = ui.input(|i| {
             (
@@ -233,6 +262,7 @@ pub fn show(
     ctx: &egui::Context,
     dialog_opt: &mut Option<Dialog>,
     dark_mode: bool,
+    placement: Placement,
 ) -> Option<DialogAction> {
     let dialog = dialog_opt.as_mut()?;
     let mut action = None;
@@ -246,6 +276,7 @@ pub fn show(
             let stock = stock_style(ctx);
             show_dialog_viewport(
                 ctx,
+                placement,
                 "Select MIDI Input",
                 Vec2::new(400.0, 300.0),
                 Vec2::new(400.0, 200.0),
@@ -300,6 +331,7 @@ pub fn show(
             let stock = stock_style(ctx);
             show_dialog_viewport(
                 ctx,
+                placement,
                 "No MIDI Input",
                 Vec2::new(420.0, 170.0),
                 Vec2::new(320.0, 140.0),
@@ -331,6 +363,7 @@ pub fn show(
             );
             show_dialog_viewport(
                 ctx,
+                placement,
                 "MIDI Error",
                 Vec2::new(420.0, 170.0),
                 Vec2::new(320.0, 140.0),
@@ -357,6 +390,7 @@ pub fn show(
             let t = theme(dark_mode);
             show_dialog_viewport(
                 ctx,
+                placement,
                 "About Ivory",
                 Vec2::new(400.0, 190.0),
                 Vec2::new(400.0, 150.0),
@@ -420,6 +454,7 @@ pub fn show(
             let target = *target;
             show_dialog_viewport(
                 ctx,
+                placement,
                 color_pick_title(target),
                 Vec2::new(320.0, 400.0),
                 Vec2::new(280.0, 320.0),
@@ -460,6 +495,7 @@ pub fn show(
             let t = theme(dark_mode);
             show_dialog_viewport(
                 ctx,
+                placement,
                 "Welcome to Ivory",
                 Vec2::new(470.0, 300.0),
                 Vec2::new(410.0, 260.0),
@@ -522,6 +558,7 @@ pub fn show(
             let t = theme(dark_mode);
             show_dialog_viewport(
                 ctx,
+                placement,
                 "Supporter Key",
                 Vec2::new(460.0, 290.0),
                 Vec2::new(400.0, 250.0),
@@ -602,6 +639,7 @@ pub fn show(
             let notes = notes.clone();
             show_dialog_viewport(
                 ctx,
+                placement,
                 "Teach Chord Name",
                 Vec2::new(420.0, 240.0),
                 Vec2::new(360.0, 200.0),
@@ -683,6 +721,7 @@ pub fn show(
             let notes = notes.clone();
             show_dialog_viewport(
                 ctx,
+                placement,
                 "Correct Chord Name",
                 Vec2::new(470.0, 370.0),
                 Vec2::new(400.0, 290.0),
@@ -810,6 +849,7 @@ pub fn show(
             let height = (lines * 13.5 + 24.0 + 30.0 + 16.0).clamp(150.0, 460.0);
             show_dialog_viewport(
                 ctx,
+                placement,
                 title,
                 Vec2::new(470.0, height),
                 Vec2::new(400.0, height.min(200.0)),
@@ -847,6 +887,7 @@ pub fn show(
             let learning_view = learning.clone();
             let r = show_dialog_viewport(
                 ctx,
+                placement,
                 "Manage Taught Chords",
                 Vec2::new(460.0, 460.0),
                 Vec2::new(360.0, 320.0),

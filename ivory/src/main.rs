@@ -215,6 +215,14 @@ fn main() {
         .with_resizable(false)
         .with_decorations(!settings.borderless_mode);
 
+    // Reopen where it was last left. Monitors are not enumerable before the
+    // window exists, so a position saved on a display that is now unplugged
+    // could land off-screen; `IvoryApp` rescues that on the first frame, once
+    // it can actually see the monitor.
+    if let Some(pos) = settings.window_pos_for_use() {
+        viewport = viewport.with_position(pos);
+    }
+
     // macOS wants a rounded-squircle icon with padding around the art; every other
     // platform expects the plain full-bleed square. Both are the same artwork.
     #[cfg(target_os = "macos")]

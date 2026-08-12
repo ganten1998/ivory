@@ -21,6 +21,34 @@ use std::time::{Duration, Instant};
 const GUI_TICK: Duration = Duration::from_millis(50);
 const DETECT_TICK: Duration = Duration::from_millis(100);
 const DEBOUNCE_100MS: Duration = Duration::from_millis(100);
+/// Quiet period after a move or resize before window geometry is written back.
+/// Long enough that a drag is one write, short enough that a kill -9 a second
+/// later still keeps the new position.
+const GEOMETRY_SAVE_DELAY: Duration = Duration::from_millis(700);
+/// How much of a restored window must be on-screen before it counts as visible.
+/// A window peeking a few pixels onto the desktop is not reachable in practice.
+const OFFSCREEN_SLACK: f32 = 40.0;
+/// Slack when comparing the size a window actually has against the size we
+/// asked for. Rounding and DPI scaling move things by a pixel or two.
+const WM_SIZE_TOLERANCE: f32 = 8.0;
+
+/// Whether something other than us is sizing our windows.
+///
+/// Under a tiling window manager (AeroSpace, yabai, i3) the size we ask for is
+/// simply overruled. Recording the result as if the user had chosen it is
+/// worse than recording nothing: the tiled geometry then follows them into
+/// every later session, including ones where nothing is tiling. That is
+/// exactly how a `detached_chord_height` of 1377 ended up in a settings file.
+fn wm_overrode_size(observed: Vec2, requested: Vec2) -> bool {
+    (observed.x - requested.x).abs() > WM_SIZE_TOLERANCE
+        || (observed.y - requested.y).abs() > WM_SIZE_TOLERANCE
+}
+
+/// How long after the detached window appears a size mismatch still counts as
+/// the window manager's doing rather than the user's. A tiling WM overrules
+/// the requested size at creation; a person reaching for the window edge takes
+/// longer than this. Size alone cannot tell the two apart, only timing can.
+const WM_GRACE: Duration = Duration::from_millis(600);
 
 /// Per-note data (spec §4.3.5): velocity is stored but never affects
 /// rendering; kept for parity and for the future teach layer.
@@ -52,12 +80,17 @@ pub struct IvoryApp {
 
     /// The detached chord window is actually on screen.
     detach_window_visible: bool,
-    /// Builder size frozen per detachment session so the per-frame builder
-    /// diff never fights user resizes (explicit syncs use ViewportCommand).
+    /// Builder size and position, frozen per detachment session so the
+    /// per-frame builder diff never fights the user's resizes and drags.
     detached_builder_size: Vec2,
+    detached_builder_pos: Option<Pos2>,
     detached_live_size: Option<Vec2>,
-    width_sync_deadline: Option<Instant>,
+    detached_live_pos: Option<Pos2>,
     startup_detach_at: Option<Instant>,
+    /// Geometry is written back on a debounce rather than on every frame: a
+    /// window drag would otherwise rewrite settings.json a hundred times, and
+    /// waiting for a clean exit loses the position whenever the app is killed.
+    geometry_save_at: Option<Instant>,
 
     menu_state: Option<MenuState>,
     dialog: Option<Dialog>,
@@ -66,6 +99,14 @@ pub struct IvoryApp {
     decorations_sent: Option<bool>,
     main_inner_origin: Pos2,
     monitor_size: Option<Vec2>,
+    /// The restored-off-screen rescue runs once, not every frame.
+    offscreen_checked: bool,
+    main_live_pos: Option<Pos2>,
+    main_live_size: Option<Vec2>,
+    /// When the detached window last appeared, and whether the window manager
+    /// took its sizing over. See `wm_overrode_size` and `WM_GRACE`.
+    detached_shown_at: Option<Instant>,
+    detached_wm_managed: bool,
 }
 
 impl IvoryApp {
@@ -99,10 +140,8 @@ impl IvoryApp {
             && settings.chord_detection_enabled)
             .then(|| Instant::now() + DEBOUNCE_100MS);
 
-        let detached_builder_size = Vec2::new(
-            main_width(&settings),
-            settings.detached_height_for_use(),
-        );
+        let detached_builder_size = settings.detached_size_for_use();
+        let detached_builder_pos = settings.detached_pos_for_use();
 
         let welcome = settings.show_welcome.then(|| Dialog::Welcome {
             dont_show_again: false,
@@ -123,15 +162,22 @@ impl IvoryApp {
             last_detection: None,
             detach_window_visible: false,
             detached_builder_size,
+            detached_builder_pos,
             detached_live_size: None,
-            width_sync_deadline: None,
+            detached_live_pos: None,
             startup_detach_at,
+            geometry_save_at: None,
             menu_state: None,
             dialog: welcome,
             last_sent_size: None,
             decorations_sent: None,
             main_inner_origin: Pos2::ZERO,
             monitor_size: None,
+            offscreen_checked: false,
+            main_live_pos: None,
+            main_live_size: None,
+            detached_shown_at: None,
+            detached_wm_managed: false,
         }
     }
 
@@ -365,25 +411,61 @@ impl IvoryApp {
     // ── Detach / attach (spec §5.7) ────────────────────────────────────────
 
     fn detach_chord_window(&mut self) {
-        let (w, _, chord_h) = self.layout_sizes();
-        // Python saves the current attached label height first.
-        if chord_h > 0.0 {
-            self.settings.detached_chord_height = chord_h as i64;
-        }
+        // Python seeded the detached height from the attached strip on every
+        // detach, which is what made the window a piano-wide sliver each time
+        // and quietly discarded whatever size the user had chosen. The window
+        // now reopens wherever and however they last left it.
         self.settings.chord_window_detached = true;
         self.detach_window_visible = true;
-        self.detached_builder_size = Vec2::new(w, self.settings.detached_height_for_use());
+        self.detached_builder_size = self.settings.detached_size_for_use();
+        self.detached_builder_pos = self
+            .settings
+            .detached_pos_for_use()
+            .map(|p| crate::settings::clamp_to_monitor(p, self.detached_builder_size, self.monitor_size));
         self.detached_live_size = None;
+        self.detached_live_pos = None;
+        self.detached_shown_at = Some(Instant::now());
+        self.detached_wm_managed = false;
         self.settings.save();
     }
 
     fn reattach_chord_window(&mut self) {
-        if let Some(size) = self.detached_live_size {
-            self.settings.detached_chord_height = size.y.round() as i64;
+        if !self.detached_wm_managed {
+            self.remember_detached_geometry();
         }
         self.detach_window_visible = false;
+        self.detached_shown_at = None;
         self.settings.chord_window_detached = false;
         self.settings.save();
+    }
+
+    /// Copy the detached window's live geometry into settings. Returns whether
+    /// anything actually changed, so the caller can avoid pointless writes.
+    fn remember_detached_geometry(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(size) = self.detached_live_size {
+            let (w, h) = (size.x.round() as i64, size.y.round() as i64);
+            if w > 0 && self.settings.detached_chord_width != Some(w) {
+                self.settings.detached_chord_width = Some(w);
+                changed = true;
+            }
+            if h > 0 && self.settings.detached_chord_height != h {
+                self.settings.detached_chord_height = h;
+                changed = true;
+            }
+        }
+        if let Some(pos) = self.detached_live_pos {
+            let (x, y) = (pos.x.round() as i64, pos.y.round() as i64);
+            if self.settings.detached_chord_x != Some(x) {
+                self.settings.detached_chord_x = Some(x);
+                changed = true;
+            }
+            if self.settings.detached_chord_y != Some(y) {
+                self.settings.detached_chord_y = Some(y);
+                changed = true;
+            }
+        }
+        changed
     }
 
     // ── Menu actions ───────────────────────────────────────────────────────
@@ -393,10 +475,8 @@ impl IvoryApp {
             MenuAction::SetSizePercent(p) => {
                 self.settings.window_size_percent = p;
                 self.settings.save();
-                if self.detach_window_visible {
-                    // 100ms debounce, restarted on changes (spec §5.7).
-                    self.width_sync_deadline = Some(Instant::now() + DEBOUNCE_100MS);
-                }
+                // The detached window deliberately does NOT follow: it is sized
+                // by the user now, not slaved to the keyboard's width.
             }
             MenuAction::ToggleBorderless => {
                 self.settings.borderless_mode = !self.settings.borderless_mode;
@@ -551,7 +631,9 @@ impl IvoryApp {
             note_names,
             current_label,
             input,
-            apply_all_keys: false,
+            // Naming a voicing usually means naming the shape, not that one
+            // key, so this starts on. The last choice is remembered.
+            apply_all_keys: self.settings.teach_apply_all_keys,
         });
     }
 
@@ -795,6 +877,11 @@ impl IvoryApp {
                 if let Some(store) = self.detector.overrides_mut() {
                     store.teach(&set, &name, apply_all_keys);
                 }
+                // Remember the choice so the box comes back the way it was left.
+                if self.settings.teach_apply_all_keys != apply_all_keys {
+                    self.settings.teach_apply_all_keys = apply_all_keys;
+                    self.settings.save();
+                }
                 self.detection_tick(true); // re-detect immediately (D-UI-5)
             }
             DialogAction::DeleteOverride { intervals } => {
@@ -867,23 +954,60 @@ impl eframe::App for IvoryApp {
                 self.startup_detach_at = None;
                 if self.settings.chord_window_detached && self.settings.chord_detection_enabled {
                     self.detach_window_visible = true;
-                    self.detached_builder_size = Vec2::new(
-                        main_width(&self.settings),
-                        self.settings.detached_height_for_use(),
-                    );
+                    self.detached_builder_size = self.settings.detached_size_for_use();
+                    self.detached_builder_pos = self.settings.detached_pos_for_use().map(|p| {
+                        crate::settings::clamp_to_monitor(
+                            p,
+                            self.detached_builder_size,
+                            self.monitor_size,
+                        )
+                    });
+                    self.detached_shown_at = Some(Instant::now());
+                    self.detached_wm_managed = false;
                 }
             }
         }
 
         self.detection_tick(false);
 
-        // Track our position on the monitor for global menu placement.
-        let (inner_rect, monitor) =
-            ctx.input(|i| (i.viewport().inner_rect, i.viewport().monitor_size));
+        // Track our position on the monitor for global menu placement, child
+        // window centring, and so the main window reopens where it was left.
+        let (inner_rect, outer_rect, monitor) = ctx.input(|i| {
+            (
+                i.viewport().inner_rect,
+                i.viewport().outer_rect,
+                i.viewport().monitor_size,
+            )
+        });
         if let Some(r) = inner_rect {
             self.main_inner_origin = r.min;
         }
         self.monitor_size = monitor;
+        // Rescue a window restored onto a monitor that is no longer there.
+        // A remembered position is the classic way for an app to launch
+        // invisibly, so this runs once, as soon as the monitor is known.
+        if !self.offscreen_checked {
+            if let (Some(r), Some(mon)) = (outer_rect.or(inner_rect), monitor) {
+                self.offscreen_checked = true;
+                let on_screen =
+                    Rect::from_min_size(Pos2::ZERO, mon).intersects(r.shrink(OFFSCREEN_SLACK));
+                if !on_screen {
+                    let fixed = crate::settings::clamp_to_monitor(r.min, r.size(), Some(mon));
+                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(fixed));
+                }
+            }
+        }
+
+        // The outer rect is what `with_position` takes, so that is what gets
+        // recorded; falling back to the inner origin is better than nothing on
+        // platforms that do not report it. Whether it is worth storing is
+        // decided at write-back time, once the size has settled.
+        let live_pos = outer_rect.map(|r| r.min).or(inner_rect.map(|r| r.min));
+        if live_pos != self.main_live_pos {
+            self.main_live_pos = live_pos;
+            self.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
+        }
+        self.main_live_size = inner_rect.map(|r| r.size());
 
         // Fixed-size enforcement: Min+Max+Inner triple whenever the target
         // changes (size %, chord toggle, detach/attach).
@@ -919,6 +1043,7 @@ impl eframe::App for IvoryApp {
                 self.current_chord.as_deref(),
                 self.settings.chord_text_color.to_color32(),
                 self.heart_color(),
+                None, // attached: it already has the piano below it as an edge
             );
         }
         let display = self.display_notes();
@@ -937,13 +1062,34 @@ impl eframe::App for IvoryApp {
             let outcome = chord_strip::show_detached_window(
                 &ctx,
                 self.detached_builder_size,
+                self.detached_builder_pos,
                 self.settings.borderless_mode,
                 self.current_chord.as_deref(),
                 self.settings.chord_text_color.to_color32(),
                 self.heart_color(),
             );
+            // A tiling WM overrules the size we asked for the moment the window
+            // appears. Inside the grace period a mismatch is therefore its
+            // doing, not the user's, and this session's geometry is not ours
+            // to remember. After it, a mismatch is a real resize.
+            if let (Some(shown), Some(size)) = (self.detached_shown_at, outcome.inner_size) {
+                if Instant::now().duration_since(shown) < WM_GRACE {
+                    self.detached_wm_managed |= wm_overrode_size(size, self.detached_builder_size);
+                } else {
+                    self.detached_shown_at = None;
+                }
+            }
+
+            let moved = outcome.inner_size != self.detached_live_size
+                || (outcome.outer_pos.is_some() && outcome.outer_pos != self.detached_live_pos);
             if let Some(size) = outcome.inner_size {
                 self.detached_live_size = Some(size);
+            }
+            if let Some(pos) = outcome.outer_pos {
+                self.detached_live_pos = Some(pos);
+            }
+            if moved && !self.detached_wm_managed {
+                self.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
             }
             if outcome.close_requested {
                 self.reattach_chord_window(); // close-to-reattach
@@ -954,14 +1100,33 @@ impl eframe::App for IvoryApp {
             }
         }
 
-        // Debounced detached-window width sync.
-        if let Some(deadline) = self.width_sync_deadline {
+        // Debounced geometry write-back: one settings.json write after the
+        // user stops dragging or resizing, rather than one per frame.
+        if let Some(deadline) = self.geometry_save_at {
             if Instant::now() >= deadline {
-                self.width_sync_deadline = None;
-                if self.detach_window_visible {
-                    if let Some(live) = self.detached_live_size {
-                        chord_strip::sync_width(&ctx, w, live);
+                self.geometry_save_at = None;
+                let mut dirty = false;
+                // The main window is not user-resizable, so once it has settled
+                // any disagreement with `target` means something else is
+                // placing it and its position is not worth remembering.
+                let ours = self
+                    .main_live_size
+                    .is_some_and(|s| !wm_overrode_size(s, target));
+                if ours {
+                    if let Some(p) = self.main_live_pos {
+                        let (x, y) = (p.x.round() as i64, p.y.round() as i64);
+                        if self.settings.window_x != Some(x) || self.settings.window_y != Some(y) {
+                            self.settings.window_x = Some(x);
+                            self.settings.window_y = Some(y);
+                            dirty = true;
+                        }
                     }
+                }
+                if self.detach_window_visible && !self.detached_wm_managed {
+                    dirty |= self.remember_detached_geometry();
+                }
+                if dirty {
+                    self.settings.save();
                 }
             }
         }
@@ -971,8 +1136,16 @@ impl eframe::App for IvoryApp {
             self.apply_menu_action(&ctx, action);
         }
 
-        // Dialog viewport.
-        if let Some(action) = dialogs::show(&ctx, &mut self.dialog, self.settings.dark_mode) {
+        // Dialog viewport. Child windows centre on the main window: without a
+        // position the OS places them, which on Windows is the top-left of the
+        // screen no matter where the user has put the piano.
+        let placement = dialogs::Placement {
+            parent: Some(Rect::from_min_size(self.main_inner_origin, target)),
+            monitor: self.monitor_size,
+        };
+        if let Some(action) =
+            dialogs::show(&ctx, &mut self.dialog, self.settings.dark_mode, placement)
+        {
             self.apply_dialog_action(&ctx, action);
         }
 
@@ -1022,5 +1195,26 @@ mod tests {
                 "window size at {pct}% detached"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    #[test]
+    fn a_tiling_wm_is_detected_but_ordinary_jitter_is_not() {
+        let asked = Vec2::new(460.0, 150.0);
+        // AeroSpace tiling the detached window to a third of a 2560x1440
+        // screen: the exact case that put detached_chord_height=1377 into a
+        // settings file, by recording the WM's choice as the user's.
+        assert!(wm_overrode_size(Vec2::new(853.0, 1377.0), asked));
+        // Sub-pixel and DPI rounding must not read as a resize.
+        assert!(!wm_overrode_size(Vec2::new(460.0, 150.0), asked));
+        assert!(!wm_overrode_size(Vec2::new(459.5, 150.4), asked));
+        assert!(!wm_overrode_size(Vec2::new(467.0, 157.0), asked));
+        // A real user resize is over the tolerance and must be honoured, which
+        // is why timing, not size, decides who did it.
+        assert!(wm_overrode_size(Vec2::new(700.0, 150.0), asked));
     }
 }
