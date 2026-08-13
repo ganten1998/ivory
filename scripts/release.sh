@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Orchestrate one Ivory release build on THIS host: verify the version, purge
+# Orchestrate one Tangent release build on THIS host: verify the version, purge
 # artifacts left over from other versions, run whichever build scripts this OS
 # can run, sanity-check the results, and write a version-scoped SHA256SUMS.
 #
@@ -43,7 +43,7 @@ if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-
   exit 2
 fi
 
-echo "==> Ivory $VERSION  host=$(uname -s)/$(uname -m)"
+echo "==> Tangent $VERSION  host=$(uname -s)/$(uname -m)"
 case "$VERSION" in
   *-*|*+*) echo "    pre-release: artifacts say $VERSION, Info.plist says ${VERSION%%[-+]*}" ;;
 esac
@@ -59,14 +59,14 @@ git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1 \
   && echo "    NOTE: tag v${VERSION} exists — you are rebuilding a shipped version"
 
 # ── Purge artifacts belonging to other versions ──────────────────────────────
-# Left in place they get swept up by any `Ivory-*` / `ivory-*` glob at checksum
+# Left in place they get swept up by any `Tangent-*` / `tangent-*` glob at checksum
 # or upload time. Only the four known artifact name shapes are ever touched.
 mkdir -p dist
 if [ "${KEEP_STALE:-0}" != "1" ]; then
   shopt -s nullglob
   STALE=()
-  for f in dist/Ivory-*-macos-*.zip dist/Ivory-*-macos-*.dmg \
-           dist/ivory-*-linux-*.tar.gz dist/ivory-*-windows-*.zip; do
+  for f in dist/Tangent-*-macos-*.zip dist/Tangent-*-macos-*.dmg \
+           dist/tangent-*-linux-*.tar.gz dist/tangent-*-windows-*.zip; do
     case "$f" in *"-${VERSION}-"*) continue ;; esac
     STALE+=("$f")
   done
@@ -128,13 +128,13 @@ for a in "${ARTIFACTS[@]}"; do
   case "$a" in
     *macos*)
       printf '%s\n' "$list" | grep -Eq '^__MACOSX'           && note "$a: carries __MACOSX junk"
-      printf '%s\n' "$list" | grep -Eq '/MacOS/ivory$'       || note "$a: no Ivory.app executable"
+      printf '%s\n' "$list" | grep -Eq '/MacOS/tangent$'       || note "$a: no Tangent.app executable"
       ;;
     *windows*)
-      printf '%s\n' "$list" | grep -Eq '^ivory\.exe$'        || note "$a: no ivory.exe"
+      printf '%s\n' "$list" | grep -Eq '^tangent\.exe$'        || note "$a: no tangent.exe"
       ;;
     *linux*)
-      printf '%s\n' "$list" | grep -Eq '/ivory$'             || note "$a: NO BINARY (the pre-2.1.0 empty-tarball bug)"
+      printf '%s\n' "$list" | grep -Eq '/tangent$'             || note "$a: NO BINARY (the pre-2.1.0 empty-tarball bug)"
       ;;
   esac
 done

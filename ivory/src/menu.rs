@@ -192,7 +192,7 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     }
     e.push(Entry::Separator);
     e.push(item(
-        if view.supporter { "Supporter Key..." } else { "Support Ivory..." },
+        if view.supporter { "Supporter Key..." } else { "Support Tangent..." },
         MenuAction::ShowSupporterKey,
     ));
     if view.supporter {
@@ -430,7 +430,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
 
     // ── Main menu viewport ─────────────────────────────────────────────────
     let builder = ViewportBuilder::default()
-        .with_title("Ivory")
+        .with_title("Tangent")
         .with_decorations(false)
         .with_resizable(false)
         .with_always_on_top()
@@ -512,7 +512,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
     if state.submenu_open && !close {
         let sub_pos = Pos2::new(state.pos.x + state.size.x, state.pos.y + state.size_row_top);
         let sub_builder = ViewportBuilder::default()
-            .with_title("Ivory")
+            .with_title("Tangent")
             .with_decorations(false)
             .with_resizable(false)
             .with_always_on_top()

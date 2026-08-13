@@ -1,11 +1,13 @@
 [Desktop Entry]
+# Source file keeps the codename; the build scripts copy it into the tarball as
+# tangent.desktop alongside tangent.png.
 Type=Application
-Name=Ivory
+Name=Tangent
 GenericName=MIDI Keyboard Monitor
 Comment=MIDI keyboard monitor with advanced chord detection
-Exec=ivory
-Icon=ivory
+Exec=tangent
+Icon=tangent
 Terminal=false
 Categories=AudioVideo;Audio;Music;
-Keywords=midi;keyboard;piano;music;chord;detection;ivory;monitor;88-key;visualizer;
-StartupWMClass=Ivory
+Keywords=midi;keyboard;piano;music;chord;detection;tangent;monitor;88-key;visualizer;
+StartupWMClass=Tangent

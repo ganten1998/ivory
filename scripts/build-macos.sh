@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Build Ivory.app for macOS and package it as a zip (primary) + DMG (best-effort).
+# Build Tangent.app for macOS and package it as a zip (primary) + DMG (best-effort).
 #
 # Usage:
 #   scripts/build-macos.sh                 # release build, host arch
 #   ARCH=universal scripts/build-macos.sh  # arm64 + x86_64 universal binary
 #   scripts/build-macos.sh icns <out.icns> # icon generation only (dry-test hook)
 #
-# Output: dist/Ivory.app
-#         dist/Ivory-<version>-macos-<arch>.zip
-#         dist/Ivory-<version>-macos-<arch>.dmg   (best-effort)
+# Output: dist/Tangent.app
+#         dist/Tangent-<version>-macos-<arch>.zip
+#         dist/Tangent-<version>-macos-<arch>.dmg   (best-effort)
 #
 # Requirements: rustup toolchain; Xcode CLT (codesign, ditto, sips, iconutil,
 # hdiutil). For ARCH=universal:
@@ -30,7 +30,7 @@ VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
 # only the bundle gets the numeric core. No-op on a plain release version.
 VERSION_NUM="${VERSION%%-*}"; VERSION_NUM="${VERSION_NUM%%+*}"
 # macOS icons are rounded squircles with padding, not full-bleed squares — using
-# the raw square art makes Ivory look oversized next to every other Dock icon.
+# the raw square art makes Tangent look oversized next to every other Dock icon.
 # assets/ivory-macos.png is the same artwork pre-composited into that shape.
 # (build-cross.sh keeps assets/ivory.png: Windows/Linux want the square.)
 ICON_SRC="assets/ivory-macos.png"
@@ -111,11 +111,11 @@ case "$ARCH" in
   *) echo "unknown ARCH=$ARCH (expected host|universal)" >&2; exit 2 ;;
 esac
 
-APP="dist/Ivory.app"
-ZIP="dist/Ivory-${VERSION}-macos-${ARCH_NAME}.zip"
-DMG="dist/Ivory-${VERSION}-macos-${ARCH_NAME}.dmg"
+APP="dist/Tangent.app"
+ZIP="dist/Tangent-${VERSION}-macos-${ARCH_NAME}.zip"
+DMG="dist/Tangent-${VERSION}-macos-${ARCH_NAME}.dmg"
 
-echo "==> Ivory $VERSION  arch=$ARCH"
+echo "==> Tangent $VERSION  arch=$ARCH"
 mkdir -p dist
 
 # License bundle must exist before packaging.
@@ -125,14 +125,14 @@ mkdir -p dist
 case "$ARCH" in
   host)
     cargo build --release -p ivory
-    BIN="target/release/ivory"
+    BIN="target/release/tangent"
     ;;
   universal)
     rustup target add x86_64-apple-darwin aarch64-apple-darwin >/dev/null 2>&1 || true
     cargo build --release -p ivory --target x86_64-apple-darwin
     cargo build --release -p ivory --target aarch64-apple-darwin
     mkdir -p target/universal/release
-    BIN="target/universal/release/ivory"
+    BIN="target/universal/release/tangent"
     lipo -create -output "$BIN" \
       target/x86_64-apple-darwin/release/ivory \
       target/aarch64-apple-darwin/release/ivory
@@ -144,8 +144,8 @@ echo "==> Assembling $APP"
 rm -rf "$APP" "$ZIP" "$DMG"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-cp "$BIN" "$APP/Contents/MacOS/ivory"
-chmod +x "$APP/Contents/MacOS/ivory"
+cp "$BIN" "$APP/Contents/MacOS/tangent"
+chmod +x "$APP/Contents/MacOS/tangent"
 
 make_icns "$APP/Contents/Resources/AppIcon.icns"
 
@@ -164,9 +164,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key>              <string>Ivory</string>
-    <key>CFBundleDisplayName</key>       <string>Ivory</string>
-    <key>CFBundleExecutable</key>        <string>ivory</string>
+    <key>CFBundleName</key>              <string>Tangent</string>
+    <key>CFBundleDisplayName</key>       <string>Tangent</string>
+    <key>CFBundleExecutable</key>        <string>tangent</string>
     <key>CFBundleIconFile</key>          <string>AppIcon</string>
     <key>CFBundleIconName</key>          <string>AppIcon</string>
     <key>CFBundleIdentifier</key>        <string>org.codeberg.ganten1998.ivory</string>
@@ -204,7 +204,7 @@ if [ -n "$SIGN_ID" ]; then
   # bundle gains a helper. --options runtime (the hardened runtime) is a
   # prerequisite for notarization; --timestamp makes the signature outlive the
   # certificate's expiry, so old downloads keep working.
-  codesign --force --options runtime --timestamp -s "$SIGN_ID" "$APP/Contents/MacOS/ivory"
+  codesign --force --options runtime --timestamp -s "$SIGN_ID" "$APP/Contents/MacOS/tangent"
   codesign --force --options runtime --timestamp -s "$SIGN_ID" "$APP"
   codesign --verify --strict --verbose=2 "$APP"
   SIGNED_RELEASE=1
@@ -228,8 +228,8 @@ if [ "$SIGNED_RELEASE" = 1 ] \
    && xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
   echo "==> Notarizing (waits on Apple; typically 1–5 minutes)"
   NOTARY_DIR="$(mktemp -d)"
-  ditto -c -k --sequesterRsrc --keepParent "$APP" "$NOTARY_DIR/Ivory.zip"
-  if xcrun notarytool submit "$NOTARY_DIR/Ivory.zip" \
+  ditto -c -k --sequesterRsrc --keepParent "$APP" "$NOTARY_DIR/Tangent.zip"
+  if xcrun notarytool submit "$NOTARY_DIR/Tangent.zip" \
        --keychain-profile "$NOTARY_PROFILE" --wait; then
     xcrun stapler staple "$APP"
     xcrun stapler validate "$APP"
@@ -254,10 +254,10 @@ touch "$APP" "$APP/Contents/Info.plist"
 # single source, so packaging "$APP" directly (as this did before 2.1.0) left
 # READ-ME-FIRST.md sitting on the build machine while the comment claimed the
 # hand-off explained itself. Windows testers got it; macOS testers did not.
-STAGE="dist/Ivory-${VERSION}-macos-${ARCH_NAME}"
+STAGE="dist/Tangent-${VERSION}-macos-${ARCH_NAME}"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-ditto "$APP" "$STAGE/Ivory.app"
+ditto "$APP" "$STAGE/Tangent.app"
 # User-facing instructions ride alongside the .app (inside the bundle they would
 # be invisible), so the zip/dmg hand-off explains itself. Shipped as .txt, not
 # .md: every platform opens .txt on double-click; .md often has no handler.
@@ -274,16 +274,16 @@ ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$ZIP"
 # `ditto -x -k` and `unzip`. zip -d exits 12 when nothing matches, hence || true.
 zip -q -d "$ZIP" '__MACOSX*' >/dev/null 2>&1 || true
 
-# The DMG gets an /Applications alias so the README's "drag Ivory.app into your
+# The DMG gets an /Applications alias so the README's "drag Tangent.app into your
 # Applications folder" has a visible target. Added AFTER the zip is written so
 # the zip does not carry a stray symlink (it would be meaningless there).
 ln -s /Applications "$STAGE/Applications"
 
 echo "==> Packaging $DMG (best-effort)"
-hdiutil create -volname "Ivory" -srcfolder "$STAGE" -ov -format UDZO "$DMG" \
+hdiutil create -volname "Tangent" -srcfolder "$STAGE" -ov -format UDZO "$DMG" \
   || echo "warn: DMG creation failed; the zip is the primary artifact"
 rm -rf "$STAGE"
 
-du -h "$APP/Contents/MacOS/ivory" "$ZIP" 2>/dev/null | sed 's/^/    /'
+du -h "$APP/Contents/MacOS/tangent" "$ZIP" 2>/dev/null | sed 's/^/    /'
 [ -f "$DMG" ] && du -h "$DMG" | sed 's/^/    /'
 echo "==> Done. Open with:  open $APP"

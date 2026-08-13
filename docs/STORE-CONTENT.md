@@ -23,14 +23,14 @@ latest. Nothing here is version-pinned, so a page written today still hands out
 
 That guarantee rests entirely on `scripts/publish-github.sh` uploading the
 version-less alias assets on every release. If a future release ships only
-`Ivory-2.3.0-macos-arm64.dmg`, all of these 404 at once, for buyers as well as
+`Tangent-2.3.0-macos-arm64.dmg`, all of these 404 at once, for buyers as well as
 for the README, and nothing anywhere reports it. See `docs/RELEASE.md` step 9.
 
 | platform | asset name |
 |---|---|
-| macOS (Apple Silicon) | `Ivory-macos-arm64.dmg`, `Ivory-macos-arm64.zip` |
-| Windows | `ivory-windows-x86_64.zip` |
-| Linux | `ivory-linux-x86_64.tar.gz` |
+| macOS (Apple Silicon) | `Tangent-macos-arm64.dmg`, `Tangent-macos-arm64.zip` |
+| Windows | `tangent-windows-x86_64.zip` |
+| Linux | `tangent-linux-x86_64.tar.gz` |
 | checksums | `SHA256SUMS` |
 
 **Links, not uploaded copies.** Gumroad can host the binaries itself, and that
@@ -42,7 +42,7 @@ the public README already has.
 
 ## Post-purchase page
 
-Gumroad → Products → Ivory → **Content** tab → paste, then **Save changes**.
+Gumroad → Products → Tangent → **Content** tab → paste, then **Save changes**.
 
 Gumroad's editor turns a bare URL into a link on paste, so this can go in as
 plain text. Headings are optional; set them with the editor's own controls
@@ -53,26 +53,26 @@ Ping and mints a real key.
 
 ---
 
-Thank you for supporting Ivory.
+Thank you for supporting Tangent.
 
-Ivory is free and stays free. Your supporter key is a thank-you, not an unlock.
+Tangent is free and stays free. Your supporter key is a thank-you, not an unlock.
 Nothing in the app is hidden behind it.
 
-DOWNLOAD IVORY
+DOWNLOAD TANGENT
 
 These links always give you the current version, so they are worth keeping.
 
 macOS 11 or later, Apple Silicon
-https://github.com/ganten1998/ivory/releases/latest/download/Ivory-macos-arm64.dmg
+https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.dmg
 
 Prefer a .zip:
-https://github.com/ganten1998/ivory/releases/latest/download/Ivory-macos-arm64.zip
+https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.zip
 
 Windows 10 or later
-https://github.com/ganten1998/ivory/releases/latest/download/ivory-windows-x86_64.zip
+https://github.com/ganten1998/ivory/releases/latest/download/tangent-windows-x86_64.zip
 
 Linux x86_64
-https://github.com/ganten1998/ivory/releases/latest/download/ivory-linux-x86_64.tar.gz
+https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz
 
 Checksums:
 https://github.com/ganten1998/ivory/releases/latest/download/SHA256SUMS
@@ -84,26 +84,26 @@ keys@ivorymidi.com. If it has not arrived, search your spam folder for that
 address. If it is still missing, reply to your Gumroad receipt and I will send
 it by hand.
 
-To use it: open Ivory, right-click anywhere, choose "Support Ivory...", paste
+To use it: open Tangent, right-click anywhere, choose "Support Tangent...", paste
 the key and press Activate. Case, spaces, dashes and line breaks do not matter.
 
 The key has no expiry, contacts no server, and works on every machine you own.
 
 FIRST LAUNCH
 
-macOS: open the .dmg and drag Ivory into your Applications folder. The app is
+macOS: open the .dmg and drag Tangent into your Applications folder. The app is
 signed with a Developer ID certificate and notarized by Apple, so it opens on a
 double-click with no security prompt.
 
-Windows: unzip it anywhere and run ivory.exe. There is no installer. The
+Windows: unzip it anywhere and run tangent.exe. There is no installer. The
 executable is not code-signed, so SmartScreen shows "Windows protected your PC"
 the first time. Click "More info", then "Run anyway". Windows remembers the
 choice.
 
-Linux: extract the archive, then chmod +x ivory and ./ivory. MIDI goes through
+Linux: extract the archive, then chmod +x tangent and ./ivory. MIDI goes through
 ALSA, so libasound.so.2 needs to be present. Requires glibc 2.32 or newer.
 
-Plug your MIDI keyboard in before you start Ivory. Everything in the app lives
+Plug your MIDI keyboard in before you start Tangent. Everything in the app lives
 in the right-click menu.
 
 Source code and release notes:

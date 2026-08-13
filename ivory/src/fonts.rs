@@ -107,7 +107,7 @@ pub fn install(ctx: &egui::Context, choice: FontChoice, custom_font_path: Option
 
     // A chosen built-in sits above Courier Prime but below any custom font.
     // Courier Prime stays in the chain underneath as glyph fallback, so a face
-    // lacking a symbol Ivory draws (°, ø, Δ) still renders it correctly.
+    // lacking a symbol Tangent draws (°, ø, Δ) still renders it correctly.
     if choice == FontChoice::Terminess {
         defs.font_data.insert(
             "Terminess-Regular".to_owned(),

@@ -218,7 +218,7 @@ pub fn show_detached_window(
 ) -> DetachedOutcome {
     let mut outcome = DetachedOutcome::default();
     let mut builder = ViewportBuilder::default()
-        .with_title("Ivory")
+        .with_title("Tangent")
         .with_inner_size(builder_size)
         .with_min_inner_size([220.0, 80.0])
         .with_resizable(true)
@@ -272,7 +272,7 @@ pub fn show_detached_window(
 mod tests {
     use super::*;
 
-    /// A headless context with Ivory's fonts actually installed. Laying text
+    /// A headless context with Tangent's fonts actually installed. Laying text
     /// out against the default font set would measure the wrong glyphs, and
     /// `fonts::courier()` names a family that only `fonts::install` binds.
     fn test_painter() -> (egui::Context, Painter) {

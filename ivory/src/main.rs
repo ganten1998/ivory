@@ -1,4 +1,4 @@
-//! Ivory — MIDI keyboard monitor with chord detection (Rust port of the
+//! Tangent — MIDI keyboard monitor with chord detection (Rust port of the
 //! PySide6 v1.1.0 app; UI parity per docs/spec/ui-spec.md).
 #![windows_subsystem = "windows"]
 
@@ -28,9 +28,9 @@ struct CliArgs {
 }
 
 fn print_usage_and_exit(code: i32) -> ! {
-    let text = "usage: ivory [-h] [-p PORT] [-l]\n\
+    let text = "usage: tangent [-h] [-p PORT] [-l]\n\
                 \n\
-                PySide6 MIDI keyboard monitor with chord detection\n\
+                MIDI keyboard monitor with chord detection\n\
                 \n\
                 options:\n\
                   -h, --help            show this help message and exit\n\
@@ -57,7 +57,7 @@ fn parse_cli() -> CliArgs {
             "-p" | "--port" => match args.next() {
                 Some(value) => port = Some(value),
                 None => {
-                    eprintln!("ivory: error: argument -p/--port: expected one argument");
+                    eprintln!("tangent: error: argument -p/--port: expected one argument");
                     std::process::exit(2);
                 }
             },
@@ -69,7 +69,7 @@ fn parse_cli() -> CliArgs {
                         port = Some(value.to_owned());
                     }
                 } else {
-                    eprintln!("ivory: error: unrecognized arguments: {other}");
+                    eprintln!("tangent: error: unrecognized arguments: {other}");
                     print_usage_and_exit(2);
                 }
             }
@@ -117,7 +117,7 @@ fn install_logger() {
     let _ = log::set_logger(logger).map(|()| log::set_max_level(level));
 }
 
-/// Top-level error surface (spec §2.3): any panic shows a critical "Ivory
+/// Top-level error surface (spec §2.3): any panic shows a critical "Tangent
 /// Error" box with the message and a backtrace, then exits with code 1.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
@@ -133,12 +133,12 @@ fn install_panic_hook() {
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_default();
         let backtrace = std::backtrace::Backtrace::force_capture();
-        let body = format!("Ivory encountered an error:\n\n{msg}\n  at {location}\n\n{backtrace}");
+        let body = format!("Tangent encountered an error:\n\n{msg}\n  at {location}\n\n{backtrace}");
         eprintln!("{body}");
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rfd::MessageDialog::new()
                 .set_level(rfd::MessageLevel::Error)
-                .set_title("Ivory Error")
+                .set_title("Tangent Error")
                 .set_description(&body)
                 .set_buttons(rfd::MessageButtons::Ok)
                 .show();
@@ -188,8 +188,8 @@ fn main() {
     if !acquire_single_instance() {
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Warning)
-            .set_title("Ivory Already Running")
-            .set_description("Ivory is already running.\n\nOnly one instance can run at a time.")
+            .set_title("Tangent Already Running")
+            .set_description("Tangent is already running.\n\nOnly one instance can run at a time.")
             .set_buttons(rfd::MessageButtons::Ok)
             .show();
         std::process::exit(0);
@@ -203,11 +203,11 @@ fn main() {
     // The app icon MUST be set here. eframe applies its own embedded default
     // (the egui hexagon) whenever the viewport icon is None, and on macOS a
     // runtime icon overrides the .app bundle's CFBundleIconFile — so without
-    // this the Dock showed the egui logo while Finder correctly showed Ivory's.
+    // this the Dock showed the egui logo while Finder correctly showed Tangent's.
     // A decode failure just means no runtime icon: on macOS the bundle icon then
     // applies, so fall back silently rather than killing startup over artwork.
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Ivory")
+        .with_title("Tangent")
         .with_app_id("ivory")
         .with_inner_size(size)
         .with_min_inner_size(size)
@@ -242,17 +242,17 @@ fn main() {
 
     let port = cli.port;
     let result = eframe::run_native(
-        "Ivory",
+        "Tangent",
         options,
         Box::new(move |cc| Ok(Box::new(app::IvoryApp::new(cc, settings, port)))),
     );
 
     if let Err(err) = result {
-        let body = format!("Ivory encountered an error:\n\n{err}");
+        let body = format!("Tangent encountered an error:\n\n{err}");
         eprintln!("{body}");
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
-            .set_title("Ivory Error")
+            .set_title("Tangent Error")
             .set_description(&body)
             .set_buttons(rfd::MessageButtons::Ok)
             .show();

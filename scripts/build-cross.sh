@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-build Ivory release artifacts for Linux and Windows from a macOS host.
+# Cross-build Tangent release artifacts for Linux and Windows from a macOS host.
 #
 #   scripts/build-cross.sh        # builds + packages everything into dist/
 #   scripts/build-cross.sh ico    # regenerate assets/ivory.ico only (dry-test hook)
@@ -139,7 +139,7 @@ sign_windows_exe() {
         --storepass "$token" \
         --alias "${TRUSTED_SIGNING_ACCOUNT}/${TRUSTED_SIGNING_PROFILE}" \
         --tsaurl http://timestamp.acs.microsoft.com \
-        --name "Ivory" \
+        --name "Tangent" \
         "$exe" || { echo "jsign failed — exe NOT signed" >&2; return 1; }
 
   # Best-effort local check; real proof is a first launch on Windows.
@@ -153,7 +153,7 @@ sign_windows_exe() {
 
 package_linux() { # $1 = rust target, $2 = artifact arch name
   local target="$1" arch="$2"
-  local stage="dist/ivory-${VERSION}-linux-${arch}"
+  local stage="dist/tangent-${VERSION}-linux-${arch}"
   # NOTE: this function is invoked as `package_linux ... || handler`, which
   # DISABLES `set -e` inside the whole body (bash: errexit is suppressed in a
   # command that is the left operand of ||). Every failure must therefore be
@@ -162,14 +162,14 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   # exactly what happened before 2.1.0.
   rm -rf "$stage" "${stage}.tar.gz"
   cargo zigbuild --release --target "${target}.${GLIBC}" -p ivory || return 1
-  if [ ! -f "target/${target}/release/ivory" ]; then
-    echo "!! no binary at target/${target}/release/ivory"
+  if [ ! -f "target/${target}/release/tangent" ]; then
+    echo "!! no binary at target/${target}/release/tangent"
     return 1
   fi
   mkdir -p "$stage/fonts" || return 1
-  cp "target/${target}/release/ivory" "$stage/" || { rm -rf "$stage"; return 1; }
-  cp assets/ivory.desktop "$stage/" || { rm -rf "$stage"; return 1; }
-  cp assets/ivory.png "$stage/" || { rm -rf "$stage"; return 1; }
+  cp "target/${target}/release/tangent" "$stage/" || { rm -rf "$stage"; return 1; }
+  cp assets/ivory.desktop "$stage/tangent.desktop" || { rm -rf "$stage"; return 1; }
+  cp assets/ivory.png "$stage/tangent.png" || { rm -rf "$stage"; return 1; }
   cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
      assets/fonts/OFL.txt "$stage/fonts/" || { rm -rf "$stage"; return 1; }
   # Licences for the four fonts eframe's `default_fonts` embeds in the binary.
@@ -180,7 +180,7 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   # The same user-facing readme the macOS and Windows artifacts carry.
   cp docs/ARTIFACT-README.md "$stage/README.txt" \
     || { rm -rf "$stage"; return 1; }
-  tar -C dist -czf "${stage}.tar.gz" "ivory-${VERSION}-linux-${arch}" || {
+  tar -C dist -czf "${stage}.tar.gz" "tangent-${VERSION}-linux-${arch}" || {
     rm -rf "$stage" "${stage}.tar.gz"; return 1;
   }
   rm -rf "$stage"
@@ -192,20 +192,20 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
 # Build Linux on Linux (CI with libasound2-dev) or provide a sysroot. Windows
 # (no ALSA) still builds below regardless.
 LINUX_OK=1
-echo "==> Ivory $VERSION — Linux x86_64"
+echo "==> Tangent $VERSION — Linux x86_64"
 package_linux x86_64-unknown-linux-gnu x86_64 || { LINUX_OK=0; echo "!! Linux x86_64 build failed (ALSA sysroot? see docs/RELEASE.md)"; }
 
-echo "==> Ivory $VERSION — Linux aarch64"
+echo "==> Tangent $VERSION — Linux aarch64"
 package_linux aarch64-unknown-linux-gnu aarch64 || { LINUX_OK=0; echo "!! Linux aarch64 build failed (ALSA sysroot? see docs/RELEASE.md)"; }
 
-echo "==> Ivory $VERSION — Windows x86_64"
+echo "==> Tangent $VERSION — Windows x86_64"
 cargo xwin build --release --target x86_64-pc-windows-msvc -p ivory
-WINSTAGE="dist/ivory-${VERSION}-windows-x86_64"
+WINSTAGE="dist/tangent-${VERSION}-windows-x86_64"
 WINZIP="${WINSTAGE}.zip"
 rm -rf "$WINSTAGE" "$WINZIP"
 mkdir -p "$WINSTAGE"
-cp target/x86_64-pc-windows-msvc/release/ivory.exe "$WINSTAGE/"
-sign_windows_exe "$WINSTAGE/ivory.exe"
+cp target/x86_64-pc-windows-msvc/release/tangent.exe "$WINSTAGE/"
+sign_windows_exe "$WINSTAGE/tangent.exe"
 cp LICENSE THIRD-PARTY-LICENSES "$WINSTAGE/"
 cp assets/fonts/OFL.txt "$WINSTAGE/"
 # Licences for the four fonts eframe's `default_fonts` embeds in ivory.exe.
@@ -222,5 +222,5 @@ cp docs/ARTIFACT-README.md "$WINSTAGE/README.txt"
 rm -rf "$WINSTAGE"
 echo "==> $WINZIP"
 
-ls -lh dist/ivory-"${VERSION}"-* 2>/dev/null | sed 's/^/    /'
+ls -lh dist/tangent-"${VERSION}"-* 2>/dev/null | sed 's/^/    /'
 [ "$LINUX_OK" = 1 ] || echo "NOTE: Linux artifacts were skipped (ALSA cross-build). Windows built OK."

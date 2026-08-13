@@ -240,7 +240,7 @@ impl IvoryApp {
         // store screenshots and for eyeballing display work (a glow or a
         // segment readout can only be judged lit). Environment-gated, so a
         // normal launch cannot reach it and it ships inert.
-        //   IVORY_DEMO_NOTES=60,64,67,71 /Applications/Ivory.app/Contents/MacOS/ivory
+        //   IVORY_DEMO_NOTES=60,64,67,71 /Applications/Tangent.app/Contents/MacOS/ivory
         if let Ok(spec) = std::env::var("IVORY_DEMO_NOTES") {
             let demo: HashSet<u8> = spec
                 .split(&[',', ' '][..])
@@ -702,11 +702,11 @@ impl IvoryApp {
                 .is_some();
             let message = if pinned {
                 format!(
-                    "This voicing has a taught name pinned to it, so Ivory is\n\
+                    "This voicing has a taught name pinned to it, so Tangent is\n\
                      not weighing any alternatives.\n\n\
                      Notes: {note_names}\nReads: {current_label}\n\n\
                      Remove it in \"Manage Taught Chords...\" first if you want\n\
-                     Ivory to choose the name again."
+                     Tangent to choose the name again."
                 )
             } else if candidates.len() == 1 {
                 // It WAS weighed — there simply was no rival. Saying "named by
@@ -715,7 +715,7 @@ impl IvoryApp {
                     "Only one chord name fits these notes, so there is nothing\n\
                      to weigh it against.\n\n\
                      Notes: {note_names}\nReads: {current_label}\n\n\
-                     Add or change a note to give Ivory a choice, or use\n\
+                     Add or change a note to give Tangent a choice, or use\n\
                      \"Teach Chord Name...\" to pin a name of your own."
                 )
             } else {
@@ -724,7 +724,7 @@ impl IvoryApp {
                 // bass) are resolved by dedicated branches before scoring ever
                 // runs, and they land here too.
                 format!(
-                    "Ivory named this voicing with a fixed rule rather than by\n\
+                    "Tangent named this voicing with a fixed rule rather than by\n\
                      weighing alternatives, so there is nothing to re-rank.\n\n\
                      Notes: {note_names}\nReads: {current_label}\n\n\
                      That is how intervals, scales and a few special chord\n\
@@ -792,7 +792,7 @@ impl IvoryApp {
             }
             TrainOutcome::AlreadyCorrect { displays_as } => {
                 if displays_as == name {
-                    format!("{name} is already Ivory's choice here, so nothing was changed.")
+                    format!("{name} is already Tangent's choice here, so nothing was changed.")
                 } else {
                     format!(
                         "{name} already wins for this voicing, so nothing was\n\
@@ -804,7 +804,7 @@ impl IvoryApp {
                 }
             }
             TrainOutcome::OutrankedByRule { wants, displays_as } => format!(
-                "{wants} is already Ivory's top-scoring reading — but the name\n\
+                "{wants} is already Tangent's top-scoring reading — but the name\n\
                  you see, \"{displays_as}\", comes from a separate rule that runs\n\
                  afterwards and overrides it.\n\n\
                  Chord learning only reorders competing chord names, so it\n\
@@ -812,14 +812,14 @@ impl IvoryApp {
                  Name...\" to pin {wants} outright."
             ),
             TrainOutcome::Stubborn { still_reads, .. } => format!(
-                "Ivory could not be nudged that far.\n\n\
+                "Tangent could not be nudged that far.\n\n\
                  {name} scores too far behind {still_reads} for a safe nudge\n\
                  to close the gap, so nothing was changed.\n\n\
                  To force this name anyway, use \"Teach Chord Name...\" — it\n\
                  pins the name outright."
             ),
             TrainOutcome::NotTrainable => format!(
-                "{name} is not one of the readings Ivory weighed for this\n\
+                "{name} is not one of the readings Tangent weighed for this\n\
                  voicing, so there is nothing to re-rank.\n\n\
                  Use \"Teach Chord Name...\" to pin it instead."
             ),
@@ -1023,7 +1023,7 @@ impl eframe::App for IvoryApp {
         let decorations = !self.settings.borderless_mode;
         if self.decorations_sent != Some(decorations) {
             ctx.send_viewport_cmd(ViewportCommand::Decorations(decorations));
-            ctx.send_viewport_cmd(ViewportCommand::Title("Ivory".to_owned()));
+            ctx.send_viewport_cmd(ViewportCommand::Title("Tangent".to_owned()));
             self.decorations_sent = Some(decorations);
         }
 

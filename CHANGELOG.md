@@ -1,6 +1,7 @@
 # Changelog
 
-All notable changes to Ivory are documented in this file.
+All notable changes to Tangent are documented in this file. Entries before 2.3.0
+refer to the app under its former name, Ivory.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -8,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
+
+### Changed
+
+- **Renamed from Ivory to Tangent.** Synthogy's Ivory is a well-known virtual
+  piano instrument, and a plugin build would have put this app in the same
+  browser. The clavichord's tangent is the blade at the back of each key that
+  strikes the string and stays in contact with it for as long as the note
+  sounds, which is what the display does with a held note.
+- The binary is now `tangent`; artifacts are `Tangent-<version>-macos-*`,
+  `tangent-<version>-windows-*` and `tangent-<version>-linux-*`.
+- Nothing you have is affected. `~/.config/ivory/` keeps your settings and
+  taught chords, existing supporter keys keep working, and downloads published
+  under the old `Ivory-*` names keep resolving.
+
+### Fixed (from the 2.2.0 tester report)
+
+- Child windows open centred on the main window instead of the top-left of the
+  screen.
+- The detached chord window is no longer locked to the piano's width, opens at a
+  readable 460x150, and remembers its size and position.
+- The main window remembers its position.
+- Long labels such as `Eb Minor Pentatonic` wrap to two lines instead of
+  shrinking to a fraction of the size of a short name.
+- The detached window has a border, so it no longer bleeds into a dark desktop.
+- "Apply in all keys" in Teach Chord Name starts checked and remembers the last
+  choice.
 
 ## [2.2.0] - 2026-08-12
 

@@ -1,7 +1,7 @@
 //! Automated Gumroad fulfilment: a sale arrives, a supporter key goes out.
 //!
 //! Gumroad Ping POSTs to `/hook/<SECRET>` on every sale. This service verifies
-//! the sale is real, mints an Ivory key with the SAME encoder the app verifies
+//! the sale is real, mints an Tangent key with the SAME encoder the app verifies
 //! with, emails it to the buyer, and records it. No manual step, ever.
 //!
 //! Deliberately boring and defensive, because it runs unattended and handles
@@ -21,7 +21,7 @@
 //!   GUMROAD_TOKEN        Gumroad access token, to verify sales
 //!   GUMROAD_SELLER_ID    your seller id, cheap first-pass rejection
 //!   RESEND_API_KEY       email provider key
-//!   MAIL_FROM            e.g. "Ivory <keys@yourdomain>"
+//!   MAIL_FROM            e.g. "Tangent <keys@yourdomain>"
 //!   LEDGER_PATH          default /data/ledger.jsonl (persist this volume!)
 //!   PORT                 default 8080
 
@@ -167,7 +167,7 @@ fn sale_is_genuine(token: &str, sale_id: &str) -> bool {
 // Never pin these to a version: buyers keep this email for years, and a link
 // to 2.2.0 in 2029 is worse than no link at all.
 const DOWNLOAD_MACOS: &str =
-    "https://github.com/ganten1998/ivory/releases/latest/download/Ivory-macos-arm64.dmg";
+    "https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.dmg";
 const DOWNLOAD_WINDOWS: &str =
     "https://github.com/ganten1998/ivory/releases/latest/download/ivory-windows-x86_64.zip";
 const DOWNLOAD_LINUX: &str =
@@ -178,11 +178,11 @@ const DOWNLOAD_LINUX: &str =
 /// a formatting mistake.
 fn email_body(key: &str) -> String {
     format!(
-        "Thank you for supporting Ivory.\n\n\
-         Ivory is free and stays free. This key is a thank-you, not an unlock.\n\n\
+        "Thank you for supporting Tangent.\n\n\
+         Tangent is free and stays free. This key is a thank-you, not an unlock.\n\n\
          Your supporter key:\n\n\
          {key}\n\n\
-         To use it: open Ivory, right-click anywhere, choose \"Support Ivory...\",\n\
+         To use it: open Tangent, right-click anywhere, choose \"Support Tangent...\",\n\
          paste the key and press Activate. Case, spaces, dashes and line breaks\n\
          do not matter.\n\n\
          Downloads. These links always give you the current version, so they are\n\
@@ -195,7 +195,7 @@ fn email_body(key: &str) -> String {
          \x20 {linux}\n\n\
          Keep this email. The key has no expiry and works on every machine you own.\n\n\
          Thanks again,\n\
-         Ivory\n",
+         Tangent\n",
         macos = DOWNLOAD_MACOS,
         windows = DOWNLOAD_WINDOWS,
         linux = DOWNLOAD_LINUX,
@@ -207,7 +207,7 @@ fn send_email(api_key: &str, from: &str, to: &str, name: &str, key: &str) -> Res
     let payload = serde_json::json!({
         "from": from,
         "to": [to],
-        "subject": "Your Ivory supporter key",
+        "subject": "Your Tangent supporter key",
         "text": body,
         "reply_to": from,
     });
@@ -312,7 +312,7 @@ fn main() {
         let sale_id = form.get("sale_id").cloned().unwrap_or_default();
         let email = form.get("email").cloned().unwrap_or_default();
         // Gumroad puts custom checkout fields under url_params/variants; the
-        // "How should Ivory thank you?" answer is optional by design.
+        // "How should Tangent thank you?" answer is optional by design.
         let display_name = form
             .get("full_name")
             .or_else(|| form.get("purchaser_name"))

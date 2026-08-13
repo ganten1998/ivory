@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Build + package the Ivory Linux release NATIVELY (run this ON a Linux host).
+# Build + package the Tangent Linux release NATIVELY (run this ON a Linux host).
 #
 # Cross-compiling from macOS fails because midir links ALSA and alsa-sys can't
 # find an ALSA sysroot (see docs/RELEASE.md). Building on Linux sidesteps that
 # entirely — this is the recommended Linux path.
 #
-#   scripts/build-linux-native.sh          # -> dist/ivory-<v>-linux-<arch>.tar.gz
+#   scripts/build-linux-native.sh          # -> dist/tangent-<v>-linux-<arch>.tar.gz
 #
 # Build dependencies:
 #   Void Linux:   sudo xbps-install -S base-devel rust cargo pkg-config \
@@ -33,14 +33,14 @@ ARCH="$(uname -m)"   # x86_64 or aarch64
 
 [ -f THIRD-PARTY-LICENSES ] || scripts/gen-third-party-licenses.sh
 
-echo "==> Ivory $VERSION — Linux $ARCH (native)"
+echo "==> Tangent $VERSION — Linux $ARCH (native)"
 cargo build --release -p ivory
 
-STAGE="dist/ivory-${VERSION}-linux-${ARCH}"
+STAGE="dist/tangent-${VERSION}-linux-${ARCH}"
 rm -rf "$STAGE"; mkdir -p "$STAGE/fonts"
-cp target/release/ivory "$STAGE/"
-cp assets/ivory.desktop "$STAGE/"
-cp assets/ivory.png "$STAGE/"
+cp target/release/tangent "$STAGE/"
+cp assets/ivory.desktop "$STAGE/tangent.desktop"
+cp assets/ivory.png "$STAGE/tangent.png"
 cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
    assets/fonts/OFL.txt "$STAGE/fonts/"
 # Licences for the four fonts eframe's `default_fonts` embeds in the binary.
@@ -49,7 +49,7 @@ cp assets/font-licenses/*.txt "$STAGE/font-licenses/"
 cp LICENSE THIRD-PARTY-LICENSES "$STAGE/"
 # The same user-facing readme the macOS and Windows artifacts carry.
 cp docs/ARTIFACT-README.md "$STAGE/README.txt"
-tar -C dist -czf "${STAGE}.tar.gz" "ivory-${VERSION}-linux-${ARCH}"
+tar -C dist -czf "${STAGE}.tar.gz" "tangent-${VERSION}-linux-${ARCH}"
 rm -rf "$STAGE"
 echo "==> ${STAGE}.tar.gz"
 ls -lh "dist/ivory-${VERSION}-linux-${ARCH}.tar.gz" | sed 's/^/    /'

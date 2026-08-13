@@ -22,7 +22,7 @@ pub enum Dialog {
         message: String,
     },
     About,
-    /// Shown at startup until dismissed with its checkbox. Ivory is free; this
+    /// Shown at startup until dismissed with its checkbox. Tangent is free; this
     /// asks for support without gating anything, so it must never feel like a
     /// paywall prompt.
     Welcome {
@@ -391,7 +391,7 @@ pub fn show(
             show_dialog_viewport(
                 ctx,
                 placement,
-                "About Ivory",
+                "About Tangent",
                 Vec2::new(400.0, 190.0),
                 Vec2::new(400.0, 150.0),
                 |ui, result| {
@@ -403,7 +403,7 @@ pub fn show(
                         .show(ui, |ui| {
                             ui.vertical_centered(|ui| {
                                 ui.label(
-                                    RichText::new("Ivory").font(bold(16.0)).color(t.text),
+                                    RichText::new("Tangent").font(bold(16.0)).color(t.text),
                                 );
                                 ui.label(
                                     RichText::new(
@@ -496,7 +496,7 @@ pub fn show(
             show_dialog_viewport(
                 ctx,
                 placement,
-                "Welcome to Ivory",
+                "Welcome to Tangent",
                 Vec2::new(470.0, 300.0),
                 Vec2::new(410.0, 260.0),
                 |ui, result| {
@@ -508,7 +508,7 @@ pub fn show(
                         .inner_margin(egui::Margin::same(14))
                         .show(ui, |ui| {
                             for line in [
-                                "Ivory is free, and it stays free.",
+                                "Tangent is free, and it stays free.",
                                 "",
                                 "It is made for the love of it. There are no",
                                 "locked features, no trial, no account, and",
@@ -578,7 +578,7 @@ pub fn show(
                                 );
                             } else {
                                 ui.label(
-                                    RichText::new("Ivory is free, and it stays free.")
+                                    RichText::new("Tangent is free, and it stays free.")
                                         .font(bold(12.0))
                                         .color(t.text),
                                 );
@@ -798,7 +798,7 @@ pub fn show(
                             // ivory-core/tests/blast_radius.rs.
                             ui.label(
                                 RichText::new(
-                                    "Ivory learns a general leaning, not this one chord.\n\
+                                    "Tangent learns a general leaning, not this one chord.\n\
                                      One correction changes about 1 chord in 10 overall,\n\
                                      often in unrelated keys. \"Forget Learning\" in Manage\n\
                                      Taught Chords undoes all of it exactly.",

@@ -14,13 +14,17 @@
 # The Gumroad post-purchase page, the supporter-key email and README.md all
 # link through it, using the version-less names:
 #
-#   Ivory-macos-arm64.dmg   Ivory-macos-arm64.zip
-#   ivory-windows-x86_64.zip   ivory-linux-x86_64.tar.gz   SHA256SUMS
+#   Tangent-macos-arm64.dmg   Tangent-macos-arm64.zip
+#   tangent-windows-x86_64.zip   tangent-linux-x86_64.tar.gz   SHA256SUMS
 #
-# Ship a release carrying only `Ivory-2.3.0-macos-arm64.dmg` and every one of
+# Ship a release carrying only `Tangent-2.3.0-macos-arm64.dmg` and every one of
 # those links 404s for everybody, including people who have already paid, with
 # nothing in any log to say so. That is the whole reason this script exists:
 # uploading the aliases is not optional polish, it is the release contract.
+#
+# AND, since the 2.3.0 rename from Ivory to Tangent, the same four assets go up
+# a THIRD time under their old Ivory-* names, because those are the links in
+# every supporter-key email already sent. See the legacy block below.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -110,6 +114,23 @@ done
 cp "$SUMS" "$STAGE/SHA256SUMS-${VERSION}"
 cp "$SUMS" "$STAGE/SHA256SUMS"
 UPLOADS+=("$STAGE/SHA256SUMS-${VERSION}" "$STAGE/SHA256SUMS")
+
+# ── Legacy Ivory-named aliases ───────────────────────────────────────────────
+# The product was renamed to Tangent at 2.3.0, but the permanent download links
+# under the OLD name are already sitting in the inbox of everyone who has bought
+# a supporter key, and in the 2.2.0 README. Those links resolve by exact asset
+# name, so dropping these four would 404 for exactly the people who paid.
+# They cost 26MB per release and they are not optional.
+for a in "${ARTIFACTS[@]}"; do
+  base="${a#dist/}"
+  legacy="${base/-${VERSION}-/-}"          # Tangent-macos-arm64.dmg
+  legacy="${legacy/#Tangent-/Ivory-}"      # Ivory-macos-arm64.dmg
+  legacy="${legacy/#tangent-/ivory-}"      # ivory-windows-x86_64.zip
+  if [ "$legacy" != "${base/-${VERSION}-/-}" ]; then
+    cp "$a" "$STAGE/$legacy"
+    UPLOADS+=("$STAGE/$legacy")
+  fi
+done
 
 echo "==> ${#UPLOADS[@]} assets (${#ARTIFACTS[@]} artifacts, each in both spellings)"
 for u in "${UPLOADS[@]}"; do echo "    $(basename "$u")"; done

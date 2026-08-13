@@ -1,10 +1,21 @@
 [package]
+# The CRATE keeps the codename. "Ivory" stays the internal name throughout:
+# crate names, ~/.config/ivory/, the macOS bundle id, the settings and override
+# file paths, and the IVORY_* developer switches. Changing any of those would
+# reset Gatekeeper trust and orphan every existing user's settings for nothing,
+# since none of it is visible to anyone using the app.
 name = "ivory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 build = "build.rs"
+
+# The BINARY carries the product name, because users type it, see it in a
+# process list, and read it in the Linux tarball.
+[[bin]]
+name = "tangent"
+path = "src/main.rs"
 
 [dependencies]
 # The GUI always enables the engine's `learning` feature — the re-ranker is a

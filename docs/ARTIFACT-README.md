@@ -1,7 +1,7 @@
-Ivory
+Tangent
 =====
 
-Ivory draws all 88 piano keys and lights them from your MIDI keyboard in real
+Tangent draws all 88 piano keys and lights them from your MIDI keyboard in real
 time. As you play, it names what you are playing — triads and sevenths through
 altered dominants, slash chords, rootless jazz voicings, scales and modes.
 
@@ -13,10 +13,10 @@ First launch
 
 macOS
 
-  Open the .dmg (or unzip the .zip) and drag Ivory.app into your Applications
+  Open the .dmg (or unzip the .zip) and drag Tangent.app into your Applications
   folder.
 
-  That is all. Ivory is signed with a Developer ID certificate and notarized by
+  That is all. Tangent is signed with a Developer ID certificate and notarized by
   Apple, with the ticket stapled to the app, so it opens on a double-click with
   no security prompt and without being online.
 
@@ -24,7 +24,7 @@ macOS
 
 Windows
 
-  Unzip the archive anywhere and run ivory.exe. There is no installer.
+  Unzip the archive anywhere and run tangent.exe. There is no installer.
 
   The executable is not code-signed, so SmartScreen shows "Windows protected
   your PC" the first time. Click "More info", then "Run anyway". Windows
@@ -32,9 +32,9 @@ Windows
 
 Linux
 
-    tar -xzf ivory-<version>-linux-<arch>.tar.gz
-    cd ivory-<version>-linux-<arch>
-    chmod +x ivory
+    tar -xzf tangent-<version>-linux-<arch>.tar.gz
+    cd tangent-<version>-linux-<arch>
+    chmod +x tangent
     ./ivory
 
   MIDI goes through ALSA, so libasound.so.2 needs to be present — package
@@ -43,14 +43,14 @@ Linux
   shows up as an ordinary ALSA sequencer port. Wayland and X11 are both
   supported. Requires glibc 2.32 or newer.
 
-  Your keyboard has to be plugged in and switched on before Ivory can see it —
+  Your keyboard has to be plugged in and switched on before Tangent can see it —
   ALSA only creates a port for hardware that is actually there.
 
   For a launcher entry:
 
-    install -Dm755 ivory         ~/.local/bin/ivory
-    install -Dm644 ivory.desktop ~/.local/share/applications/ivory.desktop
-    install -Dm644 ivory.png     ~/.local/share/icons/hicolor/128x128/apps/ivory.png
+    install -Dm755 tangent         ~/.local/bin/tangent
+    install -Dm644 tangent.desktop ~/.local/share/applications/tangent.desktop
+    install -Dm644 tangent.png     ~/.local/share/icons/hicolor/128x128/apps/tangent.png
 
   The fonts in fonts/ are already embedded in the binary. They ship as loose
   files for license compliance, and in case you want them installed system-wide.
@@ -59,42 +59,42 @@ Linux
 Connecting a MIDI keyboard
 --------------------------
 
-Plug it in, start Ivory, play. Ivory connects on its own at startup, preferring
+Plug it in, start Tangent, play. Tangent connects on its own at startup, preferring
 ports whose names contain "USB-MIDI", then "Scarlett" or both "USB" and "MIDI",
 and otherwise simply taking the first port it finds.
 
 If you connected after launching, or you have more than one device:
-right-click > "Select MIDI Input...", choose the port, click OK. Ivory does not
+right-click > "Select MIDI Input...", choose the port, click OK. Tangent does not
 reconnect by itself if a device is unplugged mid-session — plug it back in and
 pick it from that list again.
 
 From a terminal:
 
-    ivory -l                   list the available MIDI input ports
-    ivory -p "Digital Piano"   connect to one specific port
+    tangent -l                   list the available MIDI input ports
+    tangent -p "Digital Piano"   connect to one specific port
 
-(on macOS that binary lives at /Applications/Ivory.app/Contents/MacOS/ivory)
+(on macOS that binary lives at /Applications/Tangent.app/Contents/MacOS/tangent)
 
 No keyboard to hand? Right-click > "Enable Keytoggle", then click keys on the
 drawn piano to hold and release notes. Chord naming behaves exactly the same.
 
 
-When Ivory names a chord differently than you would
+When Tangent names a chord differently than you would
 ---------------------------------------------------
 
 Two menu items, and they do different things.
 
 "Teach Chord Name..." pins your name to the exact voicing you are holding. Type
-it, click OK, and that is what Ivory calls it from then on. Tick "Apply in all
+it, click OK, and that is what Tangent calls it from then on. Tick "Apply in all
 keys" and the name follows that shape into every key. It is greyed out when you
 are not holding anything, because it acts on what you are playing.
 
 "Correct Chord Name..." teaches a general preference instead. It lists the
-readings Ivory actually weighed for this voicing, with their scores; pick the
-one you would rather see and click "Learn". Ivory then leans that way
+readings Tangent actually weighed for this voicing, with their scores; pick the
+one you would rather see and click "Learn". Tangent then leans that way
 everywhere, so similar voicings shift too — about one chord in ten, sometimes
 in unrelated keys. That is the feature working, not a fault. If the name you
-want is not in the list, Ivory never considered it and cannot be argued into
+want is not in the list, Tangent never considered it and cannot be argued into
 it — pin it with "Teach Chord Name..." instead. The first correction that lands
 switches Chord Learning on, which also reactivates any earlier corrections.
 
@@ -112,19 +112,19 @@ and the detachable chord display all live in the right-click menu, and save
 themselves the moment you change them. "Reset Settings to Default" puts
 everything back.
 
-Ivory keeps two files, at the same path on every platform:
+Tangent keeps two files, at the same path on every platform:
 
     ~/.config/ivory/settings.json    appearance and window preferences
     ~/.config/ivory/overrides.json   taught chords and learned leanings
 
-On Windows that folder is C:\Users\<you>\.config\ivory\. Deleting one of these
-files resets that part of Ivory and nothing else.
+On Windows that folder is C:\Users\<you>\.config/ivory\. Deleting one of these
+files resets that part of Tangent and nothing else.
 
 
 Privacy
 -------
 
-Ivory makes no network connections and collects no data. Your settings and your
+Tangent makes no network connections and collects no data. Your settings and your
 taught chords stay on your machine. There is no telemetry, no update check, and
 no account. The one link in the app — the author's site, in the About box —
 hands the address to your browser if you click it, and that is the whole of it.
@@ -133,7 +133,7 @@ hands the address to your browser if you click it, and that is the whole of it.
 If something looks wrong
 ------------------------
 
-  "Ivory is already running"
+  "Tangent is already running"
       Only one copy runs at a time. Close the other window; if there is no
       window, quit the leftover process.
 
@@ -142,22 +142,22 @@ If something looks wrong
       Detection".
 
   Keys never light up
-      Ivory is probably on the wrong port. Right-click > "Select MIDI
+      Tangent is probably on the wrong port. Right-click > "Select MIDI
       Input..." and pick your keyboard.
 
 
 Licenses
 --------
 
-Ivory is MIT-licensed — see LICENSE. The Rust libraries it links against are
+Tangent is MIT-licensed — see LICENSE. The Rust libraries it links against are
 listed in THIRD-PARTY-LICENSES. The bundled Courier Prime fonts are
 Copyright 2015 The Courier Prime Project Authors, licensed under the SIL Open
 Font License 1.1 — see OFL.txt.
 
-  macOS     inside the app: right-click Ivory.app > Show Package Contents >
+  macOS     inside the app: right-click Tangent.app > Show Package Contents >
             Contents/Resources
-  Windows   next to ivory.exe
+  Windows   next to tangent.exe
   Linux     in this folder; OFL.txt is in fonts/
 
-Ivory is pay-what-you-can, and nothing is a perfectly good amount. Thanks for
+Tangent is pay-what-you-can, and nothing is a perfectly good amount. Thanks for
 playing.
