@@ -57,8 +57,8 @@ Intel Macs are not covered yet. The macOS build is Apple Silicon only.
   exactly. *Disable Chord Learning* silences it without erasing anything.
 - **Detachable chord display.** Pop the chord strip into its own independent
   window, and close it to reattach.
-- **Dark mode** with theme-aware context menus (tangent-on-black and
-  black-on-tangent), customizable key and note colors.
+- **Dark mode** with theme-aware context menus (ivory-on-black and
+  black-on-ivory), customizable key and note colors.
 - **Flexible window.** Size presets from 50% to 200% (any percentage works in
   the settings file), borderless mode with drag-anywhere support.
 - **MIDI device picker.** Tangent auto-connects at startup, preferring ports named
@@ -124,8 +124,8 @@ that keep it true.
 Requires a stable Rust toolchain (rustup recommended).
 
 ```sh
-cargo run -p tangent            # debug build, run directly
-cargo build --release -p tangent
+cargo run --bin tangent         # debug build, run directly
+cargo build --release --bin tangent
 cargo test --workspace        # engine + parity test suite
 ```
 
