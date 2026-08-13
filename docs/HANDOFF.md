@@ -1,7 +1,9 @@
 # Ivory 2.0 — Handoff / Resume Document
 
-**Last updated:** 2026-08-11 (docs reconciled against the code; newest engine
-work is D22–D26 plus the Tier A/B refactor pass — see §2b).
+**Last updated:** 2026-08-13. **The app is now called TANGENT.** Newest work is
+§2c: the rename, the 2.2.0 tester-report UI fixes, the egui 0.33 downgrade, the
+fretboard core, and the MIT/GPLv3 split. Read §2c FIRST; everything above it
+still says "Ivory" and that is now the internal codename, not the product.
 This file is the single source of truth for
 picking the project up cold. Read it top-to-bottom before touching anything.
 Pair it with `docs/DESIGN.md` (architecture), `docs/DIVERGENCES.md` (the chord
@@ -195,6 +197,80 @@ platform coverage:
   and one non-snake-case `has_M3`. The `ivory` crate emits none.
 
 ---
+
+## 2c. 2026-08-13 — renamed to Tangent, tester fixes, egui 0.33, fretboard core
+
+**THE NAME.** The product is **Tangent**. "Ivory" is now the INTERNAL CODENAME
+and is deliberately everywhere it is invisible: crate names (`ivory`,
+`ivory-core`, `ivory-keygen`, `ivory-fulfil`), `~/.config/ivory/`, the settings
+and overrides paths, `IVORY_*` env switches, `assets/ivory.*`, and above all
+**`CFBundleIdentifier = org.codeberg.ganten1998.ivory`, which must never
+change** (it would reset Gatekeeper trust on every signed build). The binary is
+`tangent` via a `[[bin]]` entry, so the package stays `ivory`: **`cargo run -p
+tangent` does NOT resolve, use `--bin tangent`.** Why Tangent: the clavichord's
+tangent is the blade at the back of each key that strikes the string and stays
+in contact for as long as the note sounds, which is what the display does with
+a held note. Synthogy's Ivory is a famous virtual piano and a VST3 build would
+have put us in the same browser. Three naming rounds and a trademark analysis
+are behind this; do not reopen it.
+
+**Artifacts renamed**, and `scripts/publish-github.sh` now uploads every
+artifact THREE times: version-scoped, version-less alias, and under the OLD
+`Ivory-*` names. That third set is not optional. Those exact links are in the
+inbox of everyone who has already bought a supporter key, and they resolve by
+exact asset name. The `Tangent-*` aliases were also back-filled onto the v2.2.0
+release, because the fulfilment email was redeployed with new links before new
+assets existed and 404'd for about ten minutes.
+
+**egui/eframe are pinned at 0.33, deliberately, and must NOT be bumped.**
+`nih_plug_egui` pins egui 0.31 through a stale `egui-baseview` rev; upstream
+`egui-baseview` is on 0.33. 0.33 is the only version where the desktop app and
+a nih-plug plugin editor can share one GUI. Bumping to 0.35 forks the GUI in
+two. The API differences that bite: eframe 0.33 uses `App::update(ctx)` not
+`App::ui(ui)`, `show_viewport_immediate` hands the closure a `Context` not a
+`Ui`, `Context::run` not `run_ui`, and `Stroke::new` takes `impl Into<f32>` so
+float literals need `_f32`. All of the Context-to-Ui bridging is one function,
+**`ivory/src/shell.rs::viewport_ui`**, which is also the shape the plugin
+editor needs. It is tested to hand over the whole viewport, because a default
+`CentralPanel` adds margin and would silently shift the piano.
+
+**2.2.0 tester-report fixes** are D-UI-10 through D-UI-14 in DIVERGENCES.md:
+child windows centre on the parent, the detached chord window is no longer
+slaved to the piano's width and remembers its geometry, long labels wrap to two
+lines, the detached window has a border, and Teach's "Apply in all keys"
+defaults on. **Tiling window managers are detected and excluded** from geometry
+memory (`wm_overrode_size`, `WM_GRACE`): the owner runs AeroSpace, which tiled
+the detached window to 853x1377 and got that recorded as a user preference in
+the old code. That is where `detached_chord_height: 1377` came from.
+
+**`ivory-core/src/fretboard.rs`** is the pure half of the guitar view:
+geometry (rule of 18, fret 12 at exactly 0.5), tunings, capo-as-new-nut, and
+candidate enumeration. Middle C is FIVE positions on a standard board and the
+high E string cannot reach it at all, which is why a solver is needed. Output
+is ordered and proven deterministic; out-of-range pitches fold to their pitch
+class and are flagged rather than dropped. **Next: the voicing solver**, which
+is where the taste lives and which the owner must play-test, since determinism
+is testable and musicality is not.
+
+**LICENSING.md** records the MIT/GPLv3 split: everything in the repo stays MIT
+including the standalone binary; only the `.vst3` bundle is GPL-3.0-or-later,
+because nih-plug's VST3 bindings are and copyleft attaches to the linking
+binary. Shipping both in one installer is an aggregate under GPLv3 §5. Three
+conditions keep that true and are listed there. The plugin must ship the GPLv3
+text inside its bundle and releases must pin the exact nih-plug revision.
+
+**PLUGIN DECISIONS ALREADY MADE.** VST3 only, one deliverable, shipped with the
+standalone as an optional install. This means **Logic Pro is out** (AU only)
+and so is Pro Tools (AAX). The plugin will have **no detached windows**: a VST3
+editor is one host-owned child window, so `Caps::detachable = false` removes
+those menu entries rather than faking them with an embedded `egui::Window`.
+
+**WHERE TO PICK UP.** The architecture plan from the design workflow is the
+guide. Next concrete steps, in order: the fretboard voicing solver
+(`ivory-core`, pure, testable now); then the attached fretboard panel shipped
+as 2.3.0; then the `Shell`/`Caps` refactor; then `ivory-plugin` with
+`nih_export_vst3!`; then the installer. Branch `spike/egui-033` is now
+redundant and can be deleted.
 
 ## 3. Repo layout
 
