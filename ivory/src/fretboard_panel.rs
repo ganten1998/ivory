@@ -1,0 +1,545 @@
+//! The guitar view (D-UI-15): a neck drawn under the piano, with the notes you
+//! are holding shown where a guitarist would actually put their fingers.
+//!
+//! Dumb on purpose, exactly like `piano.rs`. Every decision — which of a
+//! pitch's five possible positions lights up, what is a barre, what folded an
+//! octave, what could not fit — was already made by `ivory_core::voicing`, and
+//! this module only renders the answer. Nothing here recomputes a shape, and
+//! nothing here decides one.
+//!
+//! Geometry comes from `ivory_core::fretboard`, which works in a 0.0..=1.0
+//! space along the string. That space is NOT the width of the widget:
+//! `fret_x(22)` is 0.719, because a 22-fret neck is only 72% of the way to the
+//! bridge. The board is scaled so the last drawn fret lands on the right edge,
+//! which is how every chord chart and every guitar photograph is framed.
+//!
+//! The four pictures that are not an ordinary dot each mean something
+//! different, and keeping them distinguishable is the whole job:
+//!
+//!   * a **hollow ring left of the nut** is an open string,
+//!   * a **hollow dot with an arrow** is a note out of the instrument's range,
+//!     drawn an octave away, with the arrow saying which way,
+//!   * a **faint ring on the board** is a note the guitar can make but not at
+//!     the same time as the others, and
+//!   * an **x above the nut** is a string that must be damped.
+//!
+//! A note that is simply not shown gets none of those: it is counted in the
+//! caption instead, because the one failure that makes a panel like this
+//! untrustworthy is silently drawing five of the six notes someone played.
+
+use crate::fonts;
+use crate::settings::Settings;
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
+use ivory_core::fretboard::{self, FretboardSpec};
+use ivory_core::voicing::{Outcome, StringState, Voicing};
+
+/// Band height for a 1300pt-wide window, scaled with everything else. Six
+/// strings need enough room that a dot is a dot rather than a smear, and the
+/// piano above it is 150 at the same width.
+pub const BAND_H_AT_1300: f64 = 132.0;
+
+/// Height of the fretboard band for a window `w` points wide. Truncated like
+/// every other band in the layout (spec §3.2).
+pub fn band_height(w: f32) -> f32 {
+    (BAND_H_AT_1300 * w as f64 / 1300.0).trunc() as f32
+}
+
+/// Left margin, as a fraction of the band width, holding the open-string rings
+/// and the damped-string crosses. They live BEHIND the nut, where a chord
+/// chart puts them.
+const GUTTER: f32 = 0.026;
+/// Vertical breathing room above the top string and below the bottom one.
+const PAD_Y: f32 = 0.10;
+/// Fraction of the band given to the caption line, when there is one.
+const CAPTION_H: f32 = 0.19;
+
+struct Geom {
+    /// x of the nut, and of the right-hand end of the board.
+    left: f32,
+    right: f32,
+    /// Vertical centre of string 0 (the lowest, drawn at the BOTTOM) and the
+    /// gap between adjacent strings.
+    bottom: f32,
+    spacing: f32,
+    strings: usize,
+    /// `fret_x(frets)`, the divisor that stretches the board to the full width.
+    scale: f32,
+    frets: u8,
+    capo: u8,
+}
+
+impl Geom {
+    fn new(rect: Rect, spec: &FretboardSpec, has_caption: bool) -> Option<Self> {
+        let strings = spec.tuning.strings();
+        if strings == 0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return None;
+        }
+        let board_h = rect.height() * if has_caption { 1.0 - CAPTION_H } else { 1.0 };
+        let pad = board_h * PAD_Y;
+        let top = rect.top() + pad;
+        let bottom = rect.top() + board_h - pad;
+        let spacing = (bottom - top) / (strings as f32 - 1.0).max(1.0);
+        // `frets: 0` is a legal board (open strings only) and would divide by
+        // zero here, so fall back to a one-fret scale and draw just the nut.
+        let scale = fretboard::fret_x(spec.frets.max(1));
+        Some(Self {
+            left: rect.left() + rect.width() * GUTTER,
+            right: rect.right() - 1.0,
+            bottom,
+            spacing,
+            strings,
+            scale,
+            frets: spec.frets,
+            capo: spec.capo,
+        })
+    }
+
+    /// Screen x for a point at fractional position `t` along the string.
+    fn x(&self, t: f32) -> f32 {
+        self.left + (t / self.scale) * (self.right - self.left)
+    }
+
+    fn wire_x(&self, fret: u8) -> f32 {
+        self.x(fretboard::fret_x(fret))
+    }
+
+    /// Where a fingertip goes: centred in its fret, not on the wire.
+    fn press_x(&self, fret: u8) -> f32 {
+        self.x(fretboard::press_x(fret))
+    }
+
+    /// String 0 is the lowest-sounding and belongs at the BOTTOM of the
+    /// diagram, which is the one convention every player shares.
+    fn y(&self, string: usize) -> f32 {
+        self.bottom - string as f32 * self.spacing
+    }
+
+    fn dot_r(&self) -> f32 {
+        (self.spacing * 0.38).max(2.0)
+    }
+}
+
+struct Palette {
+    /// The band behind the neck: the piano's own background, so the two read
+    /// as one instrument rather than two panels.
+    bg: Color32,
+    /// The fingerboard itself.
+    board: Color32,
+    nut: Color32,
+    string: Color32,
+    wire: Color32,
+    inlay: Color32,
+    dot: Color32,
+    /// Marks in the gutter, which sit on `bg` rather than on the board.
+    ink: Color32,
+    faint: Color32,
+    /// Marks ON the board, which need to read against `board`.
+    on_board: Color32,
+}
+
+fn palette(s: &Settings) -> Palette {
+    // The app is flat and high-contrast by design — cream keys, near-black
+    // sharps, one accent colour for anything sounding — and the neck follows
+    // that rather than trying to look photographic. A dark fingerboard under
+    // the cream keyboard is also what the instrument actually looks like, and
+    // it is what makes a thin steel string legible at this size: the first
+    // attempt drew dark strings on the piano's own light background and came
+    // out looking like a spreadsheet.
+    let dark = s.dark_mode;
+    Palette {
+        bg: crate::piano::bg_color(dark),
+        board: if dark {
+            Color32::from_rgb(0x24, 0x1c, 0x16)
+        } else {
+            Color32::from_rgb(0x4a, 0x37, 0x28)
+        },
+        // A real nut is bone, and a light one is the only thing that makes the
+        // open-string end of the neck legible at a glance.
+        nut: Color32::from_rgb(0xE8, 0xDC, 0xC0),
+        string: if dark {
+            Color32::from_rgb(0xA8, 0xA2, 0x99)
+        } else {
+            Color32::from_rgb(0xC9, 0xC4, 0xBC)
+        },
+        wire: if dark {
+            Color32::from_rgb(0x6E, 0x68, 0x60)
+        } else {
+            Color32::from_rgb(0x8E, 0x87, 0x7C)
+        },
+        // Pearl dots, dim enough to stay behind the notes.
+        inlay: Color32::from_rgb(0xE8, 0xDC, 0xC0).gamma_multiply(0.30),
+        // Whatever a held key looks like on the piano is what a held note
+        // looks like here. The user already chose this colour once.
+        dot: s.white_key_active_color.to_color32(),
+        ink: if dark {
+            Color32::from_rgb(0xCC, 0xCC, 0xCC)
+        } else {
+            Color32::from_rgb(0x8B, 0x73, 0x55)
+        },
+        faint: if dark {
+            Color32::from_rgb(0xCC, 0xCC, 0xCC).gamma_multiply(0.45)
+        } else {
+            Color32::from_rgb(0x8B, 0x73, 0x55).gamma_multiply(0.45)
+        },
+        on_board: Color32::from_rgb(0xE8, 0xDC, 0xC0).gamma_multiply(0.75),
+    }
+}
+
+/// Draw the neck and everything on it. `voicing` must have been solved for
+/// `spec`; a mismatch is a wiring bug, and the assertion in the tests is what
+/// catches it.
+pub fn draw(painter: &Painter, rect: Rect, voicing: &Voicing, spec: &FretboardSpec, s: &Settings) {
+    let p = palette(s);
+    painter.rect_filled(rect, 0.0, p.bg);
+
+    let caption = voicing.caption();
+    let Some(g) = Geom::new(rect, spec, caption.is_some()) else {
+        // A tuning with no strings. There is no board to draw; say so rather
+        // than leaving a blank rectangle that reads as a crash.
+        draw_caption(painter, rect, "no strings", &p, s);
+        return;
+    };
+
+    // ── the board ───────────────────────────────────────────────────────────
+    // The fingerboard as a slab, from the nut to the end of the neck, with the
+    // outer strings inset rather than sitting on its edge.
+    let edge = g.spacing * 0.62;
+    let board = Rect::from_min_max(
+        Pos2::new(g.wire_x(0), g.y(g.strings - 1) - edge),
+        Pos2::new(g.right, g.y(0) + edge),
+    );
+    painter.rect_filled(board, 0.0, p.board);
+
+    for f in 1..=g.frets {
+        let x = g.wire_x(f).round() + 0.5;
+        if x > g.right {
+            break;
+        }
+        painter.line_segment(
+            [Pos2::new(x, board.top()), Pos2::new(x, board.bottom())],
+            Stroke::new(1.5_f32, p.wire),
+        );
+    }
+    for &f in fretboard::INLAY_FRETS {
+        if f > g.frets {
+            continue;
+        }
+        let x = g.press_x(f);
+        let mid = (g.y(0) + g.y(g.strings - 1)) * 0.5;
+        let r = (g.spacing * 0.22).max(1.5);
+        if fretboard::is_double_inlay(f) {
+            painter.circle_filled(Pos2::new(x, mid - g.spacing * 0.85), r, p.inlay);
+            painter.circle_filled(Pos2::new(x, mid + g.spacing * 0.85), r, p.inlay);
+        } else {
+            painter.circle_filled(Pos2::new(x, mid), r, p.inlay);
+        }
+    }
+    // The nut. Bone-coloured and heavier than a fret wire, because that is
+    // what tells you at a glance which end of the neck you are looking at.
+    let nut = g.wire_x(0);
+    painter.rect_filled(
+        Rect::from_min_max(
+            Pos2::new(nut - 2.0, board.top()),
+            Pos2::new(nut + 2.0, board.bottom()),
+        ),
+        0.0,
+        p.nut,
+    );
+    // Strings, thinner as they go up, the way they actually are.
+    for st in 0..g.strings {
+        let t = 1.0 + 1.6 * (1.0 - st as f32 / (g.strings as f32 - 1.0).max(1.0));
+        painter.line_segment(
+            [Pos2::new(nut, g.y(st)), Pos2::new(g.right, g.y(st))],
+            Stroke::new(t, p.string),
+        );
+    }
+    if g.capo > 0 && g.capo <= g.frets {
+        let x = g.press_x(g.capo);
+        let w = (g.spacing * 0.30).max(3.0);
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(x - w * 0.5, g.y(g.strings - 1) - g.spacing * 0.35),
+                Pos2::new(x + w * 0.5, g.y(0) + g.spacing * 0.35),
+            ),
+            w * 0.5,
+            p.nut,
+        );
+    }
+
+    // ── what is being played ────────────────────────────────────────────────
+    // Barre first, so the dots sit on top of it.
+    if let Some(b) = voicing.shape.barre {
+        if b.hi_string < g.strings {
+            let x = g.press_x(b.fret);
+            let w = g.dot_r() * 1.7;
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(x - w * 0.5, g.y(b.hi_string) - g.dot_r()),
+                    Pos2::new(x + w * 0.5, g.y(b.lo_string) + g.dot_r()),
+                ),
+                w * 0.5,
+                p.dot,
+            );
+        }
+    }
+
+    // Notes the guitar could make but not alongside the rest: faint rings at
+    // the places they wanted. A ring says "not at the same time"; an empty
+    // space says "this app is broken", and those must not look alike.
+    for n in &voicing.notes {
+        if let Outcome::Conflict { wanted } = &n.outcome {
+            for pos in wanted {
+                if pos.string >= g.strings {
+                    continue;
+                }
+                painter.circle_stroke(
+                    Pos2::new(g.press_x(pos.fret), g.y(pos.string)),
+                    g.dot_r() * 0.8,
+                    Stroke::new(1.5_f32, p.on_board),
+                );
+            }
+        }
+    }
+
+    for n in &voicing.notes {
+        let Outcome::Placed { pos, octave_shift, .. } = n.outcome else {
+            continue;
+        };
+        if pos.string >= g.strings {
+            continue;
+        }
+        let y = g.y(pos.string);
+        let r = g.dot_r();
+        if octave_shift != 0 {
+            // A ghost: the pitch class is right, the octave is not. Hollow, so
+            // it cannot be mistaken for a note that is really there, with the
+            // arrow saying which way it moved.
+            let x = if pos.fret == g.capo { gutter_x(rect, &g) } else { g.press_x(pos.fret) };
+            painter.circle_stroke(Pos2::new(x, y), r, Stroke::new(2.0_f32, p.dot));
+            let arrow = if octave_shift > 0 { "\u{2191}" } else { "\u{2193}" };
+            painter.text(
+                Pos2::new(x, y),
+                Align2::CENTER_CENTER,
+                arrow,
+                FontId::new((r * 1.5).max(7.0), fonts::courier_bold()),
+                p.dot,
+            );
+        } else if pos.fret == g.capo {
+            // Open (or capo'd): a ring behind the nut, never a dot on it.
+            painter.circle_stroke(
+                Pos2::new(gutter_x(rect, &g), y),
+                r * 0.75,
+                Stroke::new(2.0_f32, p.dot),
+            );
+        } else {
+            painter.circle_filled(Pos2::new(g.press_x(pos.fret), y), r, p.dot);
+        }
+    }
+
+    // Strings the player has to keep quiet, and strings simply not in use.
+    // Skipped only when something is actually sounding: on an idle board every
+    // string is "unused", and six crosses telling nobody to mute nothing is
+    // just noise on the view the app sits at all day.
+    let sounding_any = voicing
+        .strings
+        .iter()
+        .any(|s| matches!(s, StringState::Sounding { .. }));
+    for (st, state) in voicing.strings.iter().enumerate().take(g.strings) {
+        if !sounding_any {
+            break;
+        }
+        let colour = match state {
+            StringState::Skipped => p.ink,
+            StringState::Unused => p.faint,
+            StringState::Sounding { .. } => continue,
+        };
+        painter.text(
+            Pos2::new(gutter_x(rect, &g), g.y(st)),
+            Align2::CENTER_CENTER,
+            "\u{00d7}",
+            FontId::new((g.dot_r() * 1.9).max(8.0), fonts::courier_bold()),
+            colour,
+        );
+    }
+
+    // A board that cannot make any of these notes gets slashed, so it reads as
+    // "impossible" rather than as "empty".
+    if voicing.shape.unreachable_count as usize == voicing.notes.len() && !voicing.notes.is_empty()
+    {
+        painter.line_segment(
+            [board.left_top(), board.right_bottom()],
+            Stroke::new(2.0_f32, p.on_board),
+        );
+    }
+
+    if let Some(c) = caption {
+        draw_caption(painter, rect, &c, &p, s);
+    }
+}
+
+/// x of the open/damped marker column, behind the nut.
+fn gutter_x(rect: Rect, g: &Geom) -> f32 {
+    rect.left() + (g.left - rect.left()) * 0.5
+}
+
+fn draw_caption(painter: &Painter, rect: Rect, text: &str, p: &Palette, s: &Settings) {
+    let size = (rect.height() * CAPTION_H * 0.62).max(8.0);
+    painter.text(
+        Pos2::new(rect.right() - 6.0, rect.bottom() - 2.0),
+        Align2::RIGHT_BOTTOM,
+        text,
+        FontId::new(size, fonts::courier()),
+        if s.dark_mode { p.ink } else { p.ink },
+    );
+}
+
+/// One-pixel top edge so the fretboard reads as its own band rather than as
+/// more piano. Drawn by the caller, which knows what is above it.
+pub fn draw_top_edge(painter: &Painter, rect: Rect, s: &Settings) {
+    let c = if s.dark_mode {
+        Color32::from_rgb(60, 60, 60)
+    } else {
+        Color32::from_rgb(120, 100, 78)
+    };
+    painter.rect_stroke(
+        Rect::from_min_size(rect.min, Vec2::new(rect.width(), 1.0)),
+        0.0,
+        Stroke::new(1.0_f32, c),
+        StrokeKind::Inside,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ivory_core::fretboard::{Tuning, TUNINGS};
+    use ivory_core::voicing::solve_cold;
+
+    fn rect() -> Rect {
+        Rect::from_min_size(Pos2::new(0.0, 200.0), Vec2::new(1300.0, 132.0))
+    }
+
+    #[test]
+    fn the_band_scales_with_the_window_like_every_other_one() {
+        assert_eq!(band_height(1300.0), 132.0);
+        assert_eq!(band_height(650.0), 66.0);
+        // Truncated, not rounded: the piano and the chord strip both are, and a
+        // half-pixel band would put every string on a fractional row.
+        assert_eq!(band_height(1000.0), 101.0);
+        assert_eq!(band_height(0.0), 0.0);
+    }
+
+    #[test]
+    fn the_last_fret_lands_on_the_right_edge() {
+        // The trap this exists to catch: `fret_x(22)` is 0.719, so drawing
+        // straight into widget space would leave 28% of the band empty and put
+        // every dot in the wrong place.
+        let spec = FretboardSpec::default();
+        let g = Geom::new(rect(), &spec, false).unwrap();
+        assert!((g.wire_x(spec.frets) - g.right).abs() < 0.5);
+        assert!((g.wire_x(0) - g.left).abs() < 0.001, "fret 0 is the nut");
+        // The 12th fret is still visibly the halfway house it is on a real
+        // neck, which the naive normalisation would also have destroyed.
+        let half = (g.wire_x(12) - g.left) / (g.right - g.left);
+        assert!((half - 0.5 / 0.7194).abs() < 0.01, "octave landed at {half}");
+    }
+
+    #[test]
+    fn press_points_stay_inside_their_fret_and_ascend() {
+        let spec = FretboardSpec::default();
+        let g = Geom::new(rect(), &spec, false).unwrap();
+        for f in 1..=spec.frets {
+            let x = g.press_x(f);
+            assert!(x > g.wire_x(f - 1) && x < g.wire_x(f), "fret {f} escaped its space");
+        }
+        assert!(g.press_x(0) < g.left, "an open marker belongs behind the nut");
+        assert!(gutter_x(rect(), &g) < g.left);
+    }
+
+    #[test]
+    fn the_low_string_is_at_the_bottom() {
+        // Every chord chart in the world agrees on this and getting it upside
+        // down is the single most obvious way to look wrong to a guitarist.
+        let spec = FretboardSpec::default();
+        let g = Geom::new(rect(), &spec, false).unwrap();
+        assert!(g.y(0) > g.y(5), "string 0 is the low E and belongs at the bottom");
+        for st in 1..6 {
+            assert!(g.y(st) < g.y(st - 1));
+        }
+        assert!(g.y(5) >= rect().top() && g.y(0) <= rect().bottom());
+    }
+
+    #[test]
+    fn every_tuning_and_capo_produces_a_board_that_fits_the_band() {
+        for t in TUNINGS {
+            for capo in [0u8, 3, 12, 21] {
+                for w in [200.0_f32, 650.0, 1300.0, 2600.0] {
+                    let spec = FretboardSpec { tuning: t, frets: 22, capo };
+                    let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
+                    let Some(g) = Geom::new(r, &spec, true) else {
+                        panic!("{} lost its board at width {w}", t.name);
+                    };
+                    assert!(g.right > g.left);
+                    assert!(g.dot_r() > 0.0);
+                    for st in 0..g.strings {
+                        assert!(g.y(st) >= r.top() && g.y(st) <= r.bottom());
+                    }
+                    for f in 0..=spec.frets {
+                        let x = g.wire_x(f);
+                        assert!(x >= g.left - 0.5 && x <= g.right + 0.5, "fret {f} at {x}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stringless_or_fretless_board_does_not_divide_by_zero() {
+        const NONE: Tuning = Tuning { name: "None", open: &[] };
+        assert!(Geom::new(rect(), &FretboardSpec { tuning: &NONE, frets: 22, capo: 0 }, false).is_none());
+        // Zero frets is a legal board: open strings and nothing else.
+        let g = Geom::new(rect(), &FretboardSpec { frets: 0, capo: 0, ..Default::default() }, false)
+            .expect("a fretless board is still a board");
+        assert!(g.wire_x(0).is_finite() && g.right > g.left);
+        // A single-string tuning must not divide by (strings - 1).
+        const ONE: Tuning = Tuning { name: "One", open: &[40] };
+        let g = Geom::new(rect(), &FretboardSpec { tuning: &ONE, frets: 22, capo: 0 }, false).unwrap();
+        assert!(g.y(0).is_finite() && g.spacing.is_finite());
+    }
+
+    #[test]
+    fn the_renderer_survives_every_voicing_the_solver_can_produce() {
+        // The view is dumb, but it still indexes `strings` by position and
+        // reads `barre` bounds. This drives real solver output through the
+        // painter to prove none of that can be out of range.
+        let ctx = egui::Context::default();
+        // The panel draws real glyphs (the arrows, the damped-string cross),
+        // and a bare Context has no font families bound, so painting one
+        // panics rather than failing an assertion.
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        let s = Settings::default();
+        let cases: &[&[u8]] = &[
+            &[],
+            &[60],
+            &[40, 47, 52, 56, 59, 64],
+            &[41, 48, 53, 57, 60, 65],
+            &[84, 85, 86],
+            &[36, 43, 48, 52, 55, 58, 60, 64, 67, 72],
+            &[0, 1, 127],
+        ];
+        for t in TUNINGS {
+            for capo in [0u8, 5, 21] {
+                let spec = FretboardSpec { tuning: t, frets: 22, capo };
+                for held in cases {
+                    let v = solve_cold(&spec, held);
+                    let _ = ctx.run(Default::default(), |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            draw(ui.painter(), rect(), &v, &spec, &s);
+                            draw_top_edge(ui.painter(), rect(), &s);
+                        });
+                    });
+                }
+            }
+        }
+    }
+}

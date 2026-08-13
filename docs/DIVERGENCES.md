@@ -349,3 +349,61 @@ tester session on 2.2.0; the report and its screenshots are the rationale.
 
 Also from that report and **not** done: keyboard shortcuts, which the report
 asks for without saying for what.
+
+### D-UI-15 — the guitar view
+
+A third band under the piano showing the same notes on a fretboard. The Python
+app has nothing like it; this is an addition, not a divergence from parity, and
+it is scoped so that everything above it is untouched.
+
+- **Off by default.** `show_fretboard` starts `false`. Turning it on makes the
+  window taller, and a window that grows on its own after an update is exactly
+  the geometry surprise D-UI-10/11 came out of. It is one line in
+  `Settings::default()` to change that mind once the view has been played with.
+- **Menu**: `Show Fretboard` / `Hide Fretboard` in its own block before About,
+  renaming itself like every other toggle here. `Tuning` and `Capo` submenus
+  appear only while it is on — a Tuning row for a hidden fretboard is a control
+  for something the user cannot see. Both mark the current choice with a bullet
+  rather than hiding it, because a submenu that never says what is selected
+  makes you open it again to find out.
+- **Submenus are now plural.** `Size` used to be the only one and was hard-coded
+  from the entry list down to the viewport. `Entry::Submenu { label, items }`
+  replaces `Entry::SizeParent`, `MenuState` carries a `SubGeom` per submenu, and
+  one viewport id is shared because only one can be open at a time. Size comes
+  out of the generalised path byte-for-byte the same, which
+  `size_is_still_the_first_submenu_and_still_lists_the_same_percents` asserts.
+- **Settings keys** (additive): `show_fretboard`, `fretboard_tuning`,
+  `fretboard_capo`. All three are sanitised at USE, not at load: an unknown
+  tuning name draws as Standard but is written back untouched, and a capo of 40
+  is clamped to something playable. A settings file can therefore travel
+  between builds without either one eating what it did not understand.
+- **Layout**: the band is `132 * width / 1300`, truncated, stacked below the
+  piano. `initial_window_size` and `layout_sizes` were two copies of the same
+  arithmetic and are now one function, `band_sizes` — drift between them is a
+  window that visibly jumps on the first frame.
+- **The view is dumb.** Every choice (which of a pitch's five positions, what is
+  a barre, what folded an octave, what could not fit) belongs to
+  `ivory_core::voicing`; `fretboard_panel.rs` only draws the answer. The app
+  owns exactly one `VoicingSession`, so no two surfaces can disagree about the
+  shape, and it is re-solved on the same 100ms gate as chord detection rather
+  than per frame.
+- **Independent of chord detection.** The guitar view is a second instrument,
+  not a decoration on the chord strip: it works with detection off, and hiding
+  one band does not resize the other.
+- **Four pictures that are not a dot**, because the failure that makes a panel
+  like this untrustworthy is silently drawing five of the six notes someone
+  played: a hollow ring behind the nut is an open string, a hollow dot with an
+  arrow is a note outside the instrument's range shown an octave away, a faint
+  ring on the board is a note the guitar can make but not at the same time as
+  the others, and an `×` behind the nut is a string to damp. Anything genuinely
+  not shown is counted in the caption instead. Mute marks are suppressed
+  entirely while nothing sounds — six crosses telling nobody to mute nothing is
+  noise on the view the app sits at all day.
+- **Colour**: the neck is a dark fingerboard with light strings, and held notes
+  use `white_key_active_color`, the colour the user already chose for a held
+  key on the piano. The first attempt drew dark strings on the piano's own
+  light background and came out looking like a spreadsheet.
+
+Not done, and deliberately: the fretboard is read-only (keytoggle stays a piano
+gesture), there are no fret-position numbers (the inlays carry it), and the
+detached chord window does not gain a fretboard.

@@ -8,11 +8,13 @@
 
 use crate::chord_strip;
 use crate::dialogs::{self, Dialog, DialogAction, LearningStatus};
+use crate::fretboard_panel;
 use crate::menu::{self, ColorTarget, MenuAction, MenuState, MenuView};
 use crate::midi;
 use crate::piano;
 use crate::settings::{Rgb, Settings};
 use egui::{Pos2, Rect, Vec2, ViewportCommand};
+use ivory_core::voicing::{VoicingSession, Weights};
 use ivory_core::{ChordDetector, OverrideStore, TrainOutcome};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
@@ -77,6 +79,15 @@ pub struct IvoryApp {
 
     current_chord: Option<String>,
     last_detection: Option<Instant>,
+
+    /// D-UI-15: the guitar view's solver state. Exactly ONE of these exists,
+    /// so every surface that draws a fretboard is drawing the same shape, and
+    /// it carries the hysteresis that stops the picture jumping around while
+    /// somebody plays. Kept alive even while the panel is hidden — it costs a
+    /// few hundred bytes and it means the board is already right the moment
+    /// the panel is switched on.
+    voicing: VoicingSession,
+    last_voicing: Option<Instant>,
 
     /// The detached chord window is actually on screen.
     detach_window_visible: bool,
@@ -147,6 +158,10 @@ impl IvoryApp {
             dont_show_again: false,
         });
 
+        let spec = settings.fretboard_spec();
+        let weights = Weights::for_tuning(spec.tuning);
+        let voicing = VoicingSession::new(spec, weights);
+
         Self {
             settings,
             detector,
@@ -160,6 +175,8 @@ impl IvoryApp {
             manual_notes: HashSet::new(),
             current_chord: None,
             last_detection: None,
+            voicing,
+            last_voicing: None,
             detach_window_visible: false,
             detached_builder_size,
             detached_builder_pos,
@@ -183,17 +200,41 @@ impl IvoryApp {
 
     // ── Geometry (spec §3.2, integer truncation like Python) ───────────────
 
-    fn layout_sizes(&self) -> (f32, f32, f32) {
-        let w = main_width(&self.settings);
-        let piano_h = (w as f64 / (1300.0 / 150.0)).trunc() as f32;
-        let chord_visible =
-            self.settings.chord_detection_enabled && !self.settings.chord_window_detached;
-        let chord_h = if chord_visible {
-            (50.0 * w as f64 / 1300.0).trunc() as f32
-        } else {
-            0.0
-        };
-        (w, piano_h, chord_h)
+    fn layout_sizes(&self) -> (f32, f32, f32, f32) {
+        band_sizes(&self.settings)
+    }
+
+    /// Re-solve the guitar view on the detection cadence.
+    ///
+    /// Deliberately NOT the frame: `VoicingSession` caches on the held set, so
+    /// a held chord costs one slice compare either way, but tying it to the
+    /// same 100ms gate as chord detection means the two readouts change on the
+    /// same tick instead of a frame apart. It runs whether or not the panel is
+    /// visible and whether or not chord detection is on — the guitar view is
+    /// its own instrument, not a decoration on the chord strip.
+    fn voicing_tick(&mut self, force: bool) {
+        let due = force
+            || self
+                .last_voicing
+                .is_none_or(|t| t.elapsed() >= DETECT_TICK);
+        if !due {
+            return;
+        }
+        let dt = self
+            .last_voicing
+            .map_or(0, |t| t.elapsed().as_millis().min(u32::MAX as u128) as u32);
+        self.last_voicing = Some(Instant::now());
+        self.voicing.update(&self.display_notes(), dt);
+    }
+
+    /// Point the solver at whatever the settings now describe. Both calls
+    /// throw away the remembered hand, which is the point: a shape the new
+    /// board could not have produced must never survive a tuning change.
+    fn rebuild_voicing(&mut self) {
+        let spec = self.settings.fretboard_spec();
+        self.voicing.set_weights(Weights::for_tuning(spec.tuning));
+        self.voicing.set_spec(spec);
+        self.voicing_tick(true);
     }
 
     // ── MIDI state (spec §10 semantics) ────────────────────────────────────
@@ -292,6 +333,9 @@ impl IvoryApp {
             learning_on: self.detector.learning_mode(),
             supporter: self.license.is_supporter(),
             heart_on: self.settings.show_heart,
+            fretboard_on: self.settings.show_fretboard,
+            tuning: self.settings.fretboard_spec().tuning.name,
+            capo: self.settings.fretboard_spec().capo,
             next_font: {
                 use crate::fonts::FontChoice;
                 let cur = FontChoice::from_key(&self.settings.font_choice);
@@ -562,6 +606,22 @@ impl IvoryApp {
                 self.detector.set_learning_mode(on);
                 self.detection_tick(true); // readings change immediately
             }
+            MenuAction::ToggleFretboard => {
+                self.settings.show_fretboard = !self.settings.show_fretboard;
+                self.settings.save();
+                // The window height follows from layout_sizes() next pass.
+                self.voicing_tick(true);
+            }
+            MenuAction::SetTuning(name) => {
+                self.settings.fretboard_tuning = name.to_owned();
+                self.settings.save();
+                self.rebuild_voicing();
+            }
+            MenuAction::SetCapo(fret) => {
+                self.settings.fretboard_capo = fret as i64;
+                self.settings.save();
+                self.rebuild_voicing();
+            }
             MenuAction::ToggleHeart => {
                 self.settings.show_heart = !self.settings.show_heart;
                 self.settings.save();
@@ -595,6 +655,7 @@ impl IvoryApp {
         }
         self.detector.set_note_preference(true);
         self.manual_notes.clear();
+        self.rebuild_voicing();
         if had_custom_font {
             // Settings were reset: back to the bundled default font too.
             crate::fonts::install(ctx, crate::fonts::FontChoice::default(), None);
@@ -931,6 +992,19 @@ fn main_width(settings: &Settings) -> f32 {
 /// Initial fixed window size for the ViewportBuilder, computed from settings
 /// before the event loop starts (spec §3.2).
 pub fn initial_window_size(settings: &Settings) -> Vec2 {
+    let (w, piano_h, chord_h, fret_h) = band_sizes(settings);
+    Vec2::new(w, piano_h + chord_h + fret_h)
+}
+
+/// The stacked bands: window width, then chord strip, piano and fretboard
+/// heights. A hidden band is 0.0.
+///
+/// One function rather than two, because there used to be two: the copy in
+/// `initial_window_size` decides the size the window OPENS at and the copy in
+/// `layout_sizes` decides what it is resized to on the first frame, so any
+/// drift between them shows up as a window that visibly jumps at startup.
+/// Integer truncation per band, like Python (spec §3.2).
+fn band_sizes(settings: &Settings) -> (f32, f32, f32, f32) {
     let w = main_width(settings);
     let piano_h = (w as f64 / (1300.0 / 150.0)).trunc() as f32;
     let chord_visible = settings.chord_detection_enabled && !settings.chord_window_detached;
@@ -939,7 +1013,12 @@ pub fn initial_window_size(settings: &Settings) -> Vec2 {
     } else {
         0.0
     };
-    Vec2::new(w, piano_h + chord_h)
+    let fret_h = if settings.show_fretboard {
+        fretboard_panel::band_height(w)
+    } else {
+        0.0
+    };
+    (w, piano_h, chord_h, fret_h)
 }
 
 impl eframe::App for IvoryApp {
@@ -989,6 +1068,7 @@ impl IvoryApp {
         }
 
         self.detection_tick(false);
+        self.voicing_tick(false);
 
         // Track our position on the monitor for global menu placement, child
         // window centring, and so the main window reopens where it was left.
@@ -1031,8 +1111,8 @@ impl IvoryApp {
 
         // Fixed-size enforcement: Min+Max+Inner triple whenever the target
         // changes (size %, chord toggle, detach/attach).
-        let (w, piano_h, chord_h) = self.layout_sizes();
-        let target = Vec2::new(w, piano_h + chord_h);
+        let (w, piano_h, chord_h, fret_h) = self.layout_sizes();
+        let target = Vec2::new(w, piano_h + chord_h + fret_h);
         if self.last_sent_size != Some(target) {
             ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(target));
             ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(target));
@@ -1074,6 +1154,21 @@ impl IvoryApp {
             self.sustain_down,
             &self.settings,
         );
+        if fret_h > 0.0 {
+            let fret_rect = Rect::from_min_size(
+                Pos2::new(origin.x, piano_rect.bottom()),
+                Vec2::new(w, fret_h),
+            );
+            let spec = self.settings.fretboard_spec();
+            fretboard_panel::draw(
+                ui.painter(),
+                fret_rect,
+                self.voicing.current(),
+                &spec,
+                &self.settings,
+            );
+            fretboard_panel::draw_top_edge(ui.painter(), fret_rect, &self.settings);
+        }
 
         self.handle_main_interaction(&ctx, ui, piano_rect, chord_rect_for_hit);
 
@@ -1177,6 +1272,40 @@ impl IvoryApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-UI-15: the fretboard is a third band in the same stack, and the two
+    /// places that compute the window height have to agree about it. They used
+    /// to be two copies of the same arithmetic; drift between them is a window
+    /// that visibly jumps on the first frame.
+    #[test]
+    fn the_fretboard_band_joins_the_stack_at_every_size() {
+        let mut s = Settings::default();
+        for pct in [50i64, 75, 100, 125, 150, 175, 200] {
+            s.window_size_percent = pct;
+            s.show_fretboard = false;
+            let without = initial_window_size(&s);
+            s.show_fretboard = true;
+            let with = initial_window_size(&s);
+            let w = main_width(&s);
+            assert_eq!(with.x, without.x, "the fretboard must not change the width");
+            assert_eq!(
+                with.y - without.y,
+                fretboard_panel::band_height(w),
+                "band height at {pct}%"
+            );
+            assert_eq!(with.y, with.y.trunc(), "bands are whole pixels");
+        }
+        // And it is independent of the chord strip: hiding one must not resize
+        // the other.
+        s.show_fretboard = true;
+        s.chord_detection_enabled = false;
+        let piano_and_fret = initial_window_size(&s);
+        s.show_fretboard = false;
+        assert_eq!(
+            piano_and_fret.y - initial_window_size(&s).y,
+            fretboard_panel::band_height(main_width(&s))
+        );
+    }
 
     #[test]
     fn size_math_matches_python_int_truncation() {

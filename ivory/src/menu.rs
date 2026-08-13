@@ -10,6 +10,7 @@
 //! themselves (no checkmarks anywhere).
 
 use crate::fonts;
+use ivory_core::fretboard;
 use egui::{
     Button, Color32, CornerRadius, FontId, Margin, Pos2, Stroke, Vec2, ViewportBuilder, ViewportId,
 };
@@ -49,6 +50,11 @@ pub enum MenuAction {
     ShowSupporterKey,
     /// Supporter decoration: show/hide the pixel heart.
     ToggleHeart,
+    /// D-UI-15: the guitar view.
+    ToggleFretboard,
+    /// Name from `fretboard::TUNINGS`.
+    SetTuning(&'static str),
+    SetCapo(u8),
     ShowAbout,
     ResetSettings,
 }
@@ -73,6 +79,11 @@ pub struct MenuView {
     /// A valid supporter license is installed. Gates the extras block.
     pub supporter: bool,
     pub heart_on: bool,
+    /// D-UI-15: the guitar view is showing. Its Tuning and Capo submenus are
+    /// hidden while it is off, rather than offered and inert.
+    pub fretboard_on: bool,
+    pub tuning: &'static str,
+    pub capo: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -106,6 +117,9 @@ const PAD_X: f32 = 20.0; // Qt item padding 4px 20px
 const PAD_Y: f32 = 4.0;
 const SEP_H: f32 = 3.0; // 1px line + 1px margin above/below
 const SIZE_PERCENTS: [i64; 7] = [50, 75, 100, 125, 150, 175, 200];
+/// Highest capo offered. Past this it stops being a capo and starts being a
+/// different instrument, and the list has to end somewhere.
+const CAPO_MAX: u8 = 9;
 const ARROW: &str = "\u{23F5}"; // ⏵ submenu indicator
 
 enum Entry {
@@ -115,18 +129,34 @@ enum Entry {
         action: MenuAction,
         enabled: bool,
     },
-    SizeParent,
+    /// A parent row that opens a sibling viewport to its right. There used to
+    /// be exactly one of these (Size), hard-coded from the entry list all the
+    /// way down to the viewport; the guitar view needs two more, so the whole
+    /// path is now driven by the list.
+    Submenu {
+        label: String,
+        items: Vec<(String, MenuAction)>,
+    },
+}
+
+/// Where an open submenu goes and how big it is. Measured at open time with
+/// the rest of the menu, because a Qt menu is static once it is showing.
+struct SubGeom {
+    row_top: f32,
+    size: Vec2,
 }
 
 pub struct MenuState {
     pos: Pos2, // global (monitor points), top-left
     size: Vec2,
     entries: Vec<Entry>,
-    row_h: f32,        // uniform item height; buttons are forced to it so the
+    row_h: f32, // uniform item height; buttons are forced to it so the
     // stacked rows exactly fill the computed viewport size
-    size_row_top: f32, // y offset of the Size row within the menu
-    submenu_open: bool,
-    submenu_size: Vec2,
+    /// Geometry per submenu, in entry order.
+    subs: Vec<SubGeom>,
+    /// Which submenu is showing, as an index into `subs`. At most one, which
+    /// is why they can all share a single viewport id.
+    submenu_open: Option<usize>,
     dark_mode: bool,
     opened_at: Instant,
     saw_focus: bool,
@@ -146,9 +176,19 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         action,
         enabled: true,
     };
+    let submenu = |label: &str, items: Vec<(String, MenuAction)>| Entry::Submenu {
+        label: label.to_owned(),
+        items,
+    };
     let mut e = Vec::new();
     // 1. Size submenu
-    e.push(Entry::SizeParent);
+    e.push(submenu(
+        "Size",
+        SIZE_PERCENTS
+            .iter()
+            .map(|&p| (format!("{p}%"), MenuAction::SetSizePercent(p)))
+            .collect(),
+    ));
     e.push(Entry::Separator);
     // 3. Borderless toggle (label shows what you would switch TO the current
     //    state from: "Borderless" while bordered, "Bordered" while borderless)
@@ -272,6 +312,52 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         },
         MenuAction::ToggleChordLearning,
     ));
+    // D-UI-15: the guitar view. Its own block, because it is a second
+    // instrument rather than another chord-display option, and its two
+    // submenus only exist while it is on: a Tuning row on a hidden fretboard
+    // is a control for something the user cannot see.
+    e.push(Entry::Separator);
+    e.push(item(
+        if view.fretboard_on { "Hide Fretboard" } else { "Show Fretboard" },
+        MenuAction::ToggleFretboard,
+    ));
+    if view.fretboard_on {
+        e.push(submenu(
+            "Tuning",
+            fretboard::TUNINGS
+                .iter()
+                .map(|t| {
+                    (
+                        // The current one is marked rather than hidden: a
+                        // submenu that never says what is selected makes you
+                        // close it again to find out.
+                        if t.name == view.tuning {
+                            format!("{}  \u{2022}", t.name)
+                        } else {
+                            t.name.to_owned()
+                        },
+                        MenuAction::SetTuning(t.name),
+                    )
+                })
+                .collect(),
+        ));
+        e.push(submenu(
+            "Capo",
+            (0..=CAPO_MAX)
+                .map(|f| {
+                    let label = if f == 0 {
+                        "No Capo".to_owned()
+                    } else {
+                        format!("Fret {f}")
+                    };
+                    (
+                        if f == view.capo { format!("{label}  \u{2022}") } else { label },
+                        MenuAction::SetCapo(f),
+                    )
+                })
+                .collect(),
+        ));
+    }
     e.push(Entry::Separator);
     e.push(item("About", MenuAction::ShowAbout));
     e.push(item("Reset Settings to Default", MenuAction::ResetSettings));
@@ -308,8 +394,8 @@ impl MenuState {
                     text_h = text_h.max(sz.y);
                     max_w = max_w.max(sz.x);
                 }
-                Entry::SizeParent => {
-                    let sz = measure(ctx, "Size");
+                Entry::Submenu { label, .. } => {
+                    let sz = measure(ctx, label);
                     text_h = text_h.max(sz.y);
                     // text + gap + arrow
                     max_w = max_w.max(sz.x + 12.0 + arrow_w);
@@ -320,27 +406,26 @@ impl MenuState {
         let width = (max_w + 2.0 * PAD_X).ceil();
 
         let mut height = 0.0;
-        let mut size_row_top = 0.0;
+        let mut subs: Vec<SubGeom> = Vec::new();
         for entry in &entries {
             match entry {
                 Entry::Separator => height += SEP_H,
                 Entry::Item { .. } => height += row_h,
-                Entry::SizeParent => {
-                    size_row_top = height;
+                Entry::Submenu { items, .. } => {
+                    let w = items
+                        .iter()
+                        .fold(0.0_f32, |acc, (l, _)| acc.max(measure(ctx, l).x));
+                    subs.push(SubGeom {
+                        row_top: height,
+                        size: Vec2::new(
+                            (w + 2.0 * PAD_X).ceil(),
+                            items.len() as f32 * row_h,
+                        ),
+                    });
                     height += row_h;
                 }
             }
         }
-
-        // Submenu geometry.
-        let mut sub_w: f32 = 0.0;
-        for pct in SIZE_PERCENTS {
-            sub_w = sub_w.max(measure(ctx, &format!("{pct}%")).x);
-        }
-        let submenu_size = Vec2::new(
-            (sub_w + 2.0 * PAD_X).ceil(),
-            SIZE_PERCENTS.len() as f32 * row_h,
-        );
 
         // Best-effort clamp to the monitor.
         let mut pos = global_pos;
@@ -358,9 +443,8 @@ impl MenuState {
             size: Vec2::new(width, height),
             entries,
             row_h,
-            size_row_top,
-            submenu_open: false,
-            submenu_size,
+            subs,
+            submenu_open: None,
             dark_mode: view.dark_mode,
             opened_at: Instant::now(),
             saw_focus: false,
@@ -440,7 +524,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         .with_max_inner_size(state.size);
 
     let mut hover_close_submenu = false;
-    let mut hover_open_submenu = false;
+    let mut hover_open_submenu: Option<usize> = None;
     ctx.show_viewport_immediate(menu_vp_id(), builder, |vp, _class| {
         crate::shell::viewport_ui(vp, |ui| {
         apply_menu_style(ui.style_mut(), c);
@@ -455,6 +539,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         );
 
         ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+            let mut sub_idx = 0usize;
             for entry in &state.entries {
                 match entry {
                     Entry::Separator => {
@@ -474,17 +559,18 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
                             close = true;
                         }
                     }
-                    Entry::SizeParent => {
+                    Entry::Submenu { label, .. } => {
                         let r = ui.add(
-                            Button::new("Size")
+                            Button::new(label.as_str())
                                 .right_text(ARROW)
-                                .selected(state.submenu_open)
+                                .selected(state.submenu_open == Some(sub_idx))
                                 .wrap_mode(egui::TextWrapMode::Extend)
                                 .min_size(egui::vec2(0.0, state.row_h)),
                         );
                         if r.hovered() || r.clicked() {
-                            hover_open_submenu = true;
+                            hover_open_submenu = Some(sub_idx);
                         }
+                        sub_idx += 1;
                     }
                 }
             }
@@ -504,15 +590,21 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         });
     });
 
-    if hover_open_submenu {
-        state.submenu_open = true;
+    if let Some(i) = hover_open_submenu {
+        state.submenu_open = Some(i);
     } else if hover_close_submenu {
-        state.submenu_open = false;
+        state.submenu_open = None;
     }
 
-    // ── Size submenu viewport (sibling, Qt-style to the right) ─────────────
-    if state.submenu_open && !close {
-        let sub_pos = Pos2::new(state.pos.x + state.size.x, state.pos.y + state.size_row_top);
+    // ── Submenu viewport (sibling, Qt-style to the right) ─────────────────
+    // Only one submenu can be open at a time, so they all share one viewport
+    // id and it simply moves and resizes as the pointer travels down the menu.
+    let open_sub = state
+        .submenu_open
+        .filter(|_| !close)
+        .and_then(|i| state.subs.get(i).map(|g| (i, g.row_top, g.size)));
+    if let Some((sub_i, row_top, sub_size)) = open_sub {
+        let sub_pos = Pos2::new(state.pos.x + state.size.x, state.pos.y + row_top);
         let sub_builder = ViewportBuilder::default()
             .with_title("Tangent")
             .with_decorations(false)
@@ -520,19 +612,27 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
             .with_always_on_top()
             .with_active(false) // don't steal key focus from the menu
             .with_position(sub_pos)
-            .with_inner_size(state.submenu_size)
-            .with_min_inner_size(state.submenu_size)
-            .with_max_inner_size(state.submenu_size);
+            .with_inner_size(sub_size)
+            .with_min_inner_size(sub_size)
+            .with_max_inner_size(sub_size);
 
         ctx.show_viewport_immediate(submenu_vp_id(), sub_builder, |vp, _class| {
             crate::shell::viewport_ui(vp, |ui| {
             apply_menu_style(ui.style_mut(), c);
             let rect = ui.max_rect();
             ui.painter().rect_filled(rect, 0.0, c.bg);
+            let items = state
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Submenu { items, .. } => Some(items),
+                    _ => None,
+                })
+                .nth(sub_i);
             ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
-                for pct in SIZE_PERCENTS {
-                    if menu_button(ui, &format!("{pct}%"), true, state.row_h).clicked() {
-                        action = Some(MenuAction::SetSizePercent(pct));
+                for (label, a) in items.into_iter().flatten() {
+                    if menu_button(ui, label, true, state.row_h).clicked() {
+                        action = Some(*a);
                         close = true;
                     }
                 }
@@ -581,7 +681,25 @@ mod tests {
             next_font: None,
             supporter: false,
             heart_on: true,
+            fretboard_on: false,
+            tuning: "Standard",
+            capo: 0,
         }
+    }
+
+    /// Submenu rows, in menu order: (parent label, item labels, item actions).
+    fn submenus(v: MenuView) -> Vec<(String, Vec<String>, Vec<MenuAction>)> {
+        build_entries(v)
+            .into_iter()
+            .filter_map(|e| match e {
+                Entry::Submenu { label, items } => Some((
+                    label,
+                    items.iter().map(|(l, _)| l.clone()).collect(),
+                    items.into_iter().map(|(_, a)| a).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     fn rows(v: MenuView) -> Vec<(String, MenuAction, bool)> {
@@ -637,6 +755,70 @@ mod tests {
             find(v, MenuAction::ToggleChordLearning),
             Some(("Disable Chord Learning".to_owned(), true))
         );
+    }
+
+    /// The Size submenu is the one that existed before submenus were plural.
+    /// It must come out of the generalised path byte-for-byte the same.
+    #[test]
+    fn size_is_still_the_first_submenu_and_still_lists_the_same_percents() {
+        let subs = submenus(view());
+        assert_eq!(subs[0].0, "Size");
+        assert_eq!(
+            subs[0].1,
+            vec!["50%", "75%", "100%", "125%", "150%", "175%", "200%"]
+        );
+        assert_eq!(subs[0].2[2], MenuAction::SetSizePercent(100));
+    }
+
+    /// D-UI-15: the guitar view renames itself like every other toggle here,
+    /// and its two submenus exist only while it is on. A Tuning row on a
+    /// hidden fretboard is a control for something you cannot see.
+    #[test]
+    fn the_fretboard_toggle_brings_its_submenus_with_it() {
+        let mut v = view();
+        assert_eq!(
+            find(v, MenuAction::ToggleFretboard),
+            Some(("Show Fretboard".to_owned(), true))
+        );
+        assert_eq!(submenus(v).len(), 1, "only Size while the fretboard is off");
+
+        v.fretboard_on = true;
+        assert_eq!(
+            find(v, MenuAction::ToggleFretboard),
+            Some(("Hide Fretboard".to_owned(), true))
+        );
+        let subs = submenus(v);
+        assert_eq!(subs.len(), 3);
+        assert_eq!(subs[1].0, "Tuning");
+        assert_eq!(subs[2].0, "Capo");
+        // Every shipped tuning is offered, and the live one is marked rather
+        // than hidden: a submenu that never says what is selected makes you
+        // close it again to find out.
+        assert_eq!(subs[1].1.len(), fretboard::TUNINGS.len());
+        assert!(subs[1].1[0].starts_with("Standard"));
+        assert!(subs[1].1[0].ends_with('\u{2022}'), "the current tuning is marked");
+        assert!(!subs[1].1[1].ends_with('\u{2022}'));
+        assert_eq!(subs[1].2[0], MenuAction::SetTuning("Standard"));
+        assert!(
+            subs[1].2.iter().all(|a| matches!(a, MenuAction::SetTuning(n)
+                if fretboard::Tuning::by_name(n).is_some())),
+            "every offered tuning must resolve"
+        );
+
+        assert_eq!(subs[2].1[0], "No Capo  \u{2022}");
+        assert_eq!(subs[2].1[1], "Fret 1");
+        assert_eq!(subs[2].2[0], MenuAction::SetCapo(0));
+        assert_eq!(subs[2].2.len() as u8, CAPO_MAX + 1);
+    }
+
+    #[test]
+    fn the_marked_row_follows_the_settings() {
+        let v = MenuView { fretboard_on: true, tuning: "DADGAD", capo: 3, ..view() };
+        let subs = submenus(v);
+        let marked: Vec<&String> = subs[1].1.iter().filter(|l| l.ends_with('\u{2022}')).collect();
+        assert_eq!(marked.len(), 1);
+        assert!(marked[0].starts_with("DADGAD"));
+        assert_eq!(subs[2].1[3], "Fret 3  \u{2022}");
     }
 
     /// The learning block sits with the teach block, after it, and the menu

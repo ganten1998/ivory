@@ -1373,11 +1373,24 @@ impl VoicingSession {
         }
 
         self.idle_ms = 0;
-        for &p in &self.scratch {
-            let slot = &mut self.seen_at[p as usize % 128];
-            if *slot == 0 {
-                self.next_ord = self.next_ord.saturating_add(1);
-                *slot = self.next_ord;
+        // ONE ordinal per update, shared by everything new in it. Handing out
+        // a separate ordinal per note would rank a chord struck as one gesture
+        // by pitch order, and the drop policy reads that ranking as age: a
+        // ten-note voicing would then shed its lowest voices because they
+        // "arrived first", and the session would draw a different shape from
+        // `solve_cold` on the same notes. Arrival is a property of the tick,
+        // not of the note.
+        if self
+            .scratch
+            .iter()
+            .any(|&p| self.seen_at[p as usize % 128] == 0)
+        {
+            self.next_ord = self.next_ord.saturating_add(1);
+            for &p in &self.scratch {
+                let slot = &mut self.seen_at[p as usize % 128];
+                if *slot == 0 {
+                    *slot = self.next_ord;
+                }
             }
         }
         // Ordinals only ever grow; on the (theoretical) wrap, start clean
@@ -2187,6 +2200,38 @@ mod tests {
         let mut fresh = VoicingSession::new(capo, Weights::DEFAULT);
         let v: Vec<u8> = { let mut v: Vec<u8> = held.iter().copied().collect(); v.sort_unstable(); v };
         assert_eq!(after, *fresh.update_sorted(&v, 100));
+    }
+
+    #[test]
+    fn a_chord_struck_all_at_once_solves_exactly_as_a_cold_solve_would() {
+        // Caught on screen, not in a test: a ten-note voicing drew a different
+        // shape in the app than `solve_cold` produced for the same notes,
+        // because every note in the first tick was getting its own arrival
+        // ordinal in pitch order. The drop policy reads those ordinals as age,
+        // so the bass looked like the oldest voice and was shed first.
+        let spec = std_spec();
+        let mut rng = Lcg(0x4242_4242);
+        for _ in 0..200 {
+            let held = rng.set(36, 84, 10);
+            let mut s = VoicingSession::new(spec.clone(), Weights::DEFAULT);
+            let set: HashSet<u8> = held.iter().copied().collect();
+            assert_eq!(
+                *s.update(&set, 100),
+                solve_cold(&spec, &held),
+                "a fresh session disagreed with a cold solve on {held:?}"
+            );
+        }
+        // Notes that genuinely arrive later ARE younger, and that still counts.
+        let mut s = VoicingSession::new(spec.clone(), Weights::DEFAULT);
+        s.update_sorted(&[60, 64], 100);
+        s.update_sorted(&[60, 64, 67], 100);
+        let mut flat = VoicingSession::new(spec, Weights::DEFAULT);
+        flat.update_sorted(&[60, 64, 67], 100);
+        assert_eq!(
+            frets(flat.current()),
+            frets(s.current()),
+            "three notes is three notes however they got there"
+        );
     }
 
     #[test]

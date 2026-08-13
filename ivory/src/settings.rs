@@ -107,6 +107,17 @@ pub struct Settings {
     /// last choice; starts on, because naming one voicing usually means naming
     /// the shape.
     pub teach_apply_all_keys: bool,
+    /// D-UI-15: the guitar view. OFF by default, and deliberately so — turning
+    /// it on makes the window taller, and a window that grows on its own after
+    /// an update is exactly the kind of geometry surprise the 2.2.0 tester
+    /// report was about. One line here is all it takes to change that mind.
+    pub show_fretboard: bool,
+    /// Name from `fretboard::TUNINGS`. Stored verbatim; an unknown name falls
+    /// back to Standard at the point of use rather than being rewritten, so a
+    /// settings file shared with a later build keeps its tuning.
+    pub fretboard_tuning: String,
+    /// Capo fret. 0 is none. Clamped at use, never on load.
+    pub fretboard_capo: i64,
     /// Unknown keys from the file, preserved verbatim on save (file order).
     pub extra: Map<String, Value>,
 }
@@ -144,6 +155,9 @@ impl Default for Settings {
             window_x: None,
             window_y: None,
             teach_apply_all_keys: true,
+            show_fretboard: false,
+            fretboard_tuning: "Standard".to_owned(),
+            fretboard_capo: 0,
             extra: Map::new(),
         }
     }
@@ -276,6 +290,17 @@ impl Settings {
         take_opt_i64(&mut map, "window_x", &mut s.window_x);
         take_opt_i64(&mut map, "window_y", &mut s.window_y);
         take_bool(&mut map, "teach_apply_all_keys", &mut s.teach_apply_all_keys);
+        take_bool(&mut map, "show_fretboard", &mut s.show_fretboard);
+        if let Some(v) = map.remove("fretboard_tuning") {
+            if let Some(t) = v.as_str() {
+                s.fretboard_tuning = t.to_owned();
+            }
+        }
+        if let Some(v) = map.remove("fretboard_capo") {
+            if let Some(n) = v.as_i64() {
+                s.fretboard_capo = n;
+            }
+        }
 
         s.extra = map; // whatever is left, preserved in file order
         s
@@ -347,6 +372,15 @@ impl Settings {
             "teach_apply_all_keys".into(),
             Value::Bool(self.teach_apply_all_keys),
         );
+        map.insert("show_fretboard".into(), Value::Bool(self.show_fretboard));
+        map.insert(
+            "fretboard_tuning".into(),
+            Value::String(self.fretboard_tuning.clone()),
+        );
+        map.insert(
+            "fretboard_capo".into(),
+            Value::Number(self.fretboard_capo.into()),
+        );
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -410,6 +444,26 @@ impl Settings {
             _ => None,
         }
     }
+
+    /// The board the fretboard view draws, from whatever is in the file.
+    ///
+    /// Every value is sanitised HERE rather than on load, so a settings file
+    /// written by a later build (a tuning this one has never heard of, a capo
+    /// of 40) still opens, still draws something sensible, and still keeps its
+    /// own values when it goes back to the build that understands them.
+    pub fn fretboard_spec(&self) -> ivory_core::fretboard::FretboardSpec {
+        use ivory_core::fretboard::{FretboardSpec, Tuning};
+        let tuning = Tuning::by_name(&self.fretboard_tuning).unwrap_or_else(Tuning::standard);
+        let frets = FretboardSpec::default().frets;
+        FretboardSpec {
+            tuning,
+            frets,
+            // A capo at or past the last fret is a board with nothing on it.
+            // The solver handles that honestly, but nobody means it, so the
+            // stored value is clamped to something playable instead.
+            capo: self.fretboard_capo.clamp(0, frets as i64 - 1) as u8,
+        }
+    }
 }
 
 /// Keep a window fully on the monitor it is being placed on. A remembered
@@ -447,6 +501,53 @@ mod tests {
         assert_eq!(s.detached_chord_height, 50);
         assert!(!s.keytoggle_enabled);
         assert!(s.custom_font_path.is_none());
+        // D-UI-15: the guitar view is opt-in. Turning it on makes the window
+        // taller, and a window that grows on its own after an update is the
+        // geometry surprise the 2.2.0 tester report was about.
+        assert!(!s.show_fretboard);
+        assert_eq!(s.fretboard_tuning, "Standard");
+        assert_eq!(s.fretboard_capo, 0);
+    }
+
+    #[test]
+    fn a_fretboard_setting_from_the_future_still_opens_and_is_kept() {
+        // Sanitising at USE rather than at LOAD is what lets a settings file
+        // travel between builds: an older Tangent draws Standard, writes the
+        // unknown name back untouched, and the newer one still finds its
+        // tuning. The same file with a nonsense capo must not produce a board
+        // with nothing on it either.
+        let json = r##"{
+            "fretboard_tuning": "Nashville High Strung",
+            "fretboard_capo": 40,
+            "show_fretboard": true
+        }"##;
+        let map = match serde_json::from_str::<Value>(json).unwrap() {
+            Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        let s = Settings::from_map(map);
+        assert!(s.show_fretboard);
+        assert_eq!(s.fretboard_tuning, "Nashville High Strung");
+        assert_eq!(s.fretboard_capo, 40, "stored verbatim");
+        let spec = s.fretboard_spec();
+        assert_eq!(spec.tuning.name, "Standard", "unknown tuning draws as standard");
+        assert!(spec.capo < spec.frets, "a capo past the last fret is nobody's intent");
+        // And the round trip does not eat the value it could not understand.
+        let out = serde_json::to_string(&Value::Object(s.to_map())).unwrap();
+        assert!(out.contains("Nashville High Strung"));
+        assert!(out.contains("\"fretboard_capo\":40"));
+    }
+
+    #[test]
+    fn the_shipped_tunings_all_survive_a_round_trip() {
+        for t in ivory_core::fretboard::TUNINGS {
+            let mut s = Settings::default();
+            s.fretboard_tuning = t.name.to_owned();
+            s.fretboard_capo = 5;
+            let back = Settings::from_map(s.to_map());
+            assert_eq!(back.fretboard_spec().tuning.name, t.name);
+            assert_eq!(back.fretboard_spec().capo, 5);
+        }
     }
 
     #[test]

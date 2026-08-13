@@ -6,6 +6,7 @@ mod app;
 mod chord_strip;
 mod dialogs;
 mod fonts;
+mod fretboard_panel;
 mod menu;
 mod midi;
 mod piano;
