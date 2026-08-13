@@ -1,4 +1,5 @@
 pub mod detector;
+pub mod fretboard;
 pub mod license;
 pub mod overrides;
 pub mod patterns;
