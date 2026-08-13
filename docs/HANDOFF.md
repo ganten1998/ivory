@@ -1,9 +1,10 @@
 # Ivory 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-13. **The app is now called TANGENT.** Newest work is
-§2c: the rename, the 2.2.0 tester-report UI fixes, the egui 0.33 downgrade, the
-fretboard core, and the MIT/GPLv3 split. Read §2c FIRST; everything above it
-still says "Ivory" and that is now the internal codename, not the product.
+§2d: the fretboard voicing solver and the guitar view. §2c before it has the
+rename, the 2.2.0 tester-report UI fixes, the egui 0.33 downgrade and the
+MIT/GPLv3 split. Read §2c then §2d FIRST; everything above them still says
+"Ivory" and that is now the internal codename, not the product.
 This file is the single source of truth for
 picking the project up cold. Read it top-to-bottom before touching anything.
 Pair it with `docs/DESIGN.md` (architecture), `docs/DIVERGENCES.md` (the chord
@@ -265,12 +266,118 @@ and so is Pro Tools (AAX). The plugin will have **no detached windows**: a VST3
 editor is one host-owned child window, so `Caps::detachable = false` removes
 those menu entries rather than faking them with an embedded `egui::Window`.
 
-**WHERE TO PICK UP.** The architecture plan from the design workflow is the
-guide. Next concrete steps, in order: the fretboard voicing solver
-(`ivory-core`, pure, testable now); then the attached fretboard panel shipped
-as 2.3.0; then the `Shell`/`Caps` refactor; then `ivory-plugin` with
-`nih_export_vst3!`; then the installer. Branch `spike/egui-033` is now
-redundant and can be deleted.
+**WHERE TO PICK UP.** See §2d — the solver and the panel are both done.
+
+## 2d. 2026-08-13 (later) — the voicing solver and the guitar view
+
+Both of the next steps §2c named are done and committed (`aae49c9`, `ef67801`).
+`cargo test --workspace` is **196 green**, `cargo build --workspace
+--all-targets` is warning-free, and the full 13,133-row differential still
+passes (the chord engine was not touched).
+
+### `ivory-core/src/voicing.rs` — which position lights up
+
+`fretboard.rs` says where a pitch CAN go; this says where it DOES go. Design
+came from a four-proposal / three-judge panel whose numbers were executed
+against the real candidate tables, not reasoned about.
+
+**The one structural decision everything rests on: assignment is MONOTONE.**
+Ascending sounding pitch goes on ascending strings. That is not a heuristic, it
+is the search: it gives "at most one note per string" for free, forbids voice
+crossings by construction, and collapses the space to `C(n + strings, strings)`
+— at most 3003 complete shapes on six strings, small enough to enumerate
+**exhaustively**. So there are no hand-position windows, no beam, no DP table
+and no approximation anywhere. Measured: **3.8 µs per solve**, 134 leaves on a
+ten-note piano voicing. The cost of it: deliberate crossing voicings (a fretted
+9th under an open B) and thumb-over bass notes cannot be represented. Changing
+that means rewriting the search.
+
+**Costs are `i32`, never floats**, because float addition is not associative and
+a reordered sum can flip a near-tie. `REACH_MILLI` is a frozen table rather than
+a runtime `powf` for the same reason. Determinism is a shipped contract with
+tests behind it, including one that solves from 100 freshly-built `HashSet`s
+(`display_notes()` builds a new one every call and `RandomState` is seeded per
+instance — that is a real trap, not a theoretical one).
+
+**The drop tier is two orders of magnitude above the shape terms**, and
+`a_note_with_nothing_doubling_it_is_never_shed_for_a_prettier_shape` asserts the
+gap: the whole spread of shape costs is 6290 against a 15000 floor on dropping a
+note whose pitch class sounds nowhere else. A nicer hand position can therefore
+never cost you a note you played. Retire that gap and the test goes red.
+
+**Every dial is in `Weights`**, in the order the owner will reach for them:
+`position_per_fret` (30) first, then `finger_cum[5]` (the 5th finger costs 300),
+then the `stretch` table, then `drop_highest`/`drop_lowest`. The ordering
+(`drop >> fingers > stretch > position > skip > open`) is the part to defend;
+the integers are the part to lose an argument about.
+
+**Iterate it the way the chord engine is iterated:**
+```bash
+cargo run -p ivory-core --example voiceprobe --release             # the calibration set
+cargo run -p ivory-core --example voiceprobe --release -- 60 64 67  # one voicing, with runners-up
+cargo run -p ivory-core --example voiceprobe --release -- --tuning DADGAD --capo 3 57 58
+cargo test -p ivory-core --test voicing_acceptance                 # the pinned shapes
+```
+`tests/voicing_acceptance.rs` is a **tripwire, not a law**: turning a dial will
+light some rows up, and that is the point — it makes the blast radius of a taste
+change a diff instead of something noticed in a demo three weeks later. When
+play-testing disagrees with a row, the row changes, after the dial that moved it
+is written down.
+
+**The knife-edge cases to play first**, all verified by `voiceprobe`:
+- rootless Dm9 `62,65,69,72,76` → `x 17 15 14 13 12`, honestly 5 fingers and
+  labelled `TwoHands`. Every proposal in the design panel put this at frets
+  17–22. Dials: `finger_cum[5]`, `position_high_per_fret`.
+- Am7 close `57,60,64,67` → `x x 7 5 5 3` (628) vs `x 12 10 9 8 x` (723). 95
+  points apart, where `position_per_fret` and `stretch` fight.
+- E4+F4 `64,65` → `x x x 9 6 x` (424) vs `x x x x 5 1` (435). Eleven points.
+
+### `ivory/src/fretboard_panel.rs` — the view (D-UI-15, full detail there)
+
+Dumb by design, like `piano.rs`. The app owns exactly ONE `VoicingSession` and
+re-solves on the same 100ms gate as chord detection. **Off by default**
+(`show_fretboard: false`): turning it on makes the window taller, and a window
+that grows on its own after an update is the D-UI-10/11 surprise again. One line
+in `Settings::default()` to flip it once the view has been played with.
+
+Menu **submenus are plural now** — `Entry::Submenu { label, items }` replaced the
+hard-coded `Entry::SizeParent`, and Size is asserted to come out of the
+generalised path unchanged. Tuning and Capo appear only while the view is on.
+
+**Two things that only turned up on screen**, which is the argument for always
+doing the `screencapture` pass:
+1. The session drew a **different shape from `solve_cold`** on the same notes.
+   Every note in a tick was getting its own arrival ordinal in pitch order, and
+   the drop policy reads ordinals as age, so a ten-note voicing shed its bass
+   because the bass "arrived first". Arrival is a property of the TICK.
+   Regression-tested over 200 random chords.
+2. The first palette drew dark strings on the piano's light background and
+   looked like a spreadsheet. It is a dark fingerboard, light strings and a bone
+   nut now; held notes use `white_key_active_color`, which the user already
+   chose for a held piano key.
+
+Watch for: `fret_x(22)` is **0.719**, not 1.0, because a 22-fret neck is only 72%
+of the way to the bridge. The panel scales by `fret_x(frets)` so the last fret
+lands on the right edge. Drawing straight into widget space leaves a quarter of
+the band empty and puts every dot in the wrong place; the test
+`the_last_fret_lands_on_the_right_edge` is what stops that coming back.
+
+### WHERE TO PICK UP NOW
+
+1. **Play-test the solver.** It is provably deterministic and provably exhaustive
+   over its own objective; it has never been judged by a guitarist. Start with
+   the three knife-edge voicings above. Everything you would want to turn is in
+   `Weights`, and `voiceprobe` prints the runners-up so a disagreement can be
+   argued in points.
+2. **Decide `show_fretboard`'s default** once (1) has happened.
+3. **Cut 2.3.0**: bump the workspace version (it is still 2.2.0 — the version
+   bump belongs to the release commit, as it did for 2.2.0), move
+   `CHANGELOG.md`'s `[Unreleased]` under the new heading, then
+   `scripts/release.sh`. Remember `scripts/publish-github.sh` must still upload
+   the legacy `Ivory-*` names (§2c) — that is not optional.
+4. Then the `Shell`/`Caps` refactor, then `ivory-plugin` with
+   `nih_export_vst3!`, then the installer. `Caps::detachable = false` for the
+   plugin; the fretboard panel needs no detached variant either.
 
 ## 3. Repo layout
 
@@ -283,16 +390,21 @@ ivory/
 │   │   ├── patterns.rs     chord/scale tables (ORDER IS LOAD-BEARING)
 │   │   ├── detector.rs     the scoring pipeline (all the hard logic)
 │   │   ├── naming.rs       note naming / display formatting
-│   │   └── overrides.rs    teach layer (exact overrides + learning feature)
+│   │   ├── overrides.rs    teach layer (exact overrides + learning feature)
+│   │   ├── fretboard.rs    guitar geometry + every place a pitch can be played
+│   │   └── voicing.rs      which of those places lights up (§2d; ALL dials in `Weights`)
 │   ├── tests/
 │   │   ├── acceptance.rs   THE CONTRACT — 200+ (notes → name) vectors, both prefs
-│   │   └── differential.rs corpus regression guard (classifier writes this)
+│   │   ├── differential.rs corpus regression guard (classifier writes this)
+│   │   └── voicing_acceptance.rs  pinned fretboard shapes — a TRIPWIRE, not a law
 │   └── examples/
 │       ├── diffcorpus.rs   engine vs golden corpus (see §5)
-│       └── probe.rs        candidate-score dumper for one input (debug tool)
-├── ivory/                  ── GUI binary (eframe/egui 0.35, midir 0.11) ──
-│   └── src/                main, app, piano, chord_strip, menu, dialogs, midi,
-│                           settings, fonts  (see docs/DESIGN.md for each)
+│       ├── probe.rs        candidate-score dumper for one input (debug tool)
+│       └── voiceprobe.rs   the same for shapes: winner + runners-up in points
+├── ivory/                  ── GUI binary (eframe/egui 0.33 PINNED, midir 0.11) ──
+│   └── src/                main, app, piano, chord_strip, fretboard_panel, menu,
+│                           dialogs, midi, settings, fonts, shell
+│                           (see docs/DESIGN.md; egui is pinned at 0.33, see §2c)
 ├── assets/                 ivory.png (128×128 original art), ivory.ico, ivory.desktop, fonts/
 ├── tests/golden/           corpus.json (13,133 rows), gen_corpus.py, + classifier outputs
 ├── scripts/                build-macos.sh, build-cross.sh, build-linux-native.sh, gen-third-party-licenses.sh
