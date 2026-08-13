@@ -109,6 +109,16 @@ what the display does with a held note.
 Downloads published under the old `Ivory-*` asset names keep working; every
 release uploads those alongside the current ones.
 
+## Licensing
+
+The standalone app and every crate in this repo are **MIT**. The VST3 plugin
+binary is **GPL-3.0-or-later**, because NIH-plug's VST3 bindings are, and
+copyleft attaches to the binary that links them rather than to the source.
+
+Shipping both in one installer is an aggregate under GPLv3 section 5, so the
+standalone stays MIT. `LICENSING.md` records the reasoning and the three rules
+that keep it true.
+
 ## Building from source
 
 Requires a stable Rust toolchain (rustup recommended).
