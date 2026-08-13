@@ -88,8 +88,8 @@ Built for a first hands-on test by a non-owner on macOS **and** Windows.
 - **Measured blast radius** (`ivory-core/tests/blast_radius.rs`, `#[ignore]`d —
   run it with `--release -- --ignored --nocapture`): ONE correction
   (`C-E-G-A → Am7`, 5 steps) changed **1,182 of the 13,133 corpus voicings
-  (9.0%)** when measured at 2.1.0 — **re-measured 2026-08-11 after D22–D26 it
-  is 1,279 (9.7%)** — many in unrelated keys, because chord identity enters the
+  (9.0%)** when measured at 2.1.0 — **re-measured 2026-08-13 after D22–D26 it
+  is 1,278 (9.7%)** — many in unrelated keys, because chord identity enters the
   feature vector only as `hash % 97`. `Forget Learning` restored all 13,133
   exactly, both times.
   That number is the honest answer to "is the re-ranker worth keeping" — it is
@@ -177,8 +177,12 @@ What that changes for anyone picking this up:
   `tests/golden/classify.py` before quoting its per-rule table.
 - Whole workspace green at GUI 14 + engine 59 unit + 3 acceptance + 10 learning
   + differential(fast). The full 13,133-row differential is `#[ignore]`d — see §5.
-- One-correction blast radius re-measured after D22–D26: **1,279 of 13,133
-  (9.7%)**, up from the 1,182 (9.0%) quoted in §2a.
+- One-correction blast radius re-measured after D22–D26: **1,278 of 13,133
+  (9.7%)**, up from the 1,182 (9.0%) quoted in §2a. (This said 1,279 until
+  2026-08-13, when it was re-run twice here and once in a worktree at `49c6e8c`
+  and came back 1,278 every time. The engine has not moved since D26; the old
+  figure was simply off by one. Same lesson as the "543-byte placeholder icon"
+  in §8 — re-run the measurement before repeating the number.)
 
 ### Remaining work (task 8 — FINALIZE only)
 Everything above is committed. Packaging works; what is left is business +
