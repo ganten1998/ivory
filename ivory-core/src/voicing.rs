@@ -436,11 +436,13 @@ impl Weights {
     pub fn max_shape_cost(&self, strings: usize) -> i32 {
         let s = strings.min(MAX_STRINGS) as i32;
         self.finger_cum[strings.min(8)]
-            + self.barre_setup.max(0)
-            + self.stretch[8].max(0) * self.stretch_scale.max(0) / 100
-            + self.position_cap.max(0)
-            + self.open_max.max(0) * s
-            + self.skip_interior.max(0) * (s - 2).max(0)
+            .saturating_add(self.barre_setup.max(0))
+            .saturating_add(
+                self.stretch[8].max(0).saturating_mul(self.stretch_scale.clamp(0, 10_000)) / 100,
+            )
+            .saturating_add(self.position_cap.max(0))
+            .saturating_add(self.open_max.max(0).saturating_mul(s))
+            .saturating_add(self.skip_interior.max(0).saturating_mul((s - 2).max(0)))
     }
 
     /// Lower bound on the same terms. Only the open-string bonus and the
@@ -448,14 +450,19 @@ impl Weights {
     /// staying true — `tests::every_positive_term_really_is_positive` says so.
     pub fn min_shape_cost(&self, strings: usize) -> i32 {
         let s = strings.min(MAX_STRINGS) as i32;
-        self.open_min.min(0) * s + self.hyst_clamp.min(0)
+        self.open_min
+            .min(0)
+            .saturating_mul(s)
+            .saturating_add(self.hyst_clamp.min(0))
     }
 
     /// The cheapest a note whose pitch class sounds nowhere else can ever be
     /// dropped for. Compare with `max_shape_cost - min_shape_cost`: while the
     /// gap holds, no such note is ever shed to buy a nicer shape.
     pub fn min_unique_drop(&self) -> i32 {
-        self.drop_base - self.recency_cap - self.drop_stick
+        self.drop_base
+            .saturating_sub(self.recency_cap)
+            .saturating_sub(self.drop_stick)
     }
 }
 
@@ -683,7 +690,7 @@ fn run(
     // Steps 4 and 5 — static drop costs, then the pre-cap. Drop cost never
     // depends on the assignment, which is what makes both the pre-cap and the
     // search's prune sound.
-    let keep = (strings + w.note_slack).min(MAX_NOTES);
+    let keep = strings.saturating_add(w.note_slack).min(MAX_NOTES);
     while live.len() > keep {
         let victim = (0..live.len())
             .min_by_key(|&k| {
@@ -733,7 +740,7 @@ fn run(
         entries[i].state = PreState::Live(k);
     }
     for k in (0..n).rev() {
-        s.drop_suffix[k] = s.drop_suffix[k + 1] + s.drop_cost[k];
+        s.drop_suffix[k] = s.drop_suffix[k + 1].saturating_add(s.drop_cost[k]);
     }
 
     // Step 6 — the candidate table. One fret per (note, string) at most.
@@ -806,6 +813,12 @@ fn drop_cost_of(
     w: &Weights,
 ) -> i32 {
     let e = entries[live[k]];
+    // Saturating throughout, here and in `shape_cost_of`. Every number below
+    // is a DIAL the owner is invited to turn while play-testing, and turning
+    // one to something silly must produce a silly shape, not a debug-build
+    // panic. Release builds would wrap instead, which is worse: a cost that
+    // wrapped negative would make the solver prefer exactly the shape the dial
+    // was meant to discourage.
     let mut c = if e.shift != 0 {
         // A ghost is cheap to lose, and none of the modifiers below apply: it
         // is not really the bass or the melody, it is a stand-in for one.
@@ -813,13 +826,13 @@ fn drop_cost_of(
     } else {
         let mut c = w.drop_base;
         if k == 0 {
-            c += w.drop_lowest;
+            c = c.saturating_add(w.drop_lowest);
         }
         if k + 1 == live.len() {
-            c += w.drop_highest;
+            c = c.saturating_add(w.drop_highest);
         }
         if live[..k].iter().any(|&j| entries[j].target % 12 == e.target % 12) {
-            c += w.drop_doubled;
+            c = c.saturating_add(w.drop_doubled);
         }
         c
     };
@@ -829,7 +842,7 @@ fn drop_cost_of(
             .iter()
             .filter(|&&i| a[entries[i].source as usize % 128] > mine)
             .count() as i32;
-        c -= (w.recency_per * later).min(w.recency_cap);
+        c = c.saturating_sub(w.recency_per.saturating_mul(later).min(w.recency_cap));
     }
     // Stickiness is a hysteresis term, so it only exists once there is a
     // previous solve to be sticky about. With no history it is silent, not
@@ -840,7 +853,11 @@ fn drop_cost_of(
             .notes
             .iter()
             .any(|n| n.pitch == e.source && matches!(n.outcome, Outcome::Placed { .. }));
-        c += if was_placed { w.drop_stick } else { -w.drop_stick };
+        c = if was_placed {
+            c.saturating_add(w.drop_stick)
+        } else {
+            c.saturating_sub(w.drop_stick)
+        };
     }
     c
 }
@@ -850,7 +867,9 @@ impl Search<'_> {
         // Admissible prune. `>` not `>=`: an equal-cost shape with a smaller
         // tie key must still be reachable, or the argmin would depend on the
         // DFS order rather than on the key.
-        if self.have_best && committed + self.w.min_shape_cost(self.strings) > self.best_cost {
+        if self.have_best
+            && committed.saturating_add(self.w.min_shape_cost(self.strings)) > self.best_cost
+        {
             self.pruned += 1;
             return;
         }
@@ -863,7 +882,9 @@ impl Search<'_> {
                 return;
             }
             self.leaves += 1;
-            let total = committed + self.drop_suffix[i] + self.shape_cost();
+            let total = committed
+                .saturating_add(self.drop_suffix[i])
+                .saturating_add(self.shape_cost());
             self.consider(total);
             return;
         }
@@ -883,9 +904,9 @@ impl Search<'_> {
             if f != MUTED {
                 self.sel[st] = f;
                 self.sel_note[st] = j as u8;
-                self.rec(st + 1, j + 1, committed + skipped);
+                self.rec(st + 1, j + 1, committed.saturating_add(skipped));
             }
-            skipped += self.drop_cost[j];
+            skipped = skipped.saturating_add(self.drop_cost[j]);
         }
         self.sel[st] = MUTED;
         self.sel_note[st] = MUTED;
@@ -1187,25 +1208,35 @@ fn shape_cost_of(
 
     let mut cost = w.finger_cum[(fingers as usize).min(8)];
     if barre.is_some() {
-        cost += w.barre_setup;
+        cost = cost.saturating_add(w.barre_setup);
     }
 
     if let Some(a) = anchor {
         // Stretch, scaled by the neck's own geometry: the same five frets is a
         // different hand at fret 1 and at fret 12.
-        cost += w.stretch[(span as usize).min(8)] * REACH_MILLI[(a as usize).min(24)] / 1000
-            * w.stretch_scale
-            / 100;
+        cost = cost.saturating_add(
+            w.stretch[(span as usize).min(8)]
+                .saturating_mul(REACH_MILLI[(a as usize).min(24)])
+                / 1000
+                * w.stretch_scale.clamp(-10_000, 10_000)
+                / 100,
+        );
         // Position: capo-relative below the 12th, absolute above it.
-        let mut pos = w.position_per_fret * (a as i32 - capo as i32);
+        let mut pos = w.position_per_fret.saturating_mul(a as i32 - capo as i32);
         if a > w.position_high_fret {
-            pos += w.position_high_per_fret * (a as i32 - w.position_high_fret as i32);
+            pos = pos.saturating_add(
+                w.position_high_per_fret.saturating_mul(a as i32 - w.position_high_fret as i32),
+            );
         }
-        cost += pos.min(w.position_cap);
+        cost = cost.saturating_add(pos.min(w.position_cap));
     }
 
     let anchor_rel = anchor.map_or(0, |a| a as i32 - capo as i32);
-    let per_open = (w.open_min + w.open_slope * anchor_rel)
+    // `.max().min()` rather than `.clamp()`: clamp panics when min > max, and
+    // these are two independent dials that nothing stops the owner inverting.
+    let per_open = w
+        .open_min
+        .saturating_add(w.open_slope.saturating_mul(anchor_rel))
         .max(w.open_min)
         .min(w.open_max);
 
@@ -1220,16 +1251,21 @@ fn shape_cost_of(
         }
         hi = st;
         if f == capo {
-            cost += per_open;
+            cost = cost.saturating_add(per_open);
         }
         let shift = shift_of(st);
         if shift != 0 {
-            cost += w.fold_place + w.fold_per_extra_octave * (shift.unsigned_abs() as i32 - 1);
+            cost = cost.saturating_add(w.fold_place).saturating_add(
+                w.fold_per_extra_octave
+                    .saturating_mul(shift.unsigned_abs() as i32 - 1),
+            );
         }
     }
     if lo != usize::MAX {
-        cost += w.skip_interior
-            * ((lo + 1)..hi).filter(|&st| sel[st] == MUTED).count() as i32;
+        cost = cost.saturating_add(
+            w.skip_interior
+                .saturating_mul(((lo + 1)..hi).filter(|&st| sel[st] == MUTED).count() as i32),
+        );
     }
 
     if hyst {
@@ -1245,11 +1281,11 @@ fn shape_cost_of(
                 continue;
             }
             if prev_pos_of(st) == 1 + (st as u16) * 256 + f as u16 {
-                retained += w.retain_note;
+                retained = retained.saturating_add(w.retain_note);
             }
         }
-        h += retained.max(w.retain_cap);
-        cost += h.max(w.hyst_clamp);
+        h = h.saturating_add(retained.max(w.retain_cap));
+        cost = cost.saturating_add(h.max(w.hyst_clamp));
     }
 
     cost
