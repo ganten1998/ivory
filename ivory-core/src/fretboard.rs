@@ -20,6 +20,12 @@ pub struct Tuning {
 
 /// Standard first. Anything with a different string count works too: the
 /// geometry is driven by `open.len()`, never by a hard-coded 6.
+///
+/// NOTE for the voicing solver: `FretboardSpec` has no scale-length field, so
+/// nothing here can derive that "Bass (4)" is a 34" neck where the same hand
+/// covers ~1.4x fewer frets than a 25.5" guitar. That coupling lives in
+/// `voicing::Weights::for_tuning`. If a baritone or short-scale tuning is added
+/// here, add a `Weights` preset for it there too.
 pub const TUNINGS: &[Tuning] = &[
     Tuning { name: "Standard", open: &[40, 45, 50, 55, 59, 64] }, // E A D G B E
     Tuning { name: "Drop D", open: &[38, 45, 50, 55, 59, 64] },
@@ -139,6 +145,21 @@ pub fn candidates(spec: &FretboardSpec, pitch: u8) -> Vec<Position> {
         }
     }
     out
+}
+
+/// True if `pitch` can be produced anywhere on this board.
+///
+/// `candidates()` answers the same question but builds a `Vec` and walks every
+/// fret; this is O(strings) and allocation-free. The voicing solver's
+/// octave-fold probe asks up to 43 times per held note, which is where that
+/// difference stops being academic.
+pub fn reachable(spec: &FretboardSpec, pitch: u8) -> bool {
+    spec.tuning.open.iter().any(|&open| {
+        open <= pitch && {
+            let fret = pitch - open;
+            fret >= spec.capo && fret <= spec.frets
+        }
+    })
 }
 
 /// Every place any octave of `pitch`'s pitch class can be played.
@@ -276,6 +297,28 @@ mod tests {
             let mut sorted = a.clone();
             sorted.sort();
             assert_eq!(a, sorted, "output must already be in (string, fret) order");
+        }
+    }
+
+    #[test]
+    fn reachable_agrees_with_enumeration_everywhere() {
+        // `reachable` is the fast path the solver folds octaves with; the day
+        // it disagrees with `candidates` is the day a note vanishes for one
+        // code path and appears for the other.
+        for t in TUNINGS {
+            for frets in [0u8, 12, 22, 24] {
+                for capo in [0u8, 3, 12, 24, 47] {
+                    let spec = FretboardSpec { tuning: t, frets, capo };
+                    for pitch in 0..=127u8 {
+                        assert_eq!(
+                            reachable(&spec, pitch),
+                            !candidates(&spec, pitch).is_empty(),
+                            "{} frets={frets} capo={capo} pitch={pitch}",
+                            t.name
+                        );
+                    }
+                }
+            }
         }
     }
 
