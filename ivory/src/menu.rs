@@ -379,7 +379,7 @@ fn apply_menu_style(style: &mut egui::Style, c: MenuColors) {
         wv.bg_fill = bg;
         wv.weak_bg_fill = bg;
         wv.bg_stroke = Stroke::NONE;
-        wv.fg_stroke = Stroke::new(1.0, fg);
+        wv.fg_stroke = Stroke::new(1.0_f32, fg);
         wv.corner_radius = CornerRadius::ZERO;
         wv.expansion = 0.0;
     };
@@ -397,11 +397,11 @@ fn apply_menu_style(style: &mut egui::Style, c: MenuColors) {
         c.text.gamma_multiply(0.4),
     );
     // Separators draw with noninteractive.bg_stroke.
-    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, c.sep);
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, c.sep);
     style.visuals.selection.bg_fill = c.sel;
-    style.visuals.selection.stroke = Stroke::new(1.0, c.text);
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, c.text);
     style.visuals.window_fill = c.bg;
-    style.visuals.window_stroke = Stroke::new(1.0, c.bg);
+    style.visuals.window_stroke = Stroke::new(1.0_f32, c.bg);
     style.visuals.popup_shadow = egui::Shadow::NONE;
     style.visuals.window_shadow = egui::Shadow::NONE;
     style.visuals.menu_corner_radius = CornerRadius::ZERO;
@@ -441,7 +441,8 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
 
     let mut hover_close_submenu = false;
     let mut hover_open_submenu = false;
-    ctx.show_viewport_immediate(menu_vp_id(), builder, |ui, _class| {
+    ctx.show_viewport_immediate(menu_vp_id(), builder, |vp, _class| {
+        crate::shell::viewport_ui(vp, |ui| {
         apply_menu_style(ui.style_mut(), c);
         let rect = ui.max_rect();
         // Background + 1px border in the background color (visually borderless).
@@ -449,7 +450,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         ui.painter().rect_stroke(
             rect.shrink(0.5),
             0.0,
-            Stroke::new(1.0, c.bg),
+            Stroke::new(1.0_f32, c.bg),
             egui::StrokeKind::Middle,
         );
 
@@ -500,6 +501,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         if close_req || esc {
             close = true;
         }
+        });
     });
 
     if hover_open_submenu {
@@ -522,7 +524,8 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
             .with_min_inner_size(state.submenu_size)
             .with_max_inner_size(state.submenu_size);
 
-        ctx.show_viewport_immediate(submenu_vp_id(), sub_builder, |ui, _class| {
+        ctx.show_viewport_immediate(submenu_vp_id(), sub_builder, |vp, _class| {
+            crate::shell::viewport_ui(vp, |ui| {
             apply_menu_style(ui.style_mut(), c);
             let rect = ui.max_rect();
             ui.painter().rect_filled(rect, 0.0, c.bg);
@@ -540,6 +543,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
             if esc {
                 close = true;
             }
+            });
         });
     }
 

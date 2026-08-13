@@ -157,7 +157,7 @@ pub fn draw(
     painter.rect_filled(rect, 0.0, Color32::BLACK);
     // Inside, so the outline is never clipped away at the window edge.
     if let Some(bc) = border {
-        painter.rect_stroke(rect, 0.0, Stroke::new(1.0, bc), StrokeKind::Inside);
+        painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, bc), StrokeKind::Inside);
     }
     // Drawn before the early return so it shows even with no chord sounding.
     if let Some(hc) = heart {
@@ -227,7 +227,8 @@ pub fn show_detached_window(
         builder = builder.with_position(p);
     }
 
-    ctx.show_viewport_immediate(viewport_id(), builder, |ui, _class| {
+    ctx.show_viewport_immediate(viewport_id(), builder, |vp, _class| {
+        crate::shell::viewport_ui(vp, |ui| {
         let rect = ui.max_rect();
         draw(ui.painter(), rect, chord, color, heart, Some(BORDER_COLOR));
 
@@ -257,6 +258,7 @@ pub fn show_detached_window(
         if borderless && pressed && !secondary {
             ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
         }
+        });
     });
     outcome
 }
@@ -279,7 +281,7 @@ mod tests {
         let ctx = egui::Context::default();
         fonts::install(&ctx, fonts::FontChoice::default(), None);
         // One pass, so the font atlas exists before anything is laid out.
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = ctx.run(Default::default(), |_| {});
         let painter = Painter::new(ctx.clone(), egui::LayerId::debug(), Rect::EVERYTHING);
         (ctx, painter)
     }

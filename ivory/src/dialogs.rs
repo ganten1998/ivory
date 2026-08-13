@@ -163,8 +163,8 @@ fn apply_theme(style: &mut egui::Style, t: &DialogTheme) {
     let set = |wv: &mut egui::style::WidgetVisuals, bg: Color32| {
         wv.bg_fill = bg;
         wv.weak_bg_fill = bg;
-        wv.bg_stroke = Stroke::new(1.0, t.button_border);
-        wv.fg_stroke = Stroke::new(1.0, t.text);
+        wv.bg_stroke = Stroke::new(1.0_f32, t.button_border);
+        wv.fg_stroke = Stroke::new(1.0_f32, t.text);
         wv.corner_radius = CornerRadius::ZERO;
         wv.expansion = 0.0;
     };
@@ -172,12 +172,12 @@ fn apply_theme(style: &mut egui::Style, t: &DialogTheme) {
     set(&mut style.visuals.widgets.hovered, t.button_hover);
     set(&mut style.visuals.widgets.active, t.button_hover);
     set(&mut style.visuals.widgets.open, t.button_hover);
-    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, t.text);
-    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, t.text);
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, t.text);
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, t.text);
     style.visuals.override_text_color = None;
     style.visuals.window_fill = t.bg;
     style.visuals.selection.bg_fill = t.button_hover;
-    style.visuals.selection.stroke = Stroke::new(1.0, t.text);
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, t.text);
     style.visuals.hyperlink_color = t.text;
 }
 
@@ -241,7 +241,8 @@ fn show_dialog_viewport(
     if let Some(p) = placement.position_for(size) {
         builder = builder.with_position(p);
     }
-    ctx.show_viewport_immediate(dialog_vp_id(), builder, |ui, _class| {
+    ctx.show_viewport_immediate(dialog_vp_id(), builder, |vp, _class| {
+        crate::shell::viewport_ui(vp, |ui| {
         let (close_req, esc) = ui.input(|i| {
             (
                 i.viewport().close_requested(),
@@ -252,6 +253,7 @@ fn show_dialog_viewport(
             result.close = true; // window close / Esc == Cancel (strict no-op)
         }
         content(ui, &mut result);
+        });
     });
     result
 }

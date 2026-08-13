@@ -28,8 +28,8 @@ path = "src/main.rs"
 # every test still passes. `tests/license_feature.rs` guards this.
 ivory-core = { path = "../ivory-core", features = ["learning", "license"] }
 # Same crate eframe already links; direct dep so modules can `use egui::...`.
-egui = { version = "0.35", default-features = false }
-eframe = { version = "0.35", default-features = false, features = [
+egui = { version = "0.33", default-features = false }
+eframe = { version = "0.33", default-features = false, features = [
     "default_fonts",
     "glow",
     "wayland",

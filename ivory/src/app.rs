@@ -943,7 +943,27 @@ pub fn initial_window_size(settings: &Settings) -> Vec2 {
 }
 
 impl eframe::App for IvoryApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// eframe hands us a Context; everything below wants a Ui. One central
+    /// panel with no frame and no margin bridges the two without changing a
+    /// pixel: the app paints absolutely into `max_rect` and has always owned
+    /// its whole window.
+    ///
+    /// This shape is also what the plugin build needs, because
+    /// `nih_plug_egui` gives an editor a Context rather than a Ui, so the
+    /// body below is already in the right form to be shared.
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| self.paint(ui));
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 1.0]
+    }
+}
+
+impl IvoryApp {
+    fn paint(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
 
         self.process_midi_events();

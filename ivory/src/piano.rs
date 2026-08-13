@@ -124,7 +124,7 @@ pub fn draw(
         let lx = left + (sep as f64 * white_key_w).trunc() as f32 + 0.5;
         painter.line_segment(
             [Pos2::new(lx, top), Pos2::new(lx, top + h.trunc() as f32)],
-            Stroke::new(1.0, separator),
+            Stroke::new(1.0_f32, separator),
         );
     }
 
@@ -160,7 +160,7 @@ pub fn draw(
             Pos2::new(left + bx + 0.5, top + 0.5),
             Pos2::new(left + bx + bw + 0.5, top + bh + 0.5),
         );
-        painter.rect_stroke(stroke_rect, 0.0, Stroke::new(1.0, outline), StrokeKind::Middle);
+        painter.rect_stroke(stroke_rect, 0.0, Stroke::new(1.0_f32, outline), StrokeKind::Middle);
     }
 
 
