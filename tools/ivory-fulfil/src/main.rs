@@ -171,23 +171,23 @@ fn sale_is_genuine(token: &str, sale_id: &str) -> bool {
 // changed at release time, not before. `scripts/check-store-links.sh` fetches
 // every one of them and is the gate.
 //
-// The installers (`Tangent-macos.pkg`, `Tangent-windows-setup.exe`) are better
-// links and take over the moment 3.0.0 is published; the swap is written down
-// in docs/STORE-CONTENT.md. It is not done here early, because a repository
-// whose main branch hands out 404s is one where somebody eventually deploys
-// it. That has happened: this email once went out ahead of its assets and
-// 404'd for ten minutes.
+// The installers took over at 3.0.0, which is the first release that has them.
+// They are better links than the archives: each offers the app and the VST3
+// plugin as separate choices and puts the plugin where the DAW already looks,
+// so there is nothing for a buyer to drag anywhere. The swap waited until the
+// assets existed, because a repository whose main branch hands out 404s is one
+// where somebody eventually deploys it. That has happened: this email once
+// went out ahead of its assets and 404'd for ten minutes.
 const DOWNLOAD_MACOS: &str =
-    "https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.dmg";
-// tangent-*, matching the macOS line above, which had already been updated.
-// Both spellings resolve — `publish-github.sh` uploads the legacy `ivory-*`
-// names on every stable release precisely so the links in emails already sent
-// keep working — but a NEW email should hand out the product's own name.
-// Changing these requires the aliases to exist on the current stable release
-// FIRST: this email was once redeployed ahead of the assets and 404'd for ten
-// minutes. They exist on 2.2.0.
+    "https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos.pkg";
+// tangent-*, matching the macOS line above. Both spellings resolve —
+// `publish-github.sh` uploads the legacy `ivory-*` names on every stable
+// release precisely so the links in emails already sent keep working — but a
+// NEW email should hand out the product's own name. Changing these requires
+// the aliases to exist on the current stable release FIRST: this email was
+// once redeployed ahead of the assets and 404'd for ten minutes.
 const DOWNLOAD_WINDOWS: &str =
-    "https://github.com/ganten1998/ivory/releases/latest/download/tangent-windows-x86_64.zip";
+    "https://github.com/ganten1998/ivory/releases/latest/download/Tangent-windows-setup.exe";
 const DOWNLOAD_LINUX: &str =
     "https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz";
 
@@ -204,12 +204,13 @@ fn email_body(key: &str) -> String {
          paste the key and press Activate. Case, spaces, dashes and line breaks\n\
          do not matter.\n\n\
          Downloads. These links always give you the current version, so they are\n\
-         worth keeping alongside the key:\n\n\
-         \x20 macOS 11 or later\n\
+         worth keeping alongside the key. Each installer offers the app and the\n\
+         VST3 plugin as separate choices, so you can take either or both:\n\n\
+         \x20 macOS 11 or later, Apple Silicon or Intel\n\
          \x20 {macos}\n\n\
          \x20 Windows 10 or later\n\
          \x20 {windows}\n\n\
-         \x20 Linux x86_64\n\
+         \x20 Linux x86_64 (the tarball has an install.sh that needs no root)\n\
          \x20 {linux}\n\n\
          Keep this email. The key has no expiry and works on every machine you own.\n\n\
          Thanks again,\n\
