@@ -57,6 +57,9 @@ pub enum MenuAction {
     SetCapo(u8),
     /// Fingerboard wood key (see `fretboard_panel::Wood`).
     SetWood(&'static str),
+    /// D-UI-17: turn one theory diagram on or off. Independent, because any
+    /// combination of the three may be showing at once.
+    ToggleTheoryView(crate::theory_panel::View),
     /// D-UI-16: pop the guitar view into its own window, and put it back.
     DetachFretboard,
     AttachFretboard,
@@ -92,6 +95,8 @@ pub struct MenuView {
     pub wood: &'static str,
     /// D-UI-16: the guitar view is in its own window.
     pub fretboard_detached: bool,
+    /// D-UI-17: which theory diagrams are showing.
+    pub theory: crate::theory_panel::Views,
     /// What the host allows. Rows whose action needs a window, a device list,
     /// or control of its own size are not shown where they cannot work — an
     /// inert row is worse than an absent one, because the user cannot tell
@@ -352,6 +357,27 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
             "Enable Chord Learning"
         },
         MenuAction::ToggleChordLearning,
+    ));
+    // D-UI-17: the theory band. A submenu rather than three top-level rows,
+    // because the menu is already long and these three belong together — and
+    // each row renames itself the way every other toggle here does, so the
+    // submenu says what is showing without a checkmark column.
+    e.push(Entry::Separator);
+    e.push(submenu(
+        "Theory",
+        crate::theory_panel::View::ALL
+            .iter()
+            .map(|v| {
+                (
+                    if v.is_on(view.theory) {
+                        format!("Hide {}", v.label())
+                    } else {
+                        format!("Show {}", v.label())
+                    },
+                    MenuAction::ToggleTheoryView(*v),
+                )
+            })
+            .collect(),
     ));
     // D-UI-15: the guitar view. Its own block, because it is a second
     // instrument rather than another chord-display option, and its two
@@ -769,6 +795,7 @@ mod tests {
             capo: 0,
             wood: "rosewood",
             fretboard_detached: false,
+            theory: crate::theory_panel::Views::default(),
             caps: Caps::DESKTOP,
         }
     }
@@ -786,6 +813,15 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// One submenu by name. Positional indexing broke every time a submenu
+    /// was added above another, which is a test failing for the wrong reason.
+    fn sub(v: MenuView, name: &str) -> (String, Vec<String>, Vec<MenuAction>) {
+        submenus(v)
+            .into_iter()
+            .find(|(n, ..)| n == name)
+            .unwrap_or_else(|| panic!("no {name} submenu"))
     }
 
     fn rows(v: MenuView) -> Vec<(String, MenuAction, bool)> {
@@ -872,7 +908,14 @@ mod tests {
             find(v, MenuAction::ToggleFretboard),
             Some(("Show Fretboard".to_owned(), true))
         );
-        assert_eq!(submenus(v).len(), 1, "only Size while the fretboard is off");
+        assert_eq!(
+            submenus(v)
+                .iter()
+                .map(|(n, ..)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Size", "Theory"],
+            "only Size and Theory while the fretboard is off"
+        );
 
         v.fretboard_on = true;
         assert_eq!(
@@ -880,17 +923,20 @@ mod tests {
             Some(("Hide Fretboard".to_owned(), true))
         );
         let subs = submenus(v);
-        assert_eq!(subs.len(), 4);
-        assert_eq!(subs[1].0, "Wood");
-        assert_eq!(subs[2].0, "Tuning");
-        assert_eq!(subs[3].0, "Capo");
-        assert_eq!(subs[1].1.len(), 3, "three woods");
+        // Asserted as the whole list, in order: an inserted submenu that
+        // silently shifts Wood/Tuning/Capo is exactly what this catches.
+        assert_eq!(
+            subs.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>(),
+            vec!["Size", "Theory", "Wood", "Tuning", "Capo"]
+        );
+        let wood = sub(v, "Wood");
+        assert_eq!(wood.1.len(), 3, "three woods");
         assert!(
-            subs[1].1[0].starts_with("Rosewood"),
+            wood.1[0].starts_with("Rosewood"),
             "rosewood is the default and comes first"
         );
-        assert!(subs[1].1[0].ends_with('\u{2022}'));
-        assert_eq!(subs[1].2[0], MenuAction::SetWood("rosewood"));
+        assert!(wood.1[0].ends_with('\u{2022}'));
+        assert_eq!(wood.2[0], MenuAction::SetWood("rosewood"));
         // Detach mirrors the chord window's toggle, renaming itself.
         assert_eq!(
             find(v, MenuAction::DetachFretboard).map(|(l, _)| l),
@@ -907,27 +953,26 @@ mod tests {
         // Every shipped tuning is offered, and the live one is marked rather
         // than hidden: a submenu that never says what is selected makes you
         // close it again to find out.
-        assert_eq!(subs[2].1.len(), fretboard::TUNINGS.len());
-        assert!(subs[2].1[0].starts_with("Standard"));
+        let tuning = sub(v, "Tuning");
+        assert_eq!(tuning.1.len(), fretboard::TUNINGS.len());
+        assert!(tuning.1[0].starts_with("Standard"));
         assert!(
-            subs[2].1[0].ends_with('\u{2022}'),
+            tuning.1[0].ends_with('\u{2022}'),
             "the current tuning is marked"
         );
-        assert!(!subs[2].1[1].ends_with('\u{2022}'));
-        assert_eq!(subs[2].2[0], MenuAction::SetTuning("Standard"));
+        assert!(!tuning.1[1].ends_with('\u{2022}'));
+        assert_eq!(tuning.2[0], MenuAction::SetTuning("Standard"));
         assert!(
-            subs[2]
-                .2
-                .iter()
-                .all(|a| matches!(a, MenuAction::SetTuning(n)
+            tuning.2.iter().all(|a| matches!(a, MenuAction::SetTuning(n)
                 if fretboard::Tuning::by_name(n).is_some())),
             "every offered tuning must resolve"
         );
 
-        assert_eq!(subs[3].1[0], "No Capo  \u{2022}");
-        assert_eq!(subs[3].1[1], "Fret 1");
-        assert_eq!(subs[3].2[0], MenuAction::SetCapo(0));
-        assert_eq!(subs[3].2.len() as u8, CAPO_MAX + 1);
+        let capo = sub(v, "Capo");
+        assert_eq!(capo.1[0], "No Capo  \u{2022}");
+        assert_eq!(capo.1[1], "Fret 1");
+        assert_eq!(capo.2[0], MenuAction::SetCapo(0));
+        assert_eq!(capo.2.len() as u8, CAPO_MAX + 1);
     }
 
     #[test]
@@ -938,15 +983,15 @@ mod tests {
             capo: 3,
             ..view()
         };
-        let subs = submenus(v);
-        let marked: Vec<&String> = subs[2]
+        let tuning = sub(v, "Tuning");
+        let marked: Vec<&String> = tuning
             .1
             .iter()
             .filter(|l| l.ends_with('\u{2022}'))
             .collect();
         assert_eq!(marked.len(), 1);
         assert!(marked[0].starts_with("DADGAD"));
-        assert_eq!(subs[3].1[3], "Fret 3  \u{2022}");
+        assert_eq!(sub(v, "Capo").1[3], "Fret 3  \u{2022}");
     }
 
     /// A submenu low in a long menu must slide up rather than run off the
@@ -1056,10 +1101,55 @@ mod tests {
                 "{want:?} went missing"
             );
         }
-        // Tuning, Capo and Wood are pure state and must all remain.
-        let subs = submenus(v);
-        assert_eq!(subs.len(), 3, "expected Wood, Tuning, Capo");
-        assert_eq!(subs[0].0, "Wood");
+        // Theory, Wood, Tuning and Capo are pure state and must all remain:
+        // none of them needs a window, a device or a size of its own.
+        assert_eq!(
+            submenus(v)
+                .iter()
+                .map(|(n, ..)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Theory", "Wood", "Tuning", "Capo"]
+        );
+    }
+
+    /// Each theory row renames itself the way every other toggle in this menu
+    /// does, and all three are independent — the request was explicitly to be
+    /// able to show more than one at once, so turning one on must not turn
+    /// another off.
+    #[test]
+    fn the_theory_rows_rename_themselves_and_stay_independent() {
+        use crate::theory_panel::{View, Views};
+        let mut v = view();
+        assert_eq!(
+            sub(v, "Theory").1,
+            vec![
+                "Show Circle of Fifths",
+                "Show Tonnetz",
+                "Show Harmonic Triangles"
+            ]
+        );
+        assert_eq!(
+            sub(v, "Theory").2,
+            View::ALL
+                .iter()
+                .map(|x| MenuAction::ToggleTheoryView(*x))
+                .collect::<Vec<_>>()
+        );
+
+        v.theory = Views {
+            circle: true,
+            tonnetz: false,
+            triangles: true,
+        };
+        assert_eq!(
+            sub(v, "Theory").1,
+            vec![
+                "Hide Circle of Fifths",
+                "Show Tonnetz",
+                "Hide Harmonic Triangles"
+            ],
+            "the rows do not each follow their own flag"
+        );
     }
 
     /// The learning block sits with the teach block, after it, and the menu

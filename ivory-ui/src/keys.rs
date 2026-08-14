@@ -23,6 +23,7 @@ pub enum KeyAction {
     ToggleKeytoggle,
     ClearNotes,
     ToggleFretboard,
+    CycleTheory,
     ToggleDarkMode,
     ToggleDetection,
     ToggleBorderless,
@@ -44,6 +45,7 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     (Key::K, "K", KeyAction::ToggleKeytoggle, true),
     (Key::R, "R", KeyAction::ClearNotes, true),
     (Key::G, "G", KeyAction::ToggleFretboard, true),
+    (Key::T, "T", KeyAction::CycleTheory, true),
     (Key::C, "C", KeyAction::ToggleDetection, true),
     (Key::D, "D", KeyAction::ToggleDarkMode, true),
     (Key::B, "B", KeyAction::ToggleBorderless, true),
@@ -62,6 +64,7 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ToggleKeytoggle => "keytoggle: click the piano or the neck to place notes",
         KeyAction::ClearNotes => "clear every note you placed",
         KeyAction::ToggleFretboard => "guitar view",
+        KeyAction::CycleTheory => "cycle the theory band",
         KeyAction::ToggleDarkMode => "dark mode",
         KeyAction::ToggleDetection => "chord detection",
         KeyAction::ToggleBorderless => "window border",
@@ -145,7 +148,11 @@ fn layout(rect: Rect, rows: usize, widest: usize) -> (Rect, f32, usize) {
             // as clipped even when it is not, and exact-equality containment is
             // a float coin toss.
             let card = Vec2::new(w.min(rect.width() * 0.94), h.min(rect.height() * 0.96));
-            return (Rect::from_min_size(rect.center() - card * 0.5, card), size, cols);
+            return (
+                Rect::from_min_size(rect.center() - card * 0.5, card),
+                size,
+                cols,
+            );
         }
     }
     unreachable!("the loop always returns on its last iteration")
@@ -200,13 +207,24 @@ pub fn draw_help(painter: &Painter, rect: Rect, dark: bool, t: f32) {
         )
     };
     painter.rect_filled(card_rect, 4.0, bg);
-    painter.rect_stroke(card_rect, 4.0, Stroke::new(1.0_f32, edge), StrokeKind::Middle);
+    painter.rect_stroke(
+        card_rect,
+        4.0,
+        Stroke::new(1.0_f32, edge),
+        StrokeKind::Middle,
+    );
 
     for (i, (label, desc)) in rows.iter().enumerate() {
         let x = card_rect.left() + pad + (i / per_col) as f32 * col_w;
         let y = card_rect.top() + pad * 1.2 + (i % per_col) as f32 * row_h;
         painter.text(Pos2::new(x, y), Align2::LEFT_TOP, label, bold.clone(), fg);
-        painter.text(Pos2::new(x + key_w, y), Align2::LEFT_TOP, desc, font.clone(), dim);
+        painter.text(
+            Pos2::new(x + key_w, y),
+            Align2::LEFT_TOP,
+            desc,
+            font.clone(),
+            dim,
+        );
     }
 }
 
@@ -230,8 +248,11 @@ mod tests {
         // Hidden rows are the ALTERNATES: Esc, and F1 as a second help key.
         // Every hidden one must duplicate an action that is shown, or a
         // shortcut exists that the card never mentions.
-        let shown: Vec<KeyAction> =
-            BINDINGS.iter().filter(|(.., s)| *s).map(|&(_, _, a, _)| a).collect();
+        let shown: Vec<KeyAction> = BINDINGS
+            .iter()
+            .filter(|(.., s)| *s)
+            .map(|&(_, _, a, _)| a)
+            .collect();
         for &(_, label, action, is_shown) in BINDINGS {
             if !is_shown && action != KeyAction::CloseHelp {
                 assert!(shown.contains(&action), "{label} is bound but never listed");
@@ -309,8 +330,7 @@ mod tests {
                     // in 75 points. It clips there rather than escaping, and the
                     // window is one keypress from being bigger.
                     if h >= 120.0 {
-                        let used =
-                            rows.div_ceil(cols) as f32 * size * 1.75 + size * 1.4 * 1.2;
+                        let used = rows.div_ceil(cols) as f32 * size * 1.75 + size * 1.4 * 1.2;
                         assert!(
                             used <= card.height() + 0.5,
                             "{rows} rows in {cols} col(s) need {used} of {} at {w}x{h}",

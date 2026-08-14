@@ -6,17 +6,18 @@
 //! chord detection runs on its own 100ms gate (with immediate off-cadence
 //! runs after keytoggle clicks and note-preference changes).
 
+use crate::midi;
+use egui::{Pos2, Rect, Vec2, ViewportCommand};
+use ivory_core::voicing::{VoicingSession, Weights};
+use ivory_core::{ChordDetector, OverrideStore, TrainOutcome};
 use ivory_ui::chord_strip;
 use ivory_ui::dialogs::{self, Dialog, DialogAction, LearningStatus};
 use ivory_ui::fretboard_panel;
 use ivory_ui::keys;
 use ivory_ui::menu::{self, ColorTarget, MenuAction, MenuState, MenuView};
-use crate::midi;
 use ivory_ui::piano;
 use ivory_ui::settings::{Rgb, Settings};
-use egui::{Pos2, Rect, Vec2, ViewportCommand};
-use ivory_core::voicing::{VoicingSession, Weights};
-use ivory_core::{ChordDetector, OverrideStore, TrainOutcome};
+use ivory_ui::theory_panel;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -203,7 +204,11 @@ pub struct IvoryApp {
 }
 
 impl IvoryApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, settings: Settings, cli_port: Option<String>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        settings: Settings,
+        cli_port: Option<String>,
+    ) -> Self {
         ivory_ui::fonts::install(
             &cc.egui_ctx,
             ivory_ui::fonts::FontChoice::from_key(&settings.font_choice),
@@ -294,7 +299,7 @@ impl IvoryApp {
 
     // ── Geometry (spec §3.2, integer truncation like Python) ───────────────
 
-    fn layout_sizes(&self) -> (f32, f32, f32, f32) {
+    fn layout_sizes(&self) -> Bands {
         band_sizes(&self.settings)
     }
 
@@ -307,10 +312,7 @@ impl IvoryApp {
     /// visible and whether or not chord detection is on — the guitar view is
     /// its own instrument, not a decoration on the chord strip.
     fn voicing_tick(&mut self, force: bool) {
-        let due = force
-            || self
-                .last_voicing
-                .is_none_or(|t| t.elapsed() >= DETECT_TICK);
+        let due = force || self.last_voicing.is_none_or(|t| t.elapsed() >= DETECT_TICK);
         if !due {
             return;
         }
@@ -378,6 +380,32 @@ impl IvoryApp {
         set
     }
 
+    /// What the theory band draws, from the notes already on screen.
+    ///
+    /// Pitch classes, not notes: the circle, the lattice and the triangles all
+    /// have twelve positions and no octave axis, so the fold to `% 12` happens
+    /// here rather than three times inside the renderer.
+    ///
+    /// The root comes from the detector's own label when there is one, and
+    /// from the bass otherwise. Parsing a label the app itself generated is
+    /// narrow enough to be safe, and it is the only way to know that a voicing
+    /// with a C in the bass is being HEARD as an inversion of something else.
+    fn theory_input(&self, display: &HashSet<u8>) -> theory_panel::Input {
+        let pcs = display.iter().fold(0u16, |m, n| m | 1 << (n % 12));
+        let bass = display.iter().min().map(|n| n % 12);
+        let (root, minor) = self
+            .current_chord
+            .as_deref()
+            .and_then(theory_panel::parse_label)
+            .map_or((None, false), |(r, m)| (Some(r), m));
+        theory_panel::Input {
+            pcs,
+            bass,
+            root,
+            minor,
+        }
+    }
+
     // ── Chord detection (spec §12) ─────────────────────────────────────────
 
     fn detection_tick(&mut self, force: bool) {
@@ -414,6 +442,7 @@ impl IvoryApp {
             supporter: self.license.is_supporter(),
             heart_on: self.settings.show_heart,
             fretboard_on: self.settings.show_fretboard,
+            theory: self.settings.theory_views(),
             wood: self.settings.fretboard_wood().key(),
             fretboard_detached: self.settings.fretboard_detached,
             // The standalone owns its window, its device list and its config.
@@ -589,10 +618,9 @@ impl IvoryApp {
         self.settings.chord_window_detached = true;
         self.detach_window_visible = true;
         self.detached_builder_size = self.settings.detached_size_for_use();
-        self.detached_builder_pos = self
-            .settings
-            .detached_pos_for_use()
-            .map(|p| ivory_ui::settings::clamp_to_monitor(p, self.detached_builder_size, self.monitor_size));
+        self.detached_builder_pos = self.settings.detached_pos_for_use().map(|p| {
+            ivory_ui::settings::clamp_to_monitor(p, self.detached_builder_size, self.monitor_size)
+        });
         self.detached_live_size = None;
         self.detached_live_pos = None;
         self.detached_shown_at = Some(Instant::now());
@@ -606,10 +634,9 @@ impl IvoryApp {
         self.settings.fretboard_detached = true;
         self.fret_window_visible = true;
         self.fret_builder_size = self.settings.fretboard_win_size();
-        self.fret_builder_pos = self
-            .settings
-            .fretboard_win_pos()
-            .map(|p| ivory_ui::settings::clamp_to_monitor(p, self.fret_builder_size, self.monitor_size));
+        self.fret_builder_pos = self.settings.fretboard_win_pos().map(|p| {
+            ivory_ui::settings::clamp_to_monitor(p, self.fret_builder_size, self.monitor_size)
+        });
         self.fret_live_size = None;
         self.fret_live_pos = None;
         self.fret_shown_at = Some(Instant::now());
@@ -633,7 +660,11 @@ impl IvoryApp {
         let mut dirty = false;
         if let Some(size) = self.fret_live_size {
             let (w, h) = (size.x.round() as i64, size.y.round() as i64);
-            if w > 0 && h > 0 && (self.settings.fretboard_win_w, self.settings.fretboard_win_h) != (Some(w), Some(h)) {
+            if w > 0
+                && h > 0
+                && (self.settings.fretboard_win_w, self.settings.fretboard_win_h)
+                    != (Some(w), Some(h))
+            {
                 self.settings.fretboard_win_w = Some(w);
                 self.settings.fretboard_win_h = Some(h);
                 dirty = true;
@@ -641,7 +672,8 @@ impl IvoryApp {
         }
         if let Some(pos) = self.fret_live_pos {
             let (x, y) = (pos.x.round() as i64, pos.y.round() as i64);
-            if (self.settings.fretboard_win_x, self.settings.fretboard_win_y) != (Some(x), Some(y)) {
+            if (self.settings.fretboard_win_x, self.settings.fretboard_win_y) != (Some(x), Some(y))
+            {
                 self.settings.fretboard_win_x = Some(x);
                 self.settings.fretboard_win_y = Some(y);
                 dirty = true;
@@ -700,6 +732,50 @@ impl IvoryApp {
             K::ToggleHelp | K::CloseHelp => {}
             K::ToggleKeytoggle => self.apply_menu_action(ctx, MenuAction::ToggleKeytoggle),
             K::ToggleFretboard => self.apply_menu_action(ctx, MenuAction::ToggleFretboard),
+            // One key, five states, in the order someone discovering the band
+            // would want them: nothing, each diagram alone, then all three.
+            // Three independent toggles have eight states and no natural
+            // order, so the key walks a path through them rather than trying
+            // to enumerate them; the menu is there for the other three.
+            K::CycleTheory => {
+                use theory_panel::{View, Views};
+                const CYCLE: [Views; 5] = [
+                    Views {
+                        circle: true,
+                        tonnetz: false,
+                        triangles: false,
+                    },
+                    Views {
+                        circle: false,
+                        tonnetz: true,
+                        triangles: false,
+                    },
+                    Views {
+                        circle: false,
+                        tonnetz: false,
+                        triangles: true,
+                    },
+                    Views {
+                        circle: true,
+                        tonnetz: true,
+                        triangles: true,
+                    },
+                    Views {
+                        circle: false,
+                        tonnetz: false,
+                        triangles: false,
+                    },
+                ];
+                let now = self.settings.theory_views();
+                let next = CYCLE
+                    .iter()
+                    .position(|v| *v == now)
+                    .map_or(CYCLE[0], |i| CYCLE[(i + 1) % CYCLE.len()]);
+                for v in View::ALL {
+                    self.settings.set_theory_view(v, v.is_on(next));
+                }
+                self.settings.save();
+            }
             K::ToggleDarkMode => self.apply_menu_action(ctx, MenuAction::ToggleDarkMode),
             K::ToggleDetection => self.apply_menu_action(ctx, MenuAction::ToggleChordDetection),
             K::ToggleBorderless => self.apply_menu_action(ctx, MenuAction::ToggleBorderless),
@@ -773,11 +849,7 @@ impl IvoryApp {
                 {
                     self.settings.font_choice = next.key().to_owned();
                     self.settings.save();
-                    ivory_ui::fonts::install(
-                        ctx,
-                        next,
-                        self.settings.custom_font_path.as_deref(),
-                    );
+                    ivory_ui::fonts::install(ctx, next, self.settings.custom_font_path.as_deref());
                     ivory_ui::fonts::apply_text_styles(ctx);
                 }
             }
@@ -793,7 +865,8 @@ impl IvoryApp {
             }
             MenuAction::ToggleNotePreference => {
                 self.settings.prefer_flats = !self.settings.prefer_flats;
-                self.detector.set_note_preference(self.settings.prefer_flats);
+                self.detector
+                    .set_note_preference(self.settings.prefer_flats);
                 self.settings.save();
                 self.detection_tick(true); // refresh display immediately
             }
@@ -814,6 +887,11 @@ impl IvoryApp {
                 let on = !self.detector.learning_mode();
                 self.detector.set_learning_mode(on);
                 self.detection_tick(true); // readings change immediately
+            }
+            MenuAction::ToggleTheoryView(v) => {
+                let on = !v.is_on(self.settings.theory_views());
+                self.settings.set_theory_view(v, on);
+                self.settings.save();
             }
             MenuAction::ToggleFretboard => {
                 self.settings.show_fretboard = !self.settings.show_fretboard;
@@ -863,7 +941,10 @@ impl IvoryApp {
     /// "Reset Settings to Default" (spec §9, D-UI-8).
     fn reset_settings(&mut self, ctx: &egui::Context) {
         let had_custom_font = self.settings.custom_font_path.is_some();
-        let live_detached = self.detach_window_visible.then_some(self.detached_live_size).flatten();
+        let live_detached = self
+            .detach_window_visible
+            .then_some(self.detached_live_size)
+            .flatten();
 
         self.settings.reset_to_defaults();
 
@@ -1217,19 +1298,18 @@ fn main_width(settings: &Settings) -> f32 {
 /// Initial fixed window size for the ViewportBuilder, computed from settings
 /// before the event loop starts (spec §3.2).
 pub fn initial_window_size(settings: &Settings) -> Vec2 {
-    let (w, piano_h, chord_h, fret_h) = band_sizes(settings);
-    Vec2::new(w, piano_h + chord_h + fret_h)
+    band_sizes(settings).total()
 }
 
-/// The stacked bands: window width, then chord strip, piano and fretboard
-/// heights. A hidden band is 0.0.
+/// The stacked bands, top to bottom: theory, chord strip, piano, fretboard,
+/// plus the window width. A hidden band is 0.0.
 ///
 /// One function rather than two, because there used to be two: the copy in
 /// `initial_window_size` decides the size the window OPENS at and the copy in
 /// `layout_sizes` decides what it is resized to on the first frame, so any
 /// drift between them shows up as a window that visibly jumps at startup.
 /// Integer truncation per band, like Python (spec §3.2).
-fn band_sizes(settings: &Settings) -> (f32, f32, f32, f32) {
+fn band_sizes(settings: &Settings) -> Bands {
     let w = main_width(settings);
     let piano_h = (w as f64 / (1300.0 / 150.0)).trunc() as f32;
     let chord_visible = settings.chord_detection_enabled && !settings.chord_window_detached;
@@ -1243,7 +1323,38 @@ fn band_sizes(settings: &Settings) -> (f32, f32, f32, f32) {
     } else {
         0.0
     };
-    (w, piano_h, chord_h, fret_h)
+    let theory_h = theory_panel::band_height(w, settings.theory_views());
+    Bands {
+        w,
+        theory_h,
+        chord_h,
+        piano_h,
+        fret_h,
+    }
+}
+
+/// The horizontal bands the window is made of, top to bottom, and its width.
+///
+/// A struct rather than the tuple this used to be. Adding the theory band made
+/// it five values in stacking order, and a five-tuple whose third element is
+/// the piano is exactly the kind of thing that gets destructured wrong once and
+/// then silently draws the chord strip where the keyboard should be.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Bands {
+    w: f32,
+    theory_h: f32,
+    chord_h: f32,
+    piano_h: f32,
+    fret_h: f32,
+}
+
+impl Bands {
+    fn total(self) -> Vec2 {
+        Vec2::new(
+            self.w,
+            self.theory_h + self.chord_h + self.piano_h + self.fret_h,
+        )
+    }
 }
 
 impl eframe::App for IvoryApp {
@@ -1367,8 +1478,15 @@ impl IvoryApp {
 
         // Fixed-size enforcement: Min+Max+Inner triple whenever the target
         // changes (size %, chord toggle, detach/attach).
-        let (w, piano_h, chord_h, fret_h) = self.layout_sizes();
-        let target = Vec2::new(w, piano_h + chord_h + fret_h);
+        let bands = self.layout_sizes();
+        let Bands {
+            w,
+            theory_h,
+            chord_h,
+            piano_h,
+            fret_h,
+        } = bands;
+        let target = bands.total();
         if self.last_sent_size != Some(target) {
             ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(target));
             ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(target));
@@ -1383,21 +1501,30 @@ impl IvoryApp {
             self.decorations_sent = Some(decorations);
         }
 
-        // Paint: chord strip on top, piano below (spec §3.1).
+        // Paint, top to bottom: theory band, chord strip, piano, fretboard
+        // (spec §3.1, D-UI-17). Each band's top is the sum of the ones above
+        // it, and a hidden band is zero tall, so nothing needs a special case.
+        let display = self.display_notes();
         let origin = ui.max_rect().min;
-        let piano_rect = Rect::from_min_size(
-            Pos2::new(origin.x, origin.y + chord_h),
-            Vec2::new(w, piano_h),
-        );
+        let band_at = |top: f32, h: f32| {
+            Rect::from_min_size(Pos2::new(origin.x, origin.y + top), Vec2::new(w, h))
+        };
+        let piano_rect = band_at(theory_h + chord_h, piano_h);
         let mut chord_rect_for_hit: Option<Rect> = None;
-        let fret_rect_for_hit: Option<Rect> = (fret_h > 0.0).then(|| {
-            Rect::from_min_size(
-                Pos2::new(origin.x, origin.y + chord_h + piano_h),
-                Vec2::new(w, fret_h),
-            )
-        });
+        let fret_rect_for_hit: Option<Rect> =
+            (fret_h > 0.0).then(|| band_at(theory_h + chord_h + piano_h, fret_h));
+        if theory_h > 0.0 {
+            let theory_rect = band_at(0.0, theory_h);
+            theory_panel::draw(
+                ui.painter(),
+                theory_rect,
+                self.settings.theory_views(),
+                self.theory_input(&display),
+                &self.settings,
+            );
+        }
         if chord_h > 0.0 {
-            let chord_rect = Rect::from_min_size(origin, Vec2::new(w, chord_h));
+            let chord_rect = band_at(theory_h, chord_h);
             chord_rect_for_hit = Some(chord_rect);
             chord_strip::draw(
                 ui.painter(),
@@ -1408,7 +1535,6 @@ impl IvoryApp {
                 None, // attached: it already has the piano below it as an edge
             );
         }
-        let display = self.display_notes();
         piano::draw(
             ui.painter(),
             piano_rect,
@@ -1648,9 +1774,24 @@ mod tests {
 
     #[test]
     fn a_key_sounds_while_it_is_down_and_stops_when_it_is_not() {
-        let n = feed(&[NoteOn { note: 60, velocity: 100 }, NoteOn { note: 64, velocity: 80 }]);
+        let n = feed(&[
+            NoteOn {
+                note: 60,
+                velocity: 100,
+            },
+            NoteOn {
+                note: 64,
+                velocity: 80,
+            },
+        ]);
         assert_eq!(held(&n), vec![60, 64]);
-        let n = feed(&[NoteOn { note: 60, velocity: 100 }, NoteOff { note: 60 }]);
+        let n = feed(&[
+            NoteOn {
+                note: 60,
+                velocity: 100,
+            },
+            NoteOff { note: 60 },
+        ]);
         assert!(held(&n).is_empty());
         // A note-off for something never held is not an event, it is noise.
         let n = feed(&[NoteOff { note: 60 }]);
@@ -1660,7 +1801,10 @@ mod tests {
     #[test]
     fn the_pedal_holds_notes_past_the_key_and_lets_go_on_release() {
         let n = feed(&[
-            NoteOn { note: 60, velocity: 100 },
+            NoteOn {
+                note: 60,
+                velocity: 100,
+            },
             Sustain { down: true },
             NoteOff { note: 60 },
         ]);
@@ -1668,12 +1812,18 @@ mod tests {
         assert!(n.sustain_down());
 
         let n = feed(&[
-            NoteOn { note: 60, velocity: 100 },
+            NoteOn {
+                note: 60,
+                velocity: 100,
+            },
             Sustain { down: true },
             NoteOff { note: 60 },
             Sustain { down: false },
         ]);
-        assert!(held(&n).is_empty(), "lifting the pedal releases what the key let go of");
+        assert!(
+            held(&n).is_empty(),
+            "lifting the pedal releases what the key let go of"
+        );
         assert!(!n.sustain_down());
     }
 
@@ -1683,20 +1833,33 @@ mod tests {
         // key while the pedal is down leaves it queued to die at the next lift,
         // so a re-articulated note vanishes while you are still holding it.
         let n = feed(&[
-            NoteOn { note: 60, velocity: 100 },
+            NoteOn {
+                note: 60,
+                velocity: 100,
+            },
             Sustain { down: true },
             NoteOff { note: 60 },
-            NoteOn { note: 60, velocity: 100 },
+            NoteOn {
+                note: 60,
+                velocity: 100,
+            },
             Sustain { down: false },
         ]);
-        assert_eq!(held(&n), vec![60], "a re-struck key must not be released by the pedal");
+        assert_eq!(
+            held(&n),
+            vec![60],
+            "a re-struck key must not be released by the pedal"
+        );
     }
 
     #[test]
     fn only_the_down_to_up_edge_releases_anything() {
         // Pedal down while already down changes nothing.
         let n = feed(&[
-            NoteOn { note: 60, velocity: 100 },
+            NoteOn {
+                note: 60,
+                velocity: 100,
+            },
             Sustain { down: true },
             NoteOff { note: 60 },
             Sustain { down: true },
@@ -1705,7 +1868,10 @@ mod tests {
         // Pedal up while already up must not drain a set a later note-off fills.
         let n = feed(&[
             Sustain { down: false },
-            NoteOn { note: 60, velocity: 100 },
+            NoteOn {
+                note: 60,
+                velocity: 100,
+            },
             Sustain { down: true },
             NoteOff { note: 60 },
         ]);
@@ -1716,8 +1882,14 @@ mod tests {
     fn a_key_still_down_when_the_pedal_lifts_keeps_sounding() {
         // The pedal releases what the KEY let go of, and nothing else.
         let n = feed(&[
-            NoteOn { note: 60, velocity: 100 },
-            NoteOn { note: 64, velocity: 100 },
+            NoteOn {
+                note: 60,
+                velocity: 100,
+            },
+            NoteOn {
+                note: 64,
+                velocity: 100,
+            },
             Sustain { down: true },
             NoteOff { note: 60 },
             Sustain { down: false },
@@ -1732,7 +1904,9 @@ mod tests {
         // pedal twice can never leave something stuck on.
         let mut seed = 0x1234_5678u64;
         let mut next = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             seed >> 11
         };
         for _ in 0..2000 {
@@ -1742,14 +1916,19 @@ mod tests {
                 let note = 60 + (next() % 4) as u8;
                 match next() % 3 {
                     0 => {
-                        n.apply(NoteOn { note, velocity: 100 });
+                        n.apply(NoteOn {
+                            note,
+                            velocity: 100,
+                        });
                         down.insert(note);
                     }
                     1 => {
                         n.apply(NoteOff { note });
                         down.remove(&note);
                     }
-                    _ => n.apply(Sustain { down: next() % 2 == 0 }),
+                    _ => n.apply(Sustain {
+                        down: next() % 2 == 0,
+                    }),
                 }
                 // Everything physically down is always sounding.
                 for k in &down {

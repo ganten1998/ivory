@@ -129,6 +129,15 @@ pub struct Settings {
     pub fretboard_win_h: Option<i64>,
     pub fretboard_win_x: Option<i64>,
     pub fretboard_win_y: Option<i64>,
+    /// D-UI-17: which theory diagrams are showing. Three independent flags,
+    /// because any combination is allowed and an enum would need a variant per
+    /// combination to say so. All off by default, and deliberately so: the
+    /// band is 300 points tall at full width, and a window that grows on its
+    /// own after an update is the geometry surprise this app has been bitten
+    /// by before (see `show_fretboard`).
+    pub theory_circle: bool,
+    pub theory_tonnetz: bool,
+    pub theory_triangles: bool,
     /// Unknown keys from the file, preserved verbatim on save (file order).
     pub extra: Map<String, Value>,
 }
@@ -156,7 +165,11 @@ impl Default for Settings {
             keytoggle_enabled: false,
             custom_font_path: None,
             font_choice: crate::fonts::FontChoice::default().key().to_owned(),
-            chord_text_color: Rgb { r: 0xE8, g: 0xDC, b: 0xC0 },
+            chord_text_color: Rgb {
+                r: 0xE8,
+                g: 0xDC,
+                b: 0xC0,
+            },
             show_welcome: true,
             show_heart: true,
             heart_color: 0,
@@ -171,6 +184,9 @@ impl Default for Settings {
             fretboard_capo: 0,
             fretboard_wood: crate::fretboard_panel::Wood::default().key().to_owned(),
             fretboard_detached: false,
+            theory_circle: false,
+            theory_tonnetz: false,
+            theory_triangles: false,
             fretboard_win_w: None,
             fretboard_win_h: None,
             fretboard_win_x: None,
@@ -219,7 +235,11 @@ impl Settings {
             &mut s.chord_detection_enabled,
         );
         take_bool(&mut map, "borderless_mode", &mut s.borderless_mode);
-        take_bool(&mut map, "chord_window_detached", &mut s.chord_window_detached);
+        take_bool(
+            &mut map,
+            "chord_window_detached",
+            &mut s.chord_window_detached,
+        );
         take_bool(&mut map, "keytoggle_enabled", &mut s.keytoggle_enabled);
 
         let take_color = |map: &mut Map<String, Value>, key: &str, dst: &mut Rgb| {
@@ -229,8 +249,16 @@ impl Settings {
                 }
             }
         };
-        take_color(&mut map, "white_key_idle_color", &mut s.white_key_idle_color);
-        take_color(&mut map, "black_key_idle_color", &mut s.black_key_idle_color);
+        take_color(
+            &mut map,
+            "white_key_idle_color",
+            &mut s.white_key_idle_color,
+        );
+        take_color(
+            &mut map,
+            "black_key_idle_color",
+            &mut s.black_key_idle_color,
+        );
         take_color(
             &mut map,
             "white_key_active_color",
@@ -301,13 +329,24 @@ impl Settings {
                 }
             }
         };
-        take_opt_i64(&mut map, "detached_chord_width", &mut s.detached_chord_width);
+        take_opt_i64(
+            &mut map,
+            "detached_chord_width",
+            &mut s.detached_chord_width,
+        );
         take_opt_i64(&mut map, "detached_chord_x", &mut s.detached_chord_x);
         take_opt_i64(&mut map, "detached_chord_y", &mut s.detached_chord_y);
         take_opt_i64(&mut map, "window_x", &mut s.window_x);
         take_opt_i64(&mut map, "window_y", &mut s.window_y);
-        take_bool(&mut map, "teach_apply_all_keys", &mut s.teach_apply_all_keys);
+        take_bool(
+            &mut map,
+            "teach_apply_all_keys",
+            &mut s.teach_apply_all_keys,
+        );
         take_bool(&mut map, "show_fretboard", &mut s.show_fretboard);
+        take_bool(&mut map, "theory_circle", &mut s.theory_circle);
+        take_bool(&mut map, "theory_tonnetz", &mut s.theory_tonnetz);
+        take_bool(&mut map, "theory_triangles", &mut s.theory_triangles);
         if let Some(v) = map.remove("fretboard_tuning") {
             if let Some(t) = v.as_str() {
                 s.fretboard_tuning = t.to_owned();
@@ -376,12 +415,21 @@ impl Settings {
             "detached_chord_height".into(),
             Value::Number(self.detached_chord_height.into()),
         );
-        map.insert("keytoggle_enabled".into(), Value::Bool(self.keytoggle_enabled));
+        map.insert(
+            "keytoggle_enabled".into(),
+            Value::Bool(self.keytoggle_enabled),
+        );
         if let Some(ref p) = self.custom_font_path {
             map.insert("custom_font_path".into(), Value::String(p.clone()));
         }
-        map.insert("font_choice".into(), Value::String(self.font_choice.clone()));
-        map.insert("chord_text_color".into(), Value::String(self.chord_text_color.to_hex()));
+        map.insert(
+            "font_choice".into(),
+            Value::String(self.font_choice.clone()),
+        );
+        map.insert(
+            "chord_text_color".into(),
+            Value::String(self.chord_text_color.to_hex()),
+        );
         map.insert("show_welcome".into(), Value::Bool(self.show_welcome));
         map.insert("show_heart".into(), Value::Bool(self.show_heart));
         map.insert("heart_color".into(), Value::Number(self.heart_color.into()));
@@ -404,6 +452,12 @@ impl Settings {
             Value::Bool(self.teach_apply_all_keys),
         );
         map.insert("show_fretboard".into(), Value::Bool(self.show_fretboard));
+        map.insert("theory_circle".into(), Value::Bool(self.theory_circle));
+        map.insert("theory_tonnetz".into(), Value::Bool(self.theory_tonnetz));
+        map.insert(
+            "theory_triangles".into(),
+            Value::Bool(self.theory_triangles),
+        );
         map.insert(
             "fretboard_tuning".into(),
             Value::String(self.fretboard_tuning.clone()),
@@ -534,6 +588,27 @@ impl Settings {
     /// written by a later build (a tuning this one has never heard of, a capo
     /// of 40) still opens, still draws something sensible, and still keeps its
     /// own values when it goes back to the build that understands them.
+    /// D-UI-17: the selected theory diagrams, as one value.
+    pub fn theory_views(&self) -> crate::theory_panel::Views {
+        crate::theory_panel::Views {
+            circle: self.theory_circle,
+            tonnetz: self.theory_tonnetz,
+            triangles: self.theory_triangles,
+        }
+    }
+
+    /// Turn one diagram on or off. Keeping the mapping in one place means the
+    /// menu, the keyboard shortcut and the settings file cannot disagree about
+    /// which flag is which.
+    pub fn set_theory_view(&mut self, v: crate::theory_panel::View, on: bool) {
+        use crate::theory_panel::View;
+        match v {
+            View::Circle => self.theory_circle = on,
+            View::Tonnetz => self.theory_tonnetz = on,
+            View::Triangles => self.theory_triangles = on,
+        }
+    }
+
     pub fn fretboard_spec(&self) -> ivory_core::fretboard::FretboardSpec {
         use ivory_core::fretboard::{FretboardSpec, Tuning};
         let tuning = Tuning::by_name(&self.fretboard_tuning).unwrap_or_else(Tuning::standard);
@@ -552,7 +627,11 @@ impl Settings {
 /// Keep a window fully on the monitor it is being placed on. A remembered
 /// position is worthless if the monitor it referred to is gone, which is the
 /// normal state of affairs for anyone who ever undocks a laptop.
-pub fn clamp_to_monitor(pos: egui::Pos2, size: egui::Vec2, monitor: Option<egui::Vec2>) -> egui::Pos2 {
+pub fn clamp_to_monitor(
+    pos: egui::Pos2,
+    size: egui::Vec2,
+    monitor: Option<egui::Vec2>,
+) -> egui::Pos2 {
     let Some(m) = monitor else { return pos };
     if m.x <= 0.0 || m.y <= 0.0 {
         return pos;
@@ -597,7 +676,11 @@ mod tests {
         s.window_size_percent = 50;
         s.save_to(&path);
         assert_eq!(Settings::load_from(&path).window_size_percent, 50);
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "exactly one file");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "exactly one file"
+        );
 
         // The rename must not have reordered the keys: the file order is
         // Python's insertion order and unknown keys keep their place.
@@ -655,8 +738,14 @@ mod tests {
         assert_eq!(s.fretboard_tuning, "Nashville High Strung");
         assert_eq!(s.fretboard_capo, 40, "stored verbatim");
         let spec = s.fretboard_spec();
-        assert_eq!(spec.tuning.name, "Standard", "unknown tuning draws as standard");
-        assert!(spec.capo < spec.frets, "a capo past the last fret is nobody's intent");
+        assert_eq!(
+            spec.tuning.name, "Standard",
+            "unknown tuning draws as standard"
+        );
+        assert!(
+            spec.capo < spec.frets,
+            "a capo past the last fret is nobody's intent"
+        );
         // And the round trip does not eat the value it could not understand.
         let out = serde_json::to_string(&Value::Object(s.to_map())).unwrap();
         assert!(out.contains("Nashville High Strung"));
@@ -735,8 +824,14 @@ mod tests {
                 "detached_chord_width": 640, "detached_chord_height": 180,
                 "teach_apply_all_keys": false}"#,
         ));
-        assert_eq!(s.window_pos_for_use(), Some(egui::Pos2::new(-1920.0, -40.0)));
-        assert_eq!(s.detached_pos_for_use(), Some(egui::Pos2::new(300.0, 220.0)));
+        assert_eq!(
+            s.window_pos_for_use(),
+            Some(egui::Pos2::new(-1920.0, -40.0))
+        );
+        assert_eq!(
+            s.detached_pos_for_use(),
+            Some(egui::Pos2::new(300.0, 220.0))
+        );
         assert_eq!(s.detached_size_for_use(), egui::Vec2::new(640.0, 180.0));
         assert!(!s.teach_apply_all_keys);
 
@@ -789,7 +884,11 @@ mod tests {
         );
         // A window larger than the monitor still shows its top-left corner.
         assert_eq!(
-            clamp_to_monitor(egui::Pos2::new(50.0, 50.0), egui::Vec2::new(4000.0, 4000.0), mon),
+            clamp_to_monitor(
+                egui::Pos2::new(50.0, 50.0),
+                egui::Vec2::new(4000.0, 4000.0),
+                mon
+            ),
             egui::Pos2::ZERO
         );
     }
@@ -806,7 +905,8 @@ mod tests {
 
     #[test]
     fn wrong_typed_keys_fall_back_per_key() {
-        let json = r#"{"dark_mode": "yes", "window_size_percent": 150, "detached_chord_height": -3}"#;
+        let json =
+            r#"{"dark_mode": "yes", "window_size_percent": 150, "detached_chord_height": -3}"#;
         let map = match serde_json::from_str::<Value>(json).unwrap() {
             Value::Object(m) => m,
             _ => unreachable!(),

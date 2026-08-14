@@ -14,6 +14,7 @@ pub mod menu;
 pub mod piano;
 pub mod settings;
 pub mod shell;
+pub mod theory_panel;
 
 /// The version the About box reports.
 ///
