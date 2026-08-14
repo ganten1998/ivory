@@ -19,6 +19,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Extra ssh options, e.g. SSH_OPTS='-o IdentityAgent=none -p 2222'.
+# `IdentityAgent=none` is worth knowing about: in some shells the agent hangs
+# the connection instead of failing it, so a wrong key looks like a dead host
+# rather than a refused login. Setting it makes ssh use key FILES only.
+SSH_OPTS="${SSH_OPTS:-}"
+# shellcheck disable=SC2086
+ssh_() { ssh $SSH_OPTS "$@"; }
+
 HOST="${1:-}"
 if [ -z "$HOST" ]; then
   cat >&2 <<'USAGE'
@@ -38,7 +46,7 @@ VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
 echo "==> Tangent $VERSION -> $HOST:$REMOTE_DIR"
 
 # ── Reachability, before anything slow ───────────────────────────────────────
-if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" true 2>/dev/null; then
+if ! ssh_ -o BatchMode=yes -o ConnectTimeout=10 "$HOST" true 2>/dev/null; then
   cat >&2 <<EOF
 cannot ssh to '$HOST' without a password.
 
@@ -54,9 +62,9 @@ EOF
   exit 1
 fi
 
-REMOTE_OS="$(ssh "$HOST" 'uname -s' 2>/dev/null || echo unknown)"
+REMOTE_OS="$(ssh_ "$HOST" 'uname -s' 2>/dev/null || echo unknown)"
 [ "$REMOTE_OS" = "Linux" ] || { echo "'$HOST' reports '$REMOTE_OS', not Linux" >&2; exit 1; }
-REMOTE_ARCH="$(ssh "$HOST" 'uname -m')"
+REMOTE_ARCH="$(ssh_ "$HOST" 'uname -m')"
 echo "    remote: Linux $REMOTE_ARCH"
 
 # ── Build dependencies, on request ───────────────────────────────────────────
@@ -65,7 +73,7 @@ echo "    remote: Linux $REMOTE_ARCH"
 # build script rather than up front.
 if [ "${DEPS:-0}" = "1" ]; then
   echo "==> Installing build dependencies"
-  ssh -t "$HOST" 'set -e
+  ssh_ -t "$HOST" 'set -e
     if command -v xbps-install >/dev/null; then
       sudo xbps-install -Sy base-devel rust cargo pkg-config \
         alsa-lib-devel libX11-devel libxcb-devel libxkbcommon-devel \
@@ -85,7 +93,7 @@ if [ "${DEPS:-0}" = "1" ]; then
 fi
 
 # Rust has to exist over there, and the message should say how to get it.
-if ! ssh "$HOST" 'command -v cargo >/dev/null'; then
+if ! ssh_ "$HOST" 'command -v cargo >/dev/null'; then
   cat >&2 <<EOF
 no 'cargo' on $HOST.
 
@@ -98,27 +106,43 @@ fi
 
 # ── Copy the tree ────────────────────────────────────────────────────────────
 echo "==> Syncing source"
-ssh "$HOST" "mkdir -p $REMOTE_DIR"
-rsync -az --delete \
-  --exclude 'target/' --exclude 'dist/' --exclude '.git/' \
+ssh_ "$HOST" "mkdir -p $REMOTE_DIR"
+# No trailing slashes on target/dist. `target/` matches a DIRECTORY only, and
+# `target` here is a SYMLINK out of Dropbox (see docs: Dropbox breaks cargo
+# builds, so the real target lives in ~/Library/Caches). rsync happily copied
+# the symlink itself, which arrived on Linux pointing at a macOS path that does
+# not exist — and cargo failed with "Not a directory" rather than anything that
+# named the cause.
+rsync -az --delete ${SSH_OPTS:+-e "ssh $SSH_OPTS"} \
+  --exclude 'target' --exclude 'dist' --exclude '.git' \
   --exclude '.DS_Store' --exclude '*.dmg' --exclude '*.zip' \
   ./ "$HOST:$REMOTE_DIR/"
 
+# And clear any bad `target` a previous run left behind, so an existing build
+# directory does not stay poisoned.
+ssh_ "$HOST" "[ -L $REMOTE_DIR/target ] && rm -f $REMOTE_DIR/target || true"
+
 # ── Build ────────────────────────────────────────────────────────────────────
 echo "==> Building (first run compiles everything; later runs reuse the cache)"
-ssh "$HOST" "cd $REMOTE_DIR && chmod +x scripts/*.sh && scripts/build-linux-native.sh"
+ssh_ "$HOST" "cd $REMOTE_DIR && chmod +x scripts/*.sh && scripts/build-linux-native.sh"
 
 # ── Bring it home ────────────────────────────────────────────────────────────
 echo "==> Fetching the tarball"
 mkdir -p dist
-rsync -az "$HOST:$REMOTE_DIR/dist/tangent-${VERSION}-linux-*.tar.gz" dist/
+rsync -az ${SSH_OPTS:+-e "ssh $SSH_OPTS"} "$HOST:$REMOTE_DIR/dist/tangent-${VERSION}-linux-*.tar.gz" dist/
 
 TARBALL="dist/tangent-${VERSION}-linux-${REMOTE_ARCH}.tar.gz"
 [ -f "$TARBALL" ] || { echo "no $TARBALL came back" >&2; exit 1; }
 
 # Prove it carries a binary. build-cross.sh once shipped 85 KB tarballs of
 # nothing but fonts and licences for a week; "the file exists" means nothing.
-if ! tar -tzf "$TARBALL" | grep -q '/tangent$'; then
+# `grep -c`, not `grep -q`, and the reason is not style. With `set -o pipefail`
+# a `grep -q` that MATCHES exits immediately, closes the pipe, and `tar` dies of
+# SIGPIPE — so the pipeline reports failure exactly when the check succeeds, and
+# `!` turns that into the error branch. The first real Linux build was rejected
+# by this line while the tarball it was reading was perfectly good. `grep -c`
+# consumes all its input, so tar always finishes.
+if [ "$(tar -tzf "$TARBALL" | grep -c '/tangent$')" -eq 0 ]; then
   echo "FAIL: $TARBALL contains no 'tangent' binary" >&2
   tar -tzf "$TARBALL" | sed 's/^/    /' >&2
   exit 1

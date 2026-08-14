@@ -62,7 +62,13 @@ ls -lh "${STAGE}.tar.gz" | sed 's/^/    /'
 # build-cross.sh once shipped 85 KB Linux tarballs of nothing but fonts and
 # licences for a week, because `set -e` does not apply inside a function called
 # as `f || handler`. Cheap insurance against the same class of silence.
-if ! tar -tzf "${STAGE}.tar.gz" | grep -q "/tangent\$"; then
+# `grep -c`, not `grep -q`, and the reason is not style. With `set -o pipefail`
+# a `grep -q` that MATCHES exits immediately, closes the pipe, and `tar` dies of
+# SIGPIPE — so the pipeline reports failure exactly when the check succeeds, and
+# `!` turns that into the error branch. The first real Linux build was rejected
+# by this line while the tarball it was reading was perfectly good. `grep -c`
+# consumes all its input, so tar always finishes.
+if [ "$(tar -tzf "${STAGE}.tar.gz" | grep -c '/tangent$')" -eq 0 ]; then
   echo "FAIL: ${STAGE}.tar.gz contains no 'tangent' binary" >&2
   exit 1
 fi
