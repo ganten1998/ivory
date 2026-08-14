@@ -149,6 +149,12 @@ pub struct IvoryApp {
     /// A size the user asked for that the host has not been told about yet.
     /// Only ever set when the host owns the window.
     pending_resize: Option<Vec2>,
+    /// The rect the last frame was laid out into. Read when asking a host for
+    /// a new size, so the width the user already has is preserved.
+    last_pane: Vec2,
+    /// Where the bands were actually drawn, which is centred in the pane.
+    /// Child windows and in-canvas dialogs centre on this.
+    last_drawn: Rect,
 
     notes: NoteState,
     manual_notes: HashSet<u8>,
@@ -225,7 +231,24 @@ impl IvoryApp {
     /// only code that knows what it is running inside. The app starts with no
     /// MIDI source at all; a host that picks its own attaches one with
     /// `set_ports`, and one that is handed its notes never does.
-    pub fn new(ctx: &egui::Context, settings: Settings, caps: Caps) -> Self {
+    pub fn new(ctx: &egui::Context, mut settings: Settings, caps: Caps) -> Self {
+        // A host with no child windows cannot have anything detached, so it
+        // must not believe it has.
+        //
+        // These two flags persist, and a plugin instance is seeded from the
+        // same `settings.json` the standalone writes. Someone who left the
+        // chord strip popped out on the desktop got a plugin with NO chord
+        // readout: the band is zeroed by the flag, the window it was moved to
+        // is gated off by `caps.detachable`, and the Attach row that would
+        // undo it is gated off too. There was no way back except Reset
+        // Settings, which throws away every colour, font and tuning as well.
+        //
+        // Cleared on the LOCAL copy only. A plugin does not write the shared
+        // file, so the desktop's own arrangement is untouched.
+        if !caps.detachable {
+            settings.chord_window_detached = false;
+            settings.fretboard_detached = false;
+        }
         crate::fonts::install(
             ctx,
             crate::fonts::FontChoice::from_key(&settings.font_choice),
@@ -273,6 +296,8 @@ impl IvoryApp {
             ports: None,
             caps,
             pending_resize: None,
+            last_pane: Vec2::ZERO,
+            last_drawn: Rect::NOTHING,
             notes: NoteState::default(),
             manual_notes: HashSet::new(),
             manual_positions: HashMap::new(),
@@ -372,6 +397,30 @@ impl IvoryApp {
     /// app without one.
     pub fn feed(&mut self, ev: MidiEvent) {
         self.notes.apply(ev);
+    }
+
+    /// Ask the host for the height this band stack needs, keeping the width.
+    ///
+    /// On the desktop the window simply follows `layout_sizes()` on the next
+    /// frame. A plugin's editor cannot: nothing resizes it unless it asks, and
+    /// `SetSizePercent` was the only thing that ever did. So turning the
+    /// guitar view on inside a DAW did not make the editor taller — it made
+    /// the whole layout SMALLER to fit the height it already had, and the
+    /// piano lost 40% of its width to black bars either side. Every action
+    /// that adds or removes a band routes through here.
+    fn request_natural_size(&mut self) {
+        if self.caps.window_sizing {
+            return; // the window follows the layout by itself
+        }
+        // Keep the width the editor already has; only the stack height
+        // changed. Falling back to the settings width covers the first frame,
+        // before anything has been laid out.
+        let w = if self.last_pane.x > 1.0 {
+            self.last_pane.x
+        } else {
+            main_width(&self.settings)
+        };
+        self.pending_resize = Some(natural_size(&self.settings, w));
     }
 
     /// Persist, if this host owns the settings file.
@@ -657,9 +706,24 @@ impl IvoryApp {
             return;
         }
         if self.menu_state.is_some() {
-            if primary_pressed {
-                self.menu_state = None; // click in main window closes the menu
+            // A press closes the menu — but ONLY where the menu is its own
+            // window.
+            //
+            // On the desktop the menu is a separate viewport, so this handler
+            // never sees a press that lands on a menu item; the only presses
+            // it sees are elsewhere, and closing is right.
+            //
+            // Drawn INLINE, the menu is in this very context, so this handler
+            // sees the press that is landing on the item — and closed the menu
+            // before `menu::show` ran, which is later in the frame. The button
+            // was never clicked and the menu simply vanished. Every row in a
+            // plugin was dead for exactly this reason. `menu::show` closes it
+            // on a press outside its own rect instead, which it can tell and
+            // this cannot.
+            if primary_pressed && self.caps.child_windows {
+                self.menu_state = None;
             }
+            // Either way the click stops here rather than reaching a piano key.
             return;
         }
 
@@ -1044,6 +1108,7 @@ impl IvoryApp {
                 }
                 self.save_settings();
                 // Window resize follows from layout_sizes() on the next pass.
+                self.request_natural_size();
             }
             MenuAction::DetachChordWindow => self.detach_chord_window(),
             MenuAction::AttachChordWindow => self.reattach_chord_window(),
@@ -1063,6 +1128,7 @@ impl IvoryApp {
                 let on = !v.is_on(self.settings.theory_views());
                 self.settings.set_theory_view(v, on);
                 self.save_settings();
+                self.request_natural_size();
             }
             MenuAction::ToggleFretboard => {
                 self.settings.show_fretboard = !self.settings.show_fretboard;
@@ -1076,6 +1142,7 @@ impl IvoryApp {
                 self.save_settings();
                 // The window height follows from layout_sizes() next pass.
                 self.voicing_tick(true);
+                self.request_natural_size();
             }
             MenuAction::SetTuning(name) => {
                 self.settings.fretboard_tuning = name.to_owned();
@@ -1755,6 +1822,8 @@ impl IvoryApp {
             pane.min.x + ((pane.width() - w) * 0.5).max(0.0).trunc(),
             pane.min.y + ((pane.height() - target.y) * 0.5).max(0.0).trunc(),
         );
+        self.last_pane = pane.size();
+        self.last_drawn = Rect::from_min_size(origin, target);
         let band_at = |top: f32, h: f32| {
             Rect::from_min_size(Pos2::new(origin.x, origin.y + top), Vec2::new(w, h))
         };
@@ -1816,7 +1885,10 @@ impl IvoryApp {
         // Held, not toggled: press to read, release and it slides away. Drawn
         // last so it is over everything, and asked for every frame so the
         // animation can run even when nothing else changed.
-        let help = keys::help_progress(&ctx);
+        // Not while something modal is up. The key is read straight out of the
+        // raw input, so without this an `h` typed into the supporter-key field
+        // both entered the letter and slid the card down over the app.
+        let help = keys::help_progress(&ctx, self.dialog.is_none() && self.menu_state.is_none());
         if help > 0.0 {
             keys::draw_help(ui.painter(), ui.max_rect(), self.settings.dark_mode, help);
         }
@@ -1954,9 +2026,14 @@ impl IvoryApp {
         // screen no matter where the user has put the piano.
         let placement = dialogs::Placement {
             caps: self.caps,
+            // The rect the layout was actually DRAWN into, which is centred in
+            // the pane and is not the same as one anchored at its corner. With
+            // a band turned off, the two differ by half the slack and dialogs
+            // landed up to 180 points away from the app they belong to.
             parent: self
                 .main_origin_known
-                .then(|| Rect::from_min_size(self.main_inner_origin, target)),
+                .then_some(self.last_drawn)
+                .filter(|r: &Rect| r.is_positive()),
             monitor: self.monitor_size,
         };
         if let Some(action) =
@@ -1986,8 +2063,12 @@ mod tests {
     }
 
     fn headless(caps: Caps) -> (egui::Context, IvoryApp) {
+        headless_with(caps, Settings::default())
+    }
+
+    fn headless_with(caps: Caps, settings: Settings) -> (egui::Context, IvoryApp) {
         let ctx = egui::Context::default();
-        let app = IvoryApp::new(&ctx, Settings::default(), caps);
+        let app = IvoryApp::new(&ctx, settings, caps);
         (ctx, app)
     }
 
@@ -2004,6 +2085,205 @@ mod tests {
             .flat_map(|v| v.commands.iter())
             .map(|c| format!("{c:?}"))
             .collect()
+    }
+
+    /// A host that cannot open windows must not believe something is detached.
+    ///
+    /// Both flags persist, and a plugin instance is seeded from the same file
+    /// the standalone writes. Someone who left the chord strip popped out on
+    /// the desktop got a plugin with no chord readout at all: the band is
+    /// zeroed by the flag, the window is gated off by `caps.detachable`, and
+    /// the Attach row that would undo it is gated off too. The only way back
+    /// was Reset Settings.
+    #[test]
+    fn a_plugin_never_inherits_a_detached_band() {
+        let detached = Settings {
+            chord_window_detached: true,
+            fretboard_detached: true,
+            show_fretboard: true,
+            chord_detection_enabled: true,
+            show_welcome: false,
+            ..Settings::default()
+        };
+
+        let (_, plugin) = headless_with(Caps::PLUGIN, detached.clone());
+        assert!(!plugin.settings.chord_window_detached);
+        assert!(!plugin.settings.fretboard_detached);
+        let b = band_sizes(&plugin.settings);
+        assert!(
+            b.chord_h > 0.0,
+            "the chord strip vanished with nowhere to go"
+        );
+        assert!(b.fret_h > 0.0, "the fretboard vanished with nowhere to go");
+
+        // The desktop keeps what it was given: there, detached means detached.
+        let (_, desktop) = headless_with(Caps::DESKTOP, detached);
+        assert!(desktop.settings.chord_window_detached);
+        assert!(desktop.settings.fretboard_detached);
+    }
+
+    /// Turning a band on must make the editor TALLER, not the picture smaller.
+    ///
+    /// On the desktop the window follows `layout_sizes()` by itself. A plugin
+    /// editor cannot: nothing resizes it unless it asks, and only
+    /// `SetSizePercent` ever did. So "Show Fretboard" inside a DAW did not
+    /// grow the editor — it shrank the whole layout to fit the height it
+    /// already had, and the piano lost 40% of its width to black bars.
+    #[test]
+    fn a_plugin_asks_for_room_when_a_band_appears() {
+        let (ctx, mut app) = headless_with(
+            Caps::PLUGIN,
+            Settings {
+                show_welcome: false,
+                show_fretboard: false,
+                ..Settings::default()
+            },
+        );
+        let pane = Vec2::new(900.0, 137.0);
+        let run = |ctx: &egui::Context, app: &mut IvoryApp| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, pane)),
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        run(&ctx, &mut app);
+        let before = fit_bands(&app.settings, pane).total();
+        app.take_pending_resize();
+
+        for action in [
+            MenuAction::ToggleFretboard,
+            MenuAction::ToggleTheoryView(theory_panel::View::Circle),
+            MenuAction::ToggleChordDetection,
+        ] {
+            app.apply_menu_action(&ctx, action);
+            let asked = app.take_pending_resize().unwrap_or_else(|| {
+                panic!("{action:?} changed the band stack without asking for room")
+            });
+            // It asks for the height the new stack needs at the width it has,
+            // rather than squeezing the layout into the old height.
+            assert!(
+                (asked.x - pane.x).abs() < 1.5,
+                "{action:?} asked to change the WIDTH: {asked:?}"
+            );
+            let squeezed = fit_bands(&app.settings, pane).total();
+            assert!(
+                asked.y > squeezed.y || squeezed.x >= before.x - 1.0,
+                "{action:?}: squeezing into the old height gives {squeezed:?}, \
+                 which is narrower than the {before:?} it started at, and the \
+                 request {asked:?} would not fix it"
+            );
+            run(&ctx, &mut app);
+        }
+
+        // The desktop must NOT ask — its window follows the layout by itself,
+        // and a stray request there would be a viewport command in a plugin's
+        // clothing.
+        let (ctx, mut desk) = headless_with(
+            Caps::DESKTOP,
+            Settings {
+                show_welcome: false,
+                ..Settings::default()
+            },
+        );
+        let _ = &ctx;
+        desk.apply_menu_action(&ctx, MenuAction::ToggleFretboard);
+        assert_eq!(desk.take_pending_resize(), None);
+    }
+
+    /// A right-click must open the menu in a plugin, and a left-click on a row
+    /// must ACTIVATE it.
+    ///
+    /// This is the test that was missing. Every row of the plugin's menu was
+    /// dead, and nothing caught it, because `menu::show` was tested for what it
+    /// DRAWS and the app was tested for what it SENDS — and the bug was in the
+    /// order the two ran. `handle_main_interaction` closed the menu on any
+    /// press, which is right when the menu is its own OS window and this
+    /// handler never sees the press that lands on it. Drawn inline it is in
+    /// the same context, so the handler saw the press meant for the item,
+    /// cleared the menu, and returned — and `menu::show`, later in the frame,
+    /// found nothing to draw. The menu just vanished on every click.
+    ///
+    /// So this drives real pointer events at a real row position and asserts
+    /// the setting changed.
+    #[test]
+    fn a_plugin_menu_row_can_actually_be_clicked() {
+        // No welcome dialog: it is modal, and a modal correctly swallows every
+        // click, so leaving it up would test the modal rather than the menu.
+        let (ctx, mut app) = headless_with(
+            Caps::PLUGIN,
+            Settings {
+                show_welcome: false,
+                ..Settings::default()
+            },
+        );
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let size = Vec2::new(900.0, 600.0);
+
+        let run = |ctx: &egui::Context, app: &mut IvoryApp, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        // A click is three frames, as it is for a person: the pointer arrives,
+        // the button goes down, the button comes up. egui hit-tests against
+        // the widget rects it saw last frame, so a press delivered before the
+        // pointer has ever been over the widget lands on nothing.
+        let button_event =
+            |p: Pos2, button: egui::PointerButton, pressed: bool| egui::Event::PointerButton {
+                pos: p,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+        let click =
+            |ctx: &egui::Context, app: &mut IvoryApp, p: Pos2, button: egui::PointerButton| {
+                run(ctx, app, vec![egui::Event::PointerMoved(p)]);
+                run(ctx, app, vec![button_event(p, button, true)]);
+                run(ctx, app, vec![button_event(p, button, false)]);
+            };
+
+        run(&ctx, &mut app, vec![]);
+        // Right-click near the top-left opens the menu there.
+        let open_at = Pos2::new(20.0, 20.0);
+        click(&ctx, &mut app, open_at, egui::PointerButton::Secondary);
+        assert!(
+            app.menu_state.is_some(),
+            "a right-click did not open the menu in a plugin"
+        );
+
+        // The first row is Size, a submenu; the first ITEM row is what we can
+        // click without hovering a submenu open. Find it from the same view
+        // the menu was built from.
+        let view = app.menu_view();
+        let rows = menu::rows_for_test(view);
+        let (idx, _, want) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(i, (label, a))| {
+                (label.as_str() == "Dark Mode").then_some((i, label.clone(), *a))
+            })
+            .expect("Dark Mode is in the menu");
+        assert_eq!(want, MenuAction::ToggleDarkMode);
+
+        let before = app.settings.dark_mode;
+        let row = menu::row_center_for_test(app.menu_state.as_ref().unwrap(), idx);
+        click(&ctx, &mut app, row, egui::PointerButton::Primary);
+        assert_ne!(
+            app.settings.dark_mode, before,
+            "clicking a menu row in a plugin did nothing — the row is dead"
+        );
+        assert!(
+            app.menu_state.is_none(),
+            "choosing a row must close the menu"
+        );
     }
 
     /// A dialog and a menu must OPEN and DRAW inside a plugin, and still send
@@ -2056,17 +2336,26 @@ mod tests {
         );
         for i in 0..4 {
             let cmds = frame(&ctx, &mut app, vec![]);
-            assert!(cmds.is_empty(), "an open dialog commanded the host on frame {i}: {cmds:?}");
+            assert!(
+                cmds.is_empty(),
+                "an open dialog commanded the host on frame {i}: {cmds:?}"
+            );
         }
 
         // Escape closes it, inline as well as in a window.
         frame(&ctx, &mut app, vec![press(egui::Key::Escape)]);
-        assert!(app.dialog.is_none(), "Escape did not close the in-canvas dialog");
+        assert!(
+            app.dialog.is_none(),
+            "Escape did not close the in-canvas dialog"
+        );
 
         // ...and the held shortcut card, which is drawn over everything.
         for i in 0..3 {
             let cmds = frame(&ctx, &mut app, vec![press(egui::Key::H)]);
-            assert!(cmds.is_empty(), "the shortcut card commanded the host on frame {i}: {cmds:?}");
+            assert!(
+                cmds.is_empty(),
+                "the shortcut card commanded the host on frame {i}: {cmds:?}"
+            );
         }
     }
 

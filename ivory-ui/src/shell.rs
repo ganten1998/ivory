@@ -204,7 +204,31 @@ pub fn surface(
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     report.close = true;
                 }
-                add(ui, &mut body_wants_close);
+                // SCROLL rather than clip when the body does not fit.
+                //
+                // Every body here paints absolutely into `max_rect`, so handing
+                // it a rect smaller than it asked for does not make it smaller
+                // — it makes it CUT OFF, with the rows past the bottom edge
+                // drawn and unreachable. The menu is about 460 points tall and
+                // a plugin editor is often shorter than that, so the last third
+                // of it, Reset and About included, simply could not be clicked.
+                //
+                // On the desktop, and inline whenever the surface fits, this
+                // branch is not taken and not one pixel moves.
+                if spec.size.y > rect.height() + 0.5 || spec.size.x > rect.width() + 0.5 {
+                    egui::ScrollArea::both()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            let natural = Rect::from_min_size(ui.max_rect().min, spec.size);
+                            let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(natural));
+                            add(&mut inner, &mut body_wants_close);
+                            // Claim the full height so the scrollbar knows how
+                            // far there is to go.
+                            ui.allocate_rect(natural, egui::Sense::hover());
+                        });
+                } else {
+                    add(ui, &mut body_wants_close);
+                }
             });
         });
 
@@ -249,20 +273,23 @@ mod tests {
         );
     }
 
-    fn run_inline(screen: Rect, spec: &SurfaceSpec<'_>) -> (Rect, SurfaceReport) {
+    /// Returns (what the body was given, what is actually visible, report).
+    fn run_inline(screen: Rect, spec: &SurfaceSpec<'_>) -> (Rect, Rect, SurfaceReport) {
         let ctx = egui::Context::default();
         let input = egui::RawInput {
             screen_rect: Some(screen),
             ..Default::default()
         };
         let mut got = Rect::NOTHING;
+        let mut visible = Rect::NOTHING;
         let mut report = SurfaceReport::default();
         let _ = ctx.run(input, |ctx| {
             report = surface(ctx, Caps::PLUGIN, spec, &mut |ui, _close| {
                 got = ui.max_rect();
+                visible = ui.clip_rect();
             });
         });
-        (got, report)
+        (got, visible, report)
     }
 
     /// The inline surface must land inside the canvas whatever position it is
@@ -285,18 +312,25 @@ mod tests {
                 pos: Some(pos),
                 ..Default::default()
             };
-            let (got, _) = run_inline(screen, &spec);
+            let (_, visible, _) = run_inline(screen, &spec);
             assert!(
-                screen.contains_rect(got),
-                "asked for {pos:?}, got {got:?}, which is not inside {screen:?}"
+                screen.expand(1.0).contains_rect(visible),
+                "asked for {pos:?}, visible area {visible:?} is not inside {screen:?}"
             );
         }
     }
 
-    /// A surface bigger than the editor must shrink to fit rather than run off
-    /// it. The menu is ~460pt tall and a plugin editor is 200pt.
+    /// A surface bigger than the editor SCROLLS. It must not be shrunk, and it
+    /// must not be clipped.
+    ///
+    /// This test used to assert the opposite — that the body is handed a rect
+    /// that fits — and that assertion was the bug. Every body here paints
+    /// absolutely into `max_rect`, so a smaller rect does not make a smaller
+    /// menu; it makes one whose bottom rows are drawn past the edge and cannot
+    /// be clicked. The menu is ~460pt tall and a plugin editor is often less,
+    /// so Reset, About and Theory were all unreachable in a plugin.
     #[test]
-    fn an_oversized_inline_surface_shrinks_to_the_canvas() {
+    fn an_oversized_inline_surface_scrolls_rather_than_clipping() {
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 200.0));
         let spec = SurfaceSpec {
             id: "test-big",
@@ -304,14 +338,37 @@ mod tests {
             min_size: Vec2::new(200.0, 100.0),
             ..Default::default()
         };
-        let (got, _) = run_inline(screen, &spec);
+        let (got, visible, _) = run_inline(screen, &spec);
+
+        // The body gets what it asked for, so nothing it draws falls off.
         assert!(
-            screen.contains_rect(got),
-            "{got:?} does not fit inside {screen:?}"
+            got.width() >= spec.size.x - 0.5 && got.height() >= spec.size.y - 0.5,
+            "the body was given {got:?}, less than the {:?} it needs",
+            spec.size
         );
+        // What is on screen still fits on screen.
         assert!(
-            got.height() <= screen.height() && got.width() <= screen.width(),
-            "surface did not shrink: {got:?}"
+            screen.expand(1.0).contains_rect(visible),
+            "the visible area {visible:?} escapes {screen:?}"
+        );
+    }
+
+    /// ...and a surface that DOES fit is handed exactly its rect, with no
+    /// scroll area in the way. This is every dialog on the desktop and most of
+    /// them in a plugin, so it is the path that must not change.
+    #[test]
+    fn a_surface_that_fits_is_not_wrapped_in_anything() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0));
+        let spec = SurfaceSpec {
+            id: "test-fits",
+            size: Vec2::new(300.0, 200.0),
+            min_size: Vec2::new(100.0, 100.0),
+            ..Default::default()
+        };
+        let (got, _, _) = run_inline(screen, &spec);
+        assert!(
+            (got.width() - 300.0).abs() < 0.5 && (got.height() - 200.0).abs() < 0.5,
+            "a surface that fits was resized to {got:?}"
         );
     }
 
@@ -326,7 +383,7 @@ mod tests {
             size: Vec2::new(100.0, 100.0),
             ..Default::default()
         };
-        let (_, report) = run_inline(screen, &spec);
+        let (_, _, report) = run_inline(screen, &spec);
         assert_eq!(report.focused, None, "inline invented a focus state");
         assert!(!report.close, "an untouched surface asked to close");
     }

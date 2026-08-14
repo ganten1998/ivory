@@ -103,14 +103,26 @@ pub fn pressed(ctx: &egui::Context) -> Option<KeyAction> {
 /// `animate_bool_with_time` does the easing and asks for the repaints, but the
 /// app's own cadence is 50ms (20fps), which would make this visibly steppy, so
 /// an animation in progress asks for the next frame immediately.
-pub fn help_progress(ctx: &egui::Context) -> f32 {
-    let held = ctx.input(|i| {
-        !i.modifiers.any()
-            && BINDINGS
-                .iter()
-                .filter(|(_, _, a, _)| *a == KeyAction::ToggleHelp)
-                .any(|(key, ..)| i.key_down(*key))
-    });
+/// How far the shortcut card is down, 0 to 1.
+///
+/// `allowed` is not a nicety. The key is read from `InputState::keys_down`,
+/// which is built before any widget runs, so keyboard focus does not filter
+/// it — typing an `h` into the supporter-key field slid the card down over
+/// the app while the letter also went into the box. The desktop escaped that
+/// only because a dialog there is a separate OS window and the unfocused root
+/// gets `WindowFocused(false)`, which clears `keys_down`.
+///
+/// Still animates when not allowed, so a card that is already down slides back
+/// up rather than vanishing.
+pub fn help_progress(ctx: &egui::Context, allowed: bool) -> f32 {
+    let held = allowed
+        && ctx.input(|i| {
+            !i.modifiers.any()
+                && BINDINGS
+                    .iter()
+                    .filter(|(_, _, a, _)| *a == KeyAction::ToggleHelp)
+                    .any(|(key, ..)| i.key_down(*key))
+        });
     let t = ctx.animate_bool_with_time(egui::Id::new("tangent-help-card"), held, 0.16);
     if t > 0.0 && t < 1.0 {
         ctx.request_repaint();

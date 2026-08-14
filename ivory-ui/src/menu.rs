@@ -12,7 +12,7 @@
 use crate::fonts;
 use crate::fretboard_panel;
 use crate::host::Caps;
-use egui::{Button, Color32, CornerRadius, FontId, Margin, Pos2, Stroke, Vec2};
+use egui::{Button, Color32, CornerRadius, FontId, Margin, Pos2, Rect, Stroke, Vec2};
 use ivory_core::fretboard;
 use std::time::Instant;
 
@@ -577,6 +577,46 @@ impl MenuState {
     }
 }
 
+/// The clickable rows, in draw order, for a test that wants to click one.
+///
+/// Separators and submenu parents are excluded: a separator cannot be clicked
+/// and a submenu parent opens rather than acts.
+#[doc(hidden)]
+pub fn rows_for_test(view: MenuView) -> Vec<(String, MenuAction)> {
+    build_entries(view)
+        .into_iter()
+        .filter_map(|e| match e {
+            Entry::Item { label, action, .. } => Some((label, action)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The centre of clickable row `idx`, in the same coordinates `show` draws in.
+///
+/// Walks the entry list exactly as the row loop does — separators are `SEP_H`
+/// tall, everything else is `row_h` — so a test clicks where the row actually
+/// is rather than where it is assumed to be.
+#[doc(hidden)]
+pub fn row_center_for_test(state: &MenuState, idx: usize) -> Pos2 {
+    let mut y = state.pos.y;
+    let mut seen = 0usize;
+    for entry in &state.entries {
+        match entry {
+            Entry::Separator => y += SEP_H,
+            Entry::Item { .. } => {
+                if seen == idx {
+                    return Pos2::new(state.pos.x + state.size.x * 0.5, y + state.row_h * 0.5);
+                }
+                seen += 1;
+                y += state.row_h;
+            }
+            Entry::Submenu { .. } => y += state.row_h,
+        }
+    }
+    Pos2::new(state.pos.x + state.size.x * 0.5, y)
+}
+
 fn apply_menu_style(style: &mut egui::Style, c: MenuColors) {
     style.spacing.button_padding = egui::vec2(PAD_X, PAD_Y);
     style.spacing.item_spacing = egui::vec2(0.0, 0.0);
@@ -639,6 +679,10 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
 
     let mut hover_close_submenu = false;
     let mut hover_open_submenu: Option<usize> = None;
+    // Where each submenu's parent row actually landed, in whatever coordinates
+    // it was drawn in. Inline the menu may be inside a `ScrollArea`, so the
+    // measured-at-open `row_top` is not where the row IS.
+    let mut sub_row_rects: Vec<Rect> = Vec::new();
 
     // ── Main menu ──────────────────────────────────────────────────────────
     let menu_spec = crate::shell::SurfaceSpec {
@@ -693,6 +737,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
                         if r.hovered() || r.clicked() {
                             hover_open_submenu = Some(sub_idx);
                         }
+                        sub_row_rects.push(r.rect);
                         sub_idx += 1;
                     }
                 }
@@ -716,7 +761,23 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         .and_then(|i| state.subs.get(i).map(|g| (i, g.row_top, g.size)));
     let mut submenu_report = None;
     if let Some((sub_i, row_top, sub_size)) = open_sub {
-        let mut sub_pos = Pos2::new(state.pos.x + state.size.x, state.pos.y + row_top);
+        // Beside the row, and the two hosts measure that differently.
+        //
+        // On the desktop the menu is its own window: rows are drawn at
+        // window-local coordinates and `row_top` — measured at open time — is
+        // exact, so the submenu goes at the menu window's origin plus it.
+        //
+        // Inline there is no window, the row rect is already in canvas
+        // coordinates, and the menu may be scrolled. Using `row_top` there put
+        // the submenu beside a DIFFERENT row: reaching for it crossed other
+        // rows, which re-points `submenu_open`, and the click then landed in
+        // whichever submenu had taken its place — silently setting a capo
+        // nobody asked for. The row's own rect is the only thing that knows
+        // where the row ended up.
+        let mut sub_pos = match sub_row_rects.get(sub_i) {
+            Some(r) if !caps.child_windows => Pos2::new(r.max.x, r.min.y),
+            _ => Pos2::new(state.pos.x + state.size.x, state.pos.y + row_top),
+        };
         if let Some(mon) = state.monitor {
             // Slide up rather than off the bottom, and flip to the menu's LEFT
             // rather than off the right edge, which is what a native menu does.
@@ -1111,7 +1172,9 @@ mod tests {
             "a plugin with no Size submenu has no way to be made readable"
         );
         assert!(
-            !rows(v).iter().any(|(_, a, _)| *a == MenuAction::ToggleBorderless),
+            !rows(v)
+                .iter()
+                .any(|(_, a, _)| *a == MenuAction::ToggleBorderless),
             "window chrome is the host's in a plugin"
         );
         // And what SHOULD survive still does: the whole point is a plugin that
