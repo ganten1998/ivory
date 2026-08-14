@@ -64,9 +64,18 @@ pub const MAX_STRINGS: usize = 12;
 const MAX_NOTES: usize = MAX_STRINGS + 4;
 
 /// Sentinel for "this string sounds nothing" inside the fixed-size search
-/// arrays. A real fret is 0..=254, and 255 sorts last in the tie key, so a
-/// shape that uses a string beats one that mutes it at equal cost.
+/// arrays. It sorts last in the tie key, so a shape that uses a string beats
+/// one that mutes it at equal cost.
+///
+/// It is also `u8::MAX`, which is why `MAX_FRET` exists: fret 255 is a legal
+/// `FretboardSpec.frets` and would be indistinguishable from "muted", so a
+/// note playable only there came out `Dropped { Excess }` — reported as a
+/// choice when it was really a collision.
 const MUTED: u8 = u8::MAX;
+
+/// The highest fret the search can represent, one below the `MUTED` sentinel.
+/// The longest fingerboard ever built has 27; 254 is twenty-one octaves.
+const MAX_FRET: u8 = 254;
 
 /// `round(1000 * 2^(-fret/12))`, indexed by ABSOLUTE fret, clamped at 24.
 ///
@@ -500,6 +509,10 @@ impl Default for Weights {
 /// two builds that disagree here would disagree about whether a remembered
 /// shape is stale.
 pub fn spec_fingerprint(spec: &FretboardSpec) -> u64 {
+        // Capped exactly as `run` caps it, so a spec asking for 255 frets and the
+    // 254-fret board actually solved fingerprint the SAME. Otherwise the
+    // session would compare its own spec's print against the one in the
+    // `Voicing` it just produced, never match, and silently lose hysteresis.
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x100_0000_01b3;
     let mut h = OFFSET;
@@ -515,7 +528,7 @@ pub fn spec_fingerprint(spec: &FretboardSpec) -> u64 {
         eat(o);
     }
     eat(0);
-    eat(spec.frets);
+    eat(spec.frets.min(MAX_FRET));
     eat(spec.capo);
     h
 }
@@ -615,6 +628,16 @@ fn run(
     collect: bool,
 ) -> (Voicing, SolveStats, Vec<(i32, Voicing)>) {
     let fp = spec_fingerprint(spec);
+    // Solve against a board whose top fret the sentinel can represent. Done
+    // here rather than at every use so `reachable`, `candidates` and
+    // `pitch_at` all agree about where the neck ends.
+    let capped;
+    let spec = if spec.frets > MAX_FRET {
+        capped = FretboardSpec { tuning: spec.tuning, frets: MAX_FRET, capo: spec.capo };
+        &capped
+    } else {
+        spec
+    };
     let strings = spec.tuning.strings().min(MAX_STRINGS);
 
     // Step 0 — normalise. Sorted and deduped, always, whatever the caller did.
@@ -1264,12 +1287,16 @@ fn shape_cost_of(
     if let Some(a) = anchor {
         // Stretch, scaled by the neck's own geometry: the same five frets is a
         // different hand at fret 1 and at fret 12.
+        // Every step saturating, and the parentheses matter: a method call
+        // binds tighter than `/`, so `x / 1000 .saturating_mul(y)` would have
+        // multiplied 1000 by y instead. The last plain `*` here was the one
+        // arithmetic hole left — the upstream saturation pins the product at
+        // i32::MAX, and any scale past ~1000 then overflowed it.
+        let reach = w.stretch[(span as usize).min(8)]
+            .saturating_mul(REACH_MILLI[(a as usize).min(24)])
+            / 1000;
         cost = cost.saturating_add(
-            w.stretch[(span as usize).min(8)]
-                .saturating_mul(REACH_MILLI[(a as usize).min(24)])
-                / 1000
-                * w.stretch_scale.clamp(-10_000, 10_000)
-                / 100,
+            reach.saturating_mul(w.stretch_scale.clamp(-10_000, 10_000)) / 100,
         );
         // Position: capo-relative below the 12th, absolute above it.
         let mut pos = w.position_per_fret.saturating_mul(a as i32 - capo as i32);
@@ -1908,6 +1935,93 @@ mod tests {
                 w.min_unique_drop()
             );
         }
+    }
+
+    #[test]
+    fn two_dials_at_once_cannot_overflow_the_stretch_term() {
+        // The hostile sweep turned every dial, but only ever ONE PER `Weights`,
+        // and this needs two. `stretch` saturating against REACH_MILLI pins the
+        // product at i32::MAX; dividing by 1000 leaves 2_147_483; multiplying
+        // that by any scale past ~1000 overflowed. Debug panicked. Release,
+        // which is what ships, wrapped — and a wrapped stretch cost is NEGATIVE,
+        // so the dial whose whole job is to make stretching expensive became a
+        // large reward for it.
+        let spec = std_spec();
+        let both = Weights {
+            stretch: [i32::MAX; 9],
+            stretch_scale: i32::MAX,
+            ..Weights::DEFAULT
+        };
+        assert!(solve(&spec, &[60], &History::NONE, &both).cost > 0);
+        // And at the ceiling the clamp itself declares legal.
+        let mut st = Weights::DEFAULT.stretch;
+        st[0] = 300_000;
+        let edge = Weights { stretch: st, stretch_scale: 10_000, ..Weights::DEFAULT };
+        let v = solve(&spec, &[60], &History::NONE, &edge);
+        assert!(v.cost > 0, "a stretch penalty went negative: {}", v.cost);
+        // Every pair of hostile dials, not just the two that happened to bite.
+        let hostile: [(&str, Weights); 6] = [
+            ("stretch", Weights { stretch: [i32::MAX; 9], ..Weights::DEFAULT }),
+            ("scale", Weights { stretch_scale: i32::MAX, ..Weights::DEFAULT }),
+            ("finger", Weights { finger_cum: [i32::MAX; 9], ..Weights::DEFAULT }),
+            ("position", Weights { position_per_fret: i32::MAX, position_cap: i32::MAX, ..Weights::DEFAULT }),
+            ("open", Weights { open_min: i32::MIN, open_max: i32::MAX, open_slope: i32::MAX, ..Weights::DEFAULT }),
+            ("fold", Weights { fold_place: i32::MAX, fold_per_extra_octave: i32::MAX, ..Weights::DEFAULT }),
+        ];
+        for (an, a) in &hostile {
+            for (bn, b) in &hostile {
+                let mixed = Weights {
+                    stretch: if a.stretch != Weights::DEFAULT.stretch { a.stretch } else { b.stretch },
+                    stretch_scale: a.stretch_scale.max(b.stretch_scale),
+                    finger_cum: if a.finger_cum != Weights::DEFAULT.finger_cum { a.finger_cum } else { b.finger_cum },
+                    position_per_fret: a.position_per_fret.max(b.position_per_fret),
+                    position_cap: a.position_cap.max(b.position_cap),
+                    open_min: a.open_min.min(b.open_min),
+                    open_max: a.open_max.max(b.open_max),
+                    open_slope: a.open_slope.max(b.open_slope),
+                    fold_place: a.fold_place.max(b.fold_place),
+                    fold_per_extra_octave: a.fold_per_extra_octave.max(b.fold_per_extra_octave),
+                    ..Weights::DEFAULT
+                };
+                for held in [&[60u8][..], &[36, 60, 64, 67][..], &[40, 47, 52, 56, 59, 64][..]] {
+                    // The assertion is simply that it returns at all: in debug
+                    // an overflow is a panic, so arriving here is the result.
+                    let v = solve(&spec, held, &History::NONE, &mixed);
+                    assert_eq!(v.notes.len(), held.len(), "{an}+{bn} on {held:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fret_255_does_not_collide_with_the_muted_sentinel() {
+        // `MUTED` is `u8::MAX`, and 255 is a legal `frets`. A note playable
+        // only at fret 255 was therefore indistinguishable from a muted string
+        // and came out `Dropped { Excess }` — reported as a choice when it was
+        // a collision. The board is capped at 254 so the note is genuinely out
+        // of range and folds, which is the truth rather than a shrug.
+        const ZERO: Tuning = Tuning { name: "Zero", open: &[0] };
+        let spec = FretboardSpec { tuning: &ZERO, frets: 255, capo: 0 };
+        let v = solve_cold(&spec, &[255]);
+        assert!(
+            !matches!(v.notes[0].outcome, Outcome::Dropped { .. }),
+            "fret 255 collided with MUTED: {:?}",
+            v.notes[0].outcome
+        );
+        // Whatever it does, it must not claim a fret it cannot represent.
+        if let Outcome::Placed { pos, .. } = v.notes[0].outcome {
+            assert!(pos.fret < u8::MAX, "emitted the sentinel as a fret");
+        }
+        // And the fingerprint has to agree across the cap, or the session
+        // compares its own spec against the solved one, never matches, and
+        // loses hysteresis for good.
+        assert_eq!(
+            spec_fingerprint(&spec),
+            spec_fingerprint(&FretboardSpec { tuning: &ZERO, frets: 254, capo: 0 })
+        );
+        let mut sess = VoicingSession::new(spec.clone(), Weights::DEFAULT);
+        let warm = sess.update_sorted(&[255], 100).clone();
+        assert_eq!(warm, *sess.update_sorted(&[255], 100), "hysteresis went stale");
     }
 
     #[test]

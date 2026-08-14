@@ -68,7 +68,38 @@ fn hostile_weights(full: bool) -> Vec<Weights> {
         Weights { open_min: 500, open_max: -500, ..d.clone() },
         Weights { position_per_fret: i32::MAX, ..d.clone() },
     ];
+    // PAIRS, not just singles. The sweep turned every dial and still missed a
+    // real overflow, because the one that bit needed `stretch` and
+    // `stretch_scale` hostile in the SAME `Weights` and this list only ever
+    // held one apiece. Each alone was green.
     if full {
+        v.push(Weights {
+            stretch: [i32::MAX; 9],
+            stretch_scale: i32::MAX,
+            finger_cum: [i32::MAX; 9],
+            position_per_fret: i32::MAX,
+            position_cap: i32::MAX,
+            open_min: i32::MIN,
+            open_max: i32::MAX,
+            open_slope: i32::MAX,
+            fold_place: i32::MAX,
+            fold_per_extra_octave: i32::MAX,
+            skip_interior: i32::MAX,
+            drop_base: i32::MAX,
+            recency_per: i32::MAX,
+            ..d.clone()
+        });
+        v.push(Weights {
+            stretch: [i32::MIN; 9],
+            stretch_scale: i32::MIN,
+            finger_cum: [i32::MIN; 9],
+            position_per_fret: i32::MIN,
+            position_cap: i32::MIN,
+            drop_base: i32::MIN,
+            hyst_clamp: i32::MIN,
+            drop_history_clamp: i32::MAX,
+            ..d.clone()
+        });
         v.extend([
             Weights { leaf_budget: 1, ..d.clone() },
             Weights { note_slack: 0, ..d.clone() },

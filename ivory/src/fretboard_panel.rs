@@ -47,6 +47,11 @@ pub fn band_height(w: f32) -> f32 {
 /// Left margin, as a fraction of the band width, holding the open-string rings
 /// and the damped-string crosses. They live BEHIND the nut, where a chord
 /// chart puts them.
+///
+/// It is NOT a margin in the background colour: that drew a pale strip down
+/// the left of a dark neck, which read as the panel not filling its own space.
+/// The board runs the full width and this is its headstock end, so the marks
+/// sit on wood like everything else.
 const GUTTER: f32 = 0.026;
 /// Vertical breathing room above the top string and below the bottom one.
 const PAD_Y: f32 = 0.10;
@@ -209,10 +214,8 @@ struct Palette {
     /// Drawn around a note dot when the board is pale, so a light accent
     /// colour on blonde maple is still a dot rather than a smudge.
     dot_edge: Option<Color32>,
-    /// Marks in the gutter, which sit on `bg` rather than on the board.
-    ink: Color32,
-    faint: Color32,
-    /// Marks ON the board, which need to read against `board`.
+    /// Marks ON the board, which is now everything: the board runs the full
+    /// width of the band, so there is no background strip left to draw on.
     on_board: Color32,
 }
 
@@ -251,11 +254,6 @@ fn palette(s: &Settings, wood: Wood) -> Palette {
             Color32::from_rgb(0xEC, 0xE6, 0xDA).gamma_multiply(0.82),
         ),
     };
-    let ink = if dark {
-        Color32::from_rgb(0xCC, 0xCC, 0xCC)
-    } else {
-        Color32::from_rgb(0x8B, 0x73, 0x55)
-    };
     Palette {
         bg: crate::piano::bg_color(dark),
         board,
@@ -273,8 +271,6 @@ fn palette(s: &Settings, wood: Wood) -> Palette {
         // looks like here. The user already chose this colour once.
         dot: s.white_key_active_color.to_color32(),
         dot_edge: wood.pale().then(|| Color32::from_rgb(0x3a, 0x2c, 0x1a)),
-        ink,
-        faint: ink.gamma_multiply(0.45),
         on_board,
     }
 }
@@ -304,10 +300,7 @@ pub fn draw(
     // ── the board ───────────────────────────────────────────────────────────
     // The fingerboard as a slab, from the nut to the end of the neck, with the
     // outer strings inset rather than sitting on its edge.
-    let board = Rect::from_min_max(
-        Pos2::new(g.wire_x(0), g.y(g.strings - 1) - g.edge),
-        Pos2::new(g.right, g.y(0) + g.edge),
-    );
+    let board = board_rect(rect, &g);
     painter.rect_filled(board, 0.0, p.board);
 
     for f in 1..=g.frets {
@@ -463,9 +456,10 @@ pub fn draw(
         if !sounding_any {
             break;
         }
+        // On the board now, so these follow the wood rather than the band.
         let colour = match state {
-            StringState::Skipped => p.ink,
-            StringState::Unused => p.faint,
+            StringState::Skipped => p.on_board,
+            StringState::Unused => p.on_board.gamma_multiply(0.5),
             StringState::Sounding { .. } => continue,
         };
         painter.text(
@@ -490,6 +484,20 @@ pub fn draw(
     if let Some(c) = caption {
         draw_caption(painter, rect, &c, &p, s);
     }
+}
+
+/// The fingerboard slab.
+///
+/// It starts at the band's left EDGE, not at the nut. The strip behind the nut
+/// is the headstock, and leaving it in the band background painted a pale bar
+/// down the side of a dark neck that read as the panel failing to fill its own
+/// space. Everything that lives back there — open-string rings, damped-string
+/// crosses — sits on wood now like everything else.
+fn board_rect(rect: Rect, g: &Geom) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(rect.left(), g.y(g.strings - 1) - g.edge),
+        Pos2::new(g.right, g.y(0) + g.edge),
+    )
 }
 
 /// x of the open/damped marker column, behind the nut.
@@ -732,6 +740,25 @@ mod tests {
                     t.name,
                     g.spacing
                 );
+            }
+        }
+    }
+
+    /// No background strip anywhere: the neck fills the band edge to edge.
+    #[test]
+    fn the_board_leaves_no_pale_margin_down_the_left() {
+        for t in TUNINGS {
+            for w in [650.0_f32, 1300.0, 2600.0] {
+                let spec = FretboardSpec { tuning: t, frets: 22, capo: 0 };
+                let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
+                let Some(g) = Geom::new(r, &spec) else { continue };
+                let b = board_rect(r, &g);
+                assert_eq!(b.left(), r.left(), "{}: pale strip at {w}pt", t.name);
+                assert!(b.right() >= r.right() - 2.0, "{}: gap at the far end", t.name);
+                assert!(b.top() >= r.top() - 0.01 && b.bottom() <= r.bottom() + 0.01);
+                // The open/damped marks still sit behind the nut, on the board.
+                let gx = gutter_x(r, &g);
+                assert!(gx > b.left() && gx < g.wire_x(0), "markers left the headstock");
             }
         }
     }
