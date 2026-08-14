@@ -138,6 +138,15 @@ pub struct Settings {
     pub theory_circle: bool,
     pub theory_tonnetz: bool,
     pub theory_triangles: bool,
+    /// Whether the theory band follows what you are PLAYING.
+    ///
+    /// Off by default, and that is the point of it. The band is something you
+    /// look at while you play — a key you are working in, a chord you are
+    /// trying to place — and a diagram that redraws on every note you touch is
+    /// one you cannot read while touching notes. With this off it shows only
+    /// what you put there, by clicking the piano, the neck or the diagrams
+    /// themselves, and stays put until you change it.
+    pub theory_follow_midi: bool,
     /// Unknown keys from the file, preserved verbatim on save (file order).
     pub extra: Map<String, Value>,
 }
@@ -187,6 +196,7 @@ impl Default for Settings {
             theory_circle: false,
             theory_tonnetz: false,
             theory_triangles: false,
+            theory_follow_midi: false,
             fretboard_win_w: None,
             fretboard_win_h: None,
             fretboard_win_x: None,
@@ -370,6 +380,7 @@ impl Settings {
         take_bool(&mut map, "theory_circle", &mut s.theory_circle);
         take_bool(&mut map, "theory_tonnetz", &mut s.theory_tonnetz);
         take_bool(&mut map, "theory_triangles", &mut s.theory_triangles);
+        take_bool(&mut map, "theory_follow_midi", &mut s.theory_follow_midi);
         if let Some(v) = map.remove("fretboard_tuning") {
             if let Some(t) = v.as_str() {
                 s.fretboard_tuning = t.to_owned();
@@ -480,6 +491,10 @@ impl Settings {
         map.insert(
             "theory_triangles".into(),
             Value::Bool(self.theory_triangles),
+        );
+        map.insert(
+            "theory_follow_midi".into(),
+            Value::Bool(self.theory_follow_midi),
         );
         map.insert(
             "fretboard_tuning".into(),

@@ -270,6 +270,35 @@ pub fn cells(rect: Rect, views: Views) -> Vec<(View, Rect)> {
         .collect()
 }
 
+/// What a click landed on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hit {
+    /// One pitch class: a name on the circle, a node on the lattice.
+    Pc(u8),
+    /// A whole chord: a vertex of the harmonic triangles, which is a triad
+    /// rather than a note and is much more useful placed all at once.
+    Triad { root: u8, minor: bool },
+}
+
+/// What is under `pos`, if anything.
+///
+/// The exact inverse of `draw`, and deliberately in the same file a few lines
+/// from it: a hit test that lives somewhere else is a hit test that stops
+/// matching the picture the first time the picture moves.
+pub fn hit_test(rect: Rect, views: Views, input: Input, pos: Pos2) -> Option<Hit> {
+    let (view, cell) = cells(rect, views)
+        .into_iter()
+        .find(|(_, c)| c.contains(pos))?;
+    let body = body_rect(cell.shrink(8.0));
+    match view {
+        View::Circle => circle_hit(body, pos).map(Hit::Pc),
+        View::Tonnetz => tonnetz_hit(body, pos).map(Hit::Pc),
+        // The only one that needs to know what is playing: I, IV and V are
+        // relative to a tonic, and the tonic comes from the notes.
+        View::Triangles => triangles_hit(body, input.tonic(), pos),
+    }
+}
+
 pub fn draw(painter: &Painter, rect: Rect, views: Views, input: Input, s: &Settings) {
     let p = palette(s);
     painter.rect_filled(rect, 0.0, p.bg);
@@ -307,8 +336,30 @@ pub fn draw(painter: &Painter, rect: Rect, views: Views, input: Input, s: &Setti
 }
 
 /// A title over each pane, in the space the diagrams leave for it.
-fn title(painter: &Painter, rect: Rect, text: &str, p: &Palette) -> Rect {
-    let h = (rect.height() * 0.09).clamp(9.0, 15.0);
+/// A title and a one-line key to what the colours mean.
+///
+/// The legend is not decoration. Three diagrams showing three different things
+/// in the same two colours is genuinely hard to read, and a viewer who has to
+/// work out from context whether a lit shape means "this note is sounding" or
+/// "this key fits what you are playing" is being asked to do the diagram's
+/// job. One line each, in the faint ink, costs about 11 points of height.
+/// What is left of a pane once its title and legend have taken their share.
+///
+/// Shared by the drawing and the hit-testing so the two cannot disagree about
+/// where the diagram starts — the class of bug where a click lands one row
+/// above the thing it looks like it is on.
+fn body_rect(rect: Rect) -> Rect {
+    let h = (rect.height() * 0.075).clamp(9.0, 14.0);
+    let used = if rect.height() > 150.0 {
+        h + h * 0.82 + 2.0
+    } else {
+        h + 2.0
+    };
+    Rect::from_min_max(Pos2::new(rect.min.x, rect.min.y + used), rect.max)
+}
+
+fn title(painter: &Painter, rect: Rect, text: &str, legend: &str, p: &Palette) -> Rect {
+    let h = (rect.height() * 0.075).clamp(9.0, 14.0);
     painter.text(
         Pos2::new(rect.center().x, rect.min.y + h * 0.5),
         Align2::CENTER_CENTER,
@@ -316,7 +367,20 @@ fn title(painter: &Painter, rect: Rect, text: &str, p: &Palette) -> Rect {
         font(h * 0.92),
         p.faint,
     );
-    Rect::from_min_max(Pos2::new(rect.min.x, rect.min.y + h + 2.0), rect.max)
+    let lh = h * 0.82;
+    // Dropped rather than crammed when the pane is too short for it: an
+    // unreadable legend is worse than none, and it is the first thing that
+    // should give up its space.
+    if rect.height() > 150.0 && !legend.is_empty() {
+        painter.text(
+            Pos2::new(rect.center().x, rect.min.y + h + lh * 0.5),
+            Align2::CENTER_CENTER,
+            legend,
+            font_light(lh * 0.88),
+            p.faint,
+        );
+    }
+    body_rect(rect)
 }
 
 // ── circle of fifths ───────────────────────────────────────────────────────
@@ -329,104 +393,123 @@ fn circle_angle(i: usize) -> f32 {
 }
 
 fn draw_circle(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Settings) {
-    let rect = title(painter, rect, "CIRCLE OF FIFTHS", p);
+    let rect = title(
+        painter,
+        rect,
+        "CIRCLE OF FIFTHS",
+        "filled = note sounding    shaded = key that fits",
+        p,
+    );
     let c = rect.center();
     let r = rect.width().min(rect.height()) * 0.5 - 2.0;
     if r < 20.0 {
         return;
     }
 
-    // Four bands: signature, major, minor, and a hub for the reading.
     let r_sig = r;
     let r_maj = r * 0.80;
     let r_min = r * 0.56;
     let r_hub = r * 0.34;
-
     let step = std::f32::consts::TAU / 12.0;
-    for (i, &pc) in FIFTHS.iter().enumerate() {
-        let a = circle_angle(i);
-        let dir = Vec2::new(a.cos(), a.sin());
 
-        // How well this key explains what is being played. All of it in the
-        // scale is the bright case; this is the "closely related keys" the
-        // circle exists to show, and it is why neighbours light together.
-        let scale = major_scale(pc);
-        let held = input.pcs.count_ones();
-        let inside = (input.pcs & scale).count_ones();
-        let fit = if held == 0 {
-            0.0
-        } else {
-            inside as f32 / held as f32
-        };
+    // ── the wedges: which KEYS contain everything being played ─────────────
+    //
+    // One meaning, one treatment. This used to share the note colour and to
+    // shade partial fits as well, so a single chord washed most of the circle
+    // in the same blue that meant "this note is sounding" — two different
+    // questions answered in one colour, which is what made it unreadable.
+    //
+    // Now: a key that contains ALL of it gets a neutral warm wash and a
+    // boundary; a key that does not gets nothing. Nothing is a real answer.
+    let full: Vec<bool> = FIFTHS
+        .iter()
+        .map(|&pc| input.pcs != 0 && input.pcs & !major_scale(pc) == 0)
+        .collect();
 
-        // The sector wedge, drawn as a filled polygon between two radii. egui
-        // has no arc fill, so the arc is walked in small steps; eight is under
-        // half a degree of error at this radius and costs nothing.
-        if fit > 0.0 {
-            let mut poly = Vec::with_capacity(18);
-            let a0 = a - step * 0.5;
-            for k in 0..=8 {
-                let t = a0 + step * k as f32 / 8.0;
-                poly.push(c + Vec2::new(t.cos(), t.sin()) * r_maj);
-            }
-            for k in (0..=8).rev() {
-                let t = a0 + step * k as f32 / 8.0;
-                poly.push(c + Vec2::new(t.cos(), t.sin()) * r_min);
-            }
-            // Only a full fit gets real colour. A partial fit is a wash, or
-            // every sector lights for every chord and the diagram says nothing.
-            let alpha = if fit >= 1.0 { 190 } else { (fit * 55.0) as u8 };
-            painter.add(egui::Shape::convex_polygon(
-                poly,
-                p.lit.gamma_multiply(alpha as f32 / 255.0),
-                Stroke::NONE,
-            ));
+    for (i, &fits) in full.iter().enumerate() {
+        if !fits {
+            continue;
         }
+        let a0 = circle_angle(i) - step * 0.5;
+        let mut poly = Vec::with_capacity(18);
+        for k in 0..=8 {
+            let t = a0 + step * k as f32 / 8.0;
+            poly.push(c + Vec2::new(t.cos(), t.sin()) * r_sig);
+        }
+        for k in (0..=8).rev() {
+            let t = a0 + step * k as f32 / 8.0;
+            poly.push(c + Vec2::new(t.cos(), t.sin()) * r_hub);
+        }
+        painter.add(egui::Shape::convex_polygon(
+            poly,
+            p.ink.gamma_multiply(0.10),
+            Stroke::NONE,
+        ));
+    }
 
-        // Spokes.
-        let a0 = a - step * 0.5;
+    // ── the spokes and rings ───────────────────────────────────────────────
+    for i in 0..12usize {
+        let a0 = circle_angle(i) - step * 0.5;
         painter.line_segment(
             [
-                c + Vec2::new(a0.cos(), a0.sin()) * r_min,
+                c + Vec2::new(a0.cos(), a0.sin()) * r_hub,
                 c + Vec2::new(a0.cos(), a0.sin()) * r_sig,
             ],
             Stroke::new(1.0_f32, p.line),
         );
+    }
+    for ring in [r_sig, r_maj, r_min, r_hub] {
+        painter.circle_stroke(c, ring, Stroke::new(1.0_f32, p.line));
+    }
 
-        let full = fit >= 1.0 && input.pcs != 0;
-        let txt = if full { p.lit_text } else { p.ink };
+    // ── the names ──────────────────────────────────────────────────────────
+    for (i, &pc) in FIFTHS.iter().enumerate() {
+        let a = circle_angle(i);
+        let dir = Vec2::new(a.cos(), a.sin());
+        let sounding = has(input.pcs, pc);
 
-        // Major key, outer.
+        // The major name, on a filled disc when THAT PITCH CLASS is sounding.
+        // The disc is the same colour the piano paints a held key, which is
+        // the whole point: the two displays agree by construction.
+        let at = c + dir * ((r_maj + r_min) * 0.5);
+        let name_size = r * 0.135;
+        if sounding {
+            painter.circle_filled(at, name_size * 0.95, p.lit);
+            // The root is a sounding note WITH a ring, not a different fill —
+            // so it reads as "and this one is the root" rather than as a
+            // fourth unrelated colour.
+            if input.root == Some(pc) {
+                painter.circle_stroke(at, name_size * 0.95, Stroke::new(2.5_f32, p.root));
+            }
+        }
         painter.text(
-            c + dir * ((r_maj + r_min) * 0.5),
+            at,
             Align2::CENTER_CENTER,
             pc_name(pc, s.prefer_flats),
-            font(r * 0.135),
-            txt,
+            font(name_size),
+            if sounding { p.lit_text } else { p.ink },
         );
 
-        // Relative minor, inner — a sixth above, which is the same key
-        // signature and the reason it is drawn on the same spoke.
+        // The relative minor, lower case, which is how a circle of fifths has
+        // always been labelled and which also fits the inner wedge.
         //
-        // Lower case rather than a trailing "m", which is how a circle of
-        // fifths has always been labelled, and which also happens to be one
-        // character narrower. Three characters of Courier does not fit in the
-        // inner wedge: "Gbm" and "Dbm" crossed the ring they sit in.
+        // A LABEL, not a second set of lights. Every pitch class appears twice
+        // on this circle — the minor at position i is the major at position
+        // i+3 — so lighting both rings put eight discs on the screen for a
+        // four-note chord and said nothing the outer ring had not already
+        // said. The wedge behind it still shades when that key fits.
         let rel = (pc + 9) % 12;
         painter.text(
             c + dir * ((r_min + r_hub) * 0.5),
             Align2::CENTER_CENTER,
             &pc_name(rel, s.prefer_flats).to_lowercase(),
-            font_light(r * 0.105),
-            p.ink.gamma_multiply(0.75),
+            font_light(r * 0.10),
+            p.ink.gamma_multiply(0.7),
         );
 
-        // Key signature, outermost.
+        // Key signature, outermost. ASCII accidentals: neither U+266F nor
+        // U+266D is in any bundled face, and both drew as tofu boxes.
         let (sharps, flats) = signature(i);
-        // ASCII accidentals, not U+266F/U+266D. Neither music glyph is in the
-        // bundled faces or in the fallback chain, so both drew as tofu boxes;
-        // and the app spells note names "Db" and "A#" everywhere else anyway,
-        // so this is the consistent choice as well as the safe one.
         let sig = match (sharps, flats) {
             (0, 0) => String::new(),
             (n, 0) => format!("{n}#"),
@@ -442,26 +525,9 @@ fn draw_circle(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Set
                 p.faint,
             );
         }
-
-        // A pip on the rim for each sounding pitch class. This is the part
-        // that shows the SHAPE of a voicing: a triad is three neighbours plus
-        // one at four o'clock from them, a tritone is a diameter.
-        if has(input.pcs, pc) {
-            let is_root = input.root == Some(pc);
-            painter.circle_filled(
-                c + dir * (r_maj + (r_sig - r_maj) * 0.12),
-                r * 0.045,
-                if is_root { p.root } else { p.lit },
-            );
-        }
     }
 
-    for ring in [r_sig, r_maj, r_min, r_hub] {
-        painter.circle_stroke(c, ring, Stroke::new(1.0_f32, p.line));
-    }
-
-    // The hub says what the picture is of, so the diagram is readable without
-    // the chord strip and stays readable when the chord strip is turned off.
+    // ── the hub: what the picture is of ────────────────────────────────────
     if input.pcs != 0 {
         let tonic = input.tonic();
         painter.text(
@@ -475,12 +541,9 @@ fn draw_circle(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Set
             font(r * 0.19),
             p.ink,
         );
-        // How many keys contain everything being played. Zero is the useful
-        // reading, not an error: it means the voicing is chromatic.
-        let n = FIFTHS
-            .iter()
-            .filter(|&&pc| input.pcs & !major_scale(pc) == 0)
-            .count();
+        // Zero is the useful reading, not an error: it means what you are
+        // playing belongs to no single major key.
+        let n = full.iter().filter(|f| **f).count();
         painter.text(
             Pos2::new(c.x, c.y + r_hub * 0.38),
             Align2::CENTER_CENTER,
@@ -493,6 +556,30 @@ fn draw_circle(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Set
             p.faint,
         );
     }
+}
+
+/// Which pitch class the point is on, if any. The inverse of the name ring
+/// above, and kept next to it so the two cannot drift.
+fn circle_hit(rect: Rect, pos: Pos2) -> Option<u8> {
+    let c = rect.center();
+    let r = rect.width().min(rect.height()) * 0.5 - 2.0;
+    if r < 20.0 {
+        return None;
+    }
+    let v = pos - c;
+    let d = v.length();
+    // The major ring only. The signature ring, the hub and the relative-minor
+    // ring are all labels rather than controls — and since every pitch class
+    // already appears on the major ring, nothing is unreachable.
+    if !(r * 0.56..=r * 0.80).contains(&d) {
+        return None;
+    }
+    let step = std::f32::consts::TAU / 12.0;
+    // Undo `circle_angle`: subtract the -90 degree offset and round to the
+    // nearest twelfth.
+    let a = v.y.atan2(v.x) + std::f32::consts::FRAC_PI_2;
+    let i = (a / step).round().rem_euclid(12.0) as usize;
+    Some(FIFTHS[i])
 }
 
 // ── Tonnetz ────────────────────────────────────────────────────────────────
@@ -569,19 +656,32 @@ impl Lattice {
         )
     }
 
-    /// Whether a node at (u, v) is drawn. Whole nodes only: one clipped in
-    /// half by the pane edge is a note name that is not a note name — the
-    /// first render of this showed an "Eb" cut down to "Kb".
+    /// Whether a node at (u, v) is drawn.
+    ///
+    /// Two conditions, and the second is easy to forget. It has to be INSIDE
+    /// THE GRID — the triangle loop walks `-1..cols` so it can reach the cells
+    /// on the left edge, and a corner outside `0..cols` is a node that is
+    /// never drawn however well it fits. And it has to fit WHOLE: a node
+    /// clipped in half by the pane edge is a note name that is not a note
+    /// name, which is how an "Eb" once appeared as "Kb".
     fn shows(&self, rect: Rect, u: i32, v: i32) -> bool {
-        rect.contains_rect(Rect::from_center_size(
-            self.at(u, v),
-            Vec2::splat(self.node_r * 2.0),
-        ))
+        (0..self.cols).contains(&u)
+            && (0..self.rows).contains(&v)
+            && rect.contains_rect(Rect::from_center_size(
+                self.at(u, v),
+                Vec2::splat(self.node_r * 2.0),
+            ))
     }
 }
 
 fn draw_tonnetz(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Settings) {
-    let rect = title(painter, rect, "TONNETZ", p);
+    let rect = title(
+        painter,
+        rect,
+        "TONNETZ",
+        "solid triangle = major    outlined = minor",
+        p,
+    );
     // Everything below stays inside the pane. The lattice is unbounded by
     // nature, so without this it happily draws over the neighbouring diagram.
     let painter = &painter.with_clip_rect(rect);
@@ -590,7 +690,15 @@ fn draw_tonnetz(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Se
         return;
     };
     let (rows, cols, node_r) = (l.rows, l.cols, l.node_r);
-    let origin = input.tonic();
+    // The lattice is ANCHORED at C rather than re-centred on the tonic.
+    //
+    // Re-centring looked clever and is wrong once the diagram is clickable:
+    // placing a note changes the tonic, which slides the whole lattice, so the
+    // node you just clicked is no longer under your finger. Nothing is lost by
+    // anchoring — every pitch class appears somewhere on the grid, which
+    // `the_tonnetz_still_has_a_lattice_left` asserts — and the tonic is marked
+    // by the same ring it gets on the other two diagrams.
+    let origin = 0u8;
     let at = |u: i32, v: i32| l.at(u, v);
 
     // Triads first, so the nodes sit on top of their triangles.
@@ -601,20 +709,43 @@ fn draw_tonnetz(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Se
     // diagram is for, and it needs no table.
     for v in 0..rows {
         for u in -1..cols {
-            for (corners, fill) in [
-                ([(u, v), (u + 1, v), (u, v + 1)], p.lit.gamma_multiply(0.55)),
-                (
-                    [(u + 1, v), (u, v + 1), (u + 1, v + 1)],
-                    p.root.gamma_multiply(0.45),
-                ),
+            // Major and minor differ by TREATMENT, not by hue: solid versus
+            // outlined, both in the note colour. They used to be blue and
+            // orange, and orange was also the root marker — so a lit minor
+            // triad and a root note said the same thing in the same colour
+            // while meaning different things.
+            for (corners, minor) in [
+                ([(u, v), (u + 1, v), (u, v + 1)], false),
+                ([(u + 1, v), (u, v + 1), (u + 1, v + 1)], true),
             ] {
                 let mask = corners
                     .iter()
                     .fold(0u16, |m, &(u, v)| m | 1 << tonnetz_pc(u, v, origin));
-                if input.contains(mask) {
+                if !input.contains(mask) {
+                    continue;
+                }
+                // Only between nodes that are actually drawn. The lattice is
+                // clipped to the pane, so a triangle reaching past the last
+                // visible column used to be cut off mid-edge and read as an
+                // unfinished shape rather than a chord.
+                if !corners.iter().all(|&(u, v)| l.shows(rect, u, v)) {
+                    continue;
+                }
+                let pts: Vec<Pos2> = corners.iter().map(|&(u, v)| at(u, v)).collect();
+                if minor {
                     painter.add(egui::Shape::convex_polygon(
-                        corners.iter().map(|&(u, v)| at(u, v)).collect(),
-                        fill,
+                        pts.clone(),
+                        p.lit.gamma_multiply(0.16),
+                        Stroke::NONE,
+                    ));
+                    for k in 0..3 {
+                        painter
+                            .line_segment([pts[k], pts[(k + 1) % 3]], Stroke::new(2.0_f32, p.lit));
+                    }
+                } else {
+                    painter.add(egui::Shape::convex_polygon(
+                        pts,
+                        p.lit.gamma_multiply(0.50),
                         Stroke::NONE,
                     ));
                 }
@@ -641,20 +772,18 @@ fn draw_tonnetz(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Se
             let c = at(u, v);
             let pc = tonnetz_pc(u, v, origin);
             let lit = has(input.pcs, pc);
-            let is_root = input.root == Some(pc) || (input.root.is_none() && lit && pc == origin);
-            let fill = if is_root {
-                p.root
-            } else if lit {
-                p.lit
-            } else {
-                p.bg
-            };
+            let fill = if lit { p.lit } else { p.bg };
             painter.circle(
                 c,
                 node_r,
                 fill,
                 Stroke::new(1.0_f32, if lit { fill } else { p.faint }),
             );
+            // The root, ringed rather than recoloured — the same mark it gets
+            // on the circle of fifths, so one glance learns it once.
+            if input.root == Some(pc) || (input.root.is_none() && lit && pc == origin) {
+                painter.circle_stroke(c, node_r, Stroke::new(2.5_f32, p.root));
+            }
             painter.text(
                 c,
                 Align2::CENTER_CENTER,
@@ -666,7 +795,40 @@ fn draw_tonnetz(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Se
     }
 }
 
+/// The lattice node under `pos`, if any.
+fn tonnetz_hit(rect: Rect, pos: Pos2) -> Option<u8> {
+    let l = Lattice::fit(rect)?;
+    for v in 0..l.rows {
+        for u in 0..l.cols {
+            if l.shows(rect, u, v) && (l.at(u, v) - pos).length() <= l.node_r {
+                return Some(tonnetz_pc(u, v, 0));
+            }
+        }
+    }
+    None
+}
+
 // ── harmonic triangles ─────────────────────────────────────────────────────
+
+/// Vertex `k` of the upward or downward triangle.
+///
+/// One definition, used by the drawing and by the hit test, because a click
+/// that lands next to the circle it looks like it is on is the failure this
+/// shape is most prone to.
+fn hex_vertex(c: Pos2, r: f32, k: usize, down: bool) -> Pos2 {
+    let base = if down {
+        std::f32::consts::FRAC_PI_2
+    } else {
+        -std::f32::consts::FRAC_PI_2
+    };
+    let a = base + k as f32 * std::f32::consts::TAU / 3.0;
+    c + Vec2::new(a.cos(), a.sin()) * r
+}
+
+/// Vertex k of the upward triangle is I at the apex, then V and IV going
+/// clockwise, so the dominant is on the right where it is usually drawn.
+const HEX_UP_ORDER: [usize; 3] = [0, 2, 1];
+const HEX_DOWN_ORDER: [usize; 3] = [0, 1, 2];
 
 /// Distance from the centre of the harmonic-triangle figure to a vertex.
 ///
@@ -678,7 +840,13 @@ fn hexagram_radius(rect: Rect) -> f32 {
 }
 
 fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Settings) {
-    let rect = title(painter, rect, "HARMONIC TRIANGLES", p);
+    let rect = title(
+        painter,
+        rect,
+        "HARMONIC TRIANGLES",
+        "filled = you are playing that chord",
+        p,
+    );
     let c = rect.center();
     let r = hexagram_radius(rect);
     if r < 20.0 {
@@ -696,19 +864,10 @@ fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &
     // The upward triangle carries the major chords, the downward one the
     // minor. Sharing a centre makes them one shape rather than two diagrams,
     // which is the point: sliding it is a modulation.
-    let up = |k: usize| {
-        let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::TAU / 3.0;
-        c + Vec2::new(a.cos(), a.sin()) * r
-    };
-    let down = |k: usize| {
-        let a = std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::TAU / 3.0;
-        c + Vec2::new(a.cos(), a.sin()) * r
-    };
-
-    // Vertex k of the upward triangle is I at the apex, then V and IV going
-    // clockwise, so the dominant is on the right where it is usually drawn.
-    let up_order = [0usize, 2, 1];
-    let down_order = [0usize, 1, 2];
+    let up = |k: usize| hex_vertex(c, r, k, false);
+    let down = |k: usize| hex_vertex(c, r, k, true);
+    let up_order = HEX_UP_ORDER;
+    let down_order = HEX_DOWN_ORDER;
 
     let tri = |f: &dyn Fn(usize) -> Pos2| [f(0), f(1), f(2)];
 
@@ -737,6 +896,13 @@ fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &
                 if lit { p.lit } else { p.faint },
             ),
         );
+        // The tonic, ringed, exactly as on the other two diagrams — but only
+        // on the triangle whose QUALITY matches. These vertices are CHORDS,
+        // so ringing both C and Cm said "the root is C" twice, and the unlit
+        // one read as important-but-silent.
+        if input.root == Some(root) && input.minor == minor {
+            painter.circle_stroke(pos, node_r, Stroke::new(2.5_f32, p.root));
+        }
         painter.text(
             Pos2::new(pos.x, pos.y - node_r * 0.22),
             Align2::CENTER_CENTER,
@@ -772,6 +938,38 @@ fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &
         font(r * 0.24),
         p.ink.gamma_multiply(0.55),
     );
+}
+
+/// The chord vertex under `pos`, if any.
+///
+/// Returns a whole triad rather than a note: these vertices ARE chords, and
+/// placing one note of a chord you pointed at would be a strange thing for a
+/// diagram of chords to do.
+fn triangles_hit(rect: Rect, tonic: u8, pos: Pos2) -> Option<Hit> {
+    let c = rect.center();
+    let r = hexagram_radius(rect);
+    if r < 20.0 {
+        return None;
+    }
+    let node_r = r * 0.30;
+    let roots = [tonic, (tonic + 5) % 12, (tonic + 7) % 12];
+    for (k, &oi) in HEX_UP_ORDER.iter().enumerate() {
+        if (hex_vertex(c, r, k, false) - pos).length() <= node_r {
+            return Some(Hit::Triad {
+                root: roots[oi],
+                minor: false,
+            });
+        }
+    }
+    for (k, &oi) in HEX_DOWN_ORDER.iter().enumerate() {
+        if (hex_vertex(c, r, k, true) - pos).length() <= node_r {
+            return Some(Hit::Triad {
+                root: roots[oi],
+                minor: true,
+            });
+        }
+    }
+    None
 }
 
 /// A one-pixel seam over the top of the band, matching the fretboard's.
@@ -1139,6 +1337,279 @@ mod tests {
                         .unwrap_or(false),
                     "{name} has no glyph for {c:?} (U+{:04X})",
                     c as u32
+                );
+            }
+        }
+    }
+
+    /// Every Tonnetz cell the band can actually produce.
+    fn real_tonnetz_cells() -> Vec<(Rect, Rect)> {
+        let mut out = Vec::new();
+        for pct in [50i64, 75, 100, 125, 150, 175, 200] {
+            let w = (1300.0 * pct as f64 / 100.0).trunc() as f32;
+            for n in 1..=3usize {
+                let views = Views {
+                    circle: n >= 2,
+                    tonnetz: true,
+                    triangles: n >= 3,
+                };
+                let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w, views)));
+                for (v, cell) in cells(band, views) {
+                    if v == View::Tonnetz {
+                        out.push((band, cell));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// No lit triangle may have a corner on a node that is not drawn.
+    ///
+    /// The triangle loop walks `-1..cols` so it can reach the cells along the
+    /// left edge, which means it can also name corners one column past the
+    /// right edge. Those produced a shape hanging off the grid with a vertex
+    /// on nothing — it reads as a rendering fault, not as a chord.
+    #[test]
+    fn no_lit_triangle_hangs_off_the_grid() {
+        // Cm7, which is what showed the bug, plus a spread of others.
+        for pcs in [
+            0b0000_1000_1001_u16 | (1 << 3) | (1 << 10), // C Eb G Bb
+            0b0000_1001_0001,                            // C E G
+            0xFFF,
+            0b1000_0100_0001,
+        ] {
+            let input = Input {
+                pcs,
+                bass: Some(0),
+                root: Some(0),
+                minor: false,
+            };
+            // THE REAL PANES, all three combinations, because a cell in the
+            // middle of three is not the same rectangle as a band of one and
+            // this bug only showed in the three-pane case.
+            for (band, cell) in real_tonnetz_cells() {
+                let w = band.width();
+                let body = body_rect(cell.shrink(8.0));
+                let Some(l) = Lattice::fit(body) else {
+                    continue;
+                };
+                for v in 0..l.rows {
+                    for u in -1..l.cols {
+                        for corners in [
+                            [(u, v), (u + 1, v), (u, v + 1)],
+                            [(u + 1, v), (u, v + 1), (u + 1, v + 1)],
+                        ] {
+                            let mask = corners
+                                .iter()
+                                .fold(0u16, |m, &(u, v)| m | 1 << tonnetz_pc(u, v, 0));
+                            if !input.contains(mask) {
+                                continue;
+                            }
+                            let drawn = corners.iter().all(|&(u, v)| l.shows(body, u, v));
+                            if !drawn {
+                                // This is the case the renderer must skip. If
+                                // it did not, the assertion below would be the
+                                // one to change — it is asserting the SHAPE of
+                                // the guard, so it has to name it.
+                                continue;
+                            }
+                            for &(cu, cv) in &corners {
+                                assert!(
+                                    l.shows(body, cu, cv),
+                                    "a lit triangle at ({u},{v}) in a {w}pt band \
+                                     has a corner at ({cu},{cv}) that is never drawn"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A click on a Tonnetz node must return the pitch class written on it.
+    ///
+    /// Hit tests drift away from the pictures they belong to, and the drift is
+    /// invisible: the diagram still looks right and the clicks land on the
+    /// wrong thing. So this walks every node the lattice actually shows and
+    /// asks the hit test what is at its exact centre.
+    #[test]
+    fn a_click_on_a_tonnetz_node_finds_that_note() {
+        let views = Views {
+            tonnetz: true,
+            ..Default::default()
+        };
+        for pane in real_panes() {
+            let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(pane.width() + 16.0, 300.0));
+            let cell = cells(band, views)[0].1;
+            let body = body_rect(cell.shrink(8.0));
+            let Some(l) = Lattice::fit(body) else {
+                continue;
+            };
+            let mut checked = 0;
+            for v in 0..l.rows {
+                for u in 0..l.cols {
+                    if !l.shows(body, u, v) {
+                        continue;
+                    }
+                    let c = l.at(u, v);
+                    assert_eq!(
+                        hit_test(band, views, Input::default(), c),
+                        Some(Hit::Pc(tonnetz_pc(u, v, 0))),
+                        "clicking the centre of node ({u},{v}) missed it"
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(checked >= 20, "only {checked} nodes were reachable at all");
+        }
+    }
+
+    /// The same for the circle: the name you click is the note you get, on
+    /// both rings, all the way round.
+    #[test]
+    fn a_click_on_a_circle_name_finds_that_note() {
+        let views = Views {
+            circle: true,
+            ..Default::default()
+        };
+        let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(440.0, 300.0));
+        let body = body_rect(cells(band, views)[0].1.shrink(8.0));
+        let c = body.center();
+        let r = body.width().min(body.height()) * 0.5 - 2.0;
+        for (i, &pc) in FIFTHS.iter().enumerate() {
+            let a = circle_angle(i);
+            let dir = Vec2::new(a.cos(), a.sin());
+            // Where `draw` puts the major name, and the relative minor.
+            let major_at = c + dir * ((r * 0.80 + r * 0.56) * 0.5);
+            let minor_at = c + dir * ((r * 0.56 + r * 0.34) * 0.5);
+            assert_eq!(
+                hit_test(band, views, Input::default(), major_at),
+                Some(Hit::Pc(pc)),
+                "the major name at position {i} is not clickable"
+            );
+            // The relative-minor ring is a label. Every pitch class is
+            // already reachable on the major ring, so nothing is lost.
+            assert_eq!(
+                hit_test(band, views, Input::default(), minor_at),
+                None,
+                "the relative-minor label at position {i} acts as a control"
+            );
+        }
+        // The hub and the signature ring are labels, not controls.
+        assert_eq!(hit_test(band, views, Input::default(), c), None);
+    }
+
+    /// Each vertex of the hexagram gives back the chord printed on it, in
+    /// every key — and the two triangles must not answer for each other.
+    #[test]
+    fn a_click_on_a_chord_vertex_gives_that_chord() {
+        let views = Views {
+            triangles: true,
+            ..Default::default()
+        };
+        let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(440.0, 300.0));
+        let body = body_rect(cells(band, views)[0].1.shrink(8.0));
+        let c = body.center();
+        let r = hexagram_radius(body);
+        for tonic in 0..12u8 {
+            let input = Input {
+                pcs: 1 << tonic,
+                bass: Some(tonic),
+                root: Some(tonic),
+                minor: false,
+            };
+            let roots = [tonic, (tonic + 5) % 12, (tonic + 7) % 12];
+            for (k, &oi) in HEX_UP_ORDER.iter().enumerate() {
+                assert_eq!(
+                    hit_test(band, views, input, hex_vertex(c, r, k, false)),
+                    Some(Hit::Triad {
+                        root: roots[oi],
+                        minor: false
+                    }),
+                    "upward vertex {k} in key {tonic}"
+                );
+            }
+            for (k, &oi) in HEX_DOWN_ORDER.iter().enumerate() {
+                assert_eq!(
+                    hit_test(band, views, input, hex_vertex(c, r, k, true)),
+                    Some(Hit::Triad {
+                        root: roots[oi],
+                        minor: true
+                    }),
+                    "downward vertex {k} in key {tonic}"
+                );
+            }
+        }
+    }
+
+    /// A click belongs to the pane it landed in, and to no other.
+    ///
+    /// Three diagrams side by side share one rectangle, and each one's
+    /// geometry is happy to answer for a point anywhere on the plane — the
+    /// circle's rings and the lattice both extend past their cell by
+    /// arithmetic if not by drawing. `hit_test` picks the cell FIRST for
+    /// exactly that reason.
+    #[test]
+    fn a_click_belongs_to_the_pane_it_landed_in() {
+        let all = Views {
+            circle: true,
+            tonnetz: true,
+            triangles: true,
+        };
+        let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 300.0));
+        let panes = cells(band, all);
+        let triangles_cell = panes
+            .iter()
+            .find(|(v, _)| *v == View::Triangles)
+            .map(|(_, c)| *c)
+            .expect("the triangles pane");
+
+        // Sweep the whole band. Only the triangles produce chords, and only
+        // from inside their own cell.
+        let mut triads = 0;
+        let mut hits = 0;
+        for x in (0..1300).step_by(7) {
+            for y in (0..300).step_by(7) {
+                let p = Pos2::new(x as f32, y as f32);
+                match hit_test(band, all, Input::default(), p) {
+                    Some(Hit::Triad { .. }) => {
+                        assert!(
+                            triangles_cell.contains(p),
+                            "a chord came back from {p:?}, outside the triangles pane"
+                        );
+                        triads += 1;
+                        hits += 1;
+                    }
+                    Some(Hit::Pc(_)) => {
+                        assert!(
+                            !triangles_cell.contains(p),
+                            "a bare note came back from inside the triangles pane at {p:?}"
+                        );
+                        hits += 1;
+                    }
+                    None => {}
+                }
+            }
+        }
+        assert!(triads > 0, "no chord vertex was reachable anywhere");
+        assert!(
+            hits > 100,
+            "only {hits} points in the whole band are clickable"
+        );
+
+        // Nothing selected, nothing to click.
+        for x in (0..1300).step_by(53) {
+            for y in (0..300).step_by(29) {
+                assert_eq!(
+                    hit_test(
+                        band,
+                        Views::default(),
+                        Input::default(),
+                        Pos2::new(x as f32, y as f32)
+                    ),
+                    None
                 );
             }
         }

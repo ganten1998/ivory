@@ -60,6 +60,8 @@ pub enum MenuAction {
     /// D-UI-17: turn one theory diagram on or off. Independent, because any
     /// combination of the three may be showing at once.
     ToggleTheoryView(crate::theory_panel::View),
+    /// D-UI-17: whether the theory band follows live playing or stays put.
+    ToggleTheoryFollowsMidi,
     /// D-UI-16: pop the guitar view into its own window, and put it back.
     DetachFretboard,
     AttachFretboard,
@@ -97,6 +99,8 @@ pub struct MenuView {
     pub fretboard_detached: bool,
     /// D-UI-17: which theory diagrams are showing.
     pub theory: crate::theory_panel::Views,
+    /// D-UI-17: whether the theory band follows live playing.
+    pub theory_follows_midi: bool,
     /// What the host allows. Rows whose action needs a window, a device list,
     /// or control of its own size are not shown where they cannot work — an
     /// inert row is worse than an absent one, because the user cannot tell
@@ -377,6 +381,17 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                     MenuAction::ToggleTheoryView(*v),
                 )
             })
+            // Whether the band tracks your playing sits with the diagrams
+            // rather than in the keytoggle block, because it is a property of
+            // this display and of nothing else.
+            .chain(std::iter::once((
+                if view.theory_follows_midi {
+                    "Stop Following MIDI".to_owned()
+                } else {
+                    "Follow MIDI".to_owned()
+                },
+                MenuAction::ToggleTheoryFollowsMidi,
+            )))
             .collect(),
     ));
     // D-UI-15: the guitar view. Its own block, because it is a second
@@ -796,6 +811,7 @@ mod tests {
             wood: "rosewood",
             fretboard_detached: false,
             theory: crate::theory_panel::Views::default(),
+            theory_follows_midi: false,
             caps: Caps::DESKTOP,
         }
     }
@@ -1125,15 +1141,28 @@ mod tests {
             vec![
                 "Show Circle of Fifths",
                 "Show Tonnetz",
-                "Show Harmonic Triangles"
+                "Show Harmonic Triangles",
+                "Follow MIDI",
             ]
         );
+        let mut want: Vec<MenuAction> = View::ALL
+            .iter()
+            .map(|x| MenuAction::ToggleTheoryView(*x))
+            .collect();
+        want.push(MenuAction::ToggleTheoryFollowsMidi);
+        assert_eq!(sub(v, "Theory").2, want);
+
+        // The follow row renames itself like every other toggle here, and it
+        // is OFF by default: the band is something to look at while playing,
+        // and one that redrew on every note could not be read while playing.
+        assert!(!view().theory_follows_midi);
+        let following = MenuView {
+            theory_follows_midi: true,
+            ..view()
+        };
         assert_eq!(
-            sub(v, "Theory").2,
-            View::ALL
-                .iter()
-                .map(|x| MenuAction::ToggleTheoryView(*x))
-                .collect::<Vec<_>>()
+            sub(following, "Theory").1.last().map(String::as_str),
+            Some("Stop Following MIDI")
         );
 
         v.theory = Views {
@@ -1142,8 +1171,8 @@ mod tests {
             triangles: true,
         };
         assert_eq!(
-            sub(v, "Theory").1,
-            vec![
+            sub(v, "Theory").1[..3],
+            [
                 "Hide Circle of Fifths",
                 "Show Tonnetz",
                 "Hide Harmonic Triangles"

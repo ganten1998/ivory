@@ -463,12 +463,27 @@ impl IvoryApp {
     /// narrow enough to be safe, and it is the only way to know that a voicing
     /// with a C in the bass is being HEARD as an inversion of something else.
     fn theory_input(&self, display: &HashSet<u8>) -> theory_panel::Input {
-        let pcs = display.iter().fold(0u16, |m, n| m | 1 << (n % 12));
-        let bass = display.iter().min().map(|n| n % 12);
+        // The band shows what you PUT there, not what you are playing, unless
+        // you ask otherwise. It is a reference to look at while your hands are
+        // busy, and one that redrew on every note would be unreadable at
+        // exactly the moment it is wanted.
+        let notes: &HashSet<u8> = if self.settings.theory_follow_midi {
+            display
+        } else {
+            &self.manual_notes
+        };
+        let pcs = notes.iter().fold(0u16, |m, n| m | 1 << (n % 12));
+        let bass = notes.iter().min().map(|n| n % 12);
+        // The detector reads the notes on SCREEN, so its label describes this
+        // set only when the two agree. When they do not — pinned notes while
+        // something else is being played — the root is dropped rather than
+        // borrowed, and the diagrams fall back to the bass. A tonic marker
+        // pointing at a chord you are not looking at is worse than none.
         let (root, minor) = self
             .current_chord
             .as_deref()
             .and_then(theory_panel::parse_label)
+            .filter(|(r, _)| pcs & (1 << (r % 12)) != 0)
             .map_or((None, false), |(r, m)| (Some(r), m));
         theory_panel::Input {
             pcs,
@@ -476,6 +491,44 @@ impl IvoryApp {
             root,
             minor,
         }
+    }
+
+    /// Place or remove the pitch classes a click on the theory band asked for.
+    ///
+    /// Keytoggle's rules, applied to a different picture: clicking something
+    /// already lit removes it, clicking something dark adds it. A chord vertex
+    /// places the whole triad, because that vertex IS a chord and placing one
+    /// note of it would be a strange thing for a diagram of chords to do.
+    ///
+    /// Pitch classes have no octave, so they are placed in the octave above
+    /// middle C — the one the piano puts in the middle of the window.
+    fn toggle_theory_hit(&mut self, hit: theory_panel::Hit) {
+        let pcs: Vec<u8> = match hit {
+            theory_panel::Hit::Pc(pc) => vec![pc],
+            theory_panel::Hit::Triad { root, minor } => {
+                let m = if minor {
+                    theory_panel::minor_triad(root)
+                } else {
+                    theory_panel::major_triad(root)
+                };
+                (0..12u8).filter(|pc| m & (1 << pc) != 0).collect()
+            }
+        };
+        // A triad is placed whole or cleared whole: if any of it is missing,
+        // add the rest; only when all of it is already there does it come off.
+        let all_present = pcs
+            .iter()
+            .all(|pc| self.manual_notes.iter().any(|n| n % 12 == *pc));
+        for pc in pcs {
+            self.manual_notes.retain(|n| n % 12 != pc);
+            self.manual_positions.retain(|n, _| n % 12 != pc);
+            if !all_present {
+                self.manual_notes.insert(60 + pc);
+            }
+        }
+        self.sync_pins();
+        self.detection_tick(true);
+        self.voicing_tick(true);
     }
 
     // ── Chord detection (spec §12) ─────────────────────────────────────────
@@ -515,6 +568,7 @@ impl IvoryApp {
             heart_on: self.settings.show_heart,
             fretboard_on: self.settings.show_fretboard,
             theory: self.settings.theory_views(),
+            theory_follows_midi: self.settings.theory_follow_midi,
             wood: self.settings.fretboard_wood().key(),
             fretboard_detached: self.settings.fretboard_detached,
             caps: self.caps,
@@ -563,6 +617,7 @@ impl IvoryApp {
         piano_rect: Rect,
         chord_rect: Option<Rect>,
         fret_rect: Option<Rect>,
+        theory_rect: Option<Rect>,
     ) {
         let resp = ui.interact(
             ui.max_rect(),
@@ -616,6 +671,25 @@ impl IvoryApp {
                 }
                 // Keytoggle hit-test/toggle first (spec §4.5), then StartDrag
                 // (must be issued directly from the press handler).
+                // The theory band is a third instrument. Clicking a name on
+                // the circle or a node on the lattice places that note;
+                // clicking a chord vertex places the whole triad. Handled
+                // before the piano and the neck because it is the only one
+                // that speaks in pitch classes rather than in notes.
+                if self.settings.keytoggle_enabled {
+                    if let Some(hit) = theory_rect.filter(|r| r.contains(pos)).and_then(|r| {
+                        let display = self.display_notes();
+                        theory_panel::hit_test(
+                            r,
+                            self.settings.theory_views(),
+                            self.theory_input(&display),
+                            pos,
+                        )
+                    }) {
+                        self.toggle_theory_hit(hit);
+                        return;
+                    }
+                }
                 if self.settings.keytoggle_enabled {
                     // Either instrument can put a note in, and they toggle the
                     // same set — so a shape entered on the neck lights up on the
@@ -966,6 +1040,10 @@ impl IvoryApp {
                 let on = !self.detector.learning_mode();
                 self.detector.set_learning_mode(on);
                 self.detection_tick(true); // readings change immediately
+            }
+            MenuAction::ToggleTheoryFollowsMidi => {
+                self.settings.theory_follow_midi = !self.settings.theory_follow_midi;
+                self.save_settings();
             }
             MenuAction::ToggleTheoryView(v) => {
                 let on = !v.is_on(self.settings.theory_views());
@@ -1480,6 +1558,16 @@ impl IvoryApp {
         crate::shell::viewport_ui(ctx, |ui| self.paint(ui));
     }
 
+    /// One frame into a `Ui` that somebody else made.
+    ///
+    /// `nih_plug_egui`'s `ResizableWindow` opens its OWN `CentralPanel` so it
+    /// can put a drag corner in it, and two central panels under the same id
+    /// is the exact silent-garbage failure `shell::surface` exists to avoid.
+    /// So the plugin uses this and skips the bridge.
+    pub fn paint_into(&mut self, ui: &mut egui::Ui) {
+        self.paint(ui);
+    }
+
     /// The colour behind everything, for hosts that clear the surface
     /// themselves.
     pub const CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
@@ -1603,7 +1691,10 @@ impl IvoryApp {
         let bands = if self.caps.window_sizing {
             self.layout_sizes()
         } else {
-            fit_bands(&self.settings, ctx.content_rect().size())
+            // The PANE, not the context: inside a host's resizable wrapper the
+            // two differ by its frame, and laying out to the context would put
+            // the bottom band under the resize corner.
+            fit_bands(&self.settings, ui.max_rect().size())
         };
         let Bands {
             w,
@@ -1641,6 +1732,11 @@ impl IvoryApp {
         // what keeps the picture in the middle of an editor the user has
         // resized to something else.
         let pane = ui.max_rect();
+        // The app owns every pixel it is given. On the desktop the bands cover
+        // the window exactly and this changes nothing; in a plugin the layout
+        // is centred in whatever the host opened, and without this the gap
+        // shows egui's default panel fill rather than Tangent's background.
+        ui.painter().rect_filled(pane, 0.0, egui::Color32::BLACK);
         let origin = Pos2::new(
             pane.min.x + ((pane.width() - w) * 0.5).max(0.0).trunc(),
             pane.min.y + ((pane.height() - target.y) * 0.5).max(0.0).trunc(),
@@ -1652,8 +1748,8 @@ impl IvoryApp {
         let mut chord_rect_for_hit: Option<Rect> = None;
         let fret_rect_for_hit: Option<Rect> =
             (fret_h > 0.0).then(|| band_at(theory_h + chord_h + piano_h, fret_h));
-        if theory_h > 0.0 {
-            let theory_rect = band_at(0.0, theory_h);
+        let theory_rect_for_hit: Option<Rect> = (theory_h > 0.0).then(|| band_at(0.0, theory_h));
+        if let Some(theory_rect) = theory_rect_for_hit {
             theory_panel::draw(
                 ui.painter(),
                 theory_rect,
@@ -1694,7 +1790,14 @@ impl IvoryApp {
             fretboard_panel::draw_top_edge(ui.painter(), fret_rect, &self.settings);
         }
 
-        self.handle_main_interaction(&ctx, ui, piano_rect, chord_rect_for_hit, fret_rect_for_hit);
+        self.handle_main_interaction(
+            &ctx,
+            ui,
+            piano_rect,
+            chord_rect_for_hit,
+            fret_rect_for_hit,
+            theory_rect_for_hit,
+        );
 
         // Held, not toggled: press to read, release and it slides away. Drawn
         // last so it is over everything, and asked for every frame so the
@@ -1903,10 +2006,10 @@ mod tests {
             s.show_fretboard = fret;
             s.theory_circle = theory;
             for avail in [
-                Vec2::new(900.0, 260.0),   // the editor's default
-                Vec2::new(400.0, 200.0),   // a narrow rack
-                Vec2::new(1800.0, 300.0),  // wide and short: height decides
-                Vec2::new(600.0, 1200.0),  // tall and narrow: width decides
+                Vec2::new(900.0, 260.0),  // the editor's default
+                Vec2::new(400.0, 200.0),  // a narrow rack
+                Vec2::new(1800.0, 300.0), // wide and short: height decides
+                Vec2::new(600.0, 1200.0), // tall and narrow: width decides
             ] {
                 let b = fit_bands(&s, avail);
                 let t = b.total();

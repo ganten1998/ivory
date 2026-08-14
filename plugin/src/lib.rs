@@ -29,6 +29,7 @@ use ivory_ui::host::Caps;
 use ivory_ui::midi_event::MidiEvent;
 use ivory_ui::settings::Settings;
 use nih_plug::prelude::*;
+use nih_plug_egui::resizable_window::ResizableWindow;
 use nih_plug_egui::{create_egui_editor, EguiState};
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -52,6 +53,12 @@ const NOTE_QUEUE: usize = 1024;
 /// full width. A fixed height would open a first instance showing a slice of
 /// the app, with nothing on screen to explain why.
 const EDITOR_W: u32 = 900;
+
+/// Below this the piano stops being a piano. The drag corner refuses to go
+/// smaller, which is friendlier than letting someone shrink the editor to a
+/// smear and then have to guess how to get back.
+const MIN_W: f32 = 420.0;
+const MIN_H: f32 = 90.0;
 
 /// Everything the plugin keeps between the audio thread and the editor.
 struct Tangent {
@@ -170,7 +177,21 @@ impl Plugin for Tangent {
                 while let Some(ev) = notes.pop() {
                     app.feed(ev);
                 }
-                app.frame(ctx);
+                // A drag corner, because a plugin cannot resize itself any
+                // other way: nih-plug has no host-to-plugin resize path (its
+                // `Editor` trait still carries the TODO), so the editor has to
+                // ASK, and `ResizableWindow` is the piece that asks. Without
+                // it the window is whatever size it opened at forever, which
+                // is what "no resize helps" looks like from the outside.
+                //
+                // It opens its own CentralPanel, so the app paints into the
+                // `Ui` rather than through `frame()`, which would open a
+                // second one under the same id.
+                ResizableWindow::new("tangent-editor")
+                    .min_size(egui::Vec2::new(MIN_W, MIN_H))
+                    .show(ctx, params.editor_state.as_ref(), |ui| {
+                        app.paint_into(ui);
+                    });
                 // Write the settings back into the project every frame. It is
                 // a string compare and a lock the audio thread never takes,
                 // and the alternative is remembering to do it at each of the
