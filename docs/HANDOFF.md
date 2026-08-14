@@ -1,6 +1,6 @@
 # Ivory 2.0 — Handoff / Resume Document
 
-**Last updated:** 2026-08-13. **The app is now called TANGENT.** Newest work is
+**Last updated:** 2026-08-14. **The app is now called TANGENT.** Newest work is
 §2d: the fretboard voicing solver and the guitar view. §2c before it has the
 rename, the 2.2.0 tester-report UI fixes, the egui 0.33 downgrade and the
 MIT/GPLv3 split. Read §2c then §2d FIRST; everything above them still says
@@ -420,6 +420,83 @@ out yet. **Re-run the review before 2.3.0 ships** — two dimensions (determinis
 panics) never reported at all. The panics dimension is partly covered by
 `tests/voicing_stress.rs`, written here after a hostile sweep found a real
 overflow panic (`note_slack: usize::MAX`), but determinism was never reviewed.
+
+## 2e. 2026-08-14 — 2.3.0 shipped, and the plugin is half built
+
+**2.3.0 IS PUBLIC** on all three platforms (macOS signed+notarized, Windows,
+Linux x86_64 — the first Linux build this project has ever produced). Every
+permalink, including the legacy `Ivory-*` names in supporter emails already
+sent, was byte-verified as serving 2.3.0. The nine existing purchasers were
+emailed via Resend; Gumroad refuses customer email below a payout or $100 in
+sales, and `keys@ivorymidi.com` can send but not receive, so Reply-To matters.
+
+Since then, unreleased on `main`: the fretboard became an INPUT (click the neck
+with keytoggle on, positions are pinned so a hand-entered shape stays put),
+keyboard shortcuts with a hold-to-view card, JetBrains Mono as a third face, and
+the About box finally pointing at ganten.neocities.org.
+
+### Plugin progress: steps 1-4b of docs/PLUGIN-PLAN.md are DONE
+
+Read `docs/PLUGIN-PLAN.md` — it has the full plan, a verified-facts table that
+corrects several confident wrong claims, and a progress log. Landed:
+
+1-2. `NoteState` extracted and tested; `Settings::save_to` made atomic.
+3. **`ivory-ui` crate exists** — nine GUI modules moved by `git mv`, 229 tests
+   before and after. `scripts/check-firewall.sh` asserts `ivory-ui`/`ivory-core`
+   cannot see eframe, midir, rfd or fd-lock and never call `process::exit`,
+   and it is verified to FAIL when a violation is planted.
+4a. **`Caps`** in `ivory-ui/src/host.rs`. The menu drops Size, Borderless,
+   Select MIDI Input and both Detach pairs under `Caps::PLUGIN`; tests hold both
+   the desktop-unchanged and plugin-safe ends.
+4b. **All 11 dialogs** render either as an OS window or in-canvas, chosen by
+   `caps.child_windows`, with a click-swallowing scrim so in-canvas is genuinely
+   modal.
+
+### WHAT IS LEFT, in order
+
+5. **`app.rs` is the last file holding eframe.** It needs the `Shell` wrapper so
+   its paint body can be driven by either host: route the remaining
+   `send_viewport_cmd` sites (9) through a trait, and move `app.rs` into
+   `ivory-ui` leaving `impl eframe::App` behind in the binary. The orphan rule
+   forces a thin wrapper type in `ivory` — that is expected, not a problem.
+6. **The quarantined `plugin/` workspace.** `plugin/Cargo.toml` opens with an
+   empty `[workspace]` table, exactly like `tools/ivory-keygen`, so nih-plug and
+   `vst3-sys` never enter the root `Cargo.lock`. That is not tidiness: without
+   it `gen-third-party-licenses.sh` lists GPLv3 `vst3-sys` inside the MIT app's
+   shipped `THIRD-PARTY-LICENSES`.
+7. `nih_export_vst3!`, the editor, per-instance persisted state.
+8. `scripts/build-plugin.sh`, then the INSTALLER (owner requirement, see the
+   PLUGIN-PLAN addendum: all three platforms, standalone / plugin / both).
+
+### The dependency question is SETTLED — do not re-derive it
+
+Verified by compiling, not by reading:
+
+```toml
+nih_plug      = { git = "https://github.com/robbert-vdh/nih-plug.git",
+                  rev = "28b149ec4d62757d0b448809148a0c3ca6e09a95",
+                  features = ["vst3"] }
+nih_plug_egui = { git = "https://github.com/BillyDM/egui-baseview.git" }
+egui          = "0.33"
+```
+
+Clean build, ONE copy of each of egui 0.33.3, egui-baseview 0.7.0, nih_plug,
+nih_plug_egui 0.1.0 and baseview. **No `[patch]`, no fork, no vendoring** —
+`nih_plug_egui` 0.1.0 now lives INSIDE the egui-baseview repo and is already on
+egui 0.33. Taking it from the nih-plug repo instead needs two coordinated
+patches and two forks, because the two crates pin different `baseview` revs and
+`WindowHandle` becomes two incompatible types. The `rev` on nih_plug is
+mandatory: it must be the one egui-baseview's workspace pins, or there are two
+`nih_plug` packages and `Editor` stops being `Editor`.
+
+### The trap that decides step 5
+
+`show_viewport_immediate` does NOT fail in a plugin. `embed_viewports: true`
+makes it run INLINE, opening a second `CentralPanel` under an identical id and
+painting garbage over the piano. Any seam must sit ABOVE `shell::viewport_ui`.
+`ViewportCommand::InnerSize` is also honoured by egui-baseview, so `app.rs`'s
+fixed-size enforcement would resize the host's window behind its back on frame
+one — it must be GATED, not merely left to no-op.
 
 ### WHERE TO PICK UP NOW
 
