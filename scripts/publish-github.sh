@@ -181,10 +181,14 @@ else
     exit 2
   fi
   echo "==> Creating release $TAG"
+  # `${a[@]+"${a[@]}"}` and not `"${a[@]}"`: under `set -u`, bash 3.2 — which is
+  # what macOS ships — treats an EMPTY array expansion as an unbound variable
+  # and aborts. That is exactly the stable-release path, where PRE_ARGS is
+  # empty, so the bug could only ever fire on a real release.
   PRE_ARGS=()
   [ "$PRERELEASE" = 1 ] && PRE_ARGS=(--prerelease)
   gh release create "$TAG" --repo "$REPO" --title "Tangent ${VERSION}" \
-    "${PRE_ARGS[@]}" "${NOTES_ARGS[@]}"
+    ${PRE_ARGS[@]+"${PRE_ARGS[@]}"} ${NOTES_ARGS[@]+"${NOTES_ARGS[@]}"}
 fi
 
 gh release upload "$TAG" --repo "$REPO" --clobber "${UPLOADS[@]}"
