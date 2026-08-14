@@ -169,10 +169,13 @@ pub fn draw(
             Pos2::new(left + bx + 0.5, top + 0.5),
             Pos2::new(left + bx + bw + 0.5, top + bh + 0.5),
         );
-        painter.rect_stroke(stroke_rect, 0.0, Stroke::new(1.0_f32, outline), StrokeKind::Middle);
+        painter.rect_stroke(
+            stroke_rect,
+            0.0,
+            Stroke::new(1.0_f32, outline),
+            StrokeKind::Middle,
+        );
     }
-
-
 }
 
 /// Hit-test a point (widget-local) against the keys, matching the drawing math
@@ -260,7 +263,9 @@ mod tests {
     /// slivers on a 1625pt keyboard.
     #[test]
     fn white_keys_tile_with_no_gaps_at_any_window_size() {
-        for w in [650.0_f64, 975.0, 1300.0, 1625.0, 1950.0, 2275.0, 2600.0, 1000.0, 1301.0] {
+        for w in [
+            650.0_f64, 975.0, 1300.0, 1625.0, 1950.0, 2275.0, 2600.0, 1000.0, 1301.0,
+        ] {
             let wkw = w / WHITE_KEYS as f64;
             let mut prev_end: Option<f32> = None;
             for idx in 0..WHITE_KEYS {
@@ -273,7 +278,11 @@ mod tests {
                 prev_end = Some(x1);
             }
             // And the last key ends exactly at the right edge.
-            assert_eq!(prev_end, Some(w.trunc() as f32), "keyboard short at width {w}");
+            assert_eq!(
+                prev_end,
+                Some(w.trunc() as f32),
+                "keyboard short at width {w}"
+            );
         }
     }
 

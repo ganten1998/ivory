@@ -6,18 +6,20 @@
 //! chord detection runs on its own 100ms gate (with immediate off-cadence
 //! runs after keytoggle clicks and note-preference changes).
 
-use crate::midi;
+use crate::chord_strip;
+use crate::dialogs::{self, Dialog, DialogAction, LearningStatus};
+use crate::fretboard_panel;
+use crate::host::Caps;
+use crate::keys;
+use crate::menu::{self, ColorTarget, MenuAction, MenuState, MenuView};
+use crate::midi_event::MidiEvent;
+use crate::piano;
+use crate::ports::MidiPorts;
+use crate::settings::{Rgb, Settings};
+use crate::theory_panel;
 use egui::{Pos2, Rect, Vec2, ViewportCommand};
 use ivory_core::voicing::{VoicingSession, Weights};
 use ivory_core::{ChordDetector, OverrideStore, TrainOutcome};
-use ivory_ui::chord_strip;
-use ivory_ui::dialogs::{self, Dialog, DialogAction, LearningStatus};
-use ivory_ui::fretboard_panel;
-use ivory_ui::keys;
-use ivory_ui::menu::{self, ColorTarget, MenuAction, MenuState, MenuView};
-use ivory_ui::piano;
-use ivory_ui::settings::{Rgb, Settings};
-use ivory_ui::theory_panel;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -88,16 +90,16 @@ impl NoteState {
     }
 
     /// One MIDI event. The four rules, in the order they interact:
-    pub fn apply(&mut self, ev: midi::MidiEvent) {
+    pub fn apply(&mut self, ev: MidiEvent) {
         match ev {
             // A note struck again cancels a pending pedal release. Without
             // this, re-striking a key while the pedal is down would leave the
             // note queued to die at the next pedal lift.
-            midi::MidiEvent::NoteOn { note, .. } => {
+            MidiEvent::NoteOn { note, .. } => {
                 self.held.insert(note);
                 self.pedalled.remove(&note);
             }
-            midi::MidiEvent::NoteOff { note } => {
+            MidiEvent::NoteOff { note } => {
                 if self.sustain_down {
                     // Only a note that is actually sounding can be queued. A
                     // note-off for something never held must not create one.
@@ -112,7 +114,7 @@ impl NoteState {
             // Only the DOWN-to-UP edge releases. Pedal down while already down
             // changes nothing, and pedal up while already up must not drain a
             // set that a later note-off will refill.
-            midi::MidiEvent::Sustain { down } => {
+            MidiEvent::Sustain { down } => {
                 let was = self.sustain_down;
                 self.sustain_down = down;
                 if was && !down {
@@ -133,9 +135,17 @@ pub struct IvoryApp {
     /// flag to flip and none to go stale.
     license: ivory_core::license::LicenseStore,
 
-    midi_tx: mpsc::Sender<midi::MidiEvent>,
-    midi_rx: mpsc::Receiver<midi::MidiEvent>,
-    midi_conn: Option<midi::MidiConnection>,
+    midi_tx: mpsc::Sender<MidiEvent>,
+    midi_rx: mpsc::Receiver<MidiEvent>,
+    /// Where notes come from when the app picks for itself. `None` in a
+    /// plugin, which is handed its notes and has no device list to offer.
+    /// The CHANNEL above is not optional: a plugin uses the same one, filled
+    /// from `process()` instead of from a `midir` callback thread.
+    ports: Option<Box<dyn MidiPorts>>,
+    /// What the host permits. Read at every branch point rather than compared
+    /// against a host name, and captured once at construction so a frame
+    /// cannot be half-drawn under one set of rules and half under another.
+    caps: Caps,
 
     notes: NoteState,
     manual_notes: HashSet<u8>,
@@ -204,17 +214,21 @@ pub struct IvoryApp {
 }
 
 impl IvoryApp {
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
-        settings: Settings,
-        cli_port: Option<String>,
-    ) -> Self {
-        ivory_ui::fonts::install(
-            &cc.egui_ctx,
-            ivory_ui::fonts::FontChoice::from_key(&settings.font_choice),
+    /// `ctx` rather than an `eframe::CreationContext`, because eframe is one of
+    /// three things that can hand this app a context and the other two have
+    /// never heard of it. Everything the old signature used was `cc.egui_ctx`.
+    ///
+    /// `caps` says what the host permits, and is decided by the caller — the
+    /// only code that knows what it is running inside. The app starts with no
+    /// MIDI source at all; a host that picks its own attaches one with
+    /// `set_ports`, and one that is handed its notes never does.
+    pub fn new(ctx: &egui::Context, settings: Settings, caps: Caps) -> Self {
+        crate::fonts::install(
+            ctx,
+            crate::fonts::FontChoice::from_key(&settings.font_choice),
             settings.custom_font_path.as_deref(),
         );
-        ivory_ui::fonts::apply_text_styles(&cc.egui_ctx);
+        crate::fonts::apply_text_styles(ctx);
 
         let mut detector = ChordDetector::new();
         detector.set_note_preference(settings.prefer_flats);
@@ -226,12 +240,6 @@ impl IvoryApp {
         let license = ivory_core::license::LicenseStore::load();
 
         let (midi_tx, midi_rx) = mpsc::channel();
-        // Startup connection (spec §10): explicit -p port, else auto-connect
-        // priority chain. Any failure => run without MIDI, no dialog.
-        let midi_conn = match cli_port {
-            Some(name) => midi::connect_by_name(&name, midi_tx.clone(), cc.egui_ctx.clone()).ok(),
-            None => midi::auto_connect(midi_tx.clone(), cc.egui_ctx.clone()),
-        };
 
         // Recreate the detached chord window 100ms after startup (spec §5.7).
         let startup_detach_at = (settings.chord_window_detached
@@ -259,7 +267,8 @@ impl IvoryApp {
             license,
             midi_tx,
             midi_rx,
-            midi_conn,
+            ports: None,
+            caps,
             notes: NoteState::default(),
             manual_notes: HashSet::new(),
             manual_positions: HashMap::new(),
@@ -301,6 +310,47 @@ impl IvoryApp {
 
     fn layout_sizes(&self) -> Bands {
         band_sizes(&self.settings)
+    }
+
+    /// The channel every note arrives on, whoever is sending.
+    ///
+    /// `midir`'s callback thread holds one of these on the desktop; a VST3
+    /// `process()` holds one in the plugin. Neither knows about the other, and
+    /// `process_midi_events` cannot tell them apart, which is the point.
+    pub fn midi_sender(&self) -> mpsc::Sender<MidiEvent> {
+        self.midi_tx.clone()
+    }
+
+    /// Attach the thing that enumerates and opens MIDI devices.
+    ///
+    /// Separate from `new` because the source needs the sender, and the sender
+    /// is made here. A host that is given its notes never calls this, which is
+    /// also what makes the MIDI menu row and the picker dialog inert rather
+    /// than merely hidden.
+    pub fn set_ports(&mut self, ports: Option<Box<dyn MidiPorts>>) {
+        self.ports = ports;
+    }
+
+    /// Feed one event in directly, for a host that has no channel to spare.
+    ///
+    /// The plugin uses the sender instead; this exists so a test can drive the
+    /// app without one.
+    pub fn feed(&mut self, ev: MidiEvent) {
+        self.notes.apply(ev);
+    }
+
+    /// Persist, if this host owns the settings file.
+    ///
+    /// One gate instead of twenty-four call sites each remembering to check.
+    /// `~/.config/ivory/settings.json` is shared by the standalone and by
+    /// EVERY plugin instance, so without this the last editor window you
+    /// happened to touch would decide everyone's colours — and a DAW project
+    /// reopened tomorrow would silently pick up whatever the standalone was
+    /// set to. A plugin's state belongs in its own project file.
+    fn save_settings(&self) {
+        if self.caps.persist_global_settings {
+            self.settings.save();
+        }
     }
 
     /// Re-solve the guitar view on the detection cadence.
@@ -445,12 +495,11 @@ impl IvoryApp {
             theory: self.settings.theory_views(),
             wood: self.settings.fretboard_wood().key(),
             fretboard_detached: self.settings.fretboard_detached,
-            // The standalone owns its window, its device list and its config.
-            caps: ivory_ui::host::Caps::DESKTOP,
+            caps: self.caps,
             tuning: self.settings.fretboard_spec().tuning.name,
             capo: self.settings.fretboard_spec().capo,
             next_font: {
-                use ivory_ui::fonts::FontChoice;
+                use crate::fonts::FontChoice;
                 let cur = FontChoice::from_key(&self.settings.font_choice);
                 // Show the row only if some OTHER installed face can be reached.
                 FontChoice::ALL
@@ -538,7 +587,7 @@ impl IvoryApp {
                                 .heart_color
                                 .wrapping_add(1)
                                 .rem_euclid(chord_strip::HEART_COLORS.len() as i64);
-                            self.settings.save();
+                            self.save_settings();
                             return;
                         }
                     }
@@ -601,7 +650,9 @@ impl IvoryApp {
                         self.voicing_tick(true);
                     }
                 }
-                if self.settings.borderless_mode {
+                // Dragging moves OUR window. A plugin's window is the
+                // host's, and borderless_mode is not even offered there.
+                if self.settings.borderless_mode && self.caps.window_sizing {
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
             }
@@ -619,13 +670,13 @@ impl IvoryApp {
         self.detach_window_visible = true;
         self.detached_builder_size = self.settings.detached_size_for_use();
         self.detached_builder_pos = self.settings.detached_pos_for_use().map(|p| {
-            ivory_ui::settings::clamp_to_monitor(p, self.detached_builder_size, self.monitor_size)
+            crate::settings::clamp_to_monitor(p, self.detached_builder_size, self.monitor_size)
         });
         self.detached_live_size = None;
         self.detached_live_pos = None;
         self.detached_shown_at = Some(Instant::now());
         self.detached_wm_managed = false;
-        self.settings.save();
+        self.save_settings();
     }
 
     // ── The popped-out neck (D-UI-16) ─────────────────────────────────────
@@ -635,13 +686,13 @@ impl IvoryApp {
         self.fret_window_visible = true;
         self.fret_builder_size = self.settings.fretboard_win_size();
         self.fret_builder_pos = self.settings.fretboard_win_pos().map(|p| {
-            ivory_ui::settings::clamp_to_monitor(p, self.fret_builder_size, self.monitor_size)
+            crate::settings::clamp_to_monitor(p, self.fret_builder_size, self.monitor_size)
         });
         self.fret_live_size = None;
         self.fret_live_pos = None;
         self.fret_shown_at = Some(Instant::now());
         self.fret_wm_managed = false;
-        self.settings.save();
+        self.save_settings();
     }
 
     fn reattach_fretboard(&mut self) {
@@ -651,7 +702,7 @@ impl IvoryApp {
         self.settings.fretboard_detached = false;
         self.fret_window_visible = false;
         self.fret_shown_at = None;
-        self.settings.save();
+        self.save_settings();
     }
 
     /// Write back the popout's size and position. Returns whether anything
@@ -689,7 +740,7 @@ impl IvoryApp {
         self.detach_window_visible = false;
         self.detached_shown_at = None;
         self.settings.chord_window_detached = false;
-        self.settings.save();
+        self.save_settings();
     }
 
     /// Copy the detached window's live geometry into settings. Returns whether
@@ -774,7 +825,7 @@ impl IvoryApp {
                 for v in View::ALL {
                     self.settings.set_theory_view(v, v.is_on(next));
                 }
-                self.settings.save();
+                self.save_settings();
             }
             K::ToggleDarkMode => self.apply_menu_action(ctx, MenuAction::ToggleDarkMode),
             K::ToggleDetection => self.apply_menu_action(ctx, MenuAction::ToggleChordDetection),
@@ -801,23 +852,29 @@ impl IvoryApp {
         match action {
             MenuAction::SetSizePercent(p) => {
                 self.settings.window_size_percent = p;
-                self.settings.save();
+                self.save_settings();
                 // The detached window deliberately does NOT follow: it is sized
                 // by the user now, not slaved to the keyboard's width.
             }
             MenuAction::ToggleBorderless => {
                 self.settings.borderless_mode = !self.settings.borderless_mode;
-                self.settings.save();
+                self.save_settings();
             }
             MenuAction::SelectMidiInput => {
-                let ports = midi::list_port_names();
+                // Unreachable without `caps.midi_ports` — the menu drops the
+                // row — but `ports` is what actually decides, so the two
+                // cannot disagree about whether there is a device to pick.
+                let Some(src) = self.ports.as_ref() else {
+                    return;
+                };
+                let ports = src.list();
                 self.dialog = Some(if ports.is_empty() {
                     Dialog::NoMidiInput
                 } else {
                     Dialog::MidiPicker {
                         ports,
                         selected: None,
-                        current: self.midi_conn.as_ref().map(|c| c.port_name.clone()),
+                        current: src.current(),
                     }
                 });
             }
@@ -837,10 +894,10 @@ impl IvoryApp {
             }
             MenuAction::ToggleDarkMode => {
                 self.settings.dark_mode = !self.settings.dark_mode;
-                self.settings.save();
+                self.save_settings();
             }
             MenuAction::CycleFont => {
-                use ivory_ui::fonts::FontChoice;
+                use crate::fonts::FontChoice;
                 let cur = FontChoice::from_key(&self.settings.font_choice);
                 if let Some(next) = FontChoice::ALL
                     .iter()
@@ -848,9 +905,9 @@ impl IvoryApp {
                     .find(|f| *f != cur && f.is_available())
                 {
                     self.settings.font_choice = next.key().to_owned();
-                    self.settings.save();
-                    ivory_ui::fonts::install(ctx, next, self.settings.custom_font_path.as_deref());
-                    ivory_ui::fonts::apply_text_styles(ctx);
+                    self.save_settings();
+                    crate::fonts::install(ctx, next, self.settings.custom_font_path.as_deref());
+                    crate::fonts::apply_text_styles(ctx);
                 }
             }
             MenuAction::ToggleKeytoggle => {
@@ -860,14 +917,14 @@ impl IvoryApp {
                     self.manual_positions.clear();
                     self.voicing.set_pins(Vec::new());
                 }
-                self.settings.save();
+                self.save_settings();
                 self.detection_tick(true);
             }
             MenuAction::ToggleNotePreference => {
                 self.settings.prefer_flats = !self.settings.prefer_flats;
                 self.detector
                     .set_note_preference(self.settings.prefer_flats);
-                self.settings.save();
+                self.save_settings();
                 self.detection_tick(true); // refresh display immediately
             }
             MenuAction::ToggleChordDetection => {
@@ -875,7 +932,7 @@ impl IvoryApp {
                 if !self.settings.chord_detection_enabled {
                     self.current_chord = None;
                 }
-                self.settings.save();
+                self.save_settings();
                 // Window resize follows from layout_sizes() on the next pass.
             }
             MenuAction::DetachChordWindow => self.detach_chord_window(),
@@ -891,7 +948,7 @@ impl IvoryApp {
             MenuAction::ToggleTheoryView(v) => {
                 let on = !v.is_on(self.settings.theory_views());
                 self.settings.set_theory_view(v, on);
-                self.settings.save();
+                self.save_settings();
             }
             MenuAction::ToggleFretboard => {
                 self.settings.show_fretboard = !self.settings.show_fretboard;
@@ -902,29 +959,29 @@ impl IvoryApp {
                     self.reattach_fretboard();
                     self.settings.fretboard_detached = true; // remembered for next time
                 }
-                self.settings.save();
+                self.save_settings();
                 // The window height follows from layout_sizes() next pass.
                 self.voicing_tick(true);
             }
             MenuAction::SetTuning(name) => {
                 self.settings.fretboard_tuning = name.to_owned();
-                self.settings.save();
+                self.save_settings();
                 self.rebuild_voicing();
             }
             MenuAction::SetCapo(fret) => {
                 self.settings.fretboard_capo = fret as i64;
-                self.settings.save();
+                self.save_settings();
                 self.rebuild_voicing();
             }
             MenuAction::SetWood(key) => {
                 self.settings.fretboard_wood = key.to_owned();
-                self.settings.save();
+                self.save_settings();
             }
             MenuAction::DetachFretboard => self.detach_fretboard(),
             MenuAction::AttachFretboard => self.reattach_fretboard(),
             MenuAction::ToggleHeart => {
                 self.settings.show_heart = !self.settings.show_heart;
-                self.settings.save();
+                self.save_settings();
             }
             MenuAction::ShowSupporterKey => {
                 self.dialog = Some(Dialog::SupporterKey {
@@ -964,9 +1021,9 @@ impl IvoryApp {
         self.rebuild_voicing();
         if had_custom_font {
             // Settings were reset: back to the bundled default font too.
-            ivory_ui::fonts::install(ctx, ivory_ui::fonts::FontChoice::default(), None);
+            crate::fonts::install(ctx, crate::fonts::FontChoice::default(), None);
         }
-        self.settings.save();
+        self.save_settings();
     }
 
     // ── Teach layer (D-UI-5) ───────────────────────────────────────────────
@@ -1203,11 +1260,11 @@ impl IvoryApp {
         self.detection_tick(true);
     }
 
-    fn apply_dialog_action(&mut self, ctx: &egui::Context, action: DialogAction) {
+    fn apply_dialog_action(&mut self, action: DialogAction) {
         match action {
             DialogAction::SetShowWelcome(show) => {
                 self.settings.show_welcome = show;
-                self.settings.save();
+                self.save_settings();
             }
             DialogAction::InstallLicense { key } => {
                 // The dialog stays open on failure so the message can say what
@@ -1247,7 +1304,7 @@ impl IvoryApp {
                 // Remember the choice so the box comes back the way it was left.
                 if self.settings.teach_apply_all_keys != apply_all_keys {
                     self.settings.teach_apply_all_keys = apply_all_keys;
-                    self.settings.save();
+                    self.save_settings();
                 }
                 self.detection_tick(true); // re-detect immediately (D-UI-5)
             }
@@ -1263,11 +1320,8 @@ impl IvoryApp {
                 self.detection_tick(true);
             }
             DialogAction::ConnectPort(name) => {
-                // Close the old port first (parity), then open the new one.
-                self.midi_conn = None;
-                match midi::connect_by_name(&name, self.midi_tx.clone(), ctx.clone()) {
-                    Ok(conn) => self.midi_conn = Some(conn),
-                    Err(e) => {
+                if let Some(src) = self.ports.as_mut() {
+                    if let Err(e) = src.connect(&name, self.midi_tx.clone()) {
                         self.dialog = Some(Dialog::MidiError { message: e });
                     }
                 }
@@ -1285,7 +1339,7 @@ impl IvoryApp {
                     ColorTarget::Sustain => self.settings.sustain_color = rgb,
                     ColorTarget::ChordText => self.settings.chord_text_color = rgb,
                 }
-                self.settings.save();
+                self.save_settings();
             }
         }
     }
@@ -1357,27 +1411,22 @@ impl Bands {
     }
 }
 
-impl eframe::App for IvoryApp {
-    /// eframe hands us a Context; everything below wants a Ui. One central
-    /// panel with no frame and no margin bridges the two without changing a
-    /// pixel: the app paints absolutely into `max_rect` and has always owned
-    /// its whole window.
-    ///
-    /// This shape is also what the plugin build needs, because
-    /// `nih_plug_egui` gives an editor a Context rather than a Ui, so the
-    /// body below is already in the right form to be shared.
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ctx, |ui| self.paint(ui));
-    }
-
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 1.0]
-    }
-}
-
 impl IvoryApp {
+    /// One frame, from a `Context`.
+    ///
+    /// All three hosts hand over a context rather than a `Ui` — `eframe::App`
+    /// for the desktop window, `show_viewport_immediate` for a child window,
+    /// and `nih_plug_egui`'s editor callback for the VST3 build — so this is
+    /// the shape they share. `shell::viewport_ui` is the one bridge, and its
+    /// test is what proves the central panel never grew a margin.
+    pub fn frame(&mut self, ctx: &egui::Context) {
+        crate::shell::viewport_ui(ctx, |ui| self.paint(ui));
+    }
+
+    /// The colour behind everything, for hosts that clear the surface
+    /// themselves.
+    pub const CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
     fn paint(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
 
@@ -1392,7 +1441,7 @@ impl IvoryApp {
                     self.fret_window_visible = true;
                     self.fret_builder_size = self.settings.fretboard_win_size();
                     self.fret_builder_pos = self.settings.fretboard_win_pos().map(|p| {
-                        ivory_ui::settings::clamp_to_monitor(
+                        crate::settings::clamp_to_monitor(
                             p,
                             self.fret_builder_size,
                             self.monitor_size,
@@ -1412,7 +1461,7 @@ impl IvoryApp {
                     self.detach_window_visible = true;
                     self.detached_builder_size = self.settings.detached_size_for_use();
                     self.detached_builder_pos = self.settings.detached_pos_for_use().map(|p| {
-                        ivory_ui::settings::clamp_to_monitor(
+                        crate::settings::clamp_to_monitor(
                             p,
                             self.detached_builder_size,
                             self.monitor_size,
@@ -1438,13 +1487,25 @@ impl IvoryApp {
 
         // Track our position on the monitor for global menu placement, child
         // window centring, and so the main window reopens where it was left.
-        let (inner_rect, outer_rect, monitor) = ctx.input(|i| {
-            (
-                i.viewport().inner_rect,
-                i.viewport().outer_rect,
-                i.viewport().monitor_size,
-            )
-        });
+        //
+        // Gated on owning the window. Inside a plugin editor these reads do
+        // not fail — they return the ROOT viewport's values, which are the
+        // host's, so an unguarded version would quietly file the DAW's window
+        // position into the user's settings file as if it were the piano's.
+        let (inner_rect, outer_rect, monitor) = if self.caps.window_sizing {
+            ctx.input(|i| {
+                (
+                    i.viewport().inner_rect,
+                    i.viewport().outer_rect,
+                    i.viewport().monitor_size,
+                )
+            })
+        } else {
+            // The editor's own canvas IS its world: menus and dialogs position
+            // themselves inside it, and there is no monitor beyond it.
+            let r = ctx.content_rect();
+            (Some(r), Some(r), Some(r.size()))
+        };
         if let Some(r) = inner_rect {
             self.main_inner_origin = r.min;
             self.main_origin_known = true;
@@ -1453,13 +1514,13 @@ impl IvoryApp {
         // Rescue a window restored onto a monitor that is no longer there.
         // A remembered position is the classic way for an app to launch
         // invisibly, so this runs once, as soon as the monitor is known.
-        if !self.offscreen_checked {
+        if !self.offscreen_checked && self.caps.window_sizing {
             if let (Some(r), Some(mon)) = (outer_rect.or(inner_rect), monitor) {
                 self.offscreen_checked = true;
                 let on_screen =
                     Rect::from_min_size(Pos2::ZERO, mon).intersects(r.shrink(OFFSCREEN_SLACK));
                 if !on_screen {
-                    let fixed = ivory_ui::settings::clamp_to_monitor(r.min, r.size(), Some(mon));
+                    let fixed = crate::settings::clamp_to_monitor(r.min, r.size(), Some(mon));
                     ctx.send_viewport_cmd(ViewportCommand::OuterPosition(fixed));
                 }
             }
@@ -1487,7 +1548,12 @@ impl IvoryApp {
             fret_h,
         } = bands;
         let target = bands.total();
-        if self.last_sent_size != Some(target) {
+        // GATED, not merely harmless. `egui-baseview` HONOURS
+        // `ViewportCommand::InnerSize` — it calls `window.resize()` — so an
+        // ungated triple would reach into the DAW and resize the editor behind
+        // the host's back on frame one. Min/Max are swallowed there, which
+        // would leave exactly the half of the mechanism that does damage.
+        if self.caps.window_sizing && self.last_sent_size != Some(target) {
             ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(target));
             ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(target));
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
@@ -1495,7 +1561,7 @@ impl IvoryApp {
         }
         // Borderless enforcement; Qt re-sets the title after flag changes.
         let decorations = !self.settings.borderless_mode;
-        if self.decorations_sent != Some(decorations) {
+        if self.caps.window_sizing && self.decorations_sent != Some(decorations) {
             ctx.send_viewport_cmd(ViewportCommand::Decorations(decorations));
             ctx.send_viewport_cmd(ViewportCommand::Title("Tangent".to_owned()));
             self.decorations_sent = Some(decorations);
@@ -1565,8 +1631,11 @@ impl IvoryApp {
             keys::draw_help(ui.painter(), ui.max_rect(), self.settings.dark_mode, help);
         }
 
-        // The popped-out neck.
-        if self.fret_window_visible {
+        // The popped-out neck. `caps.detachable` gates the DRAWING, not just
+        // the menu row: `fretboard_detached` is a persisted setting, so a
+        // settings file written by the standalone would otherwise have a
+        // plugin opening a phantom window on its first frame.
+        if self.fret_window_visible && self.caps.detachable {
             let spec = self.settings.fretboard_spec();
             let outcome = fretboard_panel::show_detached_window(
                 &ctx,
@@ -1608,8 +1677,8 @@ impl IvoryApp {
             }
         }
 
-        // Detached chord window.
-        if self.detach_window_visible {
+        // Detached chord window, gated for the same reason as the neck above.
+        if self.detach_window_visible && self.caps.detachable {
             let outcome = chord_strip::show_detached_window(
                 &ctx,
                 self.detached_builder_size,
@@ -1680,7 +1749,7 @@ impl IvoryApp {
                     dirty |= self.remember_fretboard_geometry();
                 }
                 if dirty {
-                    self.settings.save();
+                    self.save_settings();
                 }
             }
         }
@@ -1694,7 +1763,7 @@ impl IvoryApp {
         // position the OS places them, which on Windows is the top-left of the
         // screen no matter where the user has put the piano.
         let placement = dialogs::Placement {
-            caps: ivory_ui::host::Caps::DESKTOP,
+            caps: self.caps,
             parent: self
                 .main_origin_known
                 .then(|| Rect::from_min_size(self.main_inner_origin, target)),
@@ -1703,7 +1772,7 @@ impl IvoryApp {
         if let Some(action) =
             dialogs::show(&ctx, &mut self.dialog, self.settings.dark_mode, placement)
         {
-            self.apply_dialog_action(&ctx, action);
+            self.apply_dialog_action(action);
         }
 
         // 50ms GUI cadence; MIDI events wake us sooner via request_repaint_of.
@@ -1714,6 +1783,102 @@ impl IvoryApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `nih_plug_egui::create_egui_editor` requires its state to be
+    /// `'static + Send`. Asserted HERE rather than discovered in the plugin
+    /// crate, where the same mistake arrives as a wall of trait errors
+    /// pointing at a macro. Send only, NOT Sync: `mpsc::Receiver` is not Sync,
+    /// and the 0.7 adapter does not ask for it.
+    #[test]
+    fn the_app_can_be_handed_to_a_plugin_editor() {
+        fn assert_send<T: 'static + Send>() {}
+        assert_send::<IvoryApp>();
+    }
+
+    fn headless(caps: Caps) -> (egui::Context, IvoryApp) {
+        let ctx = egui::Context::default();
+        let app = IvoryApp::new(&ctx, Settings::default(), caps);
+        (ctx, app)
+    }
+
+    fn run_one_frame(ctx: &egui::Context, app: &mut IvoryApp, size: Vec2) -> Vec<String> {
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        out.viewport_output
+            .values()
+            .flat_map(|v| v.commands.iter())
+            .map(|c| format!("{c:?}"))
+            .collect()
+    }
+
+    /// A plugin editor's window belongs to the DAW. Not one frame may ask to
+    /// resize it, undecorate it, retitle it, move it, or start dragging it.
+    ///
+    /// This is not a theoretical guard. `egui-baseview` HONOURS
+    /// `ViewportCommand::InnerSize` — it calls `window.resize()` — so the
+    /// fixed-size triple, left ungated, would reach into the host and resize
+    /// the editor behind its back on the first frame. `MinInnerSize` and
+    /// `MaxInnerSize` are swallowed there, which would have left exactly the
+    /// one third of the mechanism that does damage.
+    #[test]
+    fn a_plugin_frame_never_commands_the_hosts_window() {
+        let (ctx, mut app) = headless(Caps::PLUGIN);
+        // Several frames: the size latch and the decorations latch each fire
+        // once, and "once" is easy to miss by looking at frame one alone.
+        for i in 0..4 {
+            let cmds = run_one_frame(&ctx, &mut app, Vec2::new(1300.0, 632.0));
+            assert!(
+                cmds.is_empty(),
+                "frame {i} sent the host {} viewport command(s): {cmds:?}",
+                cmds.len()
+            );
+        }
+    }
+
+    /// ...and the desktop still does all of it, or the gate has quietly turned
+    /// the standalone into a resizable window with no title.
+    #[test]
+    fn the_desktop_still_sizes_and_titles_its_own_window() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..4 {
+            seen.extend(run_one_frame(&ctx, &mut app, Vec2::new(1300.0, 632.0)));
+        }
+        for want in [
+            "MinInnerSize",
+            "MaxInnerSize",
+            "InnerSize",
+            "Decorations",
+            "Title",
+        ] {
+            assert!(
+                seen.iter().any(|c| c.starts_with(want)),
+                "the desktop stopped sending {want}; saw {seen:?}"
+            );
+        }
+    }
+
+    /// A plugin shares `~/.config/ivory/settings.json` with the standalone and
+    /// with every other instance, so it must never write it. Asserted through
+    /// the one gate every call site now goes through.
+    #[test]
+    fn a_plugin_does_not_write_the_shared_settings_file() {
+        let before = std::fs::read(Settings::path()).ok();
+        let (_ctx, app) = headless(Caps::PLUGIN);
+        for _ in 0..3 {
+            app.save_settings();
+        }
+        assert_eq!(
+            std::fs::read(Settings::path()).ok(),
+            before,
+            "a plugin wrote the shared settings file"
+        );
+    }
 
     /// D-UI-15: the fretboard is a third band in the same stack, and the two
     /// places that compute the window height have to agree about it. They used
@@ -1756,7 +1921,7 @@ mod tests {
     // a shared crate, because "it still compiles" is not evidence that a state
     // machine still behaves.
 
-    use midi::MidiEvent::{NoteOff, NoteOn, Sustain};
+    use MidiEvent::{NoteOff, NoteOn, Sustain};
 
     fn held(n: &NoteState) -> Vec<u8> {
         let mut v: Vec<u8> = n.held().iter().copied().collect();
@@ -1764,7 +1929,7 @@ mod tests {
         v
     }
 
-    fn feed(events: &[midi::MidiEvent]) -> NoteState {
+    fn feed(events: &[MidiEvent]) -> NoteState {
         let mut n = NoteState::default();
         for e in events {
             n.apply(*e);

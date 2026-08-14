@@ -2,7 +2,7 @@
 //! PySide6 v1.1.0 app; UI parity per docs/spec/ui-spec.md).
 #![windows_subsystem = "windows"]
 
-mod app;
+mod desktop;
 mod midi;
 
 use ivory_ui::settings::Settings;
@@ -96,7 +96,11 @@ impl log::Log for StderrLogger {
 }
 
 fn install_logger() {
-    let level = match std::env::var("IVORY_LOG").unwrap_or_default().to_lowercase().as_str() {
+    let level = match std::env::var("IVORY_LOG")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
         "trace" => log::LevelFilter::Trace,
         "debug" => log::LevelFilter::Debug,
         "info" => log::LevelFilter::Info,
@@ -127,7 +131,8 @@ fn install_panic_hook() {
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_default();
         let backtrace = std::backtrace::Backtrace::force_capture();
-        let body = format!("Tangent encountered an error:\n\n{msg}\n  at {location}\n\n{backtrace}");
+        let body =
+            format!("Tangent encountered an error:\n\n{msg}\n  at {location}\n\n{backtrace}");
         eprintln!("{body}");
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rfd::MessageDialog::new()
@@ -192,7 +197,7 @@ fn main() {
     // Settings are read before building the ViewportBuilder so the very first
     // frame is right-sized (DESIGN: fixed-size via Min+Max+Inner triple).
     let settings = Settings::load();
-    let size = app::initial_window_size(&settings);
+    let size = ivory_ui::app::initial_window_size(&settings);
 
     // The app icon MUST be set here. eframe applies its own embedded default
     // (the egui hexagon) whenever the viewport icon is None, and on macOS a
@@ -238,7 +243,7 @@ fn main() {
     let result = eframe::run_native(
         "Tangent",
         options,
-        Box::new(move |cc| Ok(Box::new(app::IvoryApp::new(cc, settings, port)))),
+        Box::new(move |cc| Ok(Box::new(desktop::DesktopApp::new(cc, settings, port)))),
     );
 
     if let Err(err) = result {

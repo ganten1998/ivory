@@ -414,7 +414,10 @@ pub fn draw(
     }
 
     for n in &voicing.notes {
-        let Outcome::Placed { pos, octave_shift, .. } = n.outcome else {
+        let Outcome::Placed {
+            pos, octave_shift, ..
+        } = n.outcome
+        else {
             continue;
         };
         if pos.string >= g.strings {
@@ -426,9 +429,17 @@ pub fn draw(
             // A ghost: the pitch class is right, the octave is not. Hollow, so
             // it cannot be mistaken for a note that is really there, with the
             // arrow saying which way it moved.
-            let x = if pos.fret == g.capo { gutter_x(rect, &g) } else { g.press_x(pos.fret) };
+            let x = if pos.fret == g.capo {
+                gutter_x(rect, &g)
+            } else {
+                g.press_x(pos.fret)
+            };
             painter.circle_stroke(Pos2::new(x, y), r, Stroke::new(2.0_f32, p.dot));
-            let arrow = if octave_shift > 0 { "\u{2191}" } else { "\u{2193}" };
+            let arrow = if octave_shift > 0 {
+                "\u{2191}"
+            } else {
+                "\u{2193}"
+            };
             painter.text(
                 Pos2::new(x, y),
                 Align2::CENTER_CENTER,
@@ -721,12 +732,24 @@ mod tests {
         let s = Settings::default();
         let maple = palette(&s, Wood::Maple);
         let rose = palette(&s, Wood::Rosewood);
-        assert!(maple.dot_edge.is_some(), "a pale board needs an edge on its dots");
+        assert!(
+            maple.dot_edge.is_some(),
+            "a pale board needs an edge on its dots"
+        );
         assert!(rose.dot_edge.is_none());
         let lum = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
-        assert!(lum(maple.board) > lum(maple.string), "maple: dark strings on a pale board");
-        assert!(lum(rose.board) < lum(rose.string), "rosewood: light strings on a dark board");
-        assert!(lum(palette(&s, Wood::Ebony).board) < lum(rose.board), "ebony is the darkest");
+        assert!(
+            lum(maple.board) > lum(maple.string),
+            "maple: dark strings on a pale board"
+        );
+        assert!(
+            lum(rose.board) < lum(rose.string),
+            "rosewood: light strings on a dark board"
+        );
+        assert!(
+            lum(palette(&s, Wood::Ebony).board) < lum(rose.board),
+            "ebony is the darkest"
+        );
     }
 
     #[test]
@@ -751,7 +774,10 @@ mod tests {
         // The 12th fret is still visibly the halfway house it is on a real
         // neck, which the naive normalisation would also have destroyed.
         let half = (g.wire_x(12) - g.left) / (g.right - g.left);
-        assert!((half - 0.5 / 0.7194).abs() < 0.01, "octave landed at {half}");
+        assert!(
+            (half - 0.5 / 0.7194).abs() < 0.01,
+            "octave landed at {half}"
+        );
     }
 
     #[test]
@@ -760,13 +786,19 @@ mod tests {
         let g = Geom::new(rect(), &spec).unwrap();
         for f in 1..=spec.frets {
             let x = g.press_x(f);
-            assert!(x > g.wire_x(f - 1) && x < g.wire_x(f), "fret {f} escaped its space");
+            assert!(
+                x > g.wire_x(f - 1) && x < g.wire_x(f),
+                "fret {f} escaped its space"
+            );
         }
         // `press_x(0)` still resolves behind the nut — the geometry says so —
         // but nothing draws there any more: with no headstock there is no
         // "behind" on screen, so open and damped marks straddle the nut
         // instead. That is what `mark_x` is for.
-        assert!(g.press_x(0) < g.left, "fret 0 is still behind the nut in geometry");
+        assert!(
+            g.press_x(0) < g.left,
+            "fret 0 is still behind the nut in geometry"
+        );
         let gx = gutter_x(rect(), &g);
         assert!(gx >= g.left, "a mark must not be drawn off the left edge");
         assert!(gx < g.press_x(1), "a mark must not reach the first fret");
@@ -802,9 +834,15 @@ mod tests {
     fn dots_on_neighbouring_strings_stay_apart() {
         for t in TUNINGS {
             for w in [200.0_f32, 650.0, 1300.0, 2600.0] {
-                let spec = FretboardSpec { tuning: t, frets: 22, capo: 0 };
+                let spec = FretboardSpec {
+                    tuning: t,
+                    frets: 22,
+                    capo: 0,
+                };
                 let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
-                let Some(g) = Geom::new(r, &spec) else { continue };
+                let Some(g) = Geom::new(r, &spec) else {
+                    continue;
+                };
                 let gap = g.spacing - 2.0 * g.dot_r();
                 assert!(
                     gap > 0.15 * g.spacing,
@@ -821,12 +859,22 @@ mod tests {
     fn the_board_leaves_no_pale_margin_down_the_left() {
         for t in TUNINGS {
             for w in [650.0_f32, 1300.0, 2600.0] {
-                let spec = FretboardSpec { tuning: t, frets: 22, capo: 0 };
+                let spec = FretboardSpec {
+                    tuning: t,
+                    frets: 22,
+                    capo: 0,
+                };
                 let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
-                let Some(g) = Geom::new(r, &spec) else { continue };
+                let Some(g) = Geom::new(r, &spec) else {
+                    continue;
+                };
                 let b = board_rect(r, &g);
                 assert_eq!(b.left(), r.left(), "{}: pale strip at {w}pt", t.name);
-                assert!(b.right() >= r.right() - 2.0, "{}: gap at the far end", t.name);
+                assert!(
+                    b.right() >= r.right() - 2.0,
+                    "{}: gap at the far end",
+                    t.name
+                );
                 assert!(b.top() >= r.top() - 0.01 && b.bottom() <= r.bottom() + 0.01);
                 // No headstock: the nut is ON the left edge and the marks
                 // straddle it, drawn whole rather than clipped.
@@ -849,7 +897,11 @@ mod tests {
         let g = Geom::new(r, &spec).unwrap();
         for string in 0..g.strings {
             for fret in 0..=spec.frets {
-                let x = if fret == spec.capo { g.mark_x(r) } else { g.press_x(fret) };
+                let x = if fret == spec.capo {
+                    g.mark_x(r)
+                } else {
+                    g.press_x(fret)
+                };
                 let hit = hit_test(r, &spec, Pos2::new(x, g.y(string)));
                 assert_eq!(
                     hit,
@@ -869,10 +921,16 @@ mod tests {
         let between = (g.y(2) + g.y(3)) * 0.5;
         assert_eq!(hit_test(r, &spec, Pos2::new(g.press_x(5), between)), None);
         // Outside the board entirely.
-        assert_eq!(hit_test(r, &spec, Pos2::new(g.press_x(5), r.top() - 5.0)), None);
+        assert_eq!(
+            hit_test(r, &spec, Pos2::new(g.press_x(5), r.top() - 5.0)),
+            None
+        );
         assert_eq!(hit_test(r, &spec, Pos2::new(r.right() + 5.0, g.y(0))), None);
         // Well below the lowest string.
-        assert_eq!(hit_test(r, &spec, Pos2::new(g.press_x(5), g.y(0) + g.spacing)), None);
+        assert_eq!(
+            hit_test(r, &spec, Pos2::new(g.press_x(5), g.y(0) + g.spacing)),
+            None
+        );
     }
 
     #[test]
@@ -890,11 +948,23 @@ mod tests {
         }
         // With a capo the same click gives the capo'd pitch, not fret 0, and
         // nothing below the capo is reachable at all.
-        let capo = FretboardSpec { capo: 3, ..Default::default() };
+        let capo = FretboardSpec {
+            capo: 3,
+            ..Default::default()
+        };
         let gc = Geom::new(r, &capo).unwrap();
-        assert_eq!(hit_test(r, &capo, Pos2::new(r.left() + 1.0, gc.y(0))), capo.pitch_at(0, 3));
+        assert_eq!(
+            hit_test(r, &capo, Pos2::new(r.left() + 1.0, gc.y(0))),
+            capo.pitch_at(0, 3)
+        );
         for st in 0..gc.strings {
-            for x in [r.left(), r.left() + 20.0, gc.press_x(1), gc.press_x(2), gc.press_x(3)] {
+            for x in [
+                r.left(),
+                r.left() + 20.0,
+                gc.press_x(1),
+                gc.press_x(2),
+                gc.press_x(3),
+            ] {
                 if let Some(p) = hit_test(r, &capo, Pos2::new(x, gc.y(st))) {
                     assert!(
                         p >= capo.pitch_at(st, 3).unwrap(),
@@ -910,15 +980,25 @@ mod tests {
         for t in TUNINGS {
             for capo in [0u8, 4] {
                 for w in [650.0_f32, 1300.0, 2600.0] {
-                    let spec = FretboardSpec { tuning: t, frets: 22, capo };
+                    let spec = FretboardSpec {
+                        tuning: t,
+                        frets: 22,
+                        capo,
+                    };
                     let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
-                    let Some(g) = Geom::new(r, &spec) else { continue };
+                    let Some(g) = Geom::new(r, &spec) else {
+                        continue;
+                    };
                     for st in 0..g.strings {
                         for fret in [capo, capo + 1, 7, 12, 22] {
                             if fret > spec.frets {
                                 continue;
                             }
-                            let x = if fret == capo { g.mark_x(r) } else { g.press_x(fret) };
+                            let x = if fret == capo {
+                                g.mark_x(r)
+                            } else {
+                                g.press_x(fret)
+                            };
                             assert_eq!(
                                 hit_test(r, &spec, Pos2::new(x, g.y(st))),
                                 spec.pitch_at(st, fret),
@@ -938,7 +1018,10 @@ mod tests {
         // down is the single most obvious way to look wrong to a guitarist.
         let spec = FretboardSpec::default();
         let g = Geom::new(rect(), &spec).unwrap();
-        assert!(g.y(0) > g.y(5), "string 0 is the low E and belongs at the bottom");
+        assert!(
+            g.y(0) > g.y(5),
+            "string 0 is the low E and belongs at the bottom"
+        );
         for st in 1..6 {
             assert!(g.y(st) < g.y(st - 1));
         }
@@ -950,7 +1033,11 @@ mod tests {
         for t in TUNINGS {
             for capo in [0u8, 3, 12, 21] {
                 for w in [200.0_f32, 650.0, 1300.0, 2600.0] {
-                    let spec = FretboardSpec { tuning: t, frets: 22, capo };
+                    let spec = FretboardSpec {
+                        tuning: t,
+                        frets: 22,
+                        capo,
+                    };
                     let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
                     let Some(g) = Geom::new(r, &spec) else {
                         panic!("{} lost its board at width {w}", t.name);
@@ -987,15 +1074,44 @@ mod tests {
 
     #[test]
     fn a_stringless_or_fretless_board_does_not_divide_by_zero() {
-        const NONE: Tuning = Tuning { name: "None", open: &[] };
-        assert!(Geom::new(rect(), &FretboardSpec { tuning: &NONE, frets: 22, capo: 0 }).is_none());
+        const NONE: Tuning = Tuning {
+            name: "None",
+            open: &[],
+        };
+        assert!(Geom::new(
+            rect(),
+            &FretboardSpec {
+                tuning: &NONE,
+                frets: 22,
+                capo: 0
+            }
+        )
+        .is_none());
         // Zero frets is a legal board: open strings and nothing else.
-        let g = Geom::new(rect(), &FretboardSpec { frets: 0, capo: 0, ..Default::default() })
-            .expect("a fretless board is still a board");
+        let g = Geom::new(
+            rect(),
+            &FretboardSpec {
+                frets: 0,
+                capo: 0,
+                ..Default::default()
+            },
+        )
+        .expect("a fretless board is still a board");
         assert!(g.wire_x(0).is_finite() && g.right > g.left);
         // A single-string tuning must not divide by (strings - 1).
-        const ONE: Tuning = Tuning { name: "One", open: &[40] };
-        let g = Geom::new(rect(), &FretboardSpec { tuning: &ONE, frets: 22, capo: 0 }).unwrap();
+        const ONE: Tuning = Tuning {
+            name: "One",
+            open: &[40],
+        };
+        let g = Geom::new(
+            rect(),
+            &FretboardSpec {
+                tuning: &ONE,
+                frets: 22,
+                capo: 0,
+            },
+        )
+        .unwrap();
         assert!(g.y(0).is_finite() && g.spacing.is_finite());
     }
 
@@ -1021,7 +1137,11 @@ mod tests {
         ];
         for t in TUNINGS {
             for capo in [0u8, 5, 21] {
-                let spec = FretboardSpec { tuning: t, frets: 22, capo };
+                let spec = FretboardSpec {
+                    tuning: t,
+                    frets: 22,
+                    capo,
+                };
                 for held in cases {
                     let v = solve_cold(&spec, held);
                     // Every wood, because each one carries its own palette and

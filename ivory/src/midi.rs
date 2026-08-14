@@ -5,14 +5,9 @@
 //! - Channels merged (status high nibble only). Everything else ignored.
 //! - No reconnect logic (parity): if the port dies, events just stop.
 
+use ivory_ui::midi_event::parse_message;
+pub use ivory_ui::midi_event::MidiEvent;
 use std::sync::mpsc;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MidiEvent {
-    NoteOn { note: u8, velocity: u8 },
-    NoteOff { note: u8 },
-    Sustain { down: bool },
-}
 
 /// Holds the open connection; dropping it closes the port.
 pub struct MidiConnection {
@@ -107,24 +102,6 @@ pub fn pick_auto_port(names: &[String]) -> Option<String> {
     names.first().cloned()
 }
 
-fn parse_message(message: &[u8]) -> Option<MidiEvent> {
-    if message.len() < 3 {
-        return None;
-    }
-    let status = message[0] & 0xF0;
-    let data1 = message[1];
-    let data2 = message[2];
-    match status {
-        0x90 if data2 > 0 => Some(MidiEvent::NoteOn {
-            note: data1,
-            velocity: data2,
-        }),
-        0x90 | 0x80 => Some(MidiEvent::NoteOff { note: data1 }),
-        0xB0 if data1 == 64 => Some(MidiEvent::Sustain { down: data2 >= 64 }),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,38 +126,5 @@ mod tests {
             Some("Bar USB MIDI thing".into())
         );
         assert_eq!(pick_auto_port(&v(&["Alpha", "Beta"])), Some("Alpha".into()));
-    }
-
-    #[test]
-    fn message_parsing_semantics() {
-        // note_on vel>0
-        assert_eq!(
-            parse_message(&[0x91, 60, 100]),
-            Some(MidiEvent::NoteOn {
-                note: 60,
-                velocity: 100
-            })
-        );
-        // note_on vel==0 == note_off; channel merged
-        assert_eq!(
-            parse_message(&[0x95, 60, 0]),
-            Some(MidiEvent::NoteOff { note: 60 })
-        );
-        assert_eq!(
-            parse_message(&[0x80, 61, 40]),
-            Some(MidiEvent::NoteOff { note: 61 })
-        );
-        // sustain threshold at 64
-        assert_eq!(
-            parse_message(&[0xB0, 64, 64]),
-            Some(MidiEvent::Sustain { down: true })
-        );
-        assert_eq!(
-            parse_message(&[0xB2, 64, 63]),
-            Some(MidiEvent::Sustain { down: false })
-        );
-        // other CCs / messages ignored
-        assert_eq!(parse_message(&[0xB0, 1, 127]), None);
-        assert_eq!(parse_message(&[0xE0, 0, 64]), None);
     }
 }

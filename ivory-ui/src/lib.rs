@@ -4,6 +4,7 @@
 //! See `Cargo.toml` for why the absent dependencies matter more than the
 //! present ones.
 
+pub mod app;
 pub mod chord_strip;
 pub mod dialogs;
 pub mod fonts;
@@ -11,7 +12,9 @@ pub mod fretboard_panel;
 pub mod host;
 pub mod keys;
 pub mod menu;
+pub mod midi_event;
 pub mod piano;
+pub mod ports;
 pub mod settings;
 pub mod shell;
 pub mod theory_panel;

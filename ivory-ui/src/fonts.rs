@@ -33,8 +33,7 @@ pub static TERMINESS_BOLD: &[u8] =
 /// 270 KB a weight against Terminess's 2.6 MB.
 pub static JETBRAINS_REGULAR: &[u8] =
     include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
-pub static JETBRAINS_BOLD: &[u8] =
-    include_bytes!("../../assets/fonts/JetBrainsMono-Bold.ttf");
+pub static JETBRAINS_BOLD: &[u8] = include_bytes!("../../assets/fonts/JetBrainsMono-Bold.ttf");
 
 pub const FAMILY_COURIER: &str = "courier";
 pub const FAMILY_COURIER_BOLD: &str = "courier-bold";
@@ -87,8 +86,11 @@ impl FontChoice {
         }
     }
 
-    pub const ALL: [FontChoice; 3] =
-        [FontChoice::Courier, FontChoice::Terminess, FontChoice::JetBrains];
+    pub const ALL: [FontChoice; 3] = [
+        FontChoice::Courier,
+        FontChoice::Terminess,
+        FontChoice::JetBrains,
+    ];
 
     /// Both faces are compiled in, so every choice is always usable. Kept as a
     /// method because the menu asks per-entry and a future font may not be.
@@ -175,7 +177,9 @@ pub fn install(ctx: &egui::Context, choice: FontChoice, custom_font_path: Option
 pub fn apply_text_styles(ctx: &egui::Context) {
     use egui::{FontId, TextStyle};
     ctx.all_styles_mut(|style| {
-        style.text_styles.insert(TextStyle::Body, FontId::new(13.0, courier_bold()));
+        style
+            .text_styles
+            .insert(TextStyle::Body, FontId::new(13.0, courier_bold()));
         style
             .text_styles
             .insert(TextStyle::Button, FontId::new(13.0, courier_bold()));
@@ -225,7 +229,10 @@ mod tests {
         // from a fallback: they are the app's whole output.
         for (c, what) in &DRAWN[..3] {
             assert!(has(COURIER_PRIME_REGULAR, *c), "Courier Prime lacks {what}");
-            assert!(has(COURIER_PRIME_BOLD, *c), "Courier Prime Bold lacks {what}");
+            assert!(
+                has(COURIER_PRIME_BOLD, *c),
+                "Courier Prime Bold lacks {what}"
+            );
         }
 
         // JetBrains Mono is the one face that covers the lot on its own, which
@@ -240,7 +247,10 @@ mod tests {
             let covered = has(COURIER_PRIME_REGULAR, *c)
                 || has(TERMINESS_REGULAR, *c)
                 || has(JETBRAINS_REGULAR, *c);
-            assert!(covered, "no bundled face has {what}; it would render as tofu");
+            assert!(
+                covered,
+                "no bundled face has {what}; it would render as tofu"
+            );
         }
     }
 }

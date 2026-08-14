@@ -20,12 +20,7 @@ pub const LEGACY_TEXT_COLOR: Color32 = Color32::from_rgb(232, 220, 192);
 /// It is drawn from a bitmap rather than a glyph so it stays crisp and unmistakably
 /// pixel-art at any window size.
 const HEART: [&str; 6] = [
-    ".XX.XX.",
-    "XXXXXXX",
-    "XXXXXXX",
-    ".XXXXX.",
-    "..XXX..",
-    "...X...",
+    ".XX.XX.", "XXXXXXX", "XXXXXXX", ".XXXXX.", "..XXX..", "...X...",
 ];
 
 /// Colours the heart cycles through when clicked.
@@ -229,35 +224,35 @@ pub fn show_detached_window(
 
     ctx.show_viewport_immediate(viewport_id(), builder, |vp, _class| {
         crate::shell::viewport_ui(vp, |ui| {
-        let rect = ui.max_rect();
-        draw(ui.painter(), rect, chord, color, heart, Some(BORDER_COLOR));
+            let rect = ui.max_rect();
+            draw(ui.painter(), rect, chord, color, heart, Some(BORDER_COLOR));
 
-        let (close, inner_rect, outer_rect, pressed, secondary, pointer) = ui.input(|i| {
-            (
-                i.viewport().close_requested(),
-                i.viewport().inner_rect,
-                i.viewport().outer_rect,
-                i.pointer.primary_pressed(),
-                i.pointer.secondary_clicked(),
-                i.pointer.interact_pos(),
-            )
-        });
+            let (close, inner_rect, outer_rect, pressed, secondary, pointer) = ui.input(|i| {
+                (
+                    i.viewport().close_requested(),
+                    i.viewport().inner_rect,
+                    i.viewport().outer_rect,
+                    i.pointer.primary_pressed(),
+                    i.pointer.secondary_clicked(),
+                    i.pointer.interact_pos(),
+                )
+            });
 
-        outcome.close_requested = close;
-        outcome.inner_size = inner_rect.map(|r| r.size()).or(Some(rect.size()));
-        outcome.outer_pos = outer_rect.map(|r| r.min);
+            outcome.close_requested = close;
+            outcome.inner_size = inner_rect.map(|r| r.size()).or(Some(rect.size()));
+            outcome.outer_pos = outer_rect.map(|r| r.min);
 
-        // Right-click anywhere opens the app context menu at the cursor.
-        if secondary {
-            if let (Some(pos), Some(inner)) = (pointer, inner_rect) {
-                outcome.context_menu_at = Some(inner.min + pos.to_vec2());
+            // Right-click anywhere opens the app context menu at the cursor.
+            if secondary {
+                if let (Some(pos), Some(inner)) = (pointer, inner_rect) {
+                    outcome.context_menu_at = Some(inner.min + pos.to_vec2());
+                }
             }
-        }
 
-        // Borderless drag-anywhere: StartDrag from the press handler.
-        if borderless && pressed && !secondary {
-            ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
-        }
+            // Borderless drag-anywhere: StartDrag from the press handler.
+            if borderless && pressed && !secondary {
+                ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+            }
         });
     });
     outcome
@@ -378,7 +373,10 @@ mod tests {
         let n = HEART_COLORS.len() as i64;
         for stored in [-9_999i64, -1, 0, 3, n, n * 7 + 2, i64::MAX] {
             let idx = stored.rem_euclid(n) as usize;
-            assert!(HEART_COLORS.get(idx).is_some(), "index {stored} escaped range");
+            assert!(
+                HEART_COLORS.get(idx).is_some(),
+                "index {stored} escaped range"
+            );
         }
     }
 
@@ -387,9 +385,15 @@ mod tests {
         for (w, h) in [(300.0f32, 40.0f32), (1300.0, 46.0), (2600.0, 120.0)] {
             let strip = Rect::from_min_size(Pos2::new(0.0, 0.0), egui::vec2(w, h));
             let hr = heart_rect(strip);
-            assert!(strip.contains_rect(hr), "heart escapes the strip at {w}x{h}");
+            assert!(
+                strip.contains_rect(hr),
+                "heart escapes the strip at {w}x{h}"
+            );
             // Top-right, not centred: it must not collide with the chord label.
-            assert!(hr.center().x > strip.center().x, "heart should hug the right");
+            assert!(
+                hr.center().x > strip.center().x,
+                "heart should hug the right"
+            );
             assert!(hr.center().y < strip.center().y, "heart should hug the top");
         }
     }
