@@ -31,8 +31,8 @@ your DAW already looks.
 
 | Platform | Installer | Or unpack it yourself |
 |---|---|---|
-| macOS 11+ | [`.pkg`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos.pkg) | [`.dmg`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.dmg) · [`.zip`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.zip) |
-| Windows 10+ | [`setup.exe`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-windows-setup.exe) | [`.zip`](https://github.com/ganten1998/ivory/releases/latest/download/tangent-windows-x86_64.zip) |
+| macOS 11+ | [`.pkg`](https://github.com/ganten1998/ivory/releases/latest) | [`.dmg`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.dmg) · [`.zip`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.zip) |
+| Windows 10+ | [`setup.exe`](https://github.com/ganten1998/ivory/releases/latest) | [`.zip`](https://github.com/ganten1998/ivory/releases/latest/download/tangent-windows-x86_64.zip) |
 | Linux x86_64 | `install.sh`, inside the tarball | [`.tar.gz`](https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz) |
 
 macOS builds are universal from 3.0.0 — Apple Silicon and Intel — and signed

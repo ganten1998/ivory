@@ -90,6 +90,52 @@ Signed and notarized on macOS. Installers include the app, the plugin, or both.
 
 ---
 
+## Before pasting anything, check the links resolve
+
+Every download link resolves by EXACT asset name against whatever release is
+currently latest. A name that is not on that release 404s, and the store page
+and the key email are the two places a buyer meets those links.
+
+This has now gone wrong twice: once by redeploying the key email ahead of its
+assets, and once by writing the 3.0.0 installer names into this file while
+2.3.0 was still the latest release. Both times the text was right and the
+release was not.
+
+So check, do not assume:
+
+```sh
+scripts/check-store-links.sh
+```
+
+It pulls every `releases/latest/download/` URL out of this file and out of
+`tools/ivory-fulfil/src/main.rs` and fetches each one. Run it after publishing
+and before pasting.
+
+## The 3.0.0 swap, once 3.0.0 is published
+
+The installers are better links than the archives: they offer the app and the
+plugin as separate choices and put the plugin where the DAW already looks. They
+do NOT exist until 3.0.0 is out. After publishing, and after
+`check-store-links.sh` passes, replace the macOS and Windows lines below with:
+
+```
+macOS 11 or later, Apple Silicon or Intel
+https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos.pkg
+
+Windows 10 or later
+https://github.com/ganten1998/ivory/releases/latest/download/Tangent-windows-setup.exe
+```
+
+...and add, above them:
+
+```
+Each installer offers the app and the VST3 plugin as separate choices, so you
+can take either or both. The plugin goes where your DAW already looks.
+```
+
+`tools/ivory-fulfil/src/main.rs` already carries the installer URLs, so it must
+not be redeployed until the same moment. Publish, check, paste, deploy.
+
 ## Post-purchase page
 
 Gumroad → Products → Tangent → **Content** tab → paste, then **Save changes**.
@@ -112,36 +158,20 @@ DOWNLOAD TANGENT
 
 These links always give you the current version, so they are worth keeping.
 
-Each installer offers the app and the VST3 plugin as separate choices, so you
-can take either or both. The plugin goes where your DAW already looks.
+macOS 11 or later
+https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.dmg
 
-macOS 11 or later, Apple Silicon or Intel
-https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos.pkg
+Prefer a .zip:
+https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.zip
 
 Windows 10 or later
-https://github.com/ganten1998/ivory/releases/latest/download/Tangent-windows-setup.exe
-
-Linux x86_64 - the tarball has an install.sh that needs no root
-https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz
-
-Rather unpack it yourself:
-https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.dmg
-https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.zip
 https://github.com/ganten1998/ivory/releases/latest/download/tangent-windows-x86_64.zip
+
+Linux x86_64
+https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz
 
 Checksums:
 https://github.com/ganten1998/ivory/releases/latest/download/SHA256SUMS
-
-THE PLUGIN
-
-Tangent.vst3 shows everything the app does, reading the notes on the track it
-is on. It makes no sound of its own - it is a monitor, not an instrument - so
-put it on a MIDI or instrument track rather than in an effect slot. Its
-settings live in the DAW project, so two instances and the standalone can each
-be set up differently.
-
-Your DAW will find it the next time it scans for plugins. It appears as
-Tangent, by Ganten.
 
 YOUR SUPPORTER KEY
 
@@ -157,18 +187,17 @@ The key has no expiry, contacts no server, and works on every machine you own.
 
 FIRST LAUNCH
 
-macOS: run the .pkg and choose what you want installed. The app is signed with
-a Developer ID certificate and notarized by Apple. You can install for all
-users, which needs your password, or just for yourself, which does not.
+macOS: open the .dmg and drag Tangent into your Applications folder. The app is
+signed with a Developer ID certificate and notarized by Apple, so it opens on a
+double-click with no security prompt.
 
-Windows: run the setup and choose what you want installed. It is not
+Windows: unzip it anywhere and run tangent.exe. The executable is not
 code-signed, so SmartScreen shows "Windows protected your PC" the first time.
 Click "More info", then "Run anyway". Windows remembers the choice.
 
-Linux: extract the archive and run ./install.sh. It needs no root by default,
-and takes --app, --vst3, --system, --prefix, --uninstall and --dry-run. MIDI
-goes through ALSA, so libasound.so.2 needs to be present. Requires glibc 2.32
-or newer.
+Linux: extract the archive, then chmod +x tangent and ./tangent. MIDI goes
+through ALSA, so libasound.so.2 needs to be present. Requires glibc 2.32 or
+newer.
 
 Plug your MIDI keyboard in before you start Tangent. Everything in the app
 lives in the right-click menu, and holding H shows every keyboard shortcut.

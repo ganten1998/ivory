@@ -3,6 +3,29 @@
 This is the business/operational side of shipping Ivory 2.x. Technical design
 is in `DESIGN.md`; historical CI war stories are in `spec/product-docs.md` §3.
 
+## Store links: check them, then swap them
+
+`scripts/check-store-links.sh` fetches every `releases/latest/download/` URL in
+`README.md`, `docs/STORE-CONTENT.md` and `tools/ivory-fulfil/src/main.rs`. They
+resolve by EXACT asset name against whatever release is currently latest, so a
+new name 404s until it has shipped.
+
+Everything on `main` points at assets that exist. The 3.0.0 installer links
+(`Tangent-macos.pkg`, `Tangent-windows-setup.exe`) are BETTER links and take
+over at release time, not before — the swap is written out in
+`docs/STORE-CONTENT.md`. Order:
+
+1. `scripts/publish-github.sh` (assets exist)
+2. `scripts/check-store-links.sh` (still green)
+3. swap the two links in `STORE-CONTENT.md` and `tools/ivory-fulfil`
+4. `scripts/check-store-links.sh` again (now green with the new names)
+5. paste the store block, deploy fulfil, send the announcement
+
+This has gone wrong twice, both times by getting ahead of step 1: the key email
+was once redeployed before its assets and 404'd for ten minutes, and the 3.0.0
+installer names were once written into the store content while 2.3.0 was still
+latest. Both times the text was right and the release was not.
+
 ## Hard gates before any public release
 
 1. **Icon — informational, NOT a gate** (kept in this list so nobody re-files

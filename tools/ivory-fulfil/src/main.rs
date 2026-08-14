@@ -167,16 +167,18 @@ fn sale_is_genuine(token: &str, sale_id: &str) -> bool {
 // Never pin these to a version: buyers keep this email for years, and a link
 // to 2.2.0 in 2029 is worse than no link at all.
 //
-// 3.0.0 points these at the INSTALLERS. They offer the app and the VST3 plugin
-// as separate choices and put the plugin where the DAW already looks, which is
-// the difference between "it works" and a support email. The .dmg and .zip
-// still ship for anyone who would rather unpack it themselves.
+// These point at assets that EXIST ON THE CURRENT LATEST RELEASE, and they are
+// changed at release time, not before. `scripts/check-store-links.sh` fetches
+// every one of them and is the gate.
 //
-// ORDER MATTERS: these names must already exist on the current stable release
-// before this is redeployed. This email was once shipped ahead of the assets
-// and 404'd for ten minutes. Publish first, redeploy second.
+// The installers (`Tangent-macos.pkg`, `Tangent-windows-setup.exe`) are better
+// links and take over the moment 3.0.0 is published; the swap is written down
+// in docs/STORE-CONTENT.md. It is not done here early, because a repository
+// whose main branch hands out 404s is one where somebody eventually deploys
+// it. That has happened: this email once went out ahead of its assets and
+// 404'd for ten minutes.
 const DOWNLOAD_MACOS: &str =
-    "https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos.pkg";
+    "https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.dmg";
 // tangent-*, matching the macOS line above, which had already been updated.
 // Both spellings resolve — `publish-github.sh` uploads the legacy `ivory-*`
 // names on every stable release precisely so the links in emails already sent
@@ -185,7 +187,7 @@ const DOWNLOAD_MACOS: &str =
 // FIRST: this email was once redeployed ahead of the assets and 404'd for ten
 // minutes. They exist on 2.2.0.
 const DOWNLOAD_WINDOWS: &str =
-    "https://github.com/ganten1998/ivory/releases/latest/download/Tangent-windows-setup.exe";
+    "https://github.com/ganten1998/ivory/releases/latest/download/tangent-windows-x86_64.zip";
 const DOWNLOAD_LINUX: &str =
     "https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz";
 
@@ -203,14 +205,12 @@ fn email_body(key: &str) -> String {
          do not matter.\n\n\
          Downloads. These links always give you the current version, so they are\n\
          worth keeping alongside the key:\n\n\
-         \x20 macOS 11 or later (Apple Silicon or Intel)\n\
+         \x20 macOS 11 or later\n\
          \x20 {macos}\n\n\
          \x20 Windows 10 or later\n\
          \x20 {windows}\n\n\
-         \x20 Linux x86_64 (the tarball has an install.sh)\n\
+         \x20 Linux x86_64\n\
          \x20 {linux}\n\n\
-         Each installer offers the app and the VST3 plugin as separate choices,\n\
-         so you can take either or both.\n\n\
          Keep this email. The key has no expiry and works on every machine you own.\n\n\
          Thanks again,\n\
          Tangent\n",
