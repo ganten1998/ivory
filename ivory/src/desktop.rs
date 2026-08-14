@@ -69,7 +69,27 @@ impl DesktopApp {
         settings: Settings,
         cli_port: Option<String>,
     ) -> Self {
-        let mut app = IvoryApp::new(&cc.egui_ctx, settings, Caps::DESKTOP);
+        // Dev switch: run the DESKTOP binary through the PLUGIN's capability
+        // set, so the in-canvas menu and dialogs can be looked at, screenshot
+        // and debugged in a window — without a DAW, a rebuild, an installer
+        // and a plugin rescan between each attempt.
+        //
+        //   IVORY_INLINE=1 /Applications/Tangent.app/Contents/MacOS/tangent
+        //
+        // Environment-gated, so a normal launch cannot reach it. It is a
+        // faithful test of the path: the same `Caps::PLUGIN` the plugin uses,
+        // which also means the window will not resize itself.
+        //   IVORY_INLINE=menu also opens the menu on the first frame.
+        let caps = if matches!(
+            std::env::var("IVORY_INLINE").as_deref(),
+            Ok("1") | Ok("menu")
+        ) {
+            eprintln!("IVORY_INLINE=1: running with the plugin's capabilities");
+            Caps::PLUGIN
+        } else {
+            Caps::DESKTOP
+        };
+        let mut app = IvoryApp::new(&cc.egui_ctx, settings, caps);
         let mut device = DeviceMidi::new(cc.egui_ctx.clone());
         // `-p NAME` beats the priority chain, and a bad name is not fatal: the
         // app opens with no MIDI, which is the same outcome as no device.

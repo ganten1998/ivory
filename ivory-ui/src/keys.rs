@@ -30,6 +30,11 @@ pub enum KeyAction {
     CycleFont,
     ShowAbout,
     ShowSupporterKey,
+    TeachChordName,
+    CorrectChordName,
+    ManageTaughtChords,
+    ToggleChordLearning,
+    ToggleNotePreference,
     CloseHelp,
 }
 
@@ -52,6 +57,15 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     (Key::F, "F", KeyAction::CycleFont, true),
     (Key::A, "A", KeyAction::ShowAbout, true),
     (Key::S, "S", KeyAction::ShowSupporterKey, true),
+    // The teach block. `N` for name is the one that matters: naming a voicing
+    // is what this app is FOR, and reaching it took a right-click, a scan down
+    // a long menu, a click, and then a click into the field before a single
+    // letter could be typed.
+    (Key::N, "N", KeyAction::TeachChordName, true),
+    (Key::E, "E", KeyAction::CorrectChordName, true),
+    (Key::M, "M", KeyAction::ManageTaughtChords, true),
+    (Key::L, "L", KeyAction::ToggleChordLearning, true),
+    (Key::P, "P", KeyAction::ToggleNotePreference, true),
     // Escape only closes the card; it is not worth a row of its own.
     (Key::Escape, "Esc", KeyAction::CloseHelp, false),
 ];
@@ -71,6 +85,11 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::CycleFont => "cycle the typeface",
         KeyAction::ShowAbout => "about",
         KeyAction::ShowSupporterKey => "enter a supporter key",
+        KeyAction::TeachChordName => "name the chord you are holding",
+        KeyAction::CorrectChordName => "correct what it reads",
+        KeyAction::ManageTaughtChords => "chords you have taught",
+        KeyAction::ToggleChordLearning => "chord learning",
+        KeyAction::ToggleNotePreference => "sharps or flats",
         KeyAction::CloseHelp => "close this card",
     }
 }

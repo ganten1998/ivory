@@ -236,7 +236,11 @@ mod tests {
             FontChoice::default(),
             seen
         );
-        assert_eq!(f, FontChoice::default(), "the cycle does not come back round");
+        assert_eq!(
+            f,
+            FontChoice::default(),
+            "the cycle does not come back round"
+        );
 
         // ...from every starting point, not just the default.
         for start in FontChoice::ALL {

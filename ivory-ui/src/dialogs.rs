@@ -35,6 +35,8 @@ pub enum Dialog {
         message: Option<String>,
         /// Name on the currently installed licence, when there is one.
         installed_as: Option<String>,
+        /// As above: focus and select-all on the first frame.
+        focus: bool,
     },
     ColorPick {
         target: ColorTarget,
@@ -51,6 +53,10 @@ pub enum Dialog {
         /// Editable name, prefilled with the current label.
         input: String,
         apply_all_keys: bool,
+        /// Take keyboard focus and select the whole field on the first frame.
+        /// Cleared once done, so a later frame does not fight the user's own
+        /// cursor.
+        focus: bool,
     },
     ManageTaught {
         rows: Vec<OverrideInfo>,
@@ -195,6 +201,26 @@ fn stock_style(ctx: &egui::Context) -> egui::Style {
 
 struct VpResult {
     close: bool,
+}
+
+/// Focus a text field and select everything in it, once.
+///
+/// The point of the shortcut that opens these dialogs is that you can start
+/// typing. Without this you land on a dialog whose field is not focused, so
+/// the first thing you do is click it — and even then the caret sits at one
+/// end and the prefilled name has to be cleared by hand. Selecting the whole
+/// value means the first keystroke replaces it, which is what every rename
+/// field on every platform does.
+fn focus_and_select_all(ui: &egui::Ui, resp: &egui::Response, text: &str) {
+    resp.request_focus();
+    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), resp.id) {
+        let all = egui::text_selection::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(text.chars().count()),
+        );
+        state.cursor.set_char_range(Some(all));
+        state.store(ui.ctx(), resp.id);
+    }
 }
 
 /// Where child windows open. A viewport can only see its own geometry, so the
@@ -575,6 +601,7 @@ pub fn show(
             input,
             message,
             installed_as,
+            focus,
         } => {
             let t = theme(dark_mode);
             show_dialog_viewport(
@@ -620,7 +647,11 @@ pub fn show(
                                 .text_color(t.text)
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(5);
-                            ui.add(edit);
+                            let resp = ui.add(edit);
+                            if *focus {
+                                *focus = false;
+                                focus_and_select_all(ui, &resp, input);
+                            }
                             if let Some(msg) = message.as_deref() {
                                 ui.add_space(4.0);
                                 ui.label(RichText::new(msg).font(bold(11.0)).color(t.text));
@@ -658,6 +689,7 @@ pub fn show(
             current_label,
             input,
             apply_all_keys,
+            focus,
         } => {
             let t = theme(dark_mode);
             let notes = notes.clone();
@@ -691,7 +723,11 @@ pub fn show(
                                 .font(bold(12.0))
                                 .text_color(t.text)
                                 .desired_width(f32::INFINITY);
-                            ui.add(edit);
+                            let resp = ui.add(edit);
+                            if *focus {
+                                *focus = false;
+                                focus_and_select_all(ui, &resp, input);
+                            }
                             ui.add_space(6.0);
                             let mut apply = *apply_all_keys;
                             if ui

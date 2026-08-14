@@ -155,6 +155,8 @@ pub struct IvoryApp {
     /// Where the bands were actually drawn, which is centred in the pane.
     /// Child windows and in-canvas dialogs centre on this.
     last_drawn: Rect,
+    /// One-shot latch for the IVORY_INLINE=menu debug hook.
+    demo_menu_done: bool,
 
     notes: NoteState,
     manual_notes: HashSet<u8>,
@@ -298,6 +300,7 @@ impl IvoryApp {
             pending_resize: None,
             last_pane: Vec2::ZERO,
             last_drawn: Rect::NOTHING,
+            demo_menu_done: false,
             notes: NoteState::default(),
             manual_notes: HashSet::new(),
             manual_positions: HashMap::new(),
@@ -1007,6 +1010,16 @@ impl IvoryApp {
             // while one is up, so A cannot stack a second About on the first.
             K::ShowAbout => self.apply_menu_action(ctx, MenuAction::ShowAbout),
             K::ShowSupporterKey => self.apply_menu_action(ctx, MenuAction::ShowSupporterKey),
+            // The teach block. Each one is the menu row it names, so a
+            // shortcut and a click cannot come to mean different things — and
+            // the enabled-ness rules live in one place rather than two.
+            K::TeachChordName => self.apply_menu_action(ctx, MenuAction::TeachChordName),
+            K::CorrectChordName => self.apply_menu_action(ctx, MenuAction::CorrectChordName),
+            K::ManageTaughtChords => self.apply_menu_action(ctx, MenuAction::ManageTaughtChords),
+            K::ToggleChordLearning => self.apply_menu_action(ctx, MenuAction::ToggleChordLearning),
+            K::ToggleNotePreference => {
+                self.apply_menu_action(ctx, MenuAction::ToggleNotePreference)
+            }
             // "Clear what I placed", not "clear everything": notes arriving
             // from a MIDI keyboard are not ours to drop, and they would come
             // straight back on the next frame anyway.
@@ -1169,6 +1182,7 @@ impl IvoryApp {
                     input: String::new(),
                     message: None,
                     installed_as: self.license.display_name().map(str::to_owned),
+                    focus: true,
                 })
             }
             MenuAction::ShowAbout => self.dialog = Some(Dialog::About),
@@ -1239,6 +1253,8 @@ impl IvoryApp {
             // Naming a voicing usually means naming the shape, not that one
             // key, so this starts on. The last choice is remembered.
             apply_all_keys: self.settings.teach_apply_all_keys,
+            // The whole point of the shortcut: hold the chord, press N, type.
+            focus: true,
         });
     }
 
@@ -1462,6 +1478,9 @@ impl IvoryApp {
                             input: String::new(),
                             message: Some(format!("Thank you, {who}. That means a lot.")),
                             installed_as: self.license.display_name().map(str::to_owned),
+                            // Already installed: nothing to type, so leave the
+                            // field alone rather than grabbing the caret.
+                            focus: false,
                         });
                     }
                     Err(err) => {
@@ -1469,6 +1488,9 @@ impl IvoryApp {
                             input: key,
                             message: Some(err.message().to_owned()),
                             installed_as: self.license.display_name().map(str::to_owned),
+                            // It failed and the key is still there to fix, so
+                            // select it: the usual next move is to paste again.
+                            focus: true,
                         });
                     }
                 }
@@ -1655,6 +1677,17 @@ impl IvoryApp {
 
     fn paint(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+
+        // Dev hook, alongside IVORY_DEMO_NOTES: open the menu on the first
+        // frame so the in-canvas version can be photographed without anyone
+        // having to click, and therefore without taking focus from whatever
+        // else is being tested. Environment-gated; ships inert.
+        //   IVORY_INLINE=menu /Applications/Tangent.app/Contents/MacOS/tangent
+        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("menu") {
+            self.demo_menu_done = true;
+            let at = ui.max_rect().min + Vec2::new(20.0, 20.0);
+            self.open_menu_at(&ctx, at);
+        }
 
         self.process_midi_events();
 
@@ -2085,6 +2118,82 @@ mod tests {
             .flat_map(|v| v.commands.iter())
             .map(|c| format!("{c:?}"))
             .collect()
+    }
+
+    /// The whole menu must fit the editor it is drawn in, at every size the
+    /// plugin can open at and with every band turned on.
+    ///
+    /// A menu taller than its canvas does not look scrollable, it looks CUT
+    /// OFF — the rows past the edge are simply absent and nothing on screen
+    /// says otherwise. On the desktop it cannot happen: the menu is its own
+    /// window and may be taller than the app. In a plugin editor, which is
+    /// often shorter than the ~550 points this menu wants, it happened the
+    /// moment the guitar view was turned on.
+    #[test]
+    fn the_whole_menu_fits_a_short_editor() {
+        for (fret, theory) in [(false, false), (true, false), (true, true)] {
+            let settings = Settings {
+                show_welcome: false,
+                show_fretboard: fret,
+                theory_circle: theory,
+                theory_tonnetz: theory,
+                theory_triangles: theory,
+                ..Settings::default()
+            };
+            let (ctx, mut app) = headless_with(Caps::PLUGIN, settings.clone());
+            crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+
+            // Every editor height the plugin realistically opens at, plus a
+            // deliberately cruel one.
+            for h in [natural_size(&settings, 900.0).y, 200.0, 137.0] {
+                let pane = Vec2::new(900.0, h);
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, pane)),
+                        ..Default::default()
+                    },
+                    |ctx| app.frame(ctx),
+                );
+                app.open_menu_at(&ctx, Pos2::new(20.0, 20.0));
+                let state = app.menu_state.as_ref().expect("menu open");
+                let menu = menu::size_for_test(state);
+                let row_h = menu::row_height_for_test(state);
+                // Either it fits, or it was squeezed as far as it is allowed
+                // to go and `shell::surface` scrolls the rest. What must never
+                // happen is a menu that is too tall AND was not squeezed —
+                // that is the one that looks cut off with rows simply absent.
+                if menu.y > pane.y + 0.5 {
+                    // Measured against the same menu with no ceiling, so the
+                    // floor is whatever the code says it is rather than a
+                    // number copied into the test that can drift.
+                    let roomy = {
+                        let mut a = app.menu_view();
+                        a.caps = Caps::DESKTOP;
+                        menu::row_height_for_test(&menu::MenuState::open(
+                            &ctx,
+                            a,
+                            Pos2::ZERO,
+                            Some(Vec2::new(4000.0, 4000.0)),
+                        ))
+                    };
+                    assert!(
+                        row_h < roomy - 0.5,
+                        "menu is {}pt in a {}pt editor and its rows are still \
+                         {row_h}pt, the same as the unconstrained {roomy}pt \
+                         (fretboard {fret}, theory {theory}) — it did not \
+                         squeeze at all, so the bottom rows are simply missing",
+                        menu.y,
+                        pane.y
+                    );
+                }
+                // Readable either way: squeezing to a smear is not a fix.
+                assert!(
+                    row_h >= 12.0,
+                    "rows squeezed to {row_h}pt, which is not a menu any more"
+                );
+                app.menu_state = None;
+            }
+        }
     }
 
     /// A host that cannot open windows must not believe something is detached.

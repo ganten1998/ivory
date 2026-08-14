@@ -372,6 +372,61 @@ mod tests {
         );
     }
 
+    /// An oversized inline surface must actually SCROLL when the wheel turns.
+    ///
+    /// "It has a ScrollArea in it" is not the same as "it scrolls": the area
+    /// only scrolls if it knows its content is bigger than its viewport, and
+    /// the content size here comes from an explicitly allocated rect rather
+    /// than from laying widgets out.
+    #[test]
+    fn an_oversized_inline_surface_really_scrolls() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 200.0));
+        let spec = SurfaceSpec {
+            id: "test-scroll",
+            size: Vec2::new(400.0, 900.0),
+            min_size: Vec2::new(400.0, 900.0),
+            pos: Some(Pos2::ZERO),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut body_top = 0.0_f32;
+        let mut run = |events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    surface(ctx, Caps::PLUGIN, &spec, &mut |ui, _| {
+                        body_top = ui.max_rect().min.y;
+                    });
+                },
+            );
+            body_top
+        };
+
+        run(vec![]);
+        let before = run(vec![egui::Event::PointerMoved(Pos2::new(200.0, 100.0))]);
+        // Three notches down, over the middle of the surface.
+        let after = run(vec![
+            egui::Event::PointerMoved(Pos2::new(200.0, 100.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::Vec2::new(0.0, -240.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        run(vec![]);
+        let settled = run(vec![]);
+
+        assert!(
+            settled < before - 50.0,
+            "the wheel moved the content from {before} to {settled} \
+             (immediately after the event: {after}) — it is not scrolling"
+        );
+    }
+
     /// Inline has no window, so it has no focus. Reporting `Some(false)` would
     /// be read by the menu as "the user clicked away" on the very first frame,
     /// and the menu would shut before it could be used.

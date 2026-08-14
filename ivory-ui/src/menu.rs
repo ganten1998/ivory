@@ -143,6 +143,27 @@ const SIZE_PERCENTS: [i64; 7] = [50, 75, 100, 125, 150, 175, 200];
 /// different instrument, and the list has to end somewhere.
 const CAPO_MAX: u8 = 9;
 const ARROW: &str = "\u{23F5}"; // ⏵ submenu indicator
+/// The most a menu may be squeezed to fit a short editor before it stops being
+/// worth reading and the scroll fallback takes over instead.
+const MIN_SQUEEZE: f32 = 0.62;
+const MIN_ROW_H: f32 = 13.0;
+/// Layers in the inline menu's drop shadow.
+const SHADOW_STEPS: u32 = 5;
+
+/// Total height of a menu whose rows are `row_h` tall.
+///
+/// Separate from the loop that builds `subs` because the squeeze has to know
+/// the answer BEFORE choosing `row_h`, and computing it two different ways is
+/// how a menu ends up one row taller than the space it was measured for.
+fn measured_height(entries: &[Entry], row_h: f32) -> f32 {
+    entries
+        .iter()
+        .map(|e| match e {
+            Entry::Separator => SEP_H,
+            _ => row_h,
+        })
+        .sum()
+}
 
 enum Entry {
     Separator,
@@ -187,6 +208,10 @@ pub struct MenuState {
     dark_mode: bool,
     opened_at: Instant,
     saw_focus: bool,
+    /// Text size multiplier, below 1.0 only when the menu had to be squeezed
+    /// to fit a short editor. Applied to the row font so the labels shrink
+    /// with the rows rather than overflowing them.
+    font_scale: f32,
     /// Captured at open time, not read from the app each frame, so a menu can
     /// never be half-drawn as a window and half as a layer.
     caps: Caps,
@@ -528,8 +553,44 @@ impl MenuState {
                 }
             }
         }
-        let row_h = (text_h + 2.0 * PAD_Y).ceil();
+        let mut row_h = (text_h + 2.0 * PAD_Y).ceil();
         let width = (max_w + 2.0 * PAD_X).ceil();
+
+        // Squeeze to fit, when there is a hard ceiling.
+        //
+        // A menu that scrolls is a menu that LOOKS cut off — the rows past the
+        // edge are simply absent, and nothing on screen says to scroll. On a
+        // desktop it never comes up: the menu is its own window and may be
+        // taller than the app. In a plugin editor, which can easily be shorter
+        // than the ~550 points this menu wants, it came up immediately.
+        //
+        // Menus are static once shown, so the fix is to measure first and
+        // shrink the rows until the whole thing fits. Down to a floor: below
+        // about nine points it stops being readable, and at that point the
+        // scroll fallback in `shell::surface` takes over rather than shrinking
+        // into illegibility.
+        let mut font_scale = 1.0_f32;
+        if let Some(mon) = monitor_size {
+            if measured_height(&entries, row_h) > mon.y {
+                // Solved, not approximated. Separators are a fixed 3 points
+                // and do not shrink, so scaling the whole height by a ratio
+                // leaves the menu a few points too tall — which is the one
+                // outcome this is trying to avoid.
+                let n_sep = entries
+                    .iter()
+                    .filter(|e| matches!(e, Entry::Separator))
+                    .count() as f32;
+                let n_row = entries.len() as f32 - n_sep;
+                if n_row >= 1.0 {
+                    let room = mon.y - n_sep * SEP_H;
+                    let fitted = (room / n_row).floor();
+                    let floor = (row_h * MIN_SQUEEZE).max(MIN_ROW_H);
+                    let chosen = fitted.max(floor).min(row_h);
+                    font_scale = (chosen / row_h).clamp(MIN_SQUEEZE, 1.0);
+                    row_h = chosen;
+                }
+            }
+        }
 
         let mut height = 0.0;
         let mut subs: Vec<SubGeom> = Vec::new();
@@ -566,6 +627,7 @@ impl MenuState {
             size: Vec2::new(width, height),
             entries,
             row_h,
+            font_scale,
             subs,
             submenu_open: None,
             monitor: monitor_size,
@@ -581,6 +643,18 @@ impl MenuState {
 ///
 /// Separators and submenu parents are excluded: a separator cannot be clicked
 /// and a submenu parent opens rather than acts.
+/// The menu's natural size, for a test that needs to know whether it is taller
+/// than the editor it is being drawn into.
+#[doc(hidden)]
+pub fn size_for_test(state: &MenuState) -> Vec2 {
+    state.size
+}
+
+#[doc(hidden)]
+pub fn row_height_for_test(state: &MenuState) -> f32 {
+    state.row_h
+}
+
 #[doc(hidden)]
 pub fn rows_for_test(view: MenuView) -> Vec<(String, MenuAction)> {
     build_entries(view)
@@ -615,6 +689,59 @@ pub fn row_center_for_test(state: &MenuState, idx: usize) -> Pos2 {
         }
     }
     Pos2::new(state.pos.x + state.size.x * 0.5, y)
+}
+
+/// The menu's own background, and the edge it needs to look like an object.
+///
+/// On the desktop this is deliberately borderless: the menu is its own OS
+/// window, so the window edge and its drop shadow already separate it from
+/// whatever is behind, and a drawn border on top of that looks heavy.
+///
+/// Drawn INLINE there is no window and no shadow — and the menu's background
+/// is the same cream as the app's. The result was a menu with no visible
+/// extent at all: the rows read as text lying across the theory band and the
+/// separators as stray lines through it, which is what "the menu is cut off"
+/// looks like when nothing is actually missing. So inline it gets a real
+/// border and a shadow, and becomes a thing sitting on top of the app.
+fn draw_menu_backdrop(painter: &egui::Painter, rect: Rect, c: MenuColors, caps: Caps) {
+    if !caps.child_windows {
+        // A soft shadow, down and to the right, built from a few translucent
+        // rects. Cheaper than a blur and enough to lift the menu off the page.
+        for i in (1..=SHADOW_STEPS).rev() {
+            let k = i as f32;
+            painter.rect_filled(
+                rect.translate(Vec2::splat(k * 0.9)).expand(k * 0.4),
+                2.0,
+                Color32::from_black_alpha((14.0 / k) as u8),
+            );
+        }
+    }
+    painter.rect_filled(rect, 0.0, c.bg);
+    painter.rect_stroke(
+        rect.shrink(0.5),
+        0.0,
+        // Borderless on the desktop (the window edge does the work), a real
+        // 1px edge inline.
+        Stroke::new(1.0_f32, if caps.child_windows { c.bg } else { c.sep }),
+        egui::StrokeKind::Middle,
+    );
+}
+
+/// Shrink the row text along with the rows, when the menu had to be squeezed.
+///
+/// Without this the rows get shorter and the labels do not, so they overflow
+/// their own row and the menu looks broken rather than compact. Padding comes
+/// down with it, or the text has no room left inside the row at all.
+fn scale_menu_font(style: &mut egui::Style, scale: f32) {
+    if scale >= 0.999 {
+        return;
+    }
+    let size = (MENU_FONT_SIZE * scale).max(8.0);
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        FontId::new(size, fonts::courier_bold()),
+    );
+    style.spacing.button_padding = egui::vec2(PAD_X * scale, (PAD_Y * scale).max(1.0));
 }
 
 fn apply_menu_style(style: &mut egui::Style, c: MenuColors) {
@@ -693,17 +820,12 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         order: egui::Order::Foreground,
         ..Default::default()
     };
+    let font_scale = state.font_scale;
     let menu_report = crate::shell::surface(ctx, caps, &menu_spec, &mut |ui, want_close| {
         apply_menu_style(ui.style_mut(), c);
+        scale_menu_font(ui.style_mut(), font_scale);
         let rect = ui.max_rect();
-        // Background + 1px border in the background color (visually borderless).
-        ui.painter().rect_filled(rect, 0.0, c.bg);
-        ui.painter().rect_stroke(
-            rect.shrink(0.5),
-            0.0,
-            Stroke::new(1.0_f32, c.bg),
-            egui::StrokeKind::Middle,
-        );
+        draw_menu_backdrop(ui.painter(), rect, c, caps);
 
         ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
             let mut sub_idx = 0usize;
@@ -801,8 +923,9 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         };
         let report = crate::shell::surface(ctx, caps, &sub_spec, &mut |ui, want_close| {
             apply_menu_style(ui.style_mut(), c);
+            scale_menu_font(ui.style_mut(), font_scale);
             let rect = ui.max_rect();
-            ui.painter().rect_filled(rect, 0.0, c.bg);
+            draw_menu_backdrop(ui.painter(), rect, c, caps);
             let items = state
                 .entries
                 .iter()
