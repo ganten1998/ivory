@@ -5,7 +5,8 @@
 #
 # Usage:
 #   scripts/release.sh                  # build everything this host can
-#   ARCH=universal scripts/release.sh   # macOS: universal binary, not host arch
+#   ARCH=host scripts/release.sh        # macOS: host arch only, for a quick check
+#                                       # (releases are universal by default)
 #   scripts/release.sh --sums-only      # re-check + re-emit SHA256SUMS only
 #   SKIP_WINDOWS=1 scripts/release.sh   # macOS: skip build-cross.sh
 #   KEEP_STALE=1 scripts/release.sh     # leave other versions' artifacts in dist/

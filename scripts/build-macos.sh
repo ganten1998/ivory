@@ -104,7 +104,14 @@ if [ "${1:-}" = "icns" ]; then
   exit 0
 fi
 
-ARCH="${ARCH:-host}"
+# UNIVERSAL by default since 3.0.0.
+#
+# It used to default to the host arch, which on this Mac is arm64 — so a
+# release built without thinking about it shipped an Apple Silicon app while
+# the VST3 plugin was already universal. An Intel Mac could then install the
+# plugin and not the app, from an installer that offers them as separate
+# choices. `ARCH=host` is still there for a quick local build.
+ARCH="${ARCH:-universal}"
 case "$ARCH" in
   host)      ARCH_NAME="$(uname -m)" ;;
   universal) ARCH_NAME="universal" ;;
