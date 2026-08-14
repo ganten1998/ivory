@@ -15,7 +15,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **The fretboard works as an input.** With Keytoggle on, click the neck to
   place notes and read the chord off the piano above, instead of only the other
   way round. Shapes stay where you put them: entered by hand, a voicing is no
-  longer rearranged into the position Tangent would have chosen.
+  longer rearranged into the position Tangent would have chosen. Clicking a
+  second fret on a string moves that note rather than adding one the guitar
+  could never sound.
+- **Keyboard shortcuts.** Press **F1** for the list: `K` keytoggle, `R` clear
+  the notes you placed, `G` guitar view, `D` dark mode, `C` chord detection.
 
 ## [2.3.0] - 2026-08-13
 

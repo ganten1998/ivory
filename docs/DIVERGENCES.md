@@ -487,6 +487,39 @@ Two things this needed that were not obvious:
   obeyed, and pins are dropped on any tuning or capo change, so a stale one can
   never move a note somewhere it cannot sound.
 
+### D-UI-19 — keyboard shortcuts, and one finger per string
+
+The 2.2.0 tester report asked for keyboard shortcuts without saying for what,
+which is why it was not done then. Now there is something to bind them to.
+
+`F1` shows a card listing every shortcut; `K` keytoggle, `R` clears the notes
+you placed, `G` guitar view, `D` dark mode, `C` chord detection, `Esc` closes
+the card.
+
+- **One table, in `keys.rs`, and the card is rendered FROM it.** A shortcut that
+  works but is not listed, or is listed and does not work, is worse than no
+  shortcut; one source is the only way to guarantee neither. Every action routes
+  through the same `apply_menu_action` the menu rows use, so a key and a menu
+  item cannot drift apart in behaviour.
+- **A modifier suppresses every shortcut.** Cmd-R and Ctrl-R belong to the OS
+  and to muscle memory; swallowing them would be rude. Asserted by test.
+- **Shortcuts are dead while a dialog or the context menu is open**, both being
+  modal. A stray `K` changing the app behind a modal reads as a haunting.
+- `R` clears what the USER placed, not everything. Notes arriving from a MIDI
+  keyboard are not ours to drop, and would return on the next frame anyway.
+- **The card is drawn in the CANVAS**, not in a child window: painted directly
+  rather than via `egui::Window`, so it cannot be dragged off or resized into
+  nothing. It is also the first surface in this app that already works in a
+  VST3 editor, where no child viewport can exist, and it is the shape the rest
+  will move to (docs/PLUGIN-PLAN.md).
+
+**One finger per string.** Clicking a fret on a string that already holds a
+placed note MOVES that note rather than adding a second, because a string can
+only sound once. This is not only physical honesty: pinning is all-or-nothing,
+so a single impossible note sent every other note back to the solver to be
+rearranged, and the board started reporting "4 of 5 notes" with conflict rings
+after what looked like an ordinary click.
+
 ### D-UI-17 — the white keys tile
 
 The piano drew each white key `trunc(width / 52)` wide while stepping by the

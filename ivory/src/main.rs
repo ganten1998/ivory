@@ -7,6 +7,7 @@ mod chord_strip;
 mod dialogs;
 mod fonts;
 mod fretboard_panel;
+mod keys;
 mod menu;
 mod midi;
 mod piano;

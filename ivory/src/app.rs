@@ -9,6 +9,7 @@
 use crate::chord_strip;
 use crate::dialogs::{self, Dialog, DialogAction, LearningStatus};
 use crate::fretboard_panel;
+use crate::keys;
 use crate::menu::{self, ColorTarget, MenuAction, MenuState, MenuView};
 use crate::midi;
 use crate::piano;
@@ -180,6 +181,9 @@ pub struct IvoryApp {
     /// waiting for a clean exit loses the position whenever the app is killed.
     geometry_save_at: Option<Instant>,
 
+    /// The F1 shortcut card. Drawn in the canvas rather than in a window, so
+    /// it already works everywhere the app will run.
+    show_help: bool,
     menu_state: Option<MenuState>,
     dialog: Option<Dialog>,
 
@@ -276,6 +280,7 @@ impl IvoryApp {
             detached_live_pos: None,
             startup_detach_at,
             geometry_save_at: None,
+            show_help: false,
             menu_state: None,
             dialog: welcome,
             last_sent_size: None,
@@ -531,17 +536,38 @@ impl IvoryApp {
                         if self.manual_notes.remove(&note) {
                             self.manual_positions.remove(&note);
                         } else {
-                            self.manual_notes.insert(note);
                             // Only a fretboard click pins. A piano click says
                             // WHICH note, not where on the neck to draw it, so
                             // the solver still chooses for those.
                             if let Some(r) = fret_rect.filter(|r| r.contains(pos)) {
-                                if let Some(g) =
-                                    fretboard_panel::position_at(r, &self.settings.fretboard_spec(), pos)
-                                {
-                                    self.manual_positions.insert(note, g);
+                                if let Some((st, fret)) = fretboard_panel::position_at(
+                                    r,
+                                    &self.settings.fretboard_spec(),
+                                    pos,
+                                ) {
+                                    // One finger per string, because that is
+                                    // how a guitar works. Clicking a second
+                                    // fret on a string MOVES the note there
+                                    // rather than adding a second one that can
+                                    // never sound. Without this, one such click
+                                    // un-pinned the whole shape — pinning is
+                                    // all-or-nothing, so a single impossible
+                                    // note sent every other note back to the
+                                    // solver to be rearranged, and the board
+                                    // started reporting "4 of 5 notes".
+                                    if let Some(&occupant) = self
+                                        .manual_positions
+                                        .iter()
+                                        .find(|(_, &(s, _))| s == st)
+                                        .map(|(p, _)| p)
+                                    {
+                                        self.manual_notes.remove(&occupant);
+                                        self.manual_positions.remove(&occupant);
+                                    }
+                                    self.manual_positions.insert(note, (st, fret));
                                 }
                             }
+                            self.manual_notes.insert(note);
                         }
                         self.sync_pins();
                         self.detection_tick(true); // immediate off-cadence update
@@ -666,6 +692,30 @@ impl IvoryApp {
     }
 
     // ── Menu actions ───────────────────────────────────────────────────────
+
+    /// A shortcut. Everything here routes through the SAME code the menu rows
+    /// use, so a key and a menu item can never drift apart in behaviour.
+    fn apply_key_action(&mut self, ctx: &egui::Context, action: keys::KeyAction) {
+        use keys::KeyAction as K;
+        match action {
+            K::ToggleHelp => self.show_help = !self.show_help,
+            K::CloseHelp => self.show_help = false,
+            K::ToggleKeytoggle => self.apply_menu_action(ctx, MenuAction::ToggleKeytoggle),
+            K::ToggleFretboard => self.apply_menu_action(ctx, MenuAction::ToggleFretboard),
+            K::ToggleDarkMode => self.apply_menu_action(ctx, MenuAction::ToggleDarkMode),
+            K::ToggleDetection => self.apply_menu_action(ctx, MenuAction::ToggleChordDetection),
+            // "Clear what I placed", not "clear everything": notes arriving
+            // from a MIDI keyboard are not ours to drop, and they would come
+            // straight back on the next frame anyway.
+            K::ClearNotes => {
+                self.manual_notes.clear();
+                self.manual_positions.clear();
+                self.voicing.set_pins(Vec::new());
+                self.detection_tick(true);
+                self.voicing_tick(true);
+            }
+        }
+    }
 
     fn apply_menu_action(&mut self, ctx: &egui::Context, action: MenuAction) {
         match action {
@@ -1262,6 +1312,15 @@ impl IvoryApp {
         self.detection_tick(false);
         self.voicing_tick(false);
 
+        // Shortcuts, but never while a dialog or the context menu is up: those
+        // are modal, and a stray K behind a modal changing the app underneath
+        // it is the kind of thing that reads as a haunting.
+        if self.dialog.is_none() && self.menu_state.is_none() {
+            if let Some(action) = keys::pressed(&ctx) {
+                self.apply_key_action(&ctx, action);
+            }
+        }
+
         // Track our position on the monitor for global menu placement, child
         // window centring, and so the main window reopens where it was left.
         let (inner_rect, outer_rect, monitor) = ctx.input(|i| {
@@ -1367,6 +1426,10 @@ impl IvoryApp {
         }
 
         self.handle_main_interaction(&ctx, ui, piano_rect, chord_rect_for_hit, fret_rect_for_hit);
+
+        if self.show_help {
+            keys::draw_help(ui.painter(), ui.max_rect(), self.settings.dark_mode);
+        }
 
         // The popped-out neck.
         if self.fret_window_visible {
