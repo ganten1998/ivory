@@ -18,10 +18,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   change size on you after an update. **Tuning** (Standard, Drop D, DADGAD,
   Open G, Open D, Half Step Down, and a 4-string bass) and **Capo** appear in
   the same menu while it is showing.
-- One MIDI note can be up to six places on a guitar — middle C is five of them,
-  and the high E string cannot reach it at all — so the view picks the shape a
+- One MIDI note can be up to six places on a guitar. Middle C is five of them,
+  and the high E string cannot reach it at all, so the view picks the shape a
   player would use, weighing hand span, open strings, barres and where the hand
-  already is, and it holds that shape steady while you add notes to a chord
+  already is. It then holds that shape steady while you add notes to a chord,
   instead of jumping around.
 - Notes that will not fit are never quietly missing. An open string is a ring
   behind the nut, a note outside the guitar's range is a hollow dot with an
@@ -30,10 +30,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   damp is an `×`. Anything genuinely left off is counted underneath: "6 of 10
   notes".
 
-- **Three fingerboard woods** — Rosewood, Maple and Ebony — under **Wood** in
-  the same menu. Each is a whole palette rather than a stain: on maple the
-  strings, frets and inlays go dark, because light strings on blonde wood
-  cannot be seen.
+- **Three fingerboard woods** (Rosewood, Maple and Ebony) under **Wood** in the
+  same menu. Each is a whole palette rather than a stain: on maple the strings,
+  frets and inlays go dark, because light strings on blonde wood cannot be
+  seen.
 - **The fretboard pops out** into its own window with **Detach Fretboard**,
   exactly like the chord display: close it to put it back, right-click anywhere
   for the menu, and it remembers where you left it.

@@ -57,9 +57,9 @@ Intel Macs are not covered yet. The macOS build is Apple Silicon only.
   exactly. *Disable Chord Learning* silences it without erasing anything.
 - **Guitar view.** *Show Fretboard* adds a neck under the piano and puts the
   notes you are holding where a guitarist would actually play them. One MIDI
-  note can be six places on a guitar — middle C is five of them, and the high E
-  string cannot reach it at all — so Tangent picks the shape a player would use,
-  weighing hand span, open strings and barres, and holds it steady as you add
+  note can be six places on a guitar. Middle C is five of them, and the high E
+  string cannot reach it at all, so Tangent picks the shape a player would use,
+  weighing hand span, open strings and barres, then holds it steady as you add
   notes rather than jumping around the neck. Seven tunings including a 4-string
   bass, plus a capo. Notes that will not fit are never quietly missing: an
   out-of-range note shows as a hollow dot with the octave it moved, a note the
