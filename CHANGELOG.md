@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
-## [Unreleased]
+## [2.3.0] - 2026-08-13
 
 ### Added
 
