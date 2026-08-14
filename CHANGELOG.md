@@ -18,9 +18,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   longer rearranged into the position Tangent would have chosen. Clicking a
   second fret on a string moves that note rather than adding one the guitar
   could never sound.
-- **Keyboard shortcuts.** Press **H** for the list: `K` keytoggle, `R` clear the
-  notes you placed, `G` guitar view, `C` chord detection, `D` dark mode, `B`
-  window border, `F` cycle typeface, `A` about, `S` supporter key.
+- **Keyboard shortcuts.** Hold **H** and the list slides down; let go and it
+  slides away. `K` keytoggle, `R` clear the notes you placed, `G` guitar view,
+  `C` chord detection, `D` dark mode, `B` window border, `F` cycle typeface,
+  `A` about, `S` supporter key.
+- **JetBrains Mono** as a third bundled typeface, alongside Courier Prime and
+  Terminess. Cycle with `F` or from the menu.
 
 ## [2.3.0] - 2026-08-13
 

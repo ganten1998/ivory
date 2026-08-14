@@ -58,7 +58,7 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
 /// they cannot drift apart.
 fn describe(a: KeyAction) -> &'static str {
     match a {
-        KeyAction::ToggleHelp => "this card (or F1)",
+        KeyAction::ToggleHelp => "hold for this card",
         KeyAction::ToggleKeytoggle => "keytoggle: click the piano or the neck to place notes",
         KeyAction::ClearNotes => "clear every note you placed",
         KeyAction::ToggleFretboard => "guitar view",
@@ -84,9 +84,35 @@ pub fn pressed(ctx: &egui::Context) -> Option<KeyAction> {
         }
         BINDINGS
             .iter()
+            .filter(|(_, _, a, _)| !matches!(a, KeyAction::ToggleHelp | KeyAction::CloseHelp))
             .find(|(key, ..)| i.key_pressed(*key))
             .map(|&(_, _, action, _)| action)
     })
+}
+
+/// How far the card is out, 0.0 (hidden) to 1.0 (fully down).
+///
+/// The help key is HELD rather than toggled: press and read, let go and it is
+/// gone, with no state to get stuck in and nothing to dismiss. That only works
+/// if it moves, though — a card that blinks in and out looks like a glitch,
+/// while one that slides looks like it was always there waiting.
+///
+/// `animate_bool_with_time` does the easing and asks for the repaints, but the
+/// app's own cadence is 50ms (20fps), which would make this visibly steppy, so
+/// an animation in progress asks for the next frame immediately.
+pub fn help_progress(ctx: &egui::Context) -> f32 {
+    let held = ctx.input(|i| {
+        !i.modifiers.any()
+            && BINDINGS
+                .iter()
+                .filter(|(_, _, a, _)| *a == KeyAction::ToggleHelp)
+                .any(|(key, ..)| i.key_down(*key))
+    });
+    let t = ctx.animate_bool_with_time(egui::Id::new("tangent-help-card"), held, 0.16);
+    if t > 0.0 && t < 1.0 {
+        ctx.request_repaint();
+    }
+    t
 }
 
 /// Where the card goes, how big its text is, and how many columns it uses.
@@ -130,14 +156,20 @@ fn layout(rect: Rect, rows: usize, widest: usize) -> (Rect, f32, usize) {
 /// Centred, sized to its own content, and painted directly rather than through
 /// a `Window` so it cannot be dragged off, cannot be resized into nothing, and
 /// looks identical in a plugin editor where there is no window manager at all.
-pub fn draw_help(painter: &Painter, rect: Rect, dark: bool) {
+pub fn draw_help(painter: &Painter, rect: Rect, dark: bool, t: f32) {
     let rows: Vec<(&str, &str)> = BINDINGS
         .iter()
         .filter(|(.., shown)| *shown)
         .map(|&(_, label, action, _)| (label, describe(action)))
         .collect();
     let widest = rows.iter().map(|(_, d)| d.len()).max().unwrap_or(20);
-    let (card_rect, size, cols) = layout(rect, rows.len(), widest);
+    let (resting, size, cols) = layout(rect, rows.len(), widest);
+    // Slide down from above the top edge. At t = 0 the card sits entirely off
+    // the top, so the first frame of the animation is genuinely invisible
+    // rather than a flash of a half-drawn card.
+    let t = t.clamp(0.0, 1.0);
+    let travel = resting.bottom() - rect.top();
+    let card_rect = resting.translate(egui::vec2(0.0, -(1.0 - t) * travel));
 
     let row_h = size * 1.75;
     let pad = size * 1.4;
@@ -148,7 +180,9 @@ pub fn draw_help(painter: &Painter, rect: Rect, dark: bool) {
     let bold = FontId::new(size, crate::fonts::courier_bold());
 
     // Dim what is behind it, so the card reads as modal without being one.
-    painter.rect_filled(rect, 0.0, Color32::from_black_alpha(150));
+    // The dimming fades with the slide, or the app would go dark before the
+    // card had arrived to explain why.
+    painter.rect_filled(rect, 0.0, Color32::from_black_alpha((150.0 * t) as u8));
 
     let (bg, fg, dim, edge) = if dark {
         (
@@ -296,8 +330,13 @@ mod tests {
             let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w / 8.667 + 50.0));
             let _ = ctx.run(Default::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    draw_help(ui.painter(), rect, false);
-                    draw_help(ui.painter(), rect, true);
+                    for t in [0.0, 0.01, 0.5, 0.999, 1.0] {
+                        draw_help(ui.painter(), rect, false, t);
+                        draw_help(ui.painter(), rect, true, t);
+                    }
+                    // Out of range must not escape the window either.
+                    draw_help(ui.painter(), rect, false, -1.0);
+                    draw_help(ui.painter(), rect, true, 2.0);
                 });
             });
         }

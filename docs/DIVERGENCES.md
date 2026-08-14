@@ -492,7 +492,23 @@ Two things this needed that were not obvious:
 The 2.2.0 tester report asked for keyboard shortcuts without saying for what,
 which is why it was not done then. Now there is something to bind them to.
 
-`H` shows a card listing every shortcut. `K` keytoggle, `R` clears the notes you
+**`H` is HELD, not toggled**: press and read, let go and it is gone. There is no
+state to get stuck in and nothing to dismiss. It slides down from the top edge
+and back up on release, because a card that blinks in and out reads as a glitch
+while one that moves reads as something that was waiting. The dimming behind it
+fades with the slide, or the app would go dark before the card arrived to say
+why. `animate_bool_with_time` handles the easing, and an animation in progress
+asks for the next frame immediately, since the app's own 50ms cadence would
+otherwise make it visibly steppy.
+
+A third bundled typeface, **JetBrains Mono** (SIL OFL 1.1), fills the gap the
+other two leave: Courier Prime is a typewriter and Terminess is a terminal, and
+neither is plainly modern. It is also the only bundled face covering EVERY
+symbol Tangent draws on its own. Checking that turned up something worth
+knowing: **Courier Prime has no U+2191 or U+2193**, so on the default typeface
+the guitar view's octave arrows have always come from the fallback chain rather
+than from the chosen face. That is fine and now it is tested, rather than being
+a surprise if the chain ever changes. `K` keytoggle, `R` clears the notes you
 placed, `G` guitar view, `C` chord detection, `D` dark mode, `B` window border,
 `F` cycle typeface, `A` about, `S` supporter key, `Esc` closes the card.
 

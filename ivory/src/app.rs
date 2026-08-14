@@ -181,9 +181,6 @@ pub struct IvoryApp {
     /// waiting for a clean exit loses the position whenever the app is killed.
     geometry_save_at: Option<Instant>,
 
-    /// The F1 shortcut card. Drawn in the canvas rather than in a window, so
-    /// it already works everywhere the app will run.
-    show_help: bool,
     menu_state: Option<MenuState>,
     dialog: Option<Dialog>,
 
@@ -280,7 +277,6 @@ impl IvoryApp {
             detached_live_pos: None,
             startup_detach_at,
             geometry_save_at: None,
-            show_help: false,
             menu_state: None,
             dialog: welcome,
             last_sent_size: None,
@@ -698,8 +694,8 @@ impl IvoryApp {
     fn apply_key_action(&mut self, ctx: &egui::Context, action: keys::KeyAction) {
         use keys::KeyAction as K;
         match action {
-            K::ToggleHelp => self.show_help = !self.show_help,
-            K::CloseHelp => self.show_help = false,
+            // Help is HELD, not toggled, so it never reaches here.
+            K::ToggleHelp | K::CloseHelp => {}
             K::ToggleKeytoggle => self.apply_menu_action(ctx, MenuAction::ToggleKeytoggle),
             K::ToggleFretboard => self.apply_menu_action(ctx, MenuAction::ToggleFretboard),
             K::ToggleDarkMode => self.apply_menu_action(ctx, MenuAction::ToggleDarkMode),
@@ -1433,8 +1429,12 @@ impl IvoryApp {
 
         self.handle_main_interaction(&ctx, ui, piano_rect, chord_rect_for_hit, fret_rect_for_hit);
 
-        if self.show_help {
-            keys::draw_help(ui.painter(), ui.max_rect(), self.settings.dark_mode);
+        // Held, not toggled: press to read, release and it slides away. Drawn
+        // last so it is over everything, and asked for every frame so the
+        // animation can run even when nothing else changed.
+        let help = keys::help_progress(&ctx);
+        if help > 0.0 {
+            keys::draw_help(ui.painter(), ui.max_rect(), self.settings.dark_mode, help);
         }
 
         // The popped-out neck.

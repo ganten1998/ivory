@@ -1,10 +1,19 @@
-Font licences — Ivory
-=====================
+Font licences — Tangent
+=======================
 
-Ivory's executable statically embeds six font files. This folder holds the
-licence texts for the four that arrive with eframe/egui's `default_fonts`
-feature (the `epaint_default_fonts` crate). Courier Prime, Ivory's own UI
-typeface, is covered by OFL.txt, which ships next to the Courier Prime TTFs.
+Tangent's executable statically embeds TEN font files:
+
+  * three UI typefaces, two weights each, that Tangent chooses between —
+    Courier Prime (the default), Terminess, and JetBrains Mono; and
+  * four more that arrive with eframe/egui's `default_fonts` feature (the
+    `epaint_default_fonts` crate), which sit underneath as glyph fallback.
+
+Every one of them is covered by a licence text in this folder, except Courier
+Prime, which is covered by OFL.txt shipping next to the Courier Prime TTFs.
+
+The fallback chain is load-bearing rather than decorative: Courier Prime has no
+U+2191 or U+2193, and the guitar view marks an out-of-range note with those
+arrows, so on the default typeface they come from the fallback fonts.
 
 The SIL Open Font License and the Ubuntu Font Licence both require the
 copyright notice to accompany the licence text. The upstream files as shipped
@@ -47,3 +56,10 @@ None of these fonts has been modified, subset, or renamed, and none is sold
 standalone. Ivory's own MIT grant (see LICENSE) covers Ivory's source and
 compiled code only; it does not relicense the fonts above, which remain
 entirely under their own terms.
+
+
+JetBrains Mono  ->  JetBrainsMono-OFL-1.1.txt
+---------------------------------------------
+    Copyright 2020 The JetBrains Mono Project Authors
+    https://github.com/JetBrains/JetBrainsMono
+    Licensed under the SIL Open Font License, Version 1.1

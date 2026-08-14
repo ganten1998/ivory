@@ -24,6 +24,18 @@ pub static TERMINESS_REGULAR: &[u8] =
 pub static TERMINESS_BOLD: &[u8] =
     include_bytes!("../../assets/fonts/TerminessNerdFontMono-Bold.ttf");
 
+/// JetBrains Mono, SIL OFL 1.1. The third face fills the gap the other two
+/// leave: Courier Prime is a typewriter and Terminess is a terminal, and
+/// neither is a plainly modern one. It is also the only bundled face that
+/// covers EVERY symbol Tangent draws by itself, arrows included — Courier
+/// Prime has no U+2191/U+2193, so the guitar view's octave arrows reach the
+/// screen through the fallback chain rather than from the chosen face.
+/// 270 KB a weight against Terminess's 2.6 MB.
+pub static JETBRAINS_REGULAR: &[u8] =
+    include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
+pub static JETBRAINS_BOLD: &[u8] =
+    include_bytes!("../../assets/fonts/JetBrainsMono-Bold.ttf");
+
 pub const FAMILY_COURIER: &str = "courier";
 pub const FAMILY_COURIER_BOLD: &str = "courier-bold";
 
@@ -46,6 +58,7 @@ pub enum FontChoice {
     #[default]
     Courier,
     Terminess,
+    JetBrains,
 }
 
 impl FontChoice {
@@ -53,6 +66,7 @@ impl FontChoice {
     pub fn from_key(s: &str) -> Self {
         match s {
             "terminess" => FontChoice::Terminess,
+            "jetbrains" => FontChoice::JetBrains,
             _ => FontChoice::Courier,
         }
     }
@@ -61,6 +75,7 @@ impl FontChoice {
         match self {
             FontChoice::Courier => "courier",
             FontChoice::Terminess => "terminess",
+            FontChoice::JetBrains => "jetbrains",
         }
     }
 
@@ -68,10 +83,12 @@ impl FontChoice {
         match self {
             FontChoice::Courier => "Courier Prime",
             FontChoice::Terminess => "Terminess",
+            FontChoice::JetBrains => "JetBrains Mono",
         }
     }
 
-    pub const ALL: [FontChoice; 2] = [FontChoice::Courier, FontChoice::Terminess];
+    pub const ALL: [FontChoice; 3] =
+        [FontChoice::Courier, FontChoice::Terminess, FontChoice::JetBrains];
 
     /// Both faces are compiled in, so every choice is always usable. Kept as a
     /// method because the menu asks per-entry and a future font may not be.
@@ -108,19 +125,25 @@ pub fn install(ctx: &egui::Context, choice: FontChoice, custom_font_path: Option
     // A chosen built-in sits above Courier Prime but below any custom font.
     // Courier Prime stays in the chain underneath as glyph fallback, so a face
     // lacking a symbol Tangent draws (°, ø, Δ) still renders it correctly.
-    if choice == FontChoice::Terminess {
+    // The chosen face, whichever it is. Courier Prime stays underneath as glyph
+    // fallback, so a face missing a symbol still renders it.
+    if let Some((name, reg, bold_bytes)) = match choice {
+        FontChoice::Terminess => Some(("Terminess", TERMINESS_REGULAR, TERMINESS_BOLD)),
+        FontChoice::JetBrains => Some(("JetBrainsMono", JETBRAINS_REGULAR, JETBRAINS_BOLD)),
+        FontChoice::Courier => None,
+    } {
         defs.font_data.insert(
-            "Terminess-Regular".to_owned(),
-            Arc::new(FontData::from_static(TERMINESS_REGULAR)),
+            format!("{name}-Regular"),
+            Arc::new(FontData::from_static(reg)),
         );
         defs.font_data.insert(
-            "Terminess-Bold".to_owned(),
-            Arc::new(FontData::from_static(TERMINESS_BOLD)),
+            format!("{name}-Bold"),
+            Arc::new(FontData::from_static(bold_bytes)),
         );
-        regular.insert(0, "Terminess-Regular".to_owned());
-        // Real bold face, so picking Terminess does not flatten the menus and
+        regular.insert(0, format!("{name}-Regular"));
+        // Real bold face, so a chosen font does not flatten the menus and
         // About to a single weight.
-        bold.insert(0, "Terminess-Bold".to_owned());
+        bold.insert(0, format!("{name}-Bold"));
     }
 
     // Optional user font at top priority in both families; errors ignored.
@@ -176,18 +199,48 @@ mod tests {
     /// and ø (U+00F8) in both embedded weights.
     #[test]
     fn embedded_fonts_cover_delta_and_oslash() {
-        for (name, bytes) in [
-            ("CourierPrime-Regular", COURIER_PRIME_REGULAR),
-            ("CourierPrime-Bold", COURIER_PRIME_BOLD),
-        ] {
-            let face = ttf_parser::Face::parse(bytes, 0)
-                .unwrap_or_else(|e| panic!("{name} failed to parse: {e}"));
-            for ch in ['\u{0394}', '\u{00F8}'] {
-                assert!(
-                    face.glyph_index(ch).is_some(),
-                    "{name} lacks a glyph for {ch:?}"
-                );
-            }
+        // Every symbol Tangent actually draws, not just the two chord ones.
+        // The arrows matter: the guitar view marks a folded note with U+2191 or
+        // U+2193, and Courier Prime does NOT have them — they reach the screen
+        // through the fallback chain. That is fine, and it is worth having a
+        // test that knows it rather than a surprise if the chain ever changes.
+        const DRAWN: &[(char, &str)] = &[
+            ('\u{0394}', "major-7 delta"),
+            ('\u{00F8}', "half-diminished slash-o"),
+            ('\u{00B0}', "diminished ring"),
+            ('\u{00D7}', "muted-string cross"),
+            ('\u{2022}', "menu selection dot"),
+            ('\u{00B7}', "caption separator"),
+            ('\u{2191}', "octave up"),
+            ('\u{2193}', "octave down"),
+        ];
+
+        let has = |bytes: &[u8], c: char| {
+            ttf_parser::Face::parse(bytes, 0)
+                .map(|f| f.glyph_index(c).is_some())
+                .unwrap_or(false)
+        };
+
+        // The chord symbols must come from the bundled faces themselves, not
+        // from a fallback: they are the app's whole output.
+        for (c, what) in &DRAWN[..3] {
+            assert!(has(COURIER_PRIME_REGULAR, *c), "Courier Prime lacks {what}");
+            assert!(has(COURIER_PRIME_BOLD, *c), "Courier Prime Bold lacks {what}");
+        }
+
+        // JetBrains Mono is the one face that covers the lot on its own, which
+        // is part of why it is bundled.
+        for (c, what) in DRAWN {
+            assert!(has(JETBRAINS_REGULAR, *c), "JetBrains Mono lacks {what}");
+            assert!(has(JETBRAINS_BOLD, *c), "JetBrains Mono Bold lacks {what}");
+        }
+
+        // And everything must be reachable from SOMEWHERE in the chain.
+        for (c, what) in DRAWN {
+            let covered = has(COURIER_PRIME_REGULAR, *c)
+                || has(TERMINESS_REGULAR, *c)
+                || has(JETBRAINS_REGULAR, *c);
+            assert!(covered, "no bundled face has {what}; it would render as tofu");
         }
     }
 }
