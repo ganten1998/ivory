@@ -702,6 +702,8 @@ impl Lattice {
     /// Five rows shows the vertical period — the lattice repeats every three
     /// major thirds — with a row of context above and below it.
     const ROWS: i32 = 5;
+    /// Breathing room at every edge, so no node ever sits exactly on it.
+    const SLACK: f32 = 1.5;
 
     fn fit(rect: Rect) -> Option<Self> {
         let rows = Self::ROWS;
@@ -713,13 +715,23 @@ impl Lattice {
         if !(rect.width() >= 32.0 && rect.height() >= vspan * 16.0) {
             return None;
         }
-        let a_h = rect.height() / vspan;
+        // A pixel of slack, top and bottom.
+        //
+        // Without it the lattice is sized so its extent lands EXACTLY on the
+        // pane edge — `a * vspan == rect.height()` by construction — and a
+        // node whose bounding box touches the boundary fails `contains_rect`
+        // by a rounding error, so `shows()` drops it. The whole bottom row
+        // disappears and the diagram reads as cut off. It only showed below
+        // 100% window size, because that is where the arithmetic stopped
+        // landing on whole pixels.
+        let a_h = (rect.height() - Self::SLACK * 2.0).max(1.0) / vspan;
         // Columns are whatever the width affords at that spacing, never fewer
         // than five — below that the horizontal axis stops showing a run of
         // fifths — and never so many that the names stop being readable.
         let shear = (rows - 1) as f32 * 0.5;
-        let cols = (((rect.width() / a_h) - shear - 0.6).floor() + 1.0).clamp(5.0, 13.0) as i32;
-        let a_w = rect.width() / ((cols - 1) as f32 + shear + 0.6);
+        let cols = ((((rect.width() - Self::SLACK * 2.0) / a_h) - shear - 0.6).floor() + 1.0)
+            .clamp(5.0, 13.0) as i32;
+        let a_w = (rect.width() - Self::SLACK * 2.0).max(1.0) / ((cols - 1) as f32 + shear + 0.6);
         let a = a_h.min(a_w);
         if a < 16.0 {
             return None;
@@ -1373,6 +1385,23 @@ mod tests {
                 l.cols,
                 l.rows
             );
+
+            // EVERY row and EVERY column, whole. The lattice used to be sized
+            // so its extent landed exactly on the pane edge, and a node whose
+            // box touches the boundary fails `contains_rect` by a rounding
+            // error — so the bottom row vanished and the diagram read as cut
+            // off. It only happened below 100% window size, which is where
+            // the arithmetic stopped landing on whole pixels, so a test that
+            // checks one size proves nothing.
+            for v in 0..l.rows {
+                let in_row = (0..l.cols).filter(|&u| l.shows(pane, u, v)).count();
+                assert!(
+                    in_row >= 3,
+                    "row {v} of {} has only {in_row} whole nodes in {pane:?} — \
+                     the lattice is clipped",
+                    l.rows
+                );
+            }
             // Every pitch class reachable, so the diagram can always light the
             // note you are playing.
             let seen: u16 = (0..l.rows)
