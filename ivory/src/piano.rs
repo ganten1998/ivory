@@ -102,7 +102,6 @@ pub fn draw(
         if !is_white(note) {
             continue;
         }
-        let x = idx as f64 * white_key_w;
         let fill = if display_notes.contains(&note) {
             if sustain_down {
                 sustain
@@ -112,9 +111,19 @@ pub fn draw(
         } else {
             white_idle
         };
-        let key_rect = Rect::from_min_size(
-            Pos2::new(left + x.trunc() as f32, top),
-            egui::vec2(white_key_w.trunc() as f32, h.trunc() as f32),
+        // Each key runs to where the NEXT one starts, rather than being a
+        // truncated fixed width. Both are integer-aligned, but the fixed width
+        // is 31 while the pitch is 31.25, so every fourth key used to leave a
+        // one-pixel gap the background showed through: twelve grey slivers
+        // across the keyboard, irregularly spaced. They were invisible in dark
+        // mode, where the background happens to equal the key colour, and
+        // obvious in light mode. The separators still land on exactly the same
+        // pixels, so the look is otherwise unchanged.
+        let x0 = (idx as f64 * white_key_w).trunc() as f32;
+        let x1 = ((idx + 1) as f64 * white_key_w).trunc() as f32;
+        let key_rect = Rect::from_min_max(
+            Pos2::new(left + x0, top),
+            Pos2::new(left + x1, top + h.trunc() as f32),
         );
         painter.rect_filled(key_rect, 0.0, fill);
         idx += 1;
@@ -242,6 +251,29 @@ mod tests {
                 Some(below - 1),
                 "whiteKeysBefore mismatch for note {note}"
             );
+        }
+    }
+
+    /// The white keys must TILE: no pixel between two of them may belong to
+    /// neither. A truncated fixed width leaves a gap wherever the fractional
+    /// part of the key pitch rolls over, which showed up as twelve grey
+    /// slivers on a 1625pt keyboard.
+    #[test]
+    fn white_keys_tile_with_no_gaps_at_any_window_size() {
+        for w in [650.0_f64, 975.0, 1300.0, 1625.0, 1950.0, 2275.0, 2600.0, 1000.0, 1301.0] {
+            let wkw = w / WHITE_KEYS as f64;
+            let mut prev_end: Option<f32> = None;
+            for idx in 0..WHITE_KEYS {
+                let x0 = (idx as f64 * wkw).trunc() as f32;
+                let x1 = ((idx + 1) as f64 * wkw).trunc() as f32;
+                assert!(x1 > x0, "key {idx} is empty at width {w}");
+                if let Some(end) = prev_end {
+                    assert_eq!(x0, end, "gap before key {idx} at width {w}");
+                }
+                prev_end = Some(x1);
+            }
+            // And the last key ends exactly at the right edge.
+            assert_eq!(prev_end, Some(w.trunc() as f32), "keyboard short at width {w}");
         }
     }
 

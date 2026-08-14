@@ -10,6 +10,7 @@
 //! themselves (no checkmarks anywhere).
 
 use crate::fonts;
+use crate::fretboard_panel;
 use ivory_core::fretboard;
 use egui::{
     Button, Color32, CornerRadius, FontId, Margin, Pos2, Stroke, Vec2, ViewportBuilder, ViewportId,
@@ -55,6 +56,11 @@ pub enum MenuAction {
     /// Name from `fretboard::TUNINGS`.
     SetTuning(&'static str),
     SetCapo(u8),
+    /// Fingerboard wood key (see `fretboard_panel::Wood`).
+    SetWood(&'static str),
+    /// D-UI-16: pop the guitar view into its own window, and put it back.
+    DetachFretboard,
+    AttachFretboard,
     ShowAbout,
     ResetSettings,
 }
@@ -84,6 +90,9 @@ pub struct MenuView {
     pub fretboard_on: bool,
     pub tuning: &'static str,
     pub capo: u8,
+    pub wood: &'static str,
+    /// D-UI-16: the guitar view is in its own window.
+    pub fretboard_detached: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -157,6 +166,11 @@ pub struct MenuState {
     /// Which submenu is showing, as an index into `subs`. At most one, which
     /// is why they can all share a single viewport id.
     submenu_open: Option<usize>,
+    /// Kept so a submenu can be clamped too, not just the menu. Tuning and
+    /// Capo sit near the BOTTOM of a long menu and Capo is ten rows deep, so
+    /// unclamped they run off the screen and their lower rows cannot be
+    /// clicked. Size never hit this: it is the first row and seven rows tall.
+    monitor: Option<Vec2>,
     dark_mode: bool,
     opened_at: Instant,
     saw_focus: bool,
@@ -322,6 +336,32 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         MenuAction::ToggleFretboard,
     ));
     if view.fretboard_on {
+        // Mirrors the chord window's Detach/Attach exactly, so there is one
+        // set of habits rather than two.
+        e.push(item(
+            if view.fretboard_detached { "Attach Fretboard" } else { "Detach Fretboard" },
+            if view.fretboard_detached {
+                MenuAction::AttachFretboard
+            } else {
+                MenuAction::DetachFretboard
+            },
+        ));
+        e.push(submenu(
+            "Wood",
+            fretboard_panel::Wood::ALL
+                .iter()
+                .map(|w| {
+                    (
+                        if w.key() == view.wood {
+                            format!("{}  \u{2022}", w.label())
+                        } else {
+                            w.label().to_owned()
+                        },
+                        MenuAction::SetWood(w.key()),
+                    )
+                })
+                .collect(),
+        ));
         e.push(submenu(
             "Tuning",
             fretboard::TUNINGS
@@ -445,6 +485,7 @@ impl MenuState {
             row_h,
             subs,
             submenu_open: None,
+            monitor: monitor_size,
             dark_mode: view.dark_mode,
             opened_at: Instant::now(),
             saw_focus: false,
@@ -604,7 +645,17 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         .filter(|_| !close)
         .and_then(|i| state.subs.get(i).map(|g| (i, g.row_top, g.size)));
     if let Some((sub_i, row_top, sub_size)) = open_sub {
-        let sub_pos = Pos2::new(state.pos.x + state.size.x, state.pos.y + row_top);
+        let mut sub_pos = Pos2::new(state.pos.x + state.size.x, state.pos.y + row_top);
+        if let Some(mon) = state.monitor {
+            // Slide up rather than off the bottom, and flip to the menu's LEFT
+            // rather than off the right edge, which is what a native menu does.
+            if sub_pos.y + sub_size.y > mon.y {
+                sub_pos.y = (mon.y - sub_size.y).max(0.0);
+            }
+            if sub_pos.x + sub_size.x > mon.x {
+                sub_pos.x = (state.pos.x - sub_size.x).max(0.0);
+            }
+        }
         let sub_builder = ViewportBuilder::default()
             .with_title("Tangent")
             .with_decorations(false)
@@ -684,6 +735,8 @@ mod tests {
             fretboard_on: false,
             tuning: "Standard",
             capo: 0,
+            wood: "rosewood",
+            fretboard_detached: false,
         }
     }
 
@@ -788,37 +841,82 @@ mod tests {
             Some(("Hide Fretboard".to_owned(), true))
         );
         let subs = submenus(v);
-        assert_eq!(subs.len(), 3);
-        assert_eq!(subs[1].0, "Tuning");
-        assert_eq!(subs[2].0, "Capo");
+        assert_eq!(subs.len(), 4);
+        assert_eq!(subs[1].0, "Wood");
+        assert_eq!(subs[2].0, "Tuning");
+        assert_eq!(subs[3].0, "Capo");
+        assert_eq!(subs[1].1.len(), 3, "three woods");
+        assert!(subs[1].1[0].starts_with("Rosewood"), "rosewood is the default and comes first");
+        assert!(subs[1].1[0].ends_with('\u{2022}'));
+        assert_eq!(subs[1].2[0], MenuAction::SetWood("rosewood"));
+        // Detach mirrors the chord window's toggle, renaming itself.
+        assert_eq!(
+            find(v, MenuAction::DetachFretboard).map(|(l, _)| l),
+            Some("Detach Fretboard".to_owned())
+        );
+        let d = MenuView { fretboard_detached: true, ..v };
+        assert_eq!(
+            find(d, MenuAction::AttachFretboard).map(|(l, _)| l),
+            Some("Attach Fretboard".to_owned())
+        );
         // Every shipped tuning is offered, and the live one is marked rather
         // than hidden: a submenu that never says what is selected makes you
         // close it again to find out.
-        assert_eq!(subs[1].1.len(), fretboard::TUNINGS.len());
-        assert!(subs[1].1[0].starts_with("Standard"));
-        assert!(subs[1].1[0].ends_with('\u{2022}'), "the current tuning is marked");
-        assert!(!subs[1].1[1].ends_with('\u{2022}'));
-        assert_eq!(subs[1].2[0], MenuAction::SetTuning("Standard"));
+        assert_eq!(subs[2].1.len(), fretboard::TUNINGS.len());
+        assert!(subs[2].1[0].starts_with("Standard"));
+        assert!(subs[2].1[0].ends_with('\u{2022}'), "the current tuning is marked");
+        assert!(!subs[2].1[1].ends_with('\u{2022}'));
+        assert_eq!(subs[2].2[0], MenuAction::SetTuning("Standard"));
         assert!(
-            subs[1].2.iter().all(|a| matches!(a, MenuAction::SetTuning(n)
+            subs[2].2.iter().all(|a| matches!(a, MenuAction::SetTuning(n)
                 if fretboard::Tuning::by_name(n).is_some())),
             "every offered tuning must resolve"
         );
 
-        assert_eq!(subs[2].1[0], "No Capo  \u{2022}");
-        assert_eq!(subs[2].1[1], "Fret 1");
-        assert_eq!(subs[2].2[0], MenuAction::SetCapo(0));
-        assert_eq!(subs[2].2.len() as u8, CAPO_MAX + 1);
+        assert_eq!(subs[3].1[0], "No Capo  \u{2022}");
+        assert_eq!(subs[3].1[1], "Fret 1");
+        assert_eq!(subs[3].2[0], MenuAction::SetCapo(0));
+        assert_eq!(subs[3].2.len() as u8, CAPO_MAX + 1);
     }
 
     #[test]
     fn the_marked_row_follows_the_settings() {
         let v = MenuView { fretboard_on: true, tuning: "DADGAD", capo: 3, ..view() };
         let subs = submenus(v);
-        let marked: Vec<&String> = subs[1].1.iter().filter(|l| l.ends_with('\u{2022}')).collect();
+        let marked: Vec<&String> = subs[2].1.iter().filter(|l| l.ends_with('\u{2022}')).collect();
         assert_eq!(marked.len(), 1);
         assert!(marked[0].starts_with("DADGAD"));
-        assert_eq!(subs[2].1[3], "Fret 3  \u{2022}");
+        assert_eq!(subs[3].1[3], "Fret 3  \u{2022}");
+    }
+
+    /// A submenu low in a long menu must slide up rather than run off the
+    /// bottom of the screen. Size never needed this — it is the first row and
+    /// seven rows tall — but Capo is ten rows and sits near the end.
+    #[test]
+    fn a_submenu_near_the_bottom_is_pulled_back_onto_the_screen() {
+        // The clamp, in the same form `show` applies it.
+        let clamp = |pos: Pos2, size: Vec2, menu_x: f32, mon: Vec2| {
+            let mut p = pos;
+            if p.y + size.y > mon.y {
+                p.y = (mon.y - size.y).max(0.0);
+            }
+            if p.x + size.x > mon.x {
+                p.x = (menu_x - size.x).max(0.0);
+            }
+            p
+        };
+        let mon = Vec2::new(1440.0, 900.0);
+        let size = Vec2::new(120.0, 260.0); // ten rows of Capo
+        // Opened near the bottom: pulled up so the last row is reachable.
+        let p = clamp(Pos2::new(1000.0, 820.0), size, 900.0, mon);
+        assert!(p.y + size.y <= mon.y, "bottom row is off-screen at {p:?}");
+        // Opened near the right edge: flipped to the menu's other side.
+        let p = clamp(Pos2::new(1380.0, 100.0), size, 1260.0, mon);
+        assert!(p.x + size.x <= mon.x, "right edge is off-screen at {p:?}");
+        assert!(p.x < 1380.0, "it should flip left, not just shrink back");
+        // Comfortably inside: untouched.
+        let inside = Pos2::new(300.0, 200.0);
+        assert_eq!(clamp(inside, size, 200.0, mon), inside);
     }
 
     /// The learning block sits with the teach block, after it, and the menu

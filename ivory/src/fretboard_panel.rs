@@ -66,6 +66,14 @@ struct Geom {
     scale: f32,
     frets: u8,
     capo: u8,
+    /// How far the fingerboard slab extends past the outer strings.
+    ///
+    /// It wants to be a fraction of the string spacing, so the inset looks the
+    /// same whatever the string count — but the spacing GROWS as strings are
+    /// removed, because the outer two always sit at the same place. On the
+    /// shipped 4-string bass that put the slab 8.6pt above the band and over
+    /// the piano, so it is capped at the padding that actually exists.
+    edge: f32,
 }
 
 impl Geom {
@@ -91,6 +99,7 @@ impl Geom {
             scale,
             frets: spec.frets,
             capo: spec.capo,
+            edge: (spacing * 0.62).min(pad),
         })
     }
 
@@ -119,6 +128,60 @@ impl Geom {
     }
 }
 
+/// The three fingerboard woods.
+///
+/// Not a colour scheme bolted on: a real neck is one of a small number of
+/// woods, and each one changes what has to be drawn ON it. Maple is pale, so
+/// its strings, wires and inlay dots are DARK — the same light strings that
+/// read beautifully on rosewood vanish on blonde maple. Each wood therefore
+/// carries its whole palette rather than a single fill colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Wood {
+    /// Warm dark brown. The default because it is what most necks are, and
+    /// because it is the one that flatters the cream keyboard above it.
+    #[default]
+    Rosewood,
+    /// Blonde and light. The only one with a pale board, which inverts
+    /// everything drawn on it.
+    Maple,
+    /// Near-black and high contrast.
+    Ebony,
+}
+
+impl Wood {
+    pub const ALL: [Wood; 3] = [Wood::Rosewood, Wood::Maple, Wood::Ebony];
+
+    /// Stored in settings. Unknown values fall back to the default rather than
+    /// being rewritten, so a file from a later build keeps its wood.
+    pub fn key(self) -> &'static str {
+        match self {
+            Wood::Rosewood => "rosewood",
+            Wood::Maple => "maple",
+            Wood::Ebony => "ebony",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Wood::Rosewood => "Rosewood",
+            Wood::Maple => "Maple",
+            Wood::Ebony => "Ebony",
+        }
+    }
+
+    pub fn from_key(k: &str) -> Wood {
+        Wood::ALL
+            .into_iter()
+            .find(|w| w.key().eq_ignore_ascii_case(k))
+            .unwrap_or_default()
+    }
+
+    /// True when the board is pale enough that everything on it must be dark.
+    fn pale(self) -> bool {
+        matches!(self, Wood::Maple)
+    }
+}
+
 struct Palette {
     /// The band behind the neck: the piano's own background, so the two read
     /// as one instrument rather than two panels.
@@ -130,6 +193,9 @@ struct Palette {
     wire: Color32,
     inlay: Color32,
     dot: Color32,
+    /// Drawn around a note dot when the board is pale, so a light accent
+    /// colour on blonde maple is still a dot rather than a smudge.
+    dot_edge: Option<Color32>,
     /// Marks in the gutter, which sit on `bg` rather than on the board.
     ink: Color32,
     faint: Color32,
@@ -137,59 +203,81 @@ struct Palette {
     on_board: Color32,
 }
 
-fn palette(s: &Settings) -> Palette {
+fn palette(s: &Settings, wood: Wood) -> Palette {
     // The app is flat and high-contrast by design — cream keys, near-black
     // sharps, one accent colour for anything sounding — and the neck follows
-    // that rather than trying to look photographic. A dark fingerboard under
-    // the cream keyboard is also what the instrument actually looks like, and
-    // it is what makes a thin steel string legible at this size: the first
-    // attempt drew dark strings on the piano's own light background and came
-    // out looking like a spreadsheet.
+    // that rather than trying to look photographic. The first attempt drew dark
+    // strings on the piano's own light background and came out looking like a
+    // spreadsheet; a real board with real strings on it is what fixed that.
+    //
+    // The wood does NOT follow dark mode. A neck is made of what it is made of,
+    // and swapping maple for ebony when the lights go down would be a different
+    // instrument. Only the band around it and the gutter marks follow the theme.
     let dark = s.dark_mode;
+    let (board, string, wire, inlay, on_board) = match wood {
+        Wood::Rosewood => (
+            Color32::from_rgb(0x4a, 0x2b, 0x22),
+            Color32::from_rgb(0xC9, 0xC4, 0xBC),
+            Color32::from_rgb(0x93, 0x89, 0x7c),
+            Color32::from_rgb(0xE8, 0xDC, 0xC0).gamma_multiply(0.34),
+            Color32::from_rgb(0xE8, 0xDC, 0xC0).gamma_multiply(0.78),
+        ),
+        Wood::Maple => (
+            Color32::from_rgb(0xd8, 0xb0, 0x72),
+            // Dark strings and dark dots: the pale board inverts everything.
+            Color32::from_rgb(0x5a, 0x46, 0x2c),
+            Color32::from_rgb(0x8a, 0x6f, 0x45),
+            Color32::from_rgb(0x3a, 0x2c, 0x1a).gamma_multiply(0.55),
+            Color32::from_rgb(0x3a, 0x2c, 0x1a),
+        ),
+        Wood::Ebony => (
+            Color32::from_rgb(0x18, 0x15, 0x13),
+            Color32::from_rgb(0xB8, 0xB2, 0xA8),
+            Color32::from_rgb(0x6a, 0x64, 0x5c),
+            Color32::from_rgb(0xEC, 0xE6, 0xDA).gamma_multiply(0.42),
+            Color32::from_rgb(0xEC, 0xE6, 0xDA).gamma_multiply(0.82),
+        ),
+    };
+    let ink = if dark {
+        Color32::from_rgb(0xCC, 0xCC, 0xCC)
+    } else {
+        Color32::from_rgb(0x8B, 0x73, 0x55)
+    };
     Palette {
         bg: crate::piano::bg_color(dark),
-        board: if dark {
-            Color32::from_rgb(0x24, 0x1c, 0x16)
+        board,
+        // A real nut is bone. On maple that would disappear, so there it is the
+        // dark line a bone nut actually reads as against pale wood.
+        nut: if wood.pale() {
+            Color32::from_rgb(0x4a, 0x38, 0x22)
         } else {
-            Color32::from_rgb(0x4a, 0x37, 0x28)
+            Color32::from_rgb(0xE8, 0xDC, 0xC0)
         },
-        // A real nut is bone, and a light one is the only thing that makes the
-        // open-string end of the neck legible at a glance.
-        nut: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-        string: if dark {
-            Color32::from_rgb(0xA8, 0xA2, 0x99)
-        } else {
-            Color32::from_rgb(0xC9, 0xC4, 0xBC)
-        },
-        wire: if dark {
-            Color32::from_rgb(0x6E, 0x68, 0x60)
-        } else {
-            Color32::from_rgb(0x8E, 0x87, 0x7C)
-        },
-        // Pearl dots, dim enough to stay behind the notes.
-        inlay: Color32::from_rgb(0xE8, 0xDC, 0xC0).gamma_multiply(0.30),
+        string,
+        wire,
+        inlay,
         // Whatever a held key looks like on the piano is what a held note
         // looks like here. The user already chose this colour once.
         dot: s.white_key_active_color.to_color32(),
-        ink: if dark {
-            Color32::from_rgb(0xCC, 0xCC, 0xCC)
-        } else {
-            Color32::from_rgb(0x8B, 0x73, 0x55)
-        },
-        faint: if dark {
-            Color32::from_rgb(0xCC, 0xCC, 0xCC).gamma_multiply(0.45)
-        } else {
-            Color32::from_rgb(0x8B, 0x73, 0x55).gamma_multiply(0.45)
-        },
-        on_board: Color32::from_rgb(0xE8, 0xDC, 0xC0).gamma_multiply(0.75),
+        dot_edge: wood.pale().then(|| Color32::from_rgb(0x3a, 0x2c, 0x1a)),
+        ink,
+        faint: ink.gamma_multiply(0.45),
+        on_board,
     }
 }
 
 /// Draw the neck and everything on it. `voicing` must have been solved for
 /// `spec`; a mismatch is a wiring bug, and the assertion in the tests is what
 /// catches it.
-pub fn draw(painter: &Painter, rect: Rect, voicing: &Voicing, spec: &FretboardSpec, s: &Settings) {
-    let p = palette(s);
+pub fn draw(
+    painter: &Painter,
+    rect: Rect,
+    voicing: &Voicing,
+    spec: &FretboardSpec,
+    s: &Settings,
+    wood: Wood,
+) {
+    let p = palette(s, wood);
     painter.rect_filled(rect, 0.0, p.bg);
 
     let caption = voicing.caption();
@@ -203,10 +291,9 @@ pub fn draw(painter: &Painter, rect: Rect, voicing: &Voicing, spec: &FretboardSp
     // ── the board ───────────────────────────────────────────────────────────
     // The fingerboard as a slab, from the nut to the end of the neck, with the
     // outer strings inset rather than sitting on its edge.
-    let edge = g.spacing * 0.62;
     let board = Rect::from_min_max(
-        Pos2::new(g.wire_x(0), g.y(g.strings - 1) - edge),
-        Pos2::new(g.right, g.y(0) + edge),
+        Pos2::new(g.wire_x(0), g.y(g.strings - 1) - g.edge),
+        Pos2::new(g.right, g.y(0) + g.edge),
     );
     painter.rect_filled(board, 0.0, p.board);
 
@@ -280,6 +367,17 @@ pub fn draw(painter: &Painter, rect: Rect, voicing: &Voicing, spec: &FretboardSp
                 w * 0.5,
                 p.dot,
             );
+            if let Some(edge) = p.dot_edge {
+                painter.rect_stroke(
+                    Rect::from_min_max(
+                        Pos2::new(x - w * 0.5, g.y(b.hi_string) - g.dot_r()),
+                        Pos2::new(x + w * 0.5, g.y(b.lo_string) + g.dot_r()),
+                    ),
+                    w * 0.5,
+                    Stroke::new(1.5_f32, edge),
+                    StrokeKind::Inside,
+                );
+            }
         }
     }
 
@@ -332,7 +430,11 @@ pub fn draw(painter: &Painter, rect: Rect, voicing: &Voicing, spec: &FretboardSp
                 Stroke::new(2.0_f32, p.dot),
             );
         } else {
-            painter.circle_filled(Pos2::new(g.press_x(pos.fret), y), r, p.dot);
+            let c = Pos2::new(g.press_x(pos.fret), y);
+            painter.circle_filled(c, r, p.dot);
+            if let Some(edge) = p.dot_edge {
+                painter.circle_stroke(c, r, Stroke::new(1.5_f32, edge));
+            }
         }
     }
 
@@ -409,6 +511,102 @@ pub fn draw_top_edge(painter: &Painter, rect: Rect, s: &Settings) {
     );
 }
 
+/// Default size for the popped-out neck when nothing has been remembered.
+///
+/// Wider than it is tall by a lot, because a neck is: 22 frets across six
+/// strings only reads if the frets have room. Deliberately NOT the attached
+/// band's proportions, for the same reason the detached chord window is not
+/// the piano's (D-UI-10) — in its own window it should be legible, not a
+/// slice of the main one.
+pub const DETACHED_DEFAULT: Vec2 = Vec2::new(880.0, 190.0);
+
+pub fn viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("ivory-fretboard-window")
+}
+
+/// Outline for the popped-out window. The neck fills the whole surface and is
+/// dark in two woods out of three, so on a dark desktop the window would have
+/// no edge at all. One neutral grey reads against both.
+pub const BORDER_COLOR: Color32 = Color32::from_gray(0x5A);
+
+#[derive(Default)]
+pub struct DetachedOutcome {
+    pub close_requested: bool,
+    pub inner_size: Option<Vec2>,
+    pub outer_pos: Option<Pos2>,
+    /// Right-click position in monitor coordinates, for the context menu.
+    pub context_menu_at: Option<Pos2>,
+}
+
+/// The neck in its own window. Mirrors `chord_strip::show_detached_window`
+/// exactly — same close-to-reattach, same right-click-anywhere menu, same
+/// borderless drag-anywhere — so the two popouts behave identically and there
+/// is only one set of habits to learn.
+#[allow(clippy::too_many_arguments)]
+pub fn show_detached_window(
+    ctx: &egui::Context,
+    builder_size: Vec2,
+    builder_pos: Option<Pos2>,
+    borderless: bool,
+    voicing: &Voicing,
+    spec: &FretboardSpec,
+    s: &Settings,
+    wood: Wood,
+) -> DetachedOutcome {
+    let mut outcome = DetachedOutcome::default();
+    let mut builder = egui::ViewportBuilder::default()
+        .with_title("Tangent")
+        .with_inner_size(builder_size)
+        .with_min_inner_size([320.0, 90.0])
+        .with_resizable(true)
+        .with_decorations(!borderless);
+    if let Some(pos) = builder_pos {
+        builder = builder.with_position(pos);
+    }
+
+    ctx.show_viewport_immediate(viewport_id(), builder, |vp, _class| {
+        crate::shell::viewport_ui(vp, |ui| {
+            let rect = ui.max_rect();
+            draw(ui.painter(), rect, voicing, spec, s, wood);
+            painter_border(ui.painter(), rect);
+
+            let (close, inner_rect, outer_rect, pressed, secondary, pointer) = ui.input(|i| {
+                (
+                    i.viewport().close_requested(),
+                    i.viewport().inner_rect,
+                    i.viewport().outer_rect,
+                    i.pointer.primary_pressed(),
+                    i.pointer.secondary_clicked(),
+                    i.pointer.interact_pos(),
+                )
+            });
+
+            outcome.close_requested = close;
+            outcome.inner_size = inner_rect.map(|r| r.size()).or(Some(rect.size()));
+            outcome.outer_pos = outer_rect.map(|r| r.min);
+
+            if secondary {
+                if let (Some(pos), Some(inner)) = (pointer, inner_rect) {
+                    outcome.context_menu_at = Some(inner.min + pos.to_vec2());
+                }
+            }
+            if borderless && pressed && !secondary {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+        });
+    });
+    outcome
+}
+
+fn painter_border(painter: &Painter, rect: Rect) {
+    painter.rect_stroke(
+        rect.shrink(0.5),
+        0.0,
+        Stroke::new(1.0_f32, BORDER_COLOR),
+        StrokeKind::Middle,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +615,28 @@ mod tests {
 
     fn rect() -> Rect {
         Rect::from_min_size(Pos2::new(0.0, 200.0), Vec2::new(1300.0, 132.0))
+    }
+
+    #[test]
+    fn every_wood_round_trips_through_its_settings_key() {
+        for w in Wood::ALL {
+            assert_eq!(Wood::from_key(w.key()), w);
+            assert_eq!(Wood::from_key(&w.key().to_uppercase()), w);
+        }
+        // An unknown or future wood falls back rather than blanking the board.
+        assert_eq!(Wood::from_key("koa"), Wood::default());
+        assert_eq!(Wood::from_key(""), Wood::Rosewood);
+        // Maple is the pale one, and it is the reason the palette is per-wood
+        // rather than one fill colour: light strings vanish on blonde wood.
+        let s = Settings::default();
+        let maple = palette(&s, Wood::Maple);
+        let rose = palette(&s, Wood::Rosewood);
+        assert!(maple.dot_edge.is_some(), "a pale board needs an edge on its dots");
+        assert!(rose.dot_edge.is_none());
+        let lum = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
+        assert!(lum(maple.board) > lum(maple.string), "maple: dark strings on a pale board");
+        assert!(lum(rose.board) < lum(rose.string), "rosewood: light strings on a dark board");
+        assert!(lum(palette(&s, Wood::Ebony).board) < lum(rose.board), "ebony is the darkest");
     }
 
     #[test]
@@ -484,6 +704,22 @@ mod tests {
                     for st in 0..g.strings {
                         assert!(g.y(st) >= r.top() && g.y(st) <= r.bottom());
                     }
+                    // The SLAB, not just the strings. It extends past the outer
+                    // strings by `edge`, and that inset wants to scale with the
+                    // string spacing — which grows as strings are removed,
+                    // because the outer two stay put. Unclamped, the shipped
+                    // 4-string bass painted 8.6pt of fingerboard over the piano
+                    // above it and 8.6pt out of the bottom of the window. The
+                    // string-position assertion above cannot see that.
+                    let top = g.y(g.strings - 1) - g.edge;
+                    let bot = g.y(0) + g.edge;
+                    assert!(
+                        top >= r.top() - 0.01 && bot <= r.bottom() + 0.01,
+                        "{} ({} strings) painted its board {top}..{bot} outside the band {:?}",
+                        t.name,
+                        t.strings(),
+                        (r.top(), r.bottom())
+                    );
                     for f in 0..=spec.frets {
                         let x = g.wire_x(f);
                         assert!(x >= g.left - 0.5 && x <= g.right + 0.5, "fret {f} at {x}");
@@ -532,12 +768,17 @@ mod tests {
                 let spec = FretboardSpec { tuning: t, frets: 22, capo };
                 for held in cases {
                     let v = solve_cold(&spec, held);
-                    let _ = ctx.run(Default::default(), |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            draw(ui.painter(), rect(), &v, &spec, &s);
-                            draw_top_edge(ui.painter(), rect(), &s);
+                    // Every wood, because each one carries its own palette and
+                    // the pale board takes a different branch for the nut and
+                    // the dot edges.
+                    for wood in Wood::ALL {
+                        let _ = ctx.run(Default::default(), |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                draw(ui.painter(), rect(), &v, &spec, &s, wood);
+                                draw_top_edge(ui.painter(), rect(), &s);
+                            });
                         });
-                    });
+                    }
                 }
             }
         }

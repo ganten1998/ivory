@@ -226,9 +226,11 @@ impl Voicing {
             });
         }
         let mut parts: Vec<String> = Vec::new();
-        let placed = self.notes.len()
-            - (self.shape.dropped_count + self.shape.conflict_count + self.shape.unreachable_count)
-                as usize;
+        // Counted, not derived by subtracting the `Shape` counters: those are
+        // `u8` and saturate, so a 300-note set would have made this say "1 of
+        // 300 notes" with nothing on the board at all. Counting cannot drift
+        // from what is actually drawn.
+        let placed = self.placed().count();
         if placed < self.notes.len() {
             parts.push(format!("{placed} of {} notes", self.notes.len()));
         }
@@ -1004,10 +1006,11 @@ impl Search<'_> {
                 placed_at[sel_note[st] as usize] = st as u8;
             }
         }
-        let sounding_pcs: Vec<u8> = (0..self.strings)
+        let sounding_pitches: Vec<u8> = (0..self.strings)
             .filter(|&st| sel[st] != MUTED)
-            .map(|st| self.target[sel_note[st] as usize] % 12)
+            .map(|st| self.target[sel_note[st] as usize])
             .collect();
+        let sounding_pcs: Vec<u8> = sounding_pitches.iter().map(|p| p % 12).collect();
 
         let mut notes = Vec::with_capacity(entries.len());
         let mut dropped_count = 0u8;
@@ -1019,7 +1022,11 @@ impl Search<'_> {
                     unreachable_count = unreachable_count.saturating_add(1);
                     Outcome::Unreachable
                 }
-                PreState::Merged => {
+                // "It folded onto a pitch another note already occupies" is
+                // only true if that other note actually made it onto the board.
+                // When the survivor was itself dropped, the merge is not the
+                // reason this one is missing, so fall through and say what is.
+                PreState::Merged if sounding_pitches.contains(&e.target) => {
                     dropped_count = dropped_count.saturating_add(1);
                     Outcome::Dropped { reason: DropReason::OctaveMerged }
                 }
@@ -1031,7 +1038,7 @@ impl Search<'_> {
                         octave_shift: e.shift,
                     }
                 }
-                PreState::Live(_) | PreState::PreCapped => {
+                PreState::Live(_) | PreState::PreCapped | PreState::Merged => {
                     // Step 10, first match wins. `Doubled` is checked ahead of
                     // `Conflict` on purpose: when a note is already sounding an
                     // octave away, "already there" is the useful explanation
@@ -1040,7 +1047,17 @@ impl Search<'_> {
                         dropped_count = dropped_count.saturating_add(1);
                         Outcome::Dropped { reason: DropReason::Doubled }
                     } else {
-                        let wanted = candidates(spec, e.target);
+                        // `candidates` reports the FOLDED target's positions and
+                        // stamps them `folded: false`, which would have the view
+                        // draw a ghost's ring exactly like a real note's. The
+                        // ring is at the right place for the octave being shown;
+                        // it just has to say that is what it is.
+                        let mut wanted = candidates(spec, e.target);
+                        if e.shift != 0 {
+                            for w in &mut wanted {
+                                w.folded = true;
+                            }
+                        }
                         let free: Vec<&Position> = wanted
                             .iter()
                             .filter(|p| p.string >= self.strings || sel[p.string] == MUTED)
@@ -1947,9 +1964,11 @@ mod tests {
         };
         let v = solve_cold(&spec, &[43, 50, 55, 59, 62, 67]);
         let g4 = v.notes.iter().find(|n| n.pitch == 67).unwrap();
-        // G4 is above this board, folds down onto the G3 already held, and is
-        // merged rather than drawn twice.
-        assert_eq!(g4.outcome, Outcome::Dropped { reason: DropReason::OctaveMerged });
+        // G4 is above this board and folds down onto the G3 already held. That
+        // G3 is then itself dropped for want of a string, so "merged onto
+        // another note" would be a lie — G is still sounding (as G2), and that
+        // is what it says.
+        assert_eq!(g4.outcome, Outcome::Dropped { reason: DropReason::Doubled });
         assert!(v.placed().count() <= 4);
         assert!(v.placed().all(|(_, p)| p.string < 4));
 
@@ -1960,6 +1979,30 @@ mod tests {
             ref other => panic!("expected a folded placement, got {other:?}"),
         }
         assert_eq!(solo.caption().as_deref(), Some("1 an octave down"));
+    }
+
+    #[test]
+    fn a_merge_is_only_called_a_merge_when_something_took_its_place() {
+        let spec = std_spec();
+        // C2 folds up onto the C3 that is held, and C3 IS drawn: a real merge.
+        let merged = solve_cold(&spec, &[36, 48, 52, 55]);
+        assert!(merged.placed().any(|(p, _)| p == 48));
+        assert_eq!(
+            merged.notes.iter().find(|n| n.pitch == 36).unwrap().outcome,
+            Outcome::Dropped { reason: DropReason::OctaveMerged }
+        );
+        // On a 4-string bass the survivor is itself shed, so the merge is not
+        // why the folded note is missing and it must not claim to be.
+        let bass = FretboardSpec {
+            tuning: Tuning::by_name("Bass (4)").unwrap(),
+            ..Default::default()
+        };
+        let v = solve_cold(&bass, &[43, 50, 55, 59, 62, 67]);
+        assert!(!v.placed().any(|(p, _)| p == 55), "the survivor was shed");
+        assert_eq!(
+            v.notes.iter().find(|n| n.pitch == 67).unwrap().outcome,
+            Outcome::Dropped { reason: DropReason::Doubled }
+        );
     }
 
     #[test]

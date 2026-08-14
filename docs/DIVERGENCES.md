@@ -407,3 +407,46 @@ it is scoped so that everything above it is untouched.
 Not done, and deliberately: the fretboard is read-only (keytoggle stays a piano
 gesture), there are no fret-position numbers (the inlays carry it), and the
 detached chord window does not gain a fretboard.
+
+### D-UI-16 — three woods, and the neck in its own window
+
+- **Three fingerboard woods**, in a `Wood` submenu that appears with the rest of
+  the guitar block: **Rosewood** (default), **Maple**, **Ebony**. Stored as
+  `fretboard_wood`, sanitised at use like `font_choice`.
+- **Each wood carries its whole palette, not a fill colour.** Maple is pale, so
+  on it the strings, fret wires, inlay dots and nut are all DARK, and note dots
+  get a dark edge ring — the light strings that read well on rosewood vanish on
+  blonde wood, and an accent-coloured dot on it becomes a smudge. Rosewood and
+  ebony keep light strings on a dark board.
+- **The wood does not follow dark mode.** A neck is made of what it is made of;
+  swapping maple for ebony when the lights go down would be a different
+  instrument. Only the band around it and the gutter marks follow the theme.
+- **The neck pops out** into its own window: `Detach Fretboard` /
+  `Attach Fretboard`, mirroring the chord window's pair exactly — close to
+  reattach, right-click anywhere for the menu, drag anywhere when borderless —
+  so there is one set of habits rather than two. While it is out, the attached
+  band disappears and the main window shrinks by exactly its height.
+- Geometry is remembered in `fretboard_win_w/h/x/y`, absent until the window
+  has been placed, and it carries the same tiling-WM guard as D-UI-11: a size
+  the window manager imposed inside `WM_GRACE` is not recorded as a preference.
+  Default size is 880x190, which is a neck's proportions rather than the
+  attached band's, for the same reason the detached chord window is not the
+  piano's.
+- `Hide Fretboard` closes the popout too, rather than leaving a window on
+  screen whose menu entry has gone. The detached state is remembered, so
+  showing it again puts it back where it was.
+
+### D-UI-17 — the white keys tile
+
+The piano drew each white key `trunc(width / 52)` wide while stepping by the
+untruncated pitch, so wherever the fractional part rolled over the key was a
+pixel short and the background showed through: **twelve grey slivers** across a
+1625pt keyboard, irregularly spaced. Spec §4 calls the sub-pixel slivers part of
+the Qt look and they were preserved deliberately, but they are only invisible in
+dark mode, where the background happens to equal the white-key colour. In light
+mode they are twelve grey gaps.
+
+Each key now runs to where the next one starts. Both forms are integer-aligned
+and the separator lines land on exactly the same pixels, so nothing else about
+the keyboard changes. `white_keys_tile_with_no_gaps_at_any_window_size` checks
+every size preset.

@@ -118,6 +118,17 @@ pub struct Settings {
     pub fretboard_tuning: String,
     /// Capo fret. 0 is none. Clamped at use, never on load.
     pub fretboard_capo: i64,
+    /// Fingerboard wood: "rosewood" (default), "maple", "ebony". Stored
+    /// verbatim; an unknown value falls back at use, like `font_choice`.
+    pub fretboard_wood: String,
+    /// D-UI-16: the guitar view is in its own window.
+    pub fretboard_detached: bool,
+    /// Remembered popout geometry. Absent until the window has been placed,
+    /// exactly like the detached chord window's (D-UI-11).
+    pub fretboard_win_w: Option<i64>,
+    pub fretboard_win_h: Option<i64>,
+    pub fretboard_win_x: Option<i64>,
+    pub fretboard_win_y: Option<i64>,
     /// Unknown keys from the file, preserved verbatim on save (file order).
     pub extra: Map<String, Value>,
 }
@@ -158,6 +169,12 @@ impl Default for Settings {
             show_fretboard: false,
             fretboard_tuning: "Standard".to_owned(),
             fretboard_capo: 0,
+            fretboard_wood: crate::fretboard_panel::Wood::default().key().to_owned(),
+            fretboard_detached: false,
+            fretboard_win_w: None,
+            fretboard_win_h: None,
+            fretboard_win_x: None,
+            fretboard_win_y: None,
             extra: Map::new(),
         }
     }
@@ -301,6 +318,16 @@ impl Settings {
                 s.fretboard_capo = n;
             }
         }
+        if let Some(v) = map.remove("fretboard_wood") {
+            if let Some(t) = v.as_str() {
+                s.fretboard_wood = t.to_owned();
+            }
+        }
+        take_bool(&mut map, "fretboard_detached", &mut s.fretboard_detached);
+        take_opt_i64(&mut map, "fretboard_win_w", &mut s.fretboard_win_w);
+        take_opt_i64(&mut map, "fretboard_win_h", &mut s.fretboard_win_h);
+        take_opt_i64(&mut map, "fretboard_win_x", &mut s.fretboard_win_x);
+        take_opt_i64(&mut map, "fretboard_win_y", &mut s.fretboard_win_y);
 
         s.extra = map; // whatever is left, preserved in file order
         s
@@ -368,6 +395,10 @@ impl Settings {
         put_opt("detached_chord_y", self.detached_chord_y);
         put_opt("window_x", self.window_x);
         put_opt("window_y", self.window_y);
+        put_opt("fretboard_win_w", self.fretboard_win_w);
+        put_opt("fretboard_win_h", self.fretboard_win_h);
+        put_opt("fretboard_win_x", self.fretboard_win_x);
+        put_opt("fretboard_win_y", self.fretboard_win_y);
         map.insert(
             "teach_apply_all_keys".into(),
             Value::Bool(self.teach_apply_all_keys),
@@ -380,6 +411,14 @@ impl Settings {
         map.insert(
             "fretboard_capo".into(),
             Value::Number(self.fretboard_capo.into()),
+        );
+        map.insert(
+            "fretboard_wood".into(),
+            Value::String(self.fretboard_wood.clone()),
+        );
+        map.insert(
+            "fretboard_detached".into(),
+            Value::Bool(self.fretboard_detached),
         );
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
@@ -440,6 +479,28 @@ impl Settings {
     /// Remembered main-window position, if both coordinates are stored.
     pub fn window_pos_for_use(&self) -> Option<egui::Pos2> {
         match (self.window_x, self.window_y) {
+            (Some(x), Some(y)) => Some(egui::Pos2::new(x as f32, y as f32)),
+            _ => None,
+        }
+    }
+
+    /// The fingerboard wood, falling back rather than rewriting the file.
+    pub fn fretboard_wood(&self) -> crate::fretboard_panel::Wood {
+        crate::fretboard_panel::Wood::from_key(&self.fretboard_wood)
+    }
+
+    /// Size to open the popped-out neck at: whatever the user last left it, or
+    /// the default. A remembered width is what distinguishes the two, the same
+    /// marker the detached chord window uses.
+    pub fn fretboard_win_size(&self) -> egui::Vec2 {
+        match (self.fretboard_win_w, self.fretboard_win_h) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => egui::Vec2::new(w as f32, h as f32),
+            _ => crate::fretboard_panel::DETACHED_DEFAULT,
+        }
+    }
+
+    pub fn fretboard_win_pos(&self) -> Option<egui::Pos2> {
+        match (self.fretboard_win_x, self.fretboard_win_y) {
             (Some(x), Some(y)) => Some(egui::Pos2::new(x as f32, y as f32)),
             _ => None,
         }

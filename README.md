@@ -64,7 +64,8 @@ Intel Macs are not covered yet. The macOS build is Apple Silicon only.
   bass, plus a capo. Notes that will not fit are never quietly missing: an
   out-of-range note shows as a hollow dot with the octave it moved, a note the
   guitar cannot sound alongside the others shows as a faint ring where it wanted
-  to go, and anything left off is counted underneath.
+  to go, and anything left off is counted underneath. Three fingerboard woods
+  (rosewood, maple, ebony), and the neck pops out into its own window.
 - **Detachable chord display.** Pop the chord strip into its own independent
   window, and close it to reattach.
 - **Dark mode** with theme-aware context menus (ivory-on-black and

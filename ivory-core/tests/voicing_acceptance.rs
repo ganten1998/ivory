@@ -252,11 +252,13 @@ fn a_piano_chord_on_a_four_string_bass_is_honest_about_being_a_bass() {
     assert_eq!(v.notes.len(), 6);
     assert!(v.placed().count() <= 4, "four strings, at most four notes");
     assert!(v.placed().all(|(_, p)| p.string < 4));
-    // G4 is above this instrument entirely; it folds down onto the G3 already
-    // held rather than being invented somewhere.
+    // G4 is above this instrument entirely and folds down onto the G3 already
+    // held rather than being invented somewhere. That G3 is then shed too for
+    // want of a fourth string, so the reason given is the one that is still
+    // true: G is sounding, as G2.
     assert_eq!(
         v.notes.iter().find(|n| n.pitch == 67).unwrap().outcome,
-        Outcome::Dropped { reason: DropReason::OctaveMerged }
+        Outcome::Dropped { reason: DropReason::Doubled }
     );
     assert!(v.caption().is_some_and(|c| c.starts_with("4 of 6 notes")));
 }

@@ -88,6 +88,16 @@ pub struct IvoryApp {
     /// the panel is switched on.
     voicing: VoicingSession,
     last_voicing: Option<Instant>,
+    /// D-UI-16: the popped-out neck. Same shape of state as the detached chord
+    /// window, including the tiling-WM guard, because it has the same problem.
+    fret_window_visible: bool,
+    fret_builder_size: Vec2,
+    fret_builder_pos: Option<Pos2>,
+    fret_live_size: Option<Vec2>,
+    fret_live_pos: Option<Pos2>,
+    fret_shown_at: Option<Instant>,
+    fret_wm_managed: bool,
+    startup_fret_detach_at: Option<Instant>,
 
     /// The detached chord window is actually on screen.
     detach_window_visible: bool,
@@ -161,6 +171,10 @@ impl IvoryApp {
         let spec = settings.fretboard_spec();
         let weights = Weights::for_tuning(spec.tuning);
         let voicing = VoicingSession::new(spec, weights);
+        let settings_fret_size = settings.fretboard_win_size();
+        let settings_fret_pos = settings.fretboard_win_pos();
+        let startup_fret_detach_at = (settings.fretboard_detached && settings.show_fretboard)
+            .then(|| Instant::now() + DEBOUNCE_100MS);
 
         Self {
             settings,
@@ -177,6 +191,14 @@ impl IvoryApp {
             last_detection: None,
             voicing,
             last_voicing: None,
+            fret_window_visible: false,
+            fret_builder_size: settings_fret_size,
+            fret_builder_pos: settings_fret_pos,
+            fret_live_size: None,
+            fret_live_pos: None,
+            fret_shown_at: None,
+            fret_wm_managed: false,
+            startup_fret_detach_at,
             detach_window_visible: false,
             detached_builder_size,
             detached_builder_pos,
@@ -334,6 +356,8 @@ impl IvoryApp {
             supporter: self.license.is_supporter(),
             heart_on: self.settings.show_heart,
             fretboard_on: self.settings.show_fretboard,
+            wood: self.settings.fretboard_wood().key(),
+            fretboard_detached: self.settings.fretboard_detached,
             tuning: self.settings.fretboard_spec().tuning.name,
             capo: self.settings.fretboard_spec().capo,
             next_font: {
@@ -473,6 +497,56 @@ impl IvoryApp {
         self.settings.save();
     }
 
+    // ── The popped-out neck (D-UI-16) ─────────────────────────────────────
+
+    fn detach_fretboard(&mut self) {
+        self.settings.fretboard_detached = true;
+        self.fret_window_visible = true;
+        self.fret_builder_size = self.settings.fretboard_win_size();
+        self.fret_builder_pos = self
+            .settings
+            .fretboard_win_pos()
+            .map(|p| crate::settings::clamp_to_monitor(p, self.fret_builder_size, self.monitor_size));
+        self.fret_live_size = None;
+        self.fret_live_pos = None;
+        self.fret_shown_at = Some(Instant::now());
+        self.fret_wm_managed = false;
+        self.settings.save();
+    }
+
+    fn reattach_fretboard(&mut self) {
+        if !self.fret_wm_managed {
+            self.remember_fretboard_geometry();
+        }
+        self.settings.fretboard_detached = false;
+        self.fret_window_visible = false;
+        self.fret_shown_at = None;
+        self.settings.save();
+    }
+
+    /// Write back the popout's size and position. Returns whether anything
+    /// actually changed, so the caller can skip a needless settings write.
+    fn remember_fretboard_geometry(&mut self) -> bool {
+        let mut dirty = false;
+        if let Some(size) = self.fret_live_size {
+            let (w, h) = (size.x.round() as i64, size.y.round() as i64);
+            if w > 0 && h > 0 && (self.settings.fretboard_win_w, self.settings.fretboard_win_h) != (Some(w), Some(h)) {
+                self.settings.fretboard_win_w = Some(w);
+                self.settings.fretboard_win_h = Some(h);
+                dirty = true;
+            }
+        }
+        if let Some(pos) = self.fret_live_pos {
+            let (x, y) = (pos.x.round() as i64, pos.y.round() as i64);
+            if (self.settings.fretboard_win_x, self.settings.fretboard_win_y) != (Some(x), Some(y)) {
+                self.settings.fretboard_win_x = Some(x);
+                self.settings.fretboard_win_y = Some(y);
+                dirty = true;
+            }
+        }
+        dirty
+    }
+
     fn reattach_chord_window(&mut self) {
         if !self.detached_wm_managed {
             self.remember_detached_geometry();
@@ -608,6 +682,13 @@ impl IvoryApp {
             }
             MenuAction::ToggleFretboard => {
                 self.settings.show_fretboard = !self.settings.show_fretboard;
+                // Hiding the view hides it everywhere: leaving a popped-out
+                // neck on screen after "Hide Fretboard" would be a window with
+                // no way back to it in the menu.
+                if !self.settings.show_fretboard && self.fret_window_visible {
+                    self.reattach_fretboard();
+                    self.settings.fretboard_detached = true; // remembered for next time
+                }
                 self.settings.save();
                 // The window height follows from layout_sizes() next pass.
                 self.voicing_tick(true);
@@ -622,6 +703,12 @@ impl IvoryApp {
                 self.settings.save();
                 self.rebuild_voicing();
             }
+            MenuAction::SetWood(key) => {
+                self.settings.fretboard_wood = key.to_owned();
+                self.settings.save();
+            }
+            MenuAction::DetachFretboard => self.detach_fretboard(),
+            MenuAction::AttachFretboard => self.reattach_fretboard(),
             MenuAction::ToggleHeart => {
                 self.settings.show_heart = !self.settings.show_heart;
                 self.settings.save();
@@ -655,6 +742,8 @@ impl IvoryApp {
         }
         self.detector.set_note_preference(true);
         self.manual_notes.clear();
+        self.fret_window_visible = false;
+        self.fret_shown_at = None;
         self.rebuild_voicing();
         if had_custom_font {
             // Settings were reset: back to the bundled default font too.
@@ -1013,7 +1102,7 @@ fn band_sizes(settings: &Settings) -> (f32, f32, f32, f32) {
     } else {
         0.0
     };
-    let fret_h = if settings.show_fretboard {
+    let fret_h = if settings.show_fretboard && !settings.fretboard_detached {
         fretboard_panel::band_height(w)
     } else {
         0.0
@@ -1046,6 +1135,27 @@ impl IvoryApp {
         let ctx = ui.ctx().clone();
 
         self.process_midi_events();
+
+        // Startup restore for the popped-out neck (100ms single-shot), the
+        // same shape as the chord window's below it.
+        if let Some(t) = self.startup_fret_detach_at {
+            if Instant::now() >= t {
+                self.startup_fret_detach_at = None;
+                if self.settings.fretboard_detached && self.settings.show_fretboard {
+                    self.fret_window_visible = true;
+                    self.fret_builder_size = self.settings.fretboard_win_size();
+                    self.fret_builder_pos = self.settings.fretboard_win_pos().map(|p| {
+                        crate::settings::clamp_to_monitor(
+                            p,
+                            self.fret_builder_size,
+                            self.monitor_size,
+                        )
+                    });
+                    self.fret_shown_at = Some(Instant::now());
+                    self.fret_wm_managed = false;
+                }
+            }
+        }
 
         // Startup detach restore (100ms single-shot).
         if let Some(t) = self.startup_detach_at {
@@ -1166,11 +1276,55 @@ impl IvoryApp {
                 self.voicing.current(),
                 &spec,
                 &self.settings,
+                self.settings.fretboard_wood(),
             );
             fretboard_panel::draw_top_edge(ui.painter(), fret_rect, &self.settings);
         }
 
         self.handle_main_interaction(&ctx, ui, piano_rect, chord_rect_for_hit);
+
+        // The popped-out neck.
+        if self.fret_window_visible {
+            let spec = self.settings.fretboard_spec();
+            let outcome = fretboard_panel::show_detached_window(
+                &ctx,
+                self.fret_builder_size,
+                self.fret_builder_pos,
+                self.settings.borderless_mode,
+                self.voicing.current(),
+                &spec,
+                &self.settings,
+                self.settings.fretboard_wood(),
+            );
+            // Same tiling-WM guard as the chord window: inside the grace
+            // period a size mismatch is the window manager's doing, not the
+            // user's, and this session's geometry is not ours to remember.
+            if let (Some(shown), Some(size)) = (self.fret_shown_at, outcome.inner_size) {
+                if Instant::now().duration_since(shown) < WM_GRACE {
+                    self.fret_wm_managed |= wm_overrode_size(size, self.fret_builder_size);
+                } else {
+                    self.fret_shown_at = None;
+                }
+            }
+            let moved = outcome.inner_size != self.fret_live_size
+                || (outcome.outer_pos.is_some() && outcome.outer_pos != self.fret_live_pos);
+            if let Some(size) = outcome.inner_size {
+                self.fret_live_size = Some(size);
+            }
+            if let Some(pos) = outcome.outer_pos {
+                self.fret_live_pos = Some(pos);
+            }
+            if moved && !self.fret_wm_managed {
+                self.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
+            }
+            if outcome.close_requested {
+                self.reattach_fretboard(); // close-to-reattach, like the chord window
+            } else if let Some(pos) = outcome.context_menu_at {
+                if self.dialog.is_none() {
+                    self.open_menu_at(&ctx, pos);
+                }
+            }
+        }
 
         // Detached chord window.
         if self.detach_window_visible {
@@ -1239,6 +1393,9 @@ impl IvoryApp {
                 }
                 if self.detach_window_visible && !self.detached_wm_managed {
                     dirty |= self.remember_detached_geometry();
+                }
+                if self.fret_window_visible && !self.fret_wm_managed {
+                    dirty |= self.remember_fretboard_geometry();
                 }
                 if dirty {
                     self.settings.save();

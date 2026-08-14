@@ -30,6 +30,21 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   damp is an `×`. Anything genuinely left off is counted underneath: "6 of 10
   notes".
 
+- **Three fingerboard woods** — Rosewood, Maple and Ebony — under **Wood** in
+  the same menu. Each is a whole palette rather than a stain: on maple the
+  strings, frets and inlays go dark, because light strings on blonde wood
+  cannot be seen.
+- **The fretboard pops out** into its own window with **Detach Fretboard**,
+  exactly like the chord display: close it to put it back, right-click anywhere
+  for the menu, and it remembers where you left it.
+
+### Fixed
+
+- The piano no longer shows faint gaps between some white keys. Each key was
+  drawn a pixel narrower than its slot, so about a dozen slivers of background
+  showed through, spaced irregularly across the keyboard. Visible in light mode
+  only, which is why it lasted this long.
+
 ### Changed
 
 - **Renamed from Ivory to Tangent.** Synthogy's Ivory is a well-known virtual
