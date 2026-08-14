@@ -80,7 +80,7 @@ if command -v cargo-license >/dev/null 2>&1; then
 import json, sys
 with open(sys.argv[1]) as f:
     rows = json.load(f)
-skip = {"ivory", "ivory-core"}
+skip = {"ivory", "ivory-core", "ivory-ui"}
 rows = sorted((r for r in rows if r["name"] not in skip),
               key=lambda r: (r["name"].lower(), r["version"]))
 for r in rows:

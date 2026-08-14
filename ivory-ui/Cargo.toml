@@ -1,0 +1,36 @@
+[package]
+# The shared GUI. MIT, like everything else in this repo.
+#
+# It exists so the desktop binary and the VST3 plugin can render the SAME code
+# rather than forking into two lookalike GUIs, which is the failure the egui
+# 0.33 pin was chosen to prevent (docs/HANDOFF.md 2c).
+#
+# WHAT IS NOT A DEPENDENCY HERE IS THE POINT. No eframe, no midir, no rfd, no
+# fd-lock: a plugin has no window to own, no MIDI device to open, no native file
+# dialog to raise, and above all no business calling `process::exit`, which
+# would take the host DAW down with it. Leaving those out makes all of it
+# UNREACHABLE from shared code rather than merely discouraged, enforced by the
+# compiler instead of by review. `scripts/check-firewall.sh` asserts it.
+name = "ivory-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# `license` MUST be listed: without it ivory-core compiles the no-op
+# verification stub and every supporter key is silently rejected while every
+# test still passes. `tests/license_feature.rs` guards it here as well as in
+# the binary, because this crate is what the plugin will link.
+ivory-core = { path = "../ivory-core", features = ["learning", "license"] }
+egui = { version = "0.33", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+dirs = "6"
+log = "0.4"
+
+[dev-dependencies]
+ttf-parser = "0.25"
+
+[lints]
+workspace = true

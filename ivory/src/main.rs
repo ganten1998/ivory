@@ -3,18 +3,9 @@
 #![windows_subsystem = "windows"]
 
 mod app;
-mod chord_strip;
-mod dialogs;
-mod fonts;
-mod fretboard_panel;
-mod keys;
-mod menu;
 mod midi;
-mod piano;
-mod settings;
-mod shell;
 
-use settings::Settings;
+use ivory_ui::settings::Settings;
 
 /// On Windows, a windows-subsystem binary detaches from the console; reattach
 /// so `-l` / `-p` output still prints when launched from a terminal.

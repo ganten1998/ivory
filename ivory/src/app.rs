@@ -6,14 +6,14 @@
 //! chord detection runs on its own 100ms gate (with immediate off-cadence
 //! runs after keytoggle clicks and note-preference changes).
 
-use crate::chord_strip;
-use crate::dialogs::{self, Dialog, DialogAction, LearningStatus};
-use crate::fretboard_panel;
-use crate::keys;
-use crate::menu::{self, ColorTarget, MenuAction, MenuState, MenuView};
+use ivory_ui::chord_strip;
+use ivory_ui::dialogs::{self, Dialog, DialogAction, LearningStatus};
+use ivory_ui::fretboard_panel;
+use ivory_ui::keys;
+use ivory_ui::menu::{self, ColorTarget, MenuAction, MenuState, MenuView};
 use crate::midi;
-use crate::piano;
-use crate::settings::{Rgb, Settings};
+use ivory_ui::piano;
+use ivory_ui::settings::{Rgb, Settings};
 use egui::{Pos2, Rect, Vec2, ViewportCommand};
 use ivory_core::voicing::{VoicingSession, Weights};
 use ivory_core::{ChordDetector, OverrideStore, TrainOutcome};
@@ -204,12 +204,12 @@ pub struct IvoryApp {
 
 impl IvoryApp {
     pub fn new(cc: &eframe::CreationContext<'_>, settings: Settings, cli_port: Option<String>) -> Self {
-        crate::fonts::install(
+        ivory_ui::fonts::install(
             &cc.egui_ctx,
-            crate::fonts::FontChoice::from_key(&settings.font_choice),
+            ivory_ui::fonts::FontChoice::from_key(&settings.font_choice),
             settings.custom_font_path.as_deref(),
         );
-        crate::fonts::apply_text_styles(&cc.egui_ctx);
+        ivory_ui::fonts::apply_text_styles(&cc.egui_ctx);
 
         let mut detector = ChordDetector::new();
         detector.set_note_preference(settings.prefer_flats);
@@ -419,7 +419,7 @@ impl IvoryApp {
             tuning: self.settings.fretboard_spec().tuning.name,
             capo: self.settings.fretboard_spec().capo,
             next_font: {
-                use crate::fonts::FontChoice;
+                use ivory_ui::fonts::FontChoice;
                 let cur = FontChoice::from_key(&self.settings.font_choice);
                 // Show the row only if some OTHER installed face can be reached.
                 FontChoice::ALL
@@ -590,7 +590,7 @@ impl IvoryApp {
         self.detached_builder_pos = self
             .settings
             .detached_pos_for_use()
-            .map(|p| crate::settings::clamp_to_monitor(p, self.detached_builder_size, self.monitor_size));
+            .map(|p| ivory_ui::settings::clamp_to_monitor(p, self.detached_builder_size, self.monitor_size));
         self.detached_live_size = None;
         self.detached_live_pos = None;
         self.detached_shown_at = Some(Instant::now());
@@ -607,7 +607,7 @@ impl IvoryApp {
         self.fret_builder_pos = self
             .settings
             .fretboard_win_pos()
-            .map(|p| crate::settings::clamp_to_monitor(p, self.fret_builder_size, self.monitor_size));
+            .map(|p| ivory_ui::settings::clamp_to_monitor(p, self.fret_builder_size, self.monitor_size));
         self.fret_live_size = None;
         self.fret_live_pos = None;
         self.fret_shown_at = Some(Instant::now());
@@ -762,7 +762,7 @@ impl IvoryApp {
                 self.settings.save();
             }
             MenuAction::CycleFont => {
-                use crate::fonts::FontChoice;
+                use ivory_ui::fonts::FontChoice;
                 let cur = FontChoice::from_key(&self.settings.font_choice);
                 if let Some(next) = FontChoice::ALL
                     .iter()
@@ -771,12 +771,12 @@ impl IvoryApp {
                 {
                     self.settings.font_choice = next.key().to_owned();
                     self.settings.save();
-                    crate::fonts::install(
+                    ivory_ui::fonts::install(
                         ctx,
                         next,
                         self.settings.custom_font_path.as_deref(),
                     );
-                    crate::fonts::apply_text_styles(ctx);
+                    ivory_ui::fonts::apply_text_styles(ctx);
                 }
             }
             MenuAction::ToggleKeytoggle => {
@@ -881,7 +881,7 @@ impl IvoryApp {
         self.rebuild_voicing();
         if had_custom_font {
             // Settings were reset: back to the bundled default font too.
-            crate::fonts::install(ctx, crate::fonts::FontChoice::default(), None);
+            ivory_ui::fonts::install(ctx, ivory_ui::fonts::FontChoice::default(), None);
         }
         self.settings.save();
     }
@@ -1279,7 +1279,7 @@ impl IvoryApp {
                     self.fret_window_visible = true;
                     self.fret_builder_size = self.settings.fretboard_win_size();
                     self.fret_builder_pos = self.settings.fretboard_win_pos().map(|p| {
-                        crate::settings::clamp_to_monitor(
+                        ivory_ui::settings::clamp_to_monitor(
                             p,
                             self.fret_builder_size,
                             self.monitor_size,
@@ -1299,7 +1299,7 @@ impl IvoryApp {
                     self.detach_window_visible = true;
                     self.detached_builder_size = self.settings.detached_size_for_use();
                     self.detached_builder_pos = self.settings.detached_pos_for_use().map(|p| {
-                        crate::settings::clamp_to_monitor(
+                        ivory_ui::settings::clamp_to_monitor(
                             p,
                             self.detached_builder_size,
                             self.monitor_size,
@@ -1346,7 +1346,7 @@ impl IvoryApp {
                 let on_screen =
                     Rect::from_min_size(Pos2::ZERO, mon).intersects(r.shrink(OFFSCREEN_SLACK));
                 if !on_screen {
-                    let fixed = crate::settings::clamp_to_monitor(r.min, r.size(), Some(mon));
+                    let fixed = ivory_ui::settings::clamp_to_monitor(r.min, r.size(), Some(mon));
                     ctx.send_viewport_cmd(ViewportCommand::OuterPosition(fixed));
                 }
             }

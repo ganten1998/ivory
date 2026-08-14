@@ -27,6 +27,10 @@ path = "src/main.rs"
 # verification stub and the shipped app silently rejects every valid key while
 # every test still passes. `tests/license_feature.rs` guards this.
 ivory-core = { path = "../ivory-core", features = ["learning", "license"] }
+# The shared GUI. Everything the plugin will also link lives here; this crate
+# keeps only what genuinely belongs to a desktop binary — the window, the MIDI
+# device, the single-instance lock, the CLI.
+ivory-ui = { path = "../ivory-ui" }
 # Same crate eframe already links; direct dep so modules can `use egui::...`.
 egui = { version = "0.33", default-features = false }
 eframe = { version = "0.33", default-features = false, features = [

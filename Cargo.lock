@@ -1423,6 +1423,7 @@ dependencies = [
  "egui",
  "fd-lock",
  "ivory-core",
+ "ivory-ui",
  "log",
  "midir",
  "rfd",
@@ -1441,6 +1442,19 @@ dependencies = [
  "ed25519-compact",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ivory-ui"
+version = "2.3.0"
+dependencies = [
+ "dirs",
+ "egui",
+ "ivory-core",
+ "log",
+ "serde",
+ "serde_json",
+ "ttf-parser",
 ]
 
 [[package]]
