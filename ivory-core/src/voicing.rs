@@ -210,7 +210,7 @@ impl Voicing {
         })
     }
 
-    /// The status line: `"6 of 10 notes  ·  1 an octave up  ·  two hands"`.
+    /// The status line: `"6 of 10 notes  ·  1 an octave up"`.
     ///
     /// `None` when there is nothing to explain, which is the common case. A
     /// message on an ordinary board reads as an error.
@@ -245,11 +245,12 @@ impl Voicing {
         if down > 0 {
             parts.push(format!("{down} an octave down"));
         }
-        match self.shape.playability {
-            Playability::Stretch => parts.push("stretch".to_owned()),
-            Playability::TwoHands => parts.push("two hands".to_owned()),
-            _ => {}
-        }
+        // Playability is NOT in the caption. It told the player something they
+        // can already see — the shape is right there — and it was the line
+        // that appeared most often, so it was also the one that made the board
+        // resize under them. `shape.playability` is still on the struct for a
+        // view that wants to desaturate an unplayable shape; it just does not
+        // get to interrupt.
         if parts.is_empty() {
             None
         } else {
@@ -265,9 +266,12 @@ impl Voicing {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct History<'a> {
     pub prev: Option<&'a Voicing>,
-    /// Arrival ordinal per MIDI pitch; lower means held longer, 0 is unknown.
-    /// `None` means "everything arrived at once".
-    pub arrival: Option<&'a [u32; 128]>,
+    /// Arrival ordinal per pitch; lower means held longer, 0 is unknown.
+    /// `None` means "everything arrived at once". Indexed by the full u8 range
+    /// rather than 0..128: a pitch above 127 is reachable through `solve`'s
+    /// `&[u8]` and through `IVORY_DEMO_NOTES`, and folding the index aliased
+    /// two different notes onto one slot.
+    pub arrival: Option<&'a [u32; 256]>,
     /// Reserved hook to the chord engine. MUST be `None`: see the module doc.
     pub root_pc: Option<u8>,
 }
@@ -362,11 +366,15 @@ pub struct Weights {
     pub sticky_near: i32,
     pub retain_note: i32,
     pub retain_cap: i32,
-    /// Hard floor on `sticky + retain` combined. Inertia can never hide a note
-    /// (a drop costs 15000+) and can never survive this much genuine
-    /// improvement. This is the master switch for how stubborn the display
-    /// feels.
+    /// Hard floor on `sticky + retain` combined. This is the master switch for
+    /// how stubborn the display feels.
     pub hyst_clamp: i32,
+    /// The same idea one tier up: a bound on how far `recency_*` and
+    /// `drop_stick` together may move a DROP cost. It has to stay below half
+    /// the smallest gap between drop tiers (2000), so carried state can pick
+    /// which of two equally-droppable notes goes, but can never promote a note
+    /// out of its tier and change how many are drawn.
+    pub drop_history_clamp: i32,
 
     // ── limits ─────────────────────────────────────────────────────────────
     /// LABEL ONLY, used by `Playability`. Never a gate.
@@ -415,6 +423,7 @@ impl Weights {
         recency_cap: 4_000,
         drop_stick: 1_000,
 
+        drop_history_clamp: 900,
         sticky_anchor: -120,
         sticky_near: -60,
         retain_note: -35,
@@ -576,9 +585,11 @@ struct Search<'a> {
 
     hyst: bool,
     prev_anchor: Option<u8>,
-    /// `1 + string * 256 + fret` per MIDI pitch placed in the previous solve,
-    /// 0 for "was not placed".
-    prev_pos: [u16; 128],
+    /// `1 + string * 256 + fret` per pitch placed in the previous solve, 0 for
+    /// "was not placed". Indexed by the FULL u8 range: `solve` takes `&[u8]`
+    /// and `IVORY_DEMO_NOTES` parses with `parse::<u8>()`, so a pitch of 200 is
+    /// reachable, and folding it into 128 slots aliased it onto pitch 72.
+    prev_pos: [u16; 256],
 
     sel: [u8; MAX_STRINGS],
     sel_note: [u8; MAX_STRINGS],
@@ -728,7 +739,7 @@ fn run(
         drop_suffix: [0; MAX_NOTES + 1],
         hyst: false,
         prev_anchor: None,
-        prev_pos: [0; 128],
+        prev_pos: [0; 256],
         sel: [MUTED; MAX_STRINGS],
         sel_note: [MUTED; MAX_STRINGS],
         leaves: 0,
@@ -778,7 +789,7 @@ fn run(
             for pn in &prev.notes {
                 if let Outcome::Placed { pos, .. } = pn.outcome {
                     if pos.string < MAX_STRINGS {
-                        s.prev_pos[pn.pitch as usize % 128] =
+                        s.prev_pos[pn.pitch as usize] =
                             1 + (pos.string as u16) * 256 + pos.fret as u16;
                     }
                 }
@@ -830,7 +841,7 @@ fn drop_cost_of(
     // panic. Release builds would wrap instead, which is worse: a cost that
     // wrapped negative would make the solver prefer exactly the shape the dial
     // was meant to discourage.
-    let mut c = if e.shift != 0 {
+    let c = if e.shift != 0 {
         // A ghost is cheap to lose, and none of the modifiers below apply: it
         // is not really the bass or the melody, it is a stand-in for one.
         w.drop_folded
@@ -847,13 +858,26 @@ fn drop_cost_of(
         }
         c
     };
+    // Both history terms below are gathered into ONE adjustment and clamped,
+    // for the same reason `hyst_clamp` exists on the shape side: carried state
+    // may reorder WHICH of two similar notes is shed, and must never change
+    // WHETHER one is.
+    //
+    // Unclamped they could reach -5000, and the drop tiers are only 2000 apart
+    // (folded 6000, doubled 8000, plain 20000, melody 26000, bass 30000). A
+    // folded note's 6000 fell to 1000 and a doubled note's 8000 to 3000, both
+    // under the 6290 spread of the shape terms — so the length of the pause
+    // before a chord decided whether it was drawn with four notes or five.
+    // Same held set, two pictures, the difference being a clock. Clamping to
+    // half a tier gap makes crossing one impossible.
+    let mut adjust = 0i32;
     if let Some(a) = hist.arrival {
-        let mine = a[e.source as usize % 128];
+        let mine = a[e.source as usize];
         let later = live
             .iter()
-            .filter(|&&i| a[entries[i].source as usize % 128] > mine)
+            .filter(|&&i| a[entries[i].source as usize] > mine)
             .count() as i32;
-        c = c.saturating_sub(w.recency_per.saturating_mul(later).min(w.recency_cap));
+        adjust = adjust.saturating_sub(w.recency_per.saturating_mul(later).min(w.recency_cap));
     }
     // Stickiness is a hysteresis term, so it only exists once there is a
     // previous solve to be sticky about. With no history it is silent, not
@@ -864,13 +888,13 @@ fn drop_cost_of(
             .notes
             .iter()
             .any(|n| n.pitch == e.source && matches!(n.outcome, Outcome::Placed { .. }));
-        c = if was_placed {
-            c.saturating_add(w.drop_stick)
+        adjust = if was_placed {
+            adjust.saturating_add(w.drop_stick)
         } else {
-            c.saturating_sub(w.drop_stick)
+            adjust.saturating_sub(w.drop_stick)
         };
     }
-    c
+    c.saturating_add(adjust.clamp(-w.drop_history_clamp, w.drop_history_clamp))
 }
 
 impl Search<'_> {
@@ -956,7 +980,7 @@ impl Search<'_> {
             let k = self.sel_note[st] as usize;
             // Keyed by SOURCE pitch, which is the target undone by the shift.
             let src = self.target[k] as i32 - 12 * self.shift[k] as i32;
-            if !(0..128).contains(&src) {
+            if !(0..256).contains(&src) {
                 return 0;
             }
             self.prev_pos[src as usize]
@@ -1333,7 +1357,7 @@ pub struct VoicingSession {
     memory: Voicing,
     solved_for: Vec<u8>,
     scratch: Vec<u8>,
-    seen_at: [u32; 128],
+    seen_at: [u32; 256],
     next_ord: u32,
     idle_ms: u32,
     stats: SolveStats,
@@ -1350,7 +1374,7 @@ impl VoicingSession {
             out,
             solved_for: Vec::new(),
             scratch: Vec::new(),
-            seen_at: [0; 128],
+            seen_at: [0; 256],
             next_ord: 0,
             idle_ms: 0,
             stats: SolveStats::default(),
@@ -1374,7 +1398,7 @@ impl VoicingSession {
         self.out = solve(&self.spec, &[], &History::NONE, &self.w);
         self.memory = self.out.clone();
         self.solved_for.clear();
-        self.seen_at = [0; 128];
+        self.seen_at = [0; 256];
         self.next_ord = 0;
         self.idle_ms = 0;
         self.stats = SolveStats::default();
@@ -1419,7 +1443,7 @@ impl VoicingSession {
             self.idle_ms = self.idle_ms.saturating_add(dt_ms);
             if self.idle_ms >= self.w.idle_decay_ms {
                 self.memory = solve(&self.spec, &[], &History::NONE, &self.w);
-                self.seen_at = [0; 128];
+                self.seen_at = [0; 256];
                 self.next_ord = 0;
             }
             if !self.solved_for.is_empty() {
@@ -1445,11 +1469,11 @@ impl VoicingSession {
         if self
             .scratch
             .iter()
-            .any(|&p| self.seen_at[p as usize % 128] == 0)
+            .any(|&p| self.seen_at[p as usize] == 0)
         {
             self.next_ord = self.next_ord.saturating_add(1);
             for &p in &self.scratch {
-                let slot = &mut self.seen_at[p as usize % 128];
+                let slot = &mut self.seen_at[p as usize];
                 if *slot == 0 {
                     *slot = self.next_ord;
                 }
@@ -1458,7 +1482,7 @@ impl VoicingSession {
         // Ordinals only ever grow; on the (theoretical) wrap, start clean
         // rather than let a stale ordering decide which voice is shed.
         if self.next_ord == u32::MAX {
-            self.seen_at = [0; 128];
+            self.seen_at = [0; 256];
             self.next_ord = 0;
         }
         for (p, slot) in self.seen_at.iter_mut().enumerate() {
@@ -1908,7 +1932,7 @@ mod tests {
         assert_eq!(v.placed().count(), 6);
         assert!(v.shape.dropped_count >= 4);
         let cap = v.caption().expect("a partial board must explain itself");
-        assert!(cap.starts_with("6 of 10 notes"), "{cap}");
+        assert_eq!(cap, "6 of 10 notes", "{cap}");
         // The bass survives; it is what defines the chord.
         assert!(matches!(
             v.notes[0].outcome,
@@ -2324,16 +2348,108 @@ mod tests {
 
     #[test]
     fn the_session_never_disagrees_with_a_cold_solve_about_which_notes_show() {
-        let mut rng = Lcg(0x7777_3333);
-        let spec = std_spec();
-        let mut s = VoicingSession::new(spec.clone(), Weights::DEFAULT);
-        for _ in 0..400 {
-            let held = rng.set(38, 92, 7);
-            let set: HashSet<u8> = held.iter().copied().collect();
-            let v = s.update(&set, 100);
-            assert_eq!(v.notes.len(), held.len());
-            assert!(v.placed().count() >= solve_cold(&spec, &held).placed().count());
+        // Swept over seeds, and with releases in the mix, because the single
+        // fixed seed this used to run was a false pass: a reviewer re-ran the
+        // identical generator under 40 other seeds and found one that failed.
+        // Carried state really could shed a note, and one seed's silence hid
+        // it. Releases matter too — they are what makes `idle_decay_ms` fire,
+        // and the sharpest form of that bug was the SAME held set giving two
+        // answers depending only on how long the preceding rest was.
+        for seed in 0..40u64 {
+            let mut rng = Lcg(0x7777_3333 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let spec = std_spec();
+            let mut s = VoicingSession::new(spec.clone(), Weights::DEFAULT);
+            for _ in 0..120 {
+                if rng.next() % 5 == 0 {
+                    s.update(&HashSet::new(), (rng.next() % 2500) as u32);
+                    continue;
+                }
+                let held = rng.set(21, 108, 8);
+                let set: HashSet<u8> = held.iter().copied().collect();
+                let v = s.update(&set, 100);
+                assert_eq!(v.notes.len(), held.len());
+                assert!(
+                    v.placed().count() >= solve_cold(&spec, &held).placed().count(),
+                    "seed {seed}: carried state hid a note on {held:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn how_long_you_paused_cannot_change_the_shape() {
+        // The clock must not reach the picture. `idle_decay_ms` decides whether
+        // the previous hand is still remembered, and the drop-tier history
+        // terms used to be unclamped, so a rest of 1.1s and one of 1.2s drew
+        // the same chord with four notes and five.
+        let spec = std_spec();
+        let w = Weights::DEFAULT;
+        let mut rng = Lcg(0xfa11_bead);
+        for _ in 0..60 {
+            let first = rng.set(60, 108, 4);
+            let second = rng.set(21, 108, 7);
+            let mut shapes = Vec::new();
+            for pause in [0u32, 500, 1100, 1200, 5000] {
+                let mut s = VoicingSession::new(spec.clone(), w.clone());
+                s.update_sorted(&first, 100);
+                s.update(&HashSet::new(), pause);
+                let v = s.update_sorted(&second, 100);
+                shapes.push((v.placed().count(), frets(v)));
+            }
+            let (n0, _) = &shapes[0];
+            assert!(
+                shapes.iter().all(|(n, _)| n == n0),
+                "the rest length changed how many notes are drawn for {second:?}: {:?}",
+                shapes.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn a_pitch_above_127_gets_its_own_slot() {
+        // `solve` takes `&[u8]` and `IVORY_DEMO_NOTES` parses with
+        // `parse::<u8>()`, so 242 is reachable. The arrival and previous-
+        // position arrays were indexed `% 128`, which aliased 242 onto 114 and
+        // — worse — meant the expiry pass wiped 242's ordinal in the same call
+        // that issued it. A brand new session therefore disagreed with a cold
+        // solve on its very first tick.
+        let spec = std_spec();
+        let held = [40u8, 45, 50, 242];
+        let mut s = VoicingSession::new(spec.clone(), Weights::DEFAULT);
+        assert_eq!(*s.update_sorted(&held, 100), solve_cold(&spec, &held));
+        // And the aliased twin must not be able to change the other's fate.
+        let twinned = [40u8, 45, 50, 114, 242];
+        let mut s2 = VoicingSession::new(spec.clone(), Weights::DEFAULT);
+        assert_eq!(*s2.update_sorted(&twinned, 100), solve_cold(&spec, &twinned));
+        // 242 is out of range on a guitar, so it folds rather than vanishing.
+        let v = solve_cold(&spec, &held);
+        assert!(matches!(
+            v.notes.iter().find(|n| n.pitch == 242).unwrap().outcome,
+            Outcome::Placed { octave_shift, .. } if octave_shift < 0
+        ));
+    }
+
+    #[test]
+    fn carried_state_can_reorder_a_drop_but_never_cross_a_tier() {
+        // The bound that makes the two tests above hold by construction rather
+        // than by luck: the drop tiers are 2000 apart at their closest (folded
+        // 6000, doubled 8000), so the combined history adjustment has to stay
+        // under half of that.
+        let w = Weights::DEFAULT;
+        let tiers = [
+            w.drop_folded,
+            w.drop_base + w.drop_doubled,
+            w.drop_base,
+            w.drop_base + w.drop_highest,
+            w.drop_base + w.drop_lowest,
+        ];
+        let gap = tiers.windows(2).map(|p| p[1] - p[0]).min().unwrap();
+        assert!(gap > 0, "the drop tiers must stay ordered");
+        assert!(
+            2 * w.drop_history_clamp < gap,
+            "history can move a drop {} points across a {gap}-point tier gap",
+            2 * w.drop_history_clamp
+        );
     }
 
     // ── cost ────────────────────────────────────────────────────────────────
@@ -2431,7 +2547,9 @@ mod tests {
         assert_eq!(f, [None, Some(17), Some(15), Some(14), Some(13), Some(12)]);
         assert_eq!(v.shape.fingers, 5);
         assert_eq!(v.shape.playability, Playability::TwoHands);
-        assert_eq!(v.caption().as_deref(), Some("two hands"));
+        // Reported on the struct, deliberately NOT in the caption: every note
+        // is drawn, so there is nothing to explain and nothing to interrupt.
+        assert_eq!(v.caption(), None);
     }
 
     #[test]

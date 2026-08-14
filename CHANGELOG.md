@@ -40,6 +40,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- The fretboard no longer resizes itself when it has something to tell you. The
+  status line used to take a fifth of the panel, so the neck shrank and grew as
+  notes went in and out of range.
+- Note dots are smaller, so two on neighbouring strings no longer run together.
 - The piano no longer shows faint gaps between some white keys. Each key was
   drawn a pixel narrower than its slot, so about a dozen slivers of background
   showed through, spaced irregularly across the keyboard. Visible in light mode

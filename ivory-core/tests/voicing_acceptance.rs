@@ -227,7 +227,7 @@ fn a_ten_note_piano_voicing_keeps_the_bass_and_the_melody_and_says_what_it_lost(
     assert_eq!(v.cost, 26081);
     assert_eq!(v.notes.len(), 10, "every key pressed is still accounted for");
     assert_eq!(v.placed().count(), 6);
-    assert_eq!(v.caption().as_deref(), Some("6 of 10 notes  \u{b7}  two hands"));
+    assert_eq!(v.caption().as_deref(), Some("6 of 10 notes"));
     // The bass note folded onto a C that was already held, so it merges rather
     // than being drawn twice.
     assert_eq!(

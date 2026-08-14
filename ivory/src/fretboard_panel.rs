@@ -50,8 +50,6 @@ pub fn band_height(w: f32) -> f32 {
 const GUTTER: f32 = 0.026;
 /// Vertical breathing room above the top string and below the bottom one.
 const PAD_Y: f32 = 0.10;
-/// Fraction of the band given to the caption line, when there is one.
-const CAPTION_H: f32 = 0.19;
 
 struct Geom {
     /// x of the nut, and of the right-hand end of the board.
@@ -77,12 +75,18 @@ struct Geom {
 }
 
 impl Geom {
-    fn new(rect: Rect, spec: &FretboardSpec, has_caption: bool) -> Option<Self> {
+    /// The board's geometry does NOT depend on whether there is a caption.
+    ///
+    /// It used to: a caption took 19% of the band and the neck shrank to fit,
+    /// so a note going out of range mid-phrase resized the whole fretboard
+    /// under the player's hands. The caption is drawn OVER the board now,
+    /// down in the corner past the last inlay, and the neck never moves.
+    fn new(rect: Rect, spec: &FretboardSpec) -> Option<Self> {
         let strings = spec.tuning.strings();
         if strings == 0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
             return None;
         }
-        let board_h = rect.height() * if has_caption { 1.0 - CAPTION_H } else { 1.0 };
+        let board_h = rect.height();
         let pad = board_h * PAD_Y;
         let top = rect.top() + pad;
         let bottom = rect.top() + board_h - pad;
@@ -123,8 +127,17 @@ impl Geom {
         self.bottom - string as f32 * self.spacing
     }
 
+    /// Deliberately well under half the string spacing. At 0.38 two dots on
+    /// adjacent strings were a couple of points apart and read as one blob;
+    /// the shape matters more than the dots being big.
+    ///
+    /// The ceiling matters as much as the ratio. A flat minimum radius is what
+    /// made a small window worse rather than better: at 3pt of string spacing
+    /// a 2pt floor is a 4pt dot, which overlaps its neighbours outright. The
+    /// popped-out window can be dragged down to 90pt tall, so this is
+    /// reachable, not theoretical.
     fn dot_r(&self) -> f32 {
-        (self.spacing * 0.38).max(2.0)
+        (self.spacing * 0.30).max(1.0).min(self.spacing * 0.45)
     }
 }
 
@@ -281,7 +294,7 @@ pub fn draw(
     painter.rect_filled(rect, 0.0, p.bg);
 
     let caption = voicing.caption();
-    let Some(g) = Geom::new(rect, spec, caption.is_some()) else {
+    let Some(g) = Geom::new(rect, spec) else {
         // A tuning with no strings. There is no board to draw; say so rather
         // than leaving a blank rectangle that reads as a crash.
         draw_caption(painter, rect, "no strings", &p, s);
@@ -484,14 +497,17 @@ fn gutter_x(rect: Rect, g: &Geom) -> f32 {
     rect.left() + (g.left - rect.left()) * 0.5
 }
 
-fn draw_caption(painter: &Painter, rect: Rect, text: &str, p: &Palette, s: &Settings) {
-    let size = (rect.height() * CAPTION_H * 0.62).max(8.0);
+/// Over the board, bottom right, past the last inlay. Small and dim: it is
+/// there to be read when something is missing, not to be noticed otherwise,
+/// and above all it must not move the neck to say so.
+fn draw_caption(painter: &Painter, rect: Rect, text: &str, p: &Palette, _s: &Settings) {
+    let size = (rect.height() * 0.115).max(8.0);
     painter.text(
-        Pos2::new(rect.right() - 6.0, rect.bottom() - 2.0),
+        Pos2::new(rect.right() - 6.0, rect.bottom() - 3.0),
         Align2::RIGHT_BOTTOM,
         text,
         FontId::new(size, fonts::courier()),
-        if s.dark_mode { p.ink } else { p.ink },
+        p.on_board,
     );
 }
 
@@ -655,7 +671,7 @@ mod tests {
         // straight into widget space would leave 28% of the band empty and put
         // every dot in the wrong place.
         let spec = FretboardSpec::default();
-        let g = Geom::new(rect(), &spec, false).unwrap();
+        let g = Geom::new(rect(), &spec).unwrap();
         assert!((g.wire_x(spec.frets) - g.right).abs() < 0.5);
         assert!((g.wire_x(0) - g.left).abs() < 0.001, "fret 0 is the nut");
         // The 12th fret is still visibly the halfway house it is on a real
@@ -667,7 +683,7 @@ mod tests {
     #[test]
     fn press_points_stay_inside_their_fret_and_ascend() {
         let spec = FretboardSpec::default();
-        let g = Geom::new(rect(), &spec, false).unwrap();
+        let g = Geom::new(rect(), &spec).unwrap();
         for f in 1..=spec.frets {
             let x = g.press_x(f);
             assert!(x > g.wire_x(f - 1) && x < g.wire_x(f), "fret {f} escaped its space");
@@ -676,12 +692,56 @@ mod tests {
         assert!(gutter_x(rect(), &g) < g.left);
     }
 
+    /// The neck must not move when a caption appears. It used to: the caption
+    /// took 19% of the band and the board shrank to fit, so a note going out
+    /// of range mid-phrase resized the fretboard under the player's hands.
+    #[test]
+    fn a_caption_never_moves_the_neck() {
+        let spec = FretboardSpec::default();
+        let g = Geom::new(rect(), &spec).unwrap();
+        // There is only one geometry now, so this is true by construction —
+        // the assertion is here so that re-introducing a caption-dependent
+        // layout has to delete a test that says why not.
+        for st in 0..g.strings {
+            assert!(g.y(st) >= rect().top() && g.y(st) <= rect().bottom());
+        }
+        let solved = solve_cold(&spec, &[36, 43, 48, 52, 55, 58, 60, 64, 67, 72]);
+        assert!(solved.caption().is_some(), "this input should caption");
+        let quiet = solve_cold(&spec, &[40, 47, 52, 56, 59, 64]);
+        assert!(quiet.caption().is_none(), "an ordinary chord says nothing");
+        // Same board either way.
+        assert_eq!(
+            Geom::new(rect(), &spec).map(|g| (g.bottom, g.spacing, g.edge)),
+            Geom::new(rect(), &spec).map(|g| (g.bottom, g.spacing, g.edge))
+        );
+    }
+
+    /// Two dots on adjacent strings must not touch, or a shape reads as one
+    /// smear instead of as notes.
+    #[test]
+    fn dots_on_neighbouring_strings_stay_apart() {
+        for t in TUNINGS {
+            for w in [200.0_f32, 650.0, 1300.0, 2600.0] {
+                let spec = FretboardSpec { tuning: t, frets: 22, capo: 0 };
+                let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
+                let Some(g) = Geom::new(r, &spec) else { continue };
+                let gap = g.spacing - 2.0 * g.dot_r();
+                assert!(
+                    gap > 0.15 * g.spacing,
+                    "{} at {w}pt: adjacent dots leave only {gap:.1}pt of {:.1}pt spacing",
+                    t.name,
+                    g.spacing
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_low_string_is_at_the_bottom() {
         // Every chord chart in the world agrees on this and getting it upside
         // down is the single most obvious way to look wrong to a guitarist.
         let spec = FretboardSpec::default();
-        let g = Geom::new(rect(), &spec, false).unwrap();
+        let g = Geom::new(rect(), &spec).unwrap();
         assert!(g.y(0) > g.y(5), "string 0 is the low E and belongs at the bottom");
         for st in 1..6 {
             assert!(g.y(st) < g.y(st - 1));
@@ -696,7 +756,7 @@ mod tests {
                 for w in [200.0_f32, 650.0, 1300.0, 2600.0] {
                     let spec = FretboardSpec { tuning: t, frets: 22, capo };
                     let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
-                    let Some(g) = Geom::new(r, &spec, true) else {
+                    let Some(g) = Geom::new(r, &spec) else {
                         panic!("{} lost its board at width {w}", t.name);
                     };
                     assert!(g.right > g.left);
@@ -732,14 +792,14 @@ mod tests {
     #[test]
     fn a_stringless_or_fretless_board_does_not_divide_by_zero() {
         const NONE: Tuning = Tuning { name: "None", open: &[] };
-        assert!(Geom::new(rect(), &FretboardSpec { tuning: &NONE, frets: 22, capo: 0 }, false).is_none());
+        assert!(Geom::new(rect(), &FretboardSpec { tuning: &NONE, frets: 22, capo: 0 }).is_none());
         // Zero frets is a legal board: open strings and nothing else.
-        let g = Geom::new(rect(), &FretboardSpec { frets: 0, capo: 0, ..Default::default() }, false)
+        let g = Geom::new(rect(), &FretboardSpec { frets: 0, capo: 0, ..Default::default() })
             .expect("a fretless board is still a board");
         assert!(g.wire_x(0).is_finite() && g.right > g.left);
         // A single-string tuning must not divide by (strings - 1).
         const ONE: Tuning = Tuning { name: "One", open: &[40] };
-        let g = Geom::new(rect(), &FretboardSpec { tuning: &ONE, frets: 22, capo: 0 }, false).unwrap();
+        let g = Geom::new(rect(), &FretboardSpec { tuning: &ONE, frets: 22, capo: 0 }).unwrap();
         assert!(g.y(0).is_finite() && g.spacing.is_finite());
     }
 

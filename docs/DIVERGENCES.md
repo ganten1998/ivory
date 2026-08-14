@@ -436,6 +436,25 @@ detached chord window does not gain a fretboard.
   screen whose menu entry has gone. The detached state is remembered, so
   showing it again puts it back where it was.
 
+### D-UI-16a — play-test corrections
+
+From the first hands-on session with the guitar view:
+
+- **The caption no longer moves the neck.** It used to take 19% of the band, so
+  the board shrank whenever there was something to say and grew back when there
+  was not. A note going out of range mid-phrase resized the fretboard under the
+  player's hands. The caption is drawn OVER the board now, in the bottom-right
+  corner past the last inlay, and the geometry is constant.
+- **Playability is out of the caption.** "two hands" and "stretch" told the
+  player something the shape already shows, and being the most frequent line
+  they were also the main cause of the resizing. `Shape::playability` stays on
+  the struct for a view that wants to desaturate an unplayable shape.
+- **Dots are smaller** (0.30 of the string spacing, was 0.38) and now have a
+  ceiling as well as a floor. The flat 2pt minimum made small windows worse
+  rather than better: at 3pt of string spacing it produced a 4pt dot that
+  overlapped its neighbours, which the popped-out window can reach at its
+  minimum height.
+
 ### D-UI-17 — the white keys tile
 
 The piano drew each white key `trunc(width / 52)` wide while stepping by the
