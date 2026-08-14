@@ -7,7 +7,6 @@ use crate::fonts;
 use crate::menu::ColorTarget;
 use egui::{
     Align, Button, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Stroke, Vec2,
-    ViewportBuilder, ViewportId,
 };
 use ivory_core::OverrideInfo;
 
@@ -115,9 +114,10 @@ pub enum DialogAction {
     ForgetLearning,
 }
 
-fn dialog_vp_id() -> ViewportId {
-    ViewportId::from_hash_of("ivory-dialog")
-}
+/// Stable surface identity: a viewport id on the desktop, an `Area` id in a
+/// plugin. `dialog: Option<Dialog>` means there is never more than one open, so
+/// one id serves them all and the window keeps its place between dialogs.
+const DIALOG_ID: &str = "ivory-dialog";
 
 pub fn color_pick_title(target: ColorTarget) -> &'static str {
     match target {
@@ -240,85 +240,40 @@ fn show_dialog_viewport(
     let mut content = content;
     let mut result = VpResult { close: false };
 
-    // Two ways to be a dialog, chosen by what the host can do.
-    //
-    // The plugin path is NOT a fallback for calls that would fail. In a plugin
-    // `show_viewport_immediate` still runs — the context is built with
-    // `embed_viewports: true`, so it invokes the closure inline and opens a
-    // second `CentralPanel` under the same id as the first, painting garbage
-    // over the piano rather than erroring. That is why this branch sits ABOVE
-    // `shell::viewport_ui` instead of inside it.
-    if !placement.caps.child_windows {
-        // In-canvas, the same shape as the shortcut card: an Area floats above
-        // the panels and needs only a Context, so this works identically in a
-        // host-owned window with no window manager anywhere in sight.
-        let screen = ctx.content_rect();
-        let w = size.x.min(screen.width() * 0.94).max(min_size.x.min(screen.width()));
-        let h = size.y.min(screen.height() * 0.94).max(min_size.y.min(screen.height()));
-        let rect = Rect::from_center_size(screen.center(), Vec2::new(w, h));
-
-        // Dim the app behind it. These dialogs are modal, and without this the
-        // piano behind a plugin dialog looks live when it is not.
-        egui::Area::new(egui::Id::new("tangent-dialog-scrim"))
-            .order(egui::Order::Middle)
-            .fixed_pos(screen.min)
-            .show(ctx, |ui| {
-                ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(150));
-                // Swallow clicks so the app underneath cannot be operated
-                // through the scrim, which is what makes it genuinely modal.
-                ui.allocate_rect(screen, egui::Sense::click_and_drag());
-            });
-
-        egui::Area::new(egui::Id::new("tangent-dialog"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(rect.min)
-            .show(ctx, |ui| {
-                ui.set_clip_rect(rect);
-                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        result.close = true;
-                    }
-                    // The title is a window chrome affordance the host does not
-                    // give us, so it is drawn.
-                    ui.painter().rect_filled(rect, 4.0, ui.style().visuals.window_fill);
-                    content(ui, &mut result);
-                });
-            });
-        return result;
-    }
-
-    let mut builder = ViewportBuilder::default()
-        .with_title(title)
-        .with_inner_size(size)
-        .with_min_inner_size(min_size)
-        .with_resizable(true)
-        .with_decorations(true)
+    // Window or layer — `shell::surface` decides, and it is the only thing in
+    // this crate that does. Everything below is what a dialog adds on top:
+    // rounded fill on the inline path, because a layer has no title bar and no
+    // window edge to tell it apart from the app behind it.
+    let inline = !placement.caps.child_windows;
+    let spec = crate::shell::SurfaceSpec {
+        id: DIALOG_ID,
+        title,
+        size,
+        min_size,
         // These dialogs are MODAL — `handle_main_interaction` drops every event
         // while one is open — so a dialog that ends up behind the main window
         // is not merely untidy, it is an app that has stopped responding with
         // no visible reason why. The welcome note and the supporter key are the
         // two that open on top of a window the user is already looking at.
-        .with_always_on_top()
-        .with_active(true);
-    // Rounded and clamped, so a pixel of jitter in the reported parent rect
-    // cannot produce a new position every frame and drag the window around.
-    if let Some(p) = placement.position_for(size) {
-        builder = builder.with_position(p);
-    }
-    ctx.show_viewport_immediate(dialog_vp_id(), builder, |vp, _class| {
-        crate::shell::viewport_ui(vp, |ui| {
-        let (close_req, esc) = ui.input(|i| {
-            (
-                i.viewport().close_requested(),
-                i.key_pressed(egui::Key::Escape),
-            )
-        });
-        if close_req || esc {
-            result.close = true; // window close / Esc == Cancel (strict no-op)
+        pos: placement.position_for(size),
+        decorated: true,
+        resizable: true,
+        takes_focus: true,
+        modal: true,
+        ..Default::default()
+    };
+    let report = crate::shell::surface(ctx, placement.caps, &spec, &mut |ui, want_close| {
+        if inline {
+            ui.painter()
+                .rect_filled(ui.max_rect(), 4.0, ui.style().visuals.window_fill);
         }
-        content(ui, &mut result);
-        });
+        let mut r = VpResult { close: false };
+        content(ui, &mut r);
+        if r.close {
+            *want_close = true;
+        }
     });
+    result.close = report.close;
     result
 }
 
@@ -365,9 +320,7 @@ pub fn show(
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     for (i, name) in ports.iter().enumerate() {
-                                        if ui
-                                            .selectable_label(*selected == Some(i), name)
-                                            .clicked()
+                                        if ui.selectable_label(*selected == Some(i), name).clicked()
                                         {
                                             *selected = Some(i);
                                         }
@@ -378,8 +331,7 @@ pub fn show(
                                 if ui.button("OK").clicked() {
                                     if let Some(i) = *selected {
                                         if let Some(name) = ports.get(i) {
-                                            action =
-                                                Some(DialogAction::ConnectPort(name.clone()));
+                                            action = Some(DialogAction::ConnectPort(name.clone()));
                                         }
                                     }
                                     result.close = true;
@@ -424,9 +376,8 @@ pub fn show(
 
         Dialog::MidiError { message } => {
             let stock = stock_style(ctx);
-            let text = format!(
-                "Error opening MIDI port:\n{message}\n\nYou can still use keytoggle mode."
-            );
+            let text =
+                format!("Error opening MIDI port:\n{message}\n\nYou can still use keytoggle mode.");
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -659,7 +610,11 @@ pub fn show(
                                 );
                             }
                             ui.add_space(8.0);
-                            ui.label(RichText::new("Paste your key:").font(bold(11.0)).color(t.text));
+                            ui.label(
+                                RichText::new("Paste your key:")
+                                    .font(bold(11.0))
+                                    .color(t.text),
+                            );
                             let edit = egui::TextEdit::multiline(input)
                                 .font(bold(11.0))
                                 .text_color(t.text)
@@ -680,9 +635,8 @@ pub fn show(
                                     )
                                     .clicked()
                                 {
-                                    action = Some(DialogAction::InstallLicense {
-                                        key: input.clone(),
-                                    });
+                                    action =
+                                        Some(DialogAction::InstallLicense { key: input.clone() });
                                     // NOT closed here: the app decides, so a bad
                                     // key can report why without losing the paste.
                                 }
@@ -1027,7 +981,11 @@ pub fn show(
                                     "Chord learning: {}  ({} correction{})",
                                     if learning_view.on { "ON" } else { "off" },
                                     learning_view.corrections,
-                                    if learning_view.corrections == 1 { "" } else { "s" },
+                                    if learning_view.corrections == 1 {
+                                        ""
+                                    } else {
+                                        "s"
+                                    },
                                 ))
                                 .font(bold(11.0))
                                 .color(t.text),
@@ -1079,9 +1037,7 @@ pub fn show(
                                 if ui
                                     .add_enabled(
                                         learning_view.has_learned,
-                                        Button::new(
-                                            RichText::new("Forget Learning").color(t.text),
-                                        ),
+                                        Button::new(RichText::new("Forget Learning").color(t.text)),
                                     )
                                     .clicked()
                                 {
@@ -1115,7 +1071,6 @@ pub fn show(
     action
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1131,20 +1086,44 @@ mod tests {
         let monitor = Some(Vec2::new(2560.0, 1440.0));
 
         // Parent unknown: no position, so the platform places it.
-        assert_eq!(Placement { parent: None, monitor, caps: crate::host::Caps::DESKTOP }.position_for(size), None);
+        assert_eq!(
+            Placement {
+                parent: None,
+                monitor,
+                caps: crate::host::Caps::DESKTOP
+            }
+            .position_for(size),
+            None
+        );
 
         // Parent known: dead centre of the parent.
         let parent = Rect::from_min_size(Pos2::new(600.0, 400.0), Vec2::new(1300.0, 200.0));
-        let p = Placement { parent: Some(parent), monitor, caps: crate::host::Caps::DESKTOP }
-            .position_for(size)
-            .expect("a known parent must yield a position");
+        let p = Placement {
+            parent: Some(parent),
+            monitor,
+            caps: crate::host::Caps::DESKTOP,
+        }
+        .position_for(size)
+        .expect("a known parent must yield a position");
         let dialog_centre = p + size * 0.5;
-        assert!((dialog_centre.x - parent.center().x).abs() < 0.5, "off-centre in x");
-        assert!((dialog_centre.y - parent.center().y).abs() < 0.5, "off-centre in y");
+        assert!(
+            (dialog_centre.x - parent.center().x).abs() < 0.5,
+            "off-centre in x"
+        );
+        assert!(
+            (dialog_centre.y - parent.center().y).abs() < 0.5,
+            "off-centre in y"
+        );
 
         // A window near an edge still puts the whole dialog on the monitor.
         let edge = Rect::from_min_size(Pos2::new(2400.0, 1380.0), Vec2::new(1300.0, 200.0));
-        let p = Placement { parent: Some(edge), monitor, caps: crate::host::Caps::DESKTOP }.position_for(size).unwrap();
+        let p = Placement {
+            parent: Some(edge),
+            monitor,
+            caps: crate::host::Caps::DESKTOP,
+        }
+        .position_for(size)
+        .unwrap();
         assert!(p.x >= 0.0 && p.y >= 0.0, "pushed off the top-left: {p:?}");
         assert!(p.x + size.x <= 2560.0 + 0.5, "hangs off the right: {p:?}");
         assert!(p.y + size.y <= 1440.0 + 0.5, "hangs off the bottom: {p:?}");

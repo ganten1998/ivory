@@ -10,12 +10,10 @@
 //! themselves (no checkmarks anywhere).
 
 use crate::fonts;
-use crate::host::Caps;
 use crate::fretboard_panel;
+use crate::host::Caps;
+use egui::{Button, Color32, CornerRadius, FontId, Margin, Pos2, Stroke, Vec2};
 use ivory_core::fretboard;
-use egui::{
-    Button, Color32, CornerRadius, FontId, Margin, Pos2, Stroke, Vec2, ViewportBuilder, ViewportId,
-};
 use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -180,15 +178,15 @@ pub struct MenuState {
     dark_mode: bool,
     opened_at: Instant,
     saw_focus: bool,
+    /// Captured at open time, not read from the app each frame, so a menu can
+    /// never be half-drawn as a window and half as a layer.
+    caps: Caps,
 }
 
-fn menu_vp_id() -> ViewportId {
-    ViewportId::from_hash_of("ivory-menu")
-}
-
-fn submenu_vp_id() -> ViewportId {
-    ViewportId::from_hash_of("ivory-menu-sub")
-}
+/// Stable surface identities. On the desktop these are viewport ids; in a
+/// plugin they are `Area` ids. One string each, so the two paths cannot drift.
+const MENU_ID: &str = "ivory-menu";
+const SUBMENU_ID: &str = "ivory-menu-sub";
 
 fn build_entries(view: MenuView) -> Vec<Entry> {
     let item = |label: &str, action: MenuAction| Entry::Item {
@@ -216,7 +214,11 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         //    current state from: "Borderless" while bordered, "Bordered"
         //    while borderless)
         e.push(item(
-            if view.borderless { "Bordered" } else { "Borderless" },
+            if view.borderless {
+                "Bordered"
+            } else {
+                "Borderless"
+            },
             MenuAction::ToggleBorderless,
         ));
         e.push(Entry::Separator);
@@ -249,7 +251,11 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     ));
     e.push(Entry::Separator);
     e.push(item(
-        if view.dark_mode { "Light Mode" } else { "Dark Mode" },
+        if view.dark_mode {
+            "Light Mode"
+        } else {
+            "Dark Mode"
+        },
         MenuAction::ToggleDarkMode,
     ));
     // Only offered when a second typeface is actually installed, matching how
@@ -259,12 +265,20 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     }
     e.push(Entry::Separator);
     e.push(item(
-        if view.supporter { "Supporter Key..." } else { "Support Tangent..." },
+        if view.supporter {
+            "Supporter Key..."
+        } else {
+            "Support Tangent..."
+        },
         MenuAction::ShowSupporterKey,
     ));
     if view.supporter {
         e.push(item(
-            if view.heart_on { "Hide Heart" } else { "Show Heart" },
+            if view.heart_on {
+                "Hide Heart"
+            } else {
+                "Show Heart"
+            },
             MenuAction::ToggleHeart,
         ));
     }
@@ -345,7 +359,11 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     // is a control for something the user cannot see.
     e.push(Entry::Separator);
     e.push(item(
-        if view.fretboard_on { "Hide Fretboard" } else { "Show Fretboard" },
+        if view.fretboard_on {
+            "Hide Fretboard"
+        } else {
+            "Show Fretboard"
+        },
         MenuAction::ToggleFretboard,
     ));
     if view.fretboard_on {
@@ -353,7 +371,11 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         // set of habits rather than two.
         if view.caps.detachable {
             e.push(item(
-                if view.fretboard_detached { "Attach Fretboard" } else { "Detach Fretboard" },
+                if view.fretboard_detached {
+                    "Attach Fretboard"
+                } else {
+                    "Detach Fretboard"
+                },
                 if view.fretboard_detached {
                     MenuAction::AttachFretboard
                 } else {
@@ -406,7 +428,11 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                         format!("Fret {f}")
                     };
                     (
-                        if f == view.capo { format!("{label}  \u{2022}") } else { label },
+                        if f == view.capo {
+                            format!("{label}  \u{2022}")
+                        } else {
+                            label
+                        },
                         MenuAction::SetCapo(f),
                     )
                 })
@@ -472,10 +498,7 @@ impl MenuState {
                         .fold(0.0_f32, |acc, (l, _)| acc.max(measure(ctx, l).x));
                     subs.push(SubGeom {
                         row_top: height,
-                        size: Vec2::new(
-                            (w + 2.0 * PAD_X).ceil(),
-                            items.len() as f32 * row_h,
-                        ),
+                        size: Vec2::new((w + 2.0 * PAD_X).ceil(), items.len() as f32 * row_h),
                     });
                     height += row_h;
                 }
@@ -504,6 +527,7 @@ impl MenuState {
             dark_mode: view.dark_mode,
             opened_at: Instant::now(),
             saw_focus: false,
+            caps: view.caps,
         }
     }
 }
@@ -562,27 +586,25 @@ fn menu_button(ui: &mut egui::Ui, label: &str, enabled: bool, row_h: f32) -> egu
 pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<MenuAction> {
     let state = state_opt.as_mut()?;
     let c = colors(state.dark_mode);
+    let caps = state.caps;
+    let row_h = state.row_h;
+    let submenu_open = state.submenu_open;
     let mut action: Option<MenuAction> = None;
     let mut close = false;
 
-    let mut menu_focused = None;
-    let mut submenu_focused = None;
-
-    // ── Main menu viewport ─────────────────────────────────────────────────
-    let builder = ViewportBuilder::default()
-        .with_title("Tangent")
-        .with_decorations(false)
-        .with_resizable(false)
-        .with_always_on_top()
-        .with_position(state.pos)
-        .with_inner_size(state.size)
-        .with_min_inner_size(state.size)
-        .with_max_inner_size(state.size);
-
     let mut hover_close_submenu = false;
     let mut hover_open_submenu: Option<usize> = None;
-    ctx.show_viewport_immediate(menu_vp_id(), builder, |vp, _class| {
-        crate::shell::viewport_ui(vp, |ui| {
+
+    // ── Main menu ──────────────────────────────────────────────────────────
+    let menu_spec = crate::shell::SurfaceSpec {
+        id: MENU_ID,
+        size: state.size,
+        min_size: state.size,
+        pos: Some(state.pos),
+        order: egui::Order::Foreground,
+        ..Default::default()
+    };
+    let menu_report = crate::shell::surface(ctx, caps, &menu_spec, &mut |ui, want_close| {
         apply_menu_style(ui.style_mut(), c);
         let rect = ui.max_rect();
         // Background + 1px border in the background color (visually borderless).
@@ -606,22 +628,22 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
                         action: a,
                         enabled,
                     } => {
-                        let r = menu_button(ui, label, *enabled, state.row_h);
+                        let r = menu_button(ui, label, *enabled, row_h);
                         if r.hovered() {
                             hover_close_submenu = true;
                         }
                         if r.clicked() {
                             action = Some(*a);
-                            close = true;
+                            *want_close = true;
                         }
                     }
                     Entry::Submenu { label, .. } => {
                         let r = ui.add(
                             Button::new(label.as_str())
                                 .right_text(ARROW)
-                                .selected(state.submenu_open == Some(sub_idx))
+                                .selected(submenu_open == Some(sub_idx))
                                 .wrap_mode(egui::TextWrapMode::Extend)
-                                .min_size(egui::vec2(0.0, state.row_h)),
+                                .min_size(egui::vec2(0.0, row_h)),
                         );
                         if r.hovered() || r.clicked() {
                             hover_open_submenu = Some(sub_idx);
@@ -631,20 +653,8 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
                 }
             }
         });
-
-        let (close_req, esc, focused) = ui.input(|i| {
-            (
-                i.viewport().close_requested(),
-                i.key_pressed(egui::Key::Escape),
-                i.viewport().focused,
-            )
-        });
-        menu_focused = focused;
-        if close_req || esc {
-            close = true;
-        }
-        });
     });
+    close |= menu_report.close;
 
     if let Some(i) = hover_open_submenu {
         state.submenu_open = Some(i);
@@ -652,13 +662,14 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         state.submenu_open = None;
     }
 
-    // ── Submenu viewport (sibling, Qt-style to the right) ─────────────────
-    // Only one submenu can be open at a time, so they all share one viewport
-    // id and it simply moves and resizes as the pointer travels down the menu.
+    // ── Submenu (sibling, Qt-style to the right) ──────────────────────────
+    // Only one submenu can be open at a time, so they all share one surface id
+    // and it simply moves and resizes as the pointer travels down the menu.
     let open_sub = state
         .submenu_open
         .filter(|_| !close)
         .and_then(|i| state.subs.get(i).map(|g| (i, g.row_top, g.size)));
+    let mut submenu_report = None;
     if let Some((sub_i, row_top, sub_size)) = open_sub {
         let mut sub_pos = Pos2::new(state.pos.x + state.size.x, state.pos.y + row_top);
         if let Some(mon) = state.monitor {
@@ -671,19 +682,18 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
                 sub_pos.x = (state.pos.x - sub_size.x).max(0.0);
             }
         }
-        let sub_builder = ViewportBuilder::default()
-            .with_title("Tangent")
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_always_on_top()
-            .with_active(false) // don't steal key focus from the menu
-            .with_position(sub_pos)
-            .with_inner_size(sub_size)
-            .with_min_inner_size(sub_size)
-            .with_max_inner_size(sub_size);
 
-        ctx.show_viewport_immediate(submenu_vp_id(), sub_builder, |vp, _class| {
-            crate::shell::viewport_ui(vp, |ui| {
+        let sub_spec = crate::shell::SurfaceSpec {
+            id: SUBMENU_ID,
+            size: sub_size,
+            min_size: sub_size,
+            pos: Some(sub_pos),
+            // Don't steal key focus from the menu — and inline, sit above it.
+            takes_focus: false,
+            order: egui::Order::Tooltip,
+            ..Default::default()
+        };
+        let report = crate::shell::surface(ctx, caps, &sub_spec, &mut |ui, want_close| {
             apply_menu_style(ui.style_mut(), c);
             let rect = ui.max_rect();
             ui.painter().rect_filled(rect, 0.0, c.bg);
@@ -697,30 +707,37 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
                 .nth(sub_i);
             ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
                 for (label, a) in items.into_iter().flatten() {
-                    if menu_button(ui, label, true, state.row_h).clicked() {
+                    if menu_button(ui, label, true, row_h).clicked() {
                         action = Some(*a);
-                        close = true;
+                        *want_close = true;
                     }
                 }
             });
-            let (esc, focused) =
-                ui.input(|i| (i.key_pressed(egui::Key::Escape), i.viewport().focused));
-            submenu_focused = focused;
-            if esc {
-                close = true;
-            }
-            });
         });
+        close |= report.close;
+        submenu_report = Some(report);
     }
 
-    // ── Close-on-focus-loss (click elsewhere / other app) ──────────────────
-    if menu_focused == Some(true) || submenu_focused == Some(true) {
-        state.saw_focus = true;
-    }
-    let grace = state.opened_at.elapsed() > std::time::Duration::from_millis(250);
-    let all_unfocused =
-        menu_focused == Some(false) && submenu_focused.is_none_or(|f| !f);
-    if state.saw_focus && grace && all_unfocused {
+    // ── Closing when the user goes elsewhere ───────────────────────────────
+    //
+    // Two different signals for the same intent, because the two hosts offer
+    // different evidence. A window knows it lost focus; a layer in someone
+    // else's window has no focus to lose and has to watch the pointer instead.
+    if caps.child_windows {
+        if menu_report.focused == Some(true)
+            || submenu_report.is_some_and(|r| r.focused == Some(true))
+        {
+            state.saw_focus = true;
+        }
+        let grace = state.opened_at.elapsed() > std::time::Duration::from_millis(250);
+        let all_unfocused = menu_report.focused == Some(false)
+            && submenu_report.is_none_or(|r| r.focused != Some(true));
+        if state.saw_focus && grace && all_unfocused {
+            close = true;
+        }
+    } else if menu_report.pressed_outside && submenu_report.is_none_or(|r| r.pressed_outside) {
+        // The press that OPENED the menu is always inside it — the menu is
+        // positioned at the cursor — so this needs no opening grace.
         close = true;
     }
 
@@ -798,9 +815,15 @@ mod tests {
     fn correct_item_needs_notes_and_detection() {
         let mut v = view();
         let label = "Correct Chord Name...".to_owned();
-        assert_eq!(find(v, MenuAction::CorrectChordName), Some((label.clone(), false)));
+        assert_eq!(
+            find(v, MenuAction::CorrectChordName),
+            Some((label.clone(), false))
+        );
         v.notes_held = true;
-        assert_eq!(find(v, MenuAction::CorrectChordName), Some((label.clone(), true)));
+        assert_eq!(
+            find(v, MenuAction::CorrectChordName),
+            Some((label.clone(), true))
+        );
         // Detection off nulls current_chord — nothing to correct against.
         v.detection_enabled = false;
         assert_eq!(find(v, MenuAction::CorrectChordName), Some((label, false)));
@@ -862,7 +885,10 @@ mod tests {
         assert_eq!(subs[2].0, "Tuning");
         assert_eq!(subs[3].0, "Capo");
         assert_eq!(subs[1].1.len(), 3, "three woods");
-        assert!(subs[1].1[0].starts_with("Rosewood"), "rosewood is the default and comes first");
+        assert!(
+            subs[1].1[0].starts_with("Rosewood"),
+            "rosewood is the default and comes first"
+        );
         assert!(subs[1].1[0].ends_with('\u{2022}'));
         assert_eq!(subs[1].2[0], MenuAction::SetWood("rosewood"));
         // Detach mirrors the chord window's toggle, renaming itself.
@@ -870,7 +896,10 @@ mod tests {
             find(v, MenuAction::DetachFretboard).map(|(l, _)| l),
             Some("Detach Fretboard".to_owned())
         );
-        let d = MenuView { fretboard_detached: true, ..v };
+        let d = MenuView {
+            fretboard_detached: true,
+            ..v
+        };
         assert_eq!(
             find(d, MenuAction::AttachFretboard).map(|(l, _)| l),
             Some("Attach Fretboard".to_owned())
@@ -880,11 +909,17 @@ mod tests {
         // close it again to find out.
         assert_eq!(subs[2].1.len(), fretboard::TUNINGS.len());
         assert!(subs[2].1[0].starts_with("Standard"));
-        assert!(subs[2].1[0].ends_with('\u{2022}'), "the current tuning is marked");
+        assert!(
+            subs[2].1[0].ends_with('\u{2022}'),
+            "the current tuning is marked"
+        );
         assert!(!subs[2].1[1].ends_with('\u{2022}'));
         assert_eq!(subs[2].2[0], MenuAction::SetTuning("Standard"));
         assert!(
-            subs[2].2.iter().all(|a| matches!(a, MenuAction::SetTuning(n)
+            subs[2]
+                .2
+                .iter()
+                .all(|a| matches!(a, MenuAction::SetTuning(n)
                 if fretboard::Tuning::by_name(n).is_some())),
             "every offered tuning must resolve"
         );
@@ -897,9 +932,18 @@ mod tests {
 
     #[test]
     fn the_marked_row_follows_the_settings() {
-        let v = MenuView { fretboard_on: true, tuning: "DADGAD", capo: 3, ..view() };
+        let v = MenuView {
+            fretboard_on: true,
+            tuning: "DADGAD",
+            capo: 3,
+            ..view()
+        };
         let subs = submenus(v);
-        let marked: Vec<&String> = subs[2].1.iter().filter(|l| l.ends_with('\u{2022}')).collect();
+        let marked: Vec<&String> = subs[2]
+            .1
+            .iter()
+            .filter(|l| l.ends_with('\u{2022}'))
+            .collect();
         assert_eq!(marked.len(), 1);
         assert!(marked[0].starts_with("DADGAD"));
         assert_eq!(subs[3].1[3], "Fret 3  \u{2022}");
@@ -923,7 +967,7 @@ mod tests {
         };
         let mon = Vec2::new(1440.0, 900.0);
         let size = Vec2::new(120.0, 260.0); // ten rows of Capo
-        // Opened near the bottom: pulled up so the last row is reachable.
+                                            // Opened near the bottom: pulled up so the last row is reachable.
         let p = clamp(Pos2::new(1000.0, 820.0), size, 900.0, mon);
         assert!(p.y + size.y <= mon.y, "bottom row is off-screen at {p:?}");
         // Opened near the right edge: flipped to the menu's other side.
@@ -945,12 +989,23 @@ mod tests {
         let with = rows(v);
         // The same view, built the way it was before Caps existed, is what
         // `Caps::DESKTOP` has to reproduce: every row present.
-        assert!(with.iter().any(|(_, a, _)| *a == MenuAction::ToggleBorderless));
-        assert!(with.iter().any(|(_, a, _)| *a == MenuAction::SelectMidiInput));
-        assert!(with.iter().any(|(_, a, _)| *a == MenuAction::DetachChordWindow));
-        assert!(with.iter().any(|(_, a, _)| *a == MenuAction::DetachFretboard));
+        assert!(with
+            .iter()
+            .any(|(_, a, _)| *a == MenuAction::ToggleBorderless));
+        assert!(with
+            .iter()
+            .any(|(_, a, _)| *a == MenuAction::SelectMidiInput));
+        assert!(with
+            .iter()
+            .any(|(_, a, _)| *a == MenuAction::DetachChordWindow));
+        assert!(with
+            .iter()
+            .any(|(_, a, _)| *a == MenuAction::DetachFretboard));
         assert_eq!(submenus(v)[0].0, "Size");
-        assert_eq!(with.last().map(|(_, a, _)| *a), Some(MenuAction::ResetSettings));
+        assert_eq!(
+            with.last().map(|(_, a, _)| *a),
+            Some(MenuAction::ResetSettings)
+        );
     }
 
     /// In a plugin, every row that survives must be one the host can actually
@@ -996,7 +1051,10 @@ mod tests {
             MenuAction::ToggleFretboard,
             MenuAction::ShowAbout,
         ] {
-            assert!(kept.iter().any(|(_, a, _)| *a == want), "{want:?} went missing");
+            assert!(
+                kept.iter().any(|(_, a, _)| *a == want),
+                "{want:?} went missing"
+            );
         }
         // Tuning, Capo and Wood are pure state and must all remain.
         let subs = submenus(v);
@@ -1014,6 +1072,9 @@ mod tests {
         assert!(pos(MenuAction::ManageTaughtChords) < pos(MenuAction::CorrectChordName));
         assert!(pos(MenuAction::CorrectChordName) < pos(MenuAction::ToggleChordLearning));
         assert!(pos(MenuAction::ToggleChordLearning) < pos(MenuAction::ShowAbout));
-        assert_eq!(r.last().map(|(_, a, _)| *a), Some(MenuAction::ResetSettings));
+        assert_eq!(
+            r.last().map(|(_, a, _)| *a),
+            Some(MenuAction::ResetSettings)
+        );
     }
 }
