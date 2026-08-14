@@ -492,14 +492,28 @@ Two things this needed that were not obvious:
 The 2.2.0 tester report asked for keyboard shortcuts without saying for what,
 which is why it was not done then. Now there is something to bind them to.
 
-`H` (or `F1`) shows a card listing every shortcut; `K` keytoggle, `R` clears
-the notes you placed, `G` guitar view, `D` dark mode, `C` chord detection,
-`Esc` closes the card.
+`H` shows a card listing every shortcut. `K` keytoggle, `R` clears the notes you
+placed, `G` guitar view, `C` chord detection, `D` dark mode, `B` window border,
+`F` cycle typeface, `A` about, `S` supporter key, `Esc` closes the card.
 
-`H` exists because **macOS takes F1 for screen brightness** unless "use F1, F2
-etc. as standard function keys" is enabled, which it is not by default. The app
-never receives the keypress at all, so a help key that answers only to F1 is one
-most Mac users cannot press. F1 still works where the system allows it.
+The help key is a plain letter because both obvious alternates were tried and
+neither could be confirmed to arrive. **F1** is taken by macOS for screen
+brightness unless "use F1, F2 etc. as standard function keys" is enabled, which
+it is not by default, so the app never sees it. **Backtick** did not fire under
+test either, by keystroke or by key code, while `H` fired every time on the same
+harness; `Key::Backtick` exists in egui 0.33 and maps from Backquote/Grave, so
+that is somewhere in the winit/macOS path rather than in the table. Both stay
+bound as alternates because they cost nothing, but the card names the key that
+is known to work.
+
+The card uses **two columns** when one will not fit. This window is very wide and
+very short (1300x332 usually, 650x166 at its smallest with everything on), and
+ten shortcuts in a single column do not fit at any legible size. Using the shape
+of the window beats shrinking the type until nobody can read it. `layout()` is a
+pure function so this is tested rather than eyeballed: the first version sized
+itself from window height alone and grew past the window the moment the list
+did, cutting off the top and bottom rows, and the test then in place only checked
+that it did not panic.
 
 - **One table, in `keys.rs`, and the card is rendered FROM it.** A shortcut that
   works but is not listed, or is listed and does not work, is worse than no

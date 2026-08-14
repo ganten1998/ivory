@@ -1,4 +1,4 @@
-//! Keyboard shortcuts, and the F1 card that lists them.
+//! Keyboard shortcuts, and the card that lists them.
 //!
 //! Two things make this more than a match on `Key`.
 //!
@@ -25,6 +25,10 @@ pub enum KeyAction {
     ToggleFretboard,
     ToggleDarkMode,
     ToggleDetection,
+    ToggleBorderless,
+    CycleFont,
+    ShowAbout,
+    ShowSupporterKey,
     CloseHelp,
 }
 
@@ -40,8 +44,12 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     (Key::K, "K", KeyAction::ToggleKeytoggle, true),
     (Key::R, "R", KeyAction::ClearNotes, true),
     (Key::G, "G", KeyAction::ToggleFretboard, true),
-    (Key::D, "D", KeyAction::ToggleDarkMode, true),
     (Key::C, "C", KeyAction::ToggleDetection, true),
+    (Key::D, "D", KeyAction::ToggleDarkMode, true),
+    (Key::B, "B", KeyAction::ToggleBorderless, true),
+    (Key::F, "F", KeyAction::CycleFont, true),
+    (Key::A, "A", KeyAction::ShowAbout, true),
+    (Key::S, "S", KeyAction::ShowSupporterKey, true),
     // Escape only closes the card; it is not worth a row of its own.
     (Key::Escape, "Esc", KeyAction::CloseHelp, false),
 ];
@@ -56,6 +64,10 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ToggleFretboard => "guitar view",
         KeyAction::ToggleDarkMode => "dark mode",
         KeyAction::ToggleDetection => "chord detection",
+        KeyAction::ToggleBorderless => "window border",
+        KeyAction::CycleFont => "cycle the typeface",
+        KeyAction::ShowAbout => "about",
+        KeyAction::ShowSupporterKey => "enter a supporter key",
         KeyAction::CloseHelp => "close this card",
     }
 }
@@ -77,6 +89,42 @@ pub fn pressed(ctx: &egui::Context) -> Option<KeyAction> {
     })
 }
 
+/// Where the card goes, how big its text is, and how many columns it uses.
+///
+/// Split out so it can be TESTED, because the bug here is invisible in code and
+/// glaring on screen: sized from the window height alone, the card grew taller
+/// than the app the moment the list did, and the first and last shortcuts were
+/// cut off by the window edges.
+///
+/// Columns matter as much as type size. This window is very WIDE and very SHORT
+/// (1300x332 usually, 650x166 at the smallest with everything on), so ten
+/// shortcuts in one column do not fit at any legible size while two columns fit
+/// comfortably. Using the shape of the window beats shrinking the type until
+/// nobody can read it.
+fn layout(rect: Rect, rows: usize, widest: usize) -> (Rect, f32, usize) {
+    let rows = rows.max(1);
+    for cols in 1..=3usize {
+        let per_col = rows.div_ceil(cols);
+        let by_height = rect.height() * 0.92 / (per_col as f32 * 1.75 + 3.36);
+        let size = by_height.min(rect.height() * 0.075).clamp(8.0, 20.0);
+
+        let row_h = size * 1.75;
+        let pad = size * 1.4;
+        let col_w = size * 3.2 + widest as f32 * size * 0.62;
+        let w = col_w * cols as f32 + pad * 2.0 + pad * (cols - 1) as f32;
+        let h = per_col as f32 * row_h + pad * 2.4;
+
+        if (w <= rect.width() * 0.94 && h <= rect.height()) || cols == 3 {
+            // Never flush against the window edges: a card touching them reads
+            // as clipped even when it is not, and exact-equality containment is
+            // a float coin toss.
+            let card = Vec2::new(w.min(rect.width() * 0.94), h.min(rect.height() * 0.96));
+            return (Rect::from_min_size(rect.center() - card * 0.5, card), size, cols);
+        }
+    }
+    unreachable!("the loop always returns on its last iteration")
+}
+
 /// The help card, drawn over the app.
 ///
 /// Centred, sized to its own content, and painted directly rather than through
@@ -88,22 +136,16 @@ pub fn draw_help(painter: &Painter, rect: Rect, dark: bool) {
         .filter(|(.., shown)| *shown)
         .map(|&(_, label, action, _)| (label, describe(action)))
         .collect();
+    let widest = rows.iter().map(|(_, d)| d.len()).max().unwrap_or(20);
+    let (card_rect, size, cols) = layout(rect, rows.len(), widest);
 
-    // Scale with the window, but stay legible in a small one.
-    let size = (rect.height() * 0.075).clamp(11.0, 20.0);
     let row_h = size * 1.75;
     let pad = size * 1.4;
     let key_w = size * 3.2;
+    let per_col = rows.len().div_ceil(cols);
+    let col_w = (card_rect.width() - pad * 2.0) / cols as f32;
     let font = FontId::new(size, crate::fonts::courier());
     let bold = FontId::new(size, crate::fonts::courier_bold());
-
-    let widest = rows.iter().map(|(_, d)| d.len()).max().unwrap_or(20) as f32;
-    let card = Vec2::new(
-        (key_w + widest * size * 0.62 + pad * 2.0).min(rect.width() * 0.92),
-        rows.len() as f32 * row_h + pad * 2.4,
-    );
-    let origin = rect.center() - card * 0.5;
-    let card_rect = Rect::from_min_size(origin, card);
 
     // Dim what is behind it, so the card reads as modal without being one.
     painter.rect_filled(rect, 0.0, Color32::from_black_alpha(150));
@@ -126,23 +168,11 @@ pub fn draw_help(painter: &Painter, rect: Rect, dark: bool) {
     painter.rect_filled(card_rect, 4.0, bg);
     painter.rect_stroke(card_rect, 4.0, Stroke::new(1.0_f32, edge), StrokeKind::Middle);
 
-    let mut y = card_rect.top() + pad * 1.2;
-    for (label, desc) in &rows {
-        painter.text(
-            Pos2::new(card_rect.left() + pad, y),
-            Align2::LEFT_TOP,
-            label,
-            bold.clone(),
-            fg,
-        );
-        painter.text(
-            Pos2::new(card_rect.left() + pad + key_w, y),
-            Align2::LEFT_TOP,
-            desc,
-            font.clone(),
-            dim,
-        );
-        y += row_h;
+    for (i, (label, desc)) in rows.iter().enumerate() {
+        let x = card_rect.left() + pad + (i / per_col) as f32 * col_w;
+        let y = card_rect.top() + pad * 1.2 + (i % per_col) as f32 * row_h;
+        painter.text(Pos2::new(x, y), Align2::LEFT_TOP, label, bold.clone(), fg);
+        painter.text(Pos2::new(x + key_w, y), Align2::LEFT_TOP, desc, font.clone(), dim);
     }
 }
 
@@ -219,8 +249,47 @@ mod tests {
 
     /// The card must fit inside the window it is drawn over, at every size the
     /// app can be, or the shortcut list is the thing you cannot read.
+    /// It has to FIT. The first version sized itself from the window height
+    /// alone, so the card outgrew the app the moment another shortcut was added
+    /// and the top and bottom rows were cut off by the window edges. "It did
+    /// not panic" was all the old test checked, which is how that reached a
+    /// screenshot.
     #[test]
-    fn the_card_fits_the_window_at_every_size() {
+    fn the_card_fits_the_window_at_every_size_and_row_count() {
+        let shown = BINDINGS.iter().filter(|(.., s)| *s).count();
+        for w in [650.0_f32, 975.0, 1300.0, 1950.0, 2600.0] {
+            for h in [w / 8.667, w / 8.667 + 50.0, w / 8.667 + 182.0, 90.0] {
+                let rect = Rect::from_min_size(Pos2::new(7.0, 11.0), Vec2::new(w, h));
+                for rows in [1, shown, shown + 4, 20] {
+                    let (card, size, cols) = layout(rect, rows, 46);
+                    // ALWAYS: nothing is ever painted outside the app.
+                    assert!(size >= 8.0, "text shrank below legible at {w}x{h}");
+                    assert!(
+                        rect.contains_rect(card),
+                        "card {card:?} escapes window {rect:?}, {rows} rows"
+                    );
+                    // AND wherever there is room, every row has somewhere to be.
+                    // The exception is real rather than a fudge: the smallest
+                    // this app goes is 50% with the chord strip and the guitar
+                    // view both off, 650x75, and no number of legible rows fits
+                    // in 75 points. It clips there rather than escaping, and the
+                    // window is one keypress from being bigger.
+                    if h >= 120.0 {
+                        let used =
+                            rows.div_ceil(cols) as f32 * size * 1.75 + size * 1.4 * 1.2;
+                        assert!(
+                            used <= card.height() + 0.5,
+                            "{rows} rows in {cols} col(s) need {used} of {} at {w}x{h}",
+                            card.height()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_card_paints_without_panicking() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
         for w in [650.0_f32, 1300.0, 2600.0] {

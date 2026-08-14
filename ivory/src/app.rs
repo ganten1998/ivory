@@ -704,6 +704,12 @@ impl IvoryApp {
             K::ToggleFretboard => self.apply_menu_action(ctx, MenuAction::ToggleFretboard),
             K::ToggleDarkMode => self.apply_menu_action(ctx, MenuAction::ToggleDarkMode),
             K::ToggleDetection => self.apply_menu_action(ctx, MenuAction::ToggleChordDetection),
+            K::ToggleBorderless => self.apply_menu_action(ctx, MenuAction::ToggleBorderless),
+            K::CycleFont => self.apply_menu_action(ctx, MenuAction::CycleFont),
+            // These open dialogs. The shortcut gate already refuses to fire
+            // while one is up, so A cannot stack a second About on the first.
+            K::ShowAbout => self.apply_menu_action(ctx, MenuAction::ShowAbout),
+            K::ShowSupporterKey => self.apply_menu_action(ctx, MenuAction::ShowSupporterKey),
             // "Clear what I placed", not "clear everything": notes arriving
             // from a MIDI keyboard are not ours to drop, and they would come
             // straight back on the next frame anyway.
