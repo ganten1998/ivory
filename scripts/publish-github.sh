@@ -52,7 +52,24 @@ if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-
 fi
 TAG="v${VERSION}"
 
-echo "==> Ivory $VERSION -> $REPO $TAG"
+# A version carrying a pre-release suffix ("2.3.0-beta.1") is published as a
+# GitHub PRE-RELEASE, and that is not cosmetic.
+#
+# `releases/latest/download/<name>` resolves against the latest NON-prerelease,
+# so a beta marked correctly leaves every permanent link pointing at the last
+# stable build. Publish the same beta as a normal release and every one of
+# those links — the ones in every supporter-key email already sent, on the
+# Gumroad post-purchase page, and in the README — silently starts handing a
+# beta to people who paid for a finished app.
+#
+# For the same reason a pre-release uploads ONLY version-scoped names. The
+# version-less aliases and the legacy Ivory-* set are the permanent-link
+# contract, and a beta has no business owning them even by accident.
+PRERELEASE=0
+case "$VERSION" in *-*) PRERELEASE=1 ;; esac
+
+echo "==> Tangent $VERSION -> $REPO $TAG"
+[ "$PRERELEASE" = 1 ] && echo "    PRE-RELEASE: version-scoped assets only, permalinks stay on the last stable"
 
 RELEASE_EXISTS=0
 gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 && RELEASE_EXISTS=1
@@ -72,8 +89,11 @@ fi
 # ── Collect this version's artifacts ─────────────────────────────────────────
 shopt -s nullglob
 ARTIFACTS=()
-for f in dist/Ivory-"${VERSION}"-macos-*.zip dist/Ivory-"${VERSION}"-macos-*.dmg \
-         dist/ivory-"${VERSION}"-linux-*.tar.gz dist/ivory-"${VERSION}"-windows-*.zip; do
+# Tangent-* since the 2.3.0 rename. This glob still said Ivory-* long after
+# build-macos.sh stopped producing that name, so the script exited "no
+# artifacts in dist/" on the first release it was asked to publish.
+for f in dist/Tangent-"${VERSION}"-macos-*.zip dist/Tangent-"${VERSION}"-macos-*.dmg \
+         dist/tangent-"${VERSION}"-linux-*.tar.gz dist/tangent-"${VERSION}"-windows-*.zip; do
   [ -f "$f" ] && ARTIFACTS+=("$f")
 done
 shopt -u nullglob
@@ -101,7 +121,13 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
 UPLOADS=()
+if [ "$PRERELEASE" = 1 ]; then
+  UPLOADS=("${ARTIFACTS[@]}")
+  cp "$SUMS" "$STAGE/SHA256SUMS-${VERSION}"
+  UPLOADS+=("$STAGE/SHA256SUMS-${VERSION}")
+fi
 for a in "${ARTIFACTS[@]}"; do
+  [ "$PRERELEASE" = 1 ] && break
   base="${a#dist/}"
   alias_name="${base/-${VERSION}-/-}"
   if [ "$alias_name" = "$base" ]; then
@@ -111,9 +137,11 @@ for a in "${ARTIFACTS[@]}"; do
   cp "$a" "$STAGE/$alias_name"
   UPLOADS+=("$a" "$STAGE/$alias_name")
 done
-cp "$SUMS" "$STAGE/SHA256SUMS-${VERSION}"
-cp "$SUMS" "$STAGE/SHA256SUMS"
-UPLOADS+=("$STAGE/SHA256SUMS-${VERSION}" "$STAGE/SHA256SUMS")
+if [ "$PRERELEASE" = 0 ]; then
+  cp "$SUMS" "$STAGE/SHA256SUMS-${VERSION}"
+  cp "$SUMS" "$STAGE/SHA256SUMS"
+  UPLOADS+=("$STAGE/SHA256SUMS-${VERSION}" "$STAGE/SHA256SUMS")
+fi
 
 # ── Legacy Ivory-named aliases ───────────────────────────────────────────────
 # The product was renamed to Tangent at 2.3.0, but the permanent download links
@@ -122,6 +150,7 @@ UPLOADS+=("$STAGE/SHA256SUMS-${VERSION}" "$STAGE/SHA256SUMS")
 # name, so dropping these four would 404 for exactly the people who paid.
 # They cost 26MB per release and they are not optional.
 for a in "${ARTIFACTS[@]}"; do
+  [ "$PRERELEASE" = 1 ] && break
   base="${a#dist/}"
   legacy="${base/-${VERSION}-/-}"          # Tangent-macos-arm64.dmg
   legacy="${legacy/#Tangent-/Ivory-}"      # Ivory-macos-arm64.dmg
@@ -152,7 +181,10 @@ else
     exit 2
   fi
   echo "==> Creating release $TAG"
-  gh release create "$TAG" --repo "$REPO" --title "Ivory ${VERSION}" "${NOTES_ARGS[@]}"
+  PRE_ARGS=()
+  [ "$PRERELEASE" = 1 ] && PRE_ARGS=(--prerelease)
+  gh release create "$TAG" --repo "$REPO" --title "Tangent ${VERSION}" \
+    "${PRE_ARGS[@]}" "${NOTES_ARGS[@]}"
 fi
 
 gh release upload "$TAG" --repo "$REPO" --clobber "${UPLOADS[@]}"
