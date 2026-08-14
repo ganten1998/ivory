@@ -289,10 +289,20 @@ against the real candidate tables, not reasoned about.
 Ascending sounding pitch goes on ascending strings. That is not a heuristic, it
 is the search: it gives "at most one note per string" for free, forbids voice
 crossings by construction, and collapses the space to `C(n + strings, strings)`
-— at most 3003 complete shapes on six strings, small enough to enumerate
-**exhaustively**. So there are no hand-position windows, no beam, no DP table
-and no approximation anywhere. Measured: **3.8 µs per solve**, 134 leaves on a
-ten-note piano voicing. The cost of it: deliberate crossing voicings (a fretted
+small enough to enumerate **exhaustively**. So there are no hand-position
+windows, no beam, no DP table and no approximation anywhere. Measured:
+**6.5 µs per solve**, 254 leaves on a ten-note piano voicing, against a 40,000
+leaf budget.
+
+**`note_slack` was the one place an approximation had crept in, and it is gone.**
+The pre-cap trims the held set before the search; at the original 2 it threw
+away a note the search could have placed on **11.5% of chords big enough to
+trigger it** (measured over 14,500), so the board drew five dots where six would
+fit. At 8 that is 0 of 14,500, for ~3x the leaves and still a fiftieth of a
+frame. Note that raising it CHANGED THE COSTS in the acceptance table without
+changing a single shape: a pre-capped note never entered the objective, so its
+drop was never charged to anything. A cost is only comparable within one
+`Weights`, which is why it is never shown to a user. The cost of it: deliberate crossing voicings (a fretted
 9th under an open B) and thumb-over bass notes cannot be represented. Changing
 that means rewriting the search.
 
@@ -365,6 +375,51 @@ of the way to the bridge. The panel scales by `fret_x(frets)` so the last fret
 lands on the right edge. Drawing straight into widget space leaves a quarter of
 the band empty and puts every dot in the wrong place; the test
 `the_last_fret_lands_on_the_right_edge` is what stops that coming back.
+
+### 2026-08-13, later still: three woods, a popped-out neck, and D-UI-17
+
+- **Three fingerboard woods** (Rosewood default, Maple, Ebony) under a `Wood`
+  submenu. Each carries its WHOLE palette, not a fill colour: maple is pale, so
+  on it the strings, wires, inlays and nut all go dark and note dots gain an
+  edge ring. The wood does NOT follow dark mode — only the band around it does.
+- **The neck pops out** (`Detach Fretboard`), mirroring the chord window
+  exactly: close-to-reattach, right-click-anywhere menu, the same tiling-WM
+  geometry guard. `Hide Fretboard` closes it rather than orphaning a window.
+- **D-UI-17: the piano had twelve gaps in it.** Each white key was drawn
+  `trunc(width/52)` = 31px wide while the keys step by 31.25, so wherever the
+  fraction rolled over the key came up a pixel short and the background showed
+  through. Spec §4 preserved those truncation slivers as Qt parity — but they
+  are only invisible in DARK mode, where the background happens to equal the
+  white-key colour. In light mode they were twelve grey slivers. Keys now run to
+  where the next one starts; the separators land on the same pixels.
+  **Found by decoding a screenshot to a BMP and counting pixel runs, not by
+  squinting** — 52 key runs, 51 separators, and 12 runs of background colour
+  that should not have been there. Worth repeating for any "does this look
+  right" question; eyeballing a 1px sliver does not work.
+
+### An unverified review, and what came of it
+
+A five-dimension adversarial review ran twice. The first attempt died entirely
+on API 529s; the second got three of five dimensions through and then lost
+**every one of the eighteen refutation agents** to a session limit. Its
+"0 of 6 findings survived" is therefore meaningless — nothing was verified.
+The six claims were checked by hand instead:
+
+| Claim | Verdict |
+|---|---|
+| Fingerboard slab painted outside its band on any tuning with < 6 strings | **REAL**, fixed. Bass (4) painted 8.6pt over the piano; the existing test only checked string positions, not the slab |
+| Submenus have no monitor clamp | **REAL**, fixed. Size never hit it (first row, 7 tall); Capo is 10 rows near the bottom |
+| Pre-cap discards a placeable note | **REAL**, fixed — see `note_slack` above, 11.5% measured |
+| `caption()` derives its placed count from saturating `u8` counters | **REAL**, fixed by counting directly |
+| Conflict rings for a folded note claim `folded: false` | **REAL**, fixed |
+| `OctaveMerged` reported when the survivor is itself dropped | **REAL**, fixed — it says `Doubled` now, which is what is still true |
+
+All six were genuine. That is a much higher hit rate than a review usually has,
+and the reason is worth remembering: the module is new, so nothing had been shaken
+out yet. **Re-run the review before 2.3.0 ships** — two dimensions (determinism,
+panics) never reported at all. The panics dimension is partly covered by
+`tests/voicing_stress.rs`, written here after a hostile sweep found a real
+overflow panic (`note_slack: usize::MAX`), but determinism was never reviewed.
 
 ### WHERE TO PICK UP NOW
 

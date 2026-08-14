@@ -371,8 +371,17 @@ pub struct Weights {
     // ── limits ─────────────────────────────────────────────────────────────
     /// LABEL ONLY, used by `Playability`. Never a gate.
     pub max_fingers: u8,
-    /// The pre-cap keeps `strings + note_slack` notes and lets the search
-    /// decide the last two drops against real string conflicts.
+    /// The pre-cap keeps `strings + note_slack` notes and lets the SEARCH
+    /// decide the rest against real string conflicts, rather than a list walk
+    /// deciding them on static cost alone.
+    ///
+    /// This was 2, and 2 was wrong: measured over 14,500 random chords big
+    /// enough to trigger it, the pre-cap threw away a note the search could
+    /// have placed **11.5% of the time** — the board drew five dots where six
+    /// would fit. At 8 that is 0 of 14,500, for a mean of 928 leaves instead
+    /// of 213 (about 20us, still a fiftieth of a GUI frame) and a worst case
+    /// of 12,645, a third of `leaf_budget`. The pre-cap now only exists to
+    /// stop a pathological set from reaching the search at all.
     pub note_slack: usize,
     pub leaf_budget: u32,
     pub idle_decay_ms: u32,
@@ -413,7 +422,7 @@ impl Weights {
         hyst_clamp: -250,
 
         max_fingers: 4,
-        note_slack: 2,
+        note_slack: 8,
         leaf_budget: 40_000,
         idle_decay_ms: 1_200,
     };
@@ -2404,7 +2413,7 @@ mod tests {
             // Rows that pay the drop tier, where the interesting arithmetic is.
             (&[40, 47, 52, 56, 59, 64, 67][..], 8305),
             (&[84, 85, 86][..], 47_040),
-            (&[36, 43, 48, 52, 55, 58, 60, 64, 67, 72][..], 18_081),
+            (&[36, 43, 48, 52, 55, 58, 60, 64, 67, 72][..], 26_081),
             // Six open strings and no fingers: the objective's floor.
             (&[40, 45, 50, 55, 59, 64][..], -330),
         ] {

@@ -214,10 +214,17 @@ fn a_ten_note_piano_voicing_keeps_the_bass_and_the_melody_and_says_what_it_lost(
     let spec = spec_for("Standard", 0);
     let v = solve_cold(&spec, &[36, 43, 48, 52, 55, 58, 60, 64, 67, 72]);
     assert_eq!(shape_of(&v), [f(3), f(3), f(2), f(3), f(5), f(8)]);
-    // 2081 of shape and two 8000-point octave doubles: the drop tier is two
+    // 2081 of shape and three 8000-point octave doubles: the drop tier is two
     // orders of magnitude above the shape terms, which is what stops a nicer
     // hand position from ever being worth a note.
-    assert_eq!(v.cost, 18081);
+    //
+    // This read 18081 while `note_slack` was 2, because the pre-cap removed a
+    // note before the search and its drop was never charged to anything. The
+    // SHAPE is identical either way; raising the slack simply made the
+    // objective account for every note the player pressed. A cost is only
+    // comparable within one `Weights`, which is exactly why it is not shown to
+    // anyone.
+    assert_eq!(v.cost, 26081);
     assert_eq!(v.notes.len(), 10, "every key pressed is still accounted for");
     assert_eq!(v.placed().count(), 6);
     assert_eq!(v.caption().as_deref(), Some("6 of 10 notes  \u{b7}  two hands"));
