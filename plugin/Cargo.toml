@@ -1,0 +1,71 @@
+# ── DELIBERATELY OUTSIDE THE MAIN WORKSPACE ────────────────────────────────
+#
+# The empty `[workspace]` table below is the whole point of this file. It makes
+# this crate its own workspace with its own Cargo.lock, exactly like
+# tools/ivory-keygen, and that is a structural guarantee rather than tidiness:
+#
+#   * `cargo build` from the repo root cannot reach it,
+#   * nih_plug, vst3-sys and baseview never enter the root Cargo.lock, and
+#   * so they never appear in the MIT app's shipped THIRD-PARTY-LICENSES.
+#
+# That last one is not hypothetical. `scripts/gen-third-party-licenses.sh`
+# walks the root lock file; without this table it would list GPLv3 `vst3-sys`
+# inside an MIT application's licence manifest, which is a false statement
+# about what that binary contains.
+[workspace]
+
+[package]
+# GPL-3.0-or-later, and ONLY this crate is. The VST3 bindings reached through
+# `nih_export_vst3!` are GPLv3, so the .vst3 binary inherits it; ivory-core,
+# ivory-ui and the standalone stay MIT. See LICENSING.md.
+name = "tangent-vst3"
+version = "2.3.0"
+edition = "2021"
+rust-version = "1.92"
+license = "GPL-3.0-or-later"
+description = "Tangent as a VST3 plugin: chord detection, guitar view and theory diagrams inside a DAW"
+
+[lib]
+# `cdylib` alone. The `lib` artifact is only needed for nih-plug's standalone
+# target, and Tangent already has a standalone — a better one, with a real
+# window and a real MIDI device.
+crate-type = ["cdylib"]
+
+[dependencies]
+# The shared GUI and engine. Both MIT; linking them into a GPLv3 binary is
+# exactly what MIT permits, and the arrow only points this way.
+ivory-core = { path = "../ivory-core", features = ["learning", "license"] }
+ivory-ui = { path = "../ivory-ui" }
+egui = { version = "0.33", default-features = false }
+
+# ── the dependency recipe, settled by compiling it ─────────────────────────
+#
+# `nih_plug_egui` 0.1.0 lives INSIDE the egui-baseview repo and is already on
+# egui 0.33. Taking it from the nih-plug repo instead needs two coordinated
+# [patch] sections and two forks, because the two crates pin different
+# `baseview` revs and `WindowHandle` becomes two incompatible types.
+#
+# The `rev` on nih_plug is MANDATORY and must stay equal to the one
+# egui-baseview's workspace pins. A different rev of the same URL resolves to
+# two separate nih_plug packages, and the error you get is "expected Editor,
+# found Editor".
+#
+# Their side takes nih_plug with default-features = false, which drops `vst3`.
+# Cargo unions features, so asking for it here turns it on for the one shared
+# copy — and that feature line is precisely where GPLv3 attaches.
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "28b149ec4d62757d0b448809148a0c3ca6e09a95", features = [
+    "vst3",
+] }
+nih_plug_egui = { git = "https://github.com/BillyDM/egui-baseview.git", rev = "11f487fe915d6208961064e619474b98f971594a" }
+
+# Lock-free audio -> GUI handoff. `process()` must never block, and the editor
+# holds its state behind a mutex for a whole frame at a time, so the note queue
+# cannot be that mutex.
+crossbeam = "0.8"
+serde = { version = "1", features = ["derive"] }
+parking_lot = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

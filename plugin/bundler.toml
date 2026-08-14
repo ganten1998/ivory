@@ -1,0 +1,6 @@
+# Metadata for `cargo xtask bundle`, which is what turns the raw cdylib into a
+# real .vst3 bundle: Contents/MacOS/<name> plus an Info.plist on macOS,
+# Contents/x86_64-linux/<name>.so on Linux, Contents/x86_64-win/<name>.vst3 on
+# Windows. A plain `cargo build` produces a bare dylib that no host will load.
+[tangent-vst3]
+name = "Tangent"

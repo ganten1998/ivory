@@ -217,6 +217,29 @@ impl Settings {
         Self::from_map(map)
     }
 
+    /// Round-trip through the same JSON the settings file holds.
+    ///
+    /// A plugin instance does NOT own `~/.config/ivory/settings.json` — it is
+    /// shared with the standalone and with every other instance — so its
+    /// settings live in the DAW project instead, and this is how they get
+    /// there and back. Deliberately the same text as the file, so a project
+    /// saved by the plugin and a settings file written by the app say exactly
+    /// the same thing, unknown keys and all.
+    pub fn to_json(&self) -> String {
+        Value::Object(self.to_map()).to_string()
+    }
+
+    /// The inverse, forgiving in the same way the file loader is: anything
+    /// unreadable yields defaults rather than an error, because a plugin that
+    /// refuses to open a project over a settings blob is worse than one that
+    /// opens it looking wrong.
+    pub fn from_json(text: &str) -> Self {
+        match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(map)) => Self::from_map(map),
+            _ => Self::default(),
+        }
+    }
+
     fn from_map(mut map: Map<String, Value>) -> Self {
         let mut s = Self::default();
 
@@ -644,6 +667,44 @@ pub fn clamp_to_monitor(
 
 #[cfg(test)]
 mod tests {
+
+    /// The settings a plugin carries in its project file are the same text the
+    /// standalone writes, unknown keys included. Anything else and a project
+    /// saved by the plugin would quietly drop whatever a newer build knew
+    /// about — which is the failure `extra` exists to prevent in the file.
+    #[test]
+    fn json_round_trips_through_a_project_file() {
+        let mut s = Settings::default();
+        s.dark_mode = true;
+        s.window_size_percent = 150;
+        s.theory_tonnetz = true;
+        s.fretboard_tuning = "DADGAD".to_owned();
+        s.extra.insert(
+            "a_key_from_a_later_build".into(),
+            Value::String("kept".into()),
+        );
+
+        let back = Settings::from_json(&s.to_json());
+        assert_eq!(back, s, "a project round trip changed the settings");
+        assert_eq!(
+            back.extra.get("a_key_from_a_later_build"),
+            Some(&Value::String("kept".into())),
+            "the plugin dropped a key it did not understand"
+        );
+    }
+
+    /// Garbage in a project file yields defaults, not a panic and not a
+    /// refusal to open. Same rule as the settings file (spec §8).
+    #[test]
+    fn unreadable_project_settings_fall_back_to_defaults() {
+        for junk in ["", "null", "[]", "{", "not json at all", "42"] {
+            assert_eq!(
+                Settings::from_json(junk),
+                Settings::default(),
+                "{junk:?} did not fall back"
+            );
+        }
+    }
     use super::*;
 
     /// A torn write costs the user every setting they ever chose, because

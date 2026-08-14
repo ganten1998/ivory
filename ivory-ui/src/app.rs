@@ -331,6 +331,28 @@ impl IvoryApp {
         self.ports = ports;
     }
 
+    /// Put the typeface back on a context that has never seen it.
+    ///
+    /// A plugin editor is a window the host opens and closes at will, and each
+    /// time it opens there is a new GL context and a new, empty font atlas.
+    /// The app is not rebuilt — reopening a window must not reset the tuning —
+    /// so the faces have to be reinstalled without it.
+    pub fn install_fonts(&self, ctx: &egui::Context) {
+        crate::fonts::install(
+            ctx,
+            crate::fonts::FontChoice::from_key(&self.settings.font_choice),
+            self.settings.custom_font_path.as_deref(),
+        );
+        crate::fonts::apply_text_styles(ctx);
+    }
+
+    /// The current settings as the same JSON the settings file holds.
+    ///
+    /// For a host that persists state itself rather than sharing the file.
+    pub fn settings_json(&self) -> String {
+        self.settings.to_json()
+    }
+
     /// Feed one event in directly, for a host that has no channel to spare.
     ///
     /// The plugin uses the sender instead; this exists so a test can drive the

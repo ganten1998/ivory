@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# Build Tangent.vst3 and lay it out as a real VST3 bundle.
+#
+#   scripts/build-plugin.sh                 # host platform
+#   scripts/build-plugin.sh macos           # universal (x86_64 + arm64), signed
+#   scripts/build-plugin.sh windows         # cross-compiled from macOS
+#   scripts/build-plugin.sh linux           # cross-compiled from macOS
+#
+# Output: dist/plugin/<platform>/Tangent.vst3
+#
+# WHY THIS EXISTS RATHER THAN `cargo xtask bundle`
+#
+# nih-plug ships a bundler that produces the same directory layout, and this
+# script was written against its source rather than instead of reading it. Two
+# things stopped it being usable directly: it hardcodes
+# `CFBundleIdentifier = com.nih-plug.<package>` and `CFBundleVersion = 1.0.0`,
+# both of which would be false statements about this plugin, and adopting it
+# means an `xtask` crate that would itself have to live outside the root
+# workspace to keep the GPLv3 dependency tree quarantined. The layout below is
+# taken verbatim from `nih_plug_xtask/src/lib.rs:660-730` and matches the VST3
+# specification's bundle format.
+#
+# THE PLUGIN IS ITS OWN WORKSPACE. `plugin/Cargo.toml` opens with an empty
+# `[workspace]` table so nih_plug, vst3-sys and baseview never enter the root
+# Cargo.lock, and therefore never appear in the MIT app's THIRD-PARTY-LICENSES.
+# Every cargo command below is run from `plugin/` for that reason.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+PKG="tangent-vst3"          # cargo package
+LIB="libtangent_vst3"       # cdylib basename cargo emits
+NAME="Tangent"              # what the bundle and the host call it
+VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+BUNDLE_ID="com.ganten.tangent.vst3"
+
+# rustup's cargo, not Homebrew's: Homebrew rust shadows it on PATH and then
+# cross-target std libraries are not found. Same guard as build-cross.sh.
+TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
+[ -n "$TOOLCHAIN_BIN" ] && export PATH="$TOOLCHAIN_BIN:$HOME/.cargo/bin:$PATH"
+
+PLATFORM="${1:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
+case "$PLATFORM" in
+  darwin) PLATFORM=macos ;;
+esac
+
+OUT="dist/plugin/$PLATFORM"
+BUNDLE="$OUT/$NAME.vst3"
+
+# write_plist — the macOS bundle metadata. `BNDL????` in PkgInfo and
+# CFBundlePackageType is what tells macOS this is a plugin bundle rather than
+# an application; a host that finds the wrong one silently skips the folder.
+write_plist() {
+  mkdir -p "$BUNDLE/Contents"
+  printf 'BNDL????' > "$BUNDLE/Contents/PkgInfo"
+  cat > "$BUNDLE/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>CFBundleExecutable</key>
+    <string>$NAME</string>
+    <key>CFBundleIdentifier</key>
+    <string>$BUNDLE_ID</string>
+    <key>CFBundleName</key>
+    <string>$NAME</string>
+    <key>CFBundleDisplayName</key>
+    <string>$NAME</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$VERSION</string>
+    <key>CFBundleVersion</key>
+    <string>$VERSION</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Tangent $VERSION. GPL-3.0-or-later.</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+  </dict>
+</plist>
+PLIST
+}
+
+# ship_licences — the GPL obligation, travelling with the binary rather than
+# assumed. This bundle is the one artifact in the project that is not MIT.
+ship_licences() {
+  mkdir -p "$BUNDLE/Contents/Resources"
+  cp LICENSE-GPL-3.0 "$BUNDLE/Contents/Resources/LICENSE"
+  cp LICENSING.md "$BUNDLE/Contents/Resources/LICENSING.md"
+  cp assets/fonts/OFL.txt "$BUNDLE/Contents/Resources/OFL.txt"
+}
+
+build_macos() {
+  echo "==> $NAME $VERSION — macOS VST3 (universal)"
+  ( cd plugin
+    for t in x86_64-apple-darwin aarch64-apple-darwin; do
+      rustup target add "$t" >/dev/null 2>&1 || true
+      cargo build --release --target "$t"
+    done )
+
+  rm -rf "$BUNDLE"
+  mkdir -p "$BUNDLE/Contents/MacOS"
+  # One binary for both architectures. A DAW is whichever it is, and a user on
+  # Rosetta should not have to know which build they downloaded.
+  lipo -create -output "$BUNDLE/Contents/MacOS/$NAME" \
+    "plugin/target/x86_64-apple-darwin/release/$LIB.dylib" \
+    "plugin/target/aarch64-apple-darwin/release/$LIB.dylib"
+  write_plist
+  ship_licences
+
+  # Signing. Same identity resolution as build-macos.sh, and the same fallback:
+  # an ad-hoc signature is enough for the machine that built it, which is what
+  # matters for a local test. Distribution needs the Developer ID.
+  local sign_id
+  sign_id="${IVORY_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
+    | grep 'Developer ID Application' | head -1 | sed -E 's/.*"(.*)"/\1/')}"
+  if [ -n "$sign_id" ]; then
+    echo "    signing as: $sign_id"
+    codesign --force --options runtime --timestamp -s "$sign_id" "$BUNDLE"
+  else
+    echo "    no Developer ID — signing ad-hoc (loads locally, not distributable)"
+    codesign --force --deep -s - "$BUNDLE"
+  fi
+  codesign --verify --strict --verbose=2 "$BUNDLE"
+
+  echo "    lipo: $(lipo -archs "$BUNDLE/Contents/MacOS/$NAME")"
+  echo "    -> $BUNDLE"
+}
+
+build_windows() {
+  echo "==> $NAME $VERSION — Windows VST3 (x86_64)"
+  ( cd plugin
+    rustup target add x86_64-pc-windows-msvc >/dev/null 2>&1 || true
+    cargo xwin build --release --target x86_64-pc-windows-msvc )
+
+  rm -rf "$BUNDLE"
+  # Windows VST3 is a BUNDLE DIRECTORY, not a bare DLL. The .dll is renamed to
+  # .vst3 and buried under Contents/x86_64-win. Hosts do still accept a loose
+  # .vst3 file, but the bundle is what the spec says and what the installer
+  # can place identically on all three platforms.
+  mkdir -p "$BUNDLE/Contents/x86_64-win" "$BUNDLE/Contents/Resources"
+  cp "plugin/target/x86_64-pc-windows-msvc/release/tangent_vst3.dll" \
+     "$BUNDLE/Contents/x86_64-win/$NAME.vst3"
+  ship_licences
+  echo "    -> $BUNDLE"
+}
+
+build_linux() {
+  echo "==> $NAME $VERSION — Linux VST3 (x86_64)"
+  ( cd plugin
+    rustup target add x86_64-unknown-linux-gnu >/dev/null 2>&1 || true
+    if command -v cargo-zigbuild >/dev/null 2>&1 && [ "$(uname -s)" != "Linux" ]; then
+      cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.32
+    else
+      cargo build --release --target x86_64-unknown-linux-gnu
+    fi )
+
+  rm -rf "$BUNDLE"
+  mkdir -p "$BUNDLE/Contents/x86_64-linux" "$BUNDLE/Contents/Resources"
+  cp "plugin/target/x86_64-unknown-linux-gnu/release/$LIB.so" \
+     "$BUNDLE/Contents/x86_64-linux/$NAME.so"
+  ship_licences
+  echo "    -> $BUNDLE"
+}
+
+mkdir -p "$OUT"
+case "$PLATFORM" in
+  macos)   build_macos ;;
+  windows) build_windows ;;
+  linux)   build_linux ;;
+  *) echo "unknown platform: $PLATFORM (want macos, windows or linux)" >&2; exit 2 ;;
+esac
+
+echo
+echo "Bundle contents:"
+find "$BUNDLE" -type f | sed "s|^|  |"
