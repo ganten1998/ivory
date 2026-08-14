@@ -204,6 +204,9 @@ pub struct Placement {
     /// The main window's inner rect, in monitor coordinates.
     pub parent: Option<Rect>,
     pub monitor: Option<Vec2>,
+    /// What the host allows. `child_windows` decides whether a dialog is an OS
+    /// window or is drawn in the canvas.
+    pub caps: crate::host::Caps,
 }
 
 impl Placement {
@@ -236,6 +239,54 @@ fn show_dialog_viewport(
 ) -> VpResult {
     let mut content = content;
     let mut result = VpResult { close: false };
+
+    // Two ways to be a dialog, chosen by what the host can do.
+    //
+    // The plugin path is NOT a fallback for calls that would fail. In a plugin
+    // `show_viewport_immediate` still runs — the context is built with
+    // `embed_viewports: true`, so it invokes the closure inline and opens a
+    // second `CentralPanel` under the same id as the first, painting garbage
+    // over the piano rather than erroring. That is why this branch sits ABOVE
+    // `shell::viewport_ui` instead of inside it.
+    if !placement.caps.child_windows {
+        // In-canvas, the same shape as the shortcut card: an Area floats above
+        // the panels and needs only a Context, so this works identically in a
+        // host-owned window with no window manager anywhere in sight.
+        let screen = ctx.content_rect();
+        let w = size.x.min(screen.width() * 0.94).max(min_size.x.min(screen.width()));
+        let h = size.y.min(screen.height() * 0.94).max(min_size.y.min(screen.height()));
+        let rect = Rect::from_center_size(screen.center(), Vec2::new(w, h));
+
+        // Dim the app behind it. These dialogs are modal, and without this the
+        // piano behind a plugin dialog looks live when it is not.
+        egui::Area::new(egui::Id::new("tangent-dialog-scrim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(150));
+                // Swallow clicks so the app underneath cannot be operated
+                // through the scrim, which is what makes it genuinely modal.
+                ui.allocate_rect(screen, egui::Sense::click_and_drag());
+            });
+
+        egui::Area::new(egui::Id::new("tangent-dialog"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                ui.set_clip_rect(rect);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        result.close = true;
+                    }
+                    // The title is a window chrome affordance the host does not
+                    // give us, so it is drawn.
+                    ui.painter().rect_filled(rect, 4.0, ui.style().visuals.window_fill);
+                    content(ui, &mut result);
+                });
+            });
+        return result;
+    }
+
     let mut builder = ViewportBuilder::default()
         .with_title(title)
         .with_inner_size(size)
@@ -1080,11 +1131,11 @@ mod tests {
         let monitor = Some(Vec2::new(2560.0, 1440.0));
 
         // Parent unknown: no position, so the platform places it.
-        assert_eq!(Placement { parent: None, monitor }.position_for(size), None);
+        assert_eq!(Placement { parent: None, monitor, caps: crate::host::Caps::DESKTOP }.position_for(size), None);
 
         // Parent known: dead centre of the parent.
         let parent = Rect::from_min_size(Pos2::new(600.0, 400.0), Vec2::new(1300.0, 200.0));
-        let p = Placement { parent: Some(parent), monitor }
+        let p = Placement { parent: Some(parent), monitor, caps: crate::host::Caps::DESKTOP }
             .position_for(size)
             .expect("a known parent must yield a position");
         let dialog_centre = p + size * 0.5;
@@ -1093,7 +1144,7 @@ mod tests {
 
         // A window near an edge still puts the whole dialog on the monitor.
         let edge = Rect::from_min_size(Pos2::new(2400.0, 1380.0), Vec2::new(1300.0, 200.0));
-        let p = Placement { parent: Some(edge), monitor }.position_for(size).unwrap();
+        let p = Placement { parent: Some(edge), monitor, caps: crate::host::Caps::DESKTOP }.position_for(size).unwrap();
         assert!(p.x >= 0.0 && p.y >= 0.0, "pushed off the top-left: {p:?}");
         assert!(p.x + size.x <= 2560.0 + 0.5, "hangs off the right: {p:?}");
         assert!(p.y + size.y <= 1440.0 + 0.5, "hangs off the bottom: {p:?}");

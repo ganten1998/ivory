@@ -1568,6 +1568,7 @@ impl IvoryApp {
         // position the OS places them, which on Windows is the top-left of the
         // screen no matter where the user has put the piano.
         let placement = dialogs::Placement {
+            caps: ivory_ui::host::Caps::DESKTOP,
             parent: self
                 .main_origin_known
                 .then(|| Rect::from_min_size(self.main_inner_origin, target)),
