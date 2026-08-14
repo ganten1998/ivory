@@ -232,7 +232,7 @@ fn email_body(key: &str) -> String {
 /// Overridable, but it defaults to a real inbox rather than to `from`, because
 /// the failure is invisible from this end: nothing bounces, nothing logs, the
 /// reply just never arrives.
-const DEFAULT_REPLY_TO: &str = "ganten7@gmail.com";
+const DEFAULT_REPLY_TO: &str = "ganten1998@gmail.com";
 
 fn send_email(api_key: &str, from: &str, to: &str, name: &str, key: &str) -> Result<(), String> {
     let body = email_body(key);
