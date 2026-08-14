@@ -427,12 +427,16 @@ pub fn show(
                                     .font(bold(10.0))
                                     .color(t.text),
                                 );
+                                // The author's own site. It was still the old
+                                // shambhaline address, carried through the port
+                                // from the Python app's spec (docs/spec/
+                                // ui-spec.md 244) and never revisited.
                                 ui.hyperlink_to(
-                                    RichText::new("shambhaline@neocities.org")
+                                    RichText::new("ganten.neocities.org")
                                         .font(bold(10.0))
                                         .color(t.text)
                                         .underline(),
-                                    "https://shambhaline.neocities.org",
+                                    "https://ganten.neocities.org",
                                 );
                             });
                             // Stretch, then bottom block.

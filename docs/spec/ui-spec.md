@@ -241,7 +241,7 @@ QMenu::separator { height: 1px; background-color: <sep>; margin: 1px 0px 1px 0px
 - Vertical layout, all fonts chosen with exactMatch fallback chain **Courier Prime → Courier New → Courier → monospace**, all **Bold**:
   1. `Ivory` — 16 pt, centered.
   2. `Simple MIDI Keyboard Monitor with Advanced Chord Detection` — 10 pt, centered.
-  3. Link label, 10 pt, centered, external-link enabled, HTML: `<a href="https://shambhaline.neocities.org" style="color: <text>;">shambhaline@neocities.org</a>`.
+  3. Link label, 10 pt, centered, external-link enabled, HTML: `<a href="https://ganten.neocities.org" style="color: <text>;">ganten.neocities.org</a>` (was shambhaline until 2.3.1; the spec records the Python app, the app itself is the authority).
   4. Stretch.
   5. `Version 1.1.0` — 8 pt, left-aligned.
   6. `QDialogButtonBox(Ok)` → closes.
