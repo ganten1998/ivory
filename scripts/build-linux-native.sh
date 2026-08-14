@@ -52,4 +52,18 @@ cp docs/ARTIFACT-README.md "$STAGE/README.txt"
 tar -C dist -czf "${STAGE}.tar.gz" "tangent-${VERSION}-linux-${ARCH}"
 rm -rf "$STAGE"
 echo "==> ${STAGE}.tar.gz"
-ls -lh "dist/ivory-${VERSION}-linux-${ARCH}.tar.gz" | sed 's/^/    /'
+# `${STAGE}` and not a re-spelled path: this line said ivory-* long after the
+# tar above started writing tangent-*, and under `set -e` a failed `ls` exits
+# non-zero — so the script reported failure at the very end of a build that had
+# completely succeeded. Derive the name, never retype it.
+ls -lh "${STAGE}.tar.gz" | sed 's/^/    /'
+
+# Prove the tarball actually contains a binary before anyone trusts it.
+# build-cross.sh once shipped 85 KB Linux tarballs of nothing but fonts and
+# licences for a week, because `set -e` does not apply inside a function called
+# as `f || handler`. Cheap insurance against the same class of silence.
+if ! tar -tzf "${STAGE}.tar.gz" | grep -q "/tangent\$"; then
+  echo "FAIL: ${STAGE}.tar.gz contains no 'tangent' binary" >&2
+  exit 1
+fi
+echo "    contains: $(tar -tzf "${STAGE}.tar.gz" | wc -l | tr -d ' ') entries, binary present"

@@ -242,7 +242,19 @@ zip/dmg.
    `cargo-zigbuild`, `cargo-xwin`, the rustup targets — header lists them). It
    emits the Windows zip; its Linux stage is expected to fail on the ALSA
    cross-build (non-fatal).
-   **Build Linux natively** on a Linux host (the owner's Void machine):
+   **Build Linux from here in one command** (preferred):
+
+   ```sh
+   DEPS=1 scripts/build-linux-remote.sh void   # first time: also installs deps
+   scripts/build-linux-remote.sh void          # afterwards
+   ```
+
+   It rsyncs the working tree (so uncommitted changes build too), runs
+   `build-linux-native.sh` over ssh, brings the tarball back into `dist/`, and
+   fails loudly if it contains no binary. `void` is any ssh host — a `Host`
+   block in `~/.ssh/config`, or `user@ip`.
+
+   Or **build Linux natively** on a Linux host (the owner's Void machine):
    `scripts/build-linux-native.sh` — installs are in that script's header
    (`alsa-lib-devel` + X11/Wayland/GL `-dev` packages). This is the recommended
    Linux path; run it once per arch (x86_64, aarch64) on matching hardware.
