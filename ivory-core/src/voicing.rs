@@ -283,6 +283,17 @@ pub struct History<'a> {
     pub arrival: Option<&'a [u32; 256]>,
     /// Reserved hook to the chord engine. MUST be `None`: see the module doc.
     pub root_pc: Option<u8>,
+    /// Positions the USER chose, as `(pitch, string, fret)`.
+    ///
+    /// A pinned pitch gets exactly one candidate instead of six, so it stays
+    /// where it was put. This exists because the solver is an excellent
+    /// READOUT and a hopeless INPUT: asked to redraw a shape a player had just
+    /// clicked in, it moved it 75% of the time, which is right when it is
+    /// choosing and infuriating when you have already chosen.
+    ///
+    /// A pin that does not name a real position for its pitch is ignored
+    /// rather than honoured, so a stale pin cannot invent a note.
+    pub pins: Option<&'a [(u8, usize, u8)]>,
 }
 
 impl History<'_> {
@@ -290,6 +301,7 @@ impl History<'_> {
         prev: None,
         arrival: None,
         root_pc: None,
+        pins: None,
     };
 }
 
@@ -800,6 +812,25 @@ fn run(
             }
         }
     }
+    // A pinned note keeps ONE candidate: the position the user put it in. Done
+    // by removing the others rather than by scoring, so nothing in the cost
+    // table can outbid a deliberate choice. A pin whose position does not
+    // actually sound that pitch is dropped, so a stale pin cannot move a note
+    // somewhere it does not belong.
+    if let Some(pins) = hist.pins {
+        for k in 0..n {
+            let source = entries[live[k]].source;
+            let Some(&(_, pin_st, pin_fret)) = pins.iter().find(|(p, ..)| *p == source) else {
+                continue;
+            };
+            if pin_st >= strings || spec.pitch_at(pin_st, pin_fret) != Some(s.target[k]) {
+                continue;
+            }
+            for st in 0..strings {
+                s.cand[st][k] = if st == pin_st { pin_fret } else { MUTED };
+            }
+        }
+    }
 
     // Hysteresis, gated on a matching board AND a shared pitch. A clean jump
     // to an unrelated chord gets no inertia, because the player's hand moved.
@@ -820,8 +851,55 @@ fn run(
         }
     }
 
-    // Step 7 — the search.
-    s.rec(0, 0, 0);
+    // Step 7 — the search, UNLESS the user has already made every choice.
+    //
+    // When every held note is pinned there is nothing to search: the answer is
+    // what the player clicked. Placing them directly also sidesteps the
+    // monotone constraint, which is not optional inside `rec` and which
+    // ordinary guitar shapes really do violate — low E at fret 6 sounds Bb2
+    // (46) against an open A (45), a higher pitch on a lower string, entirely
+    // playable and structurally undrawable by the search. Narrowing candidates
+    // was not enough: the search simply dropped one of them.
+    let fully_pinned = n > 0
+        && hist.pins.is_some_and(|pins| {
+            let mut strings_used: Vec<usize> = Vec::with_capacity(n);
+            (0..n).all(|k| {
+                let source = entries[live[k]].source;
+                pins.iter().any(|&(pitch, pin_st, pin_fret)| {
+                    pitch == source
+                        && pin_st < strings
+                        && spec.pitch_at(pin_st, pin_fret) == Some(s.target[k])
+                        && !strings_used.contains(&pin_st)
+                        && {
+                            strings_used.push(pin_st);
+                            true
+                        }
+                })
+            })
+        });
+
+    if fully_pinned {
+        let pins = hist.pins.unwrap_or(&[]);
+        for k in 0..n {
+            let source = entries[live[k]].source;
+            if let Some(&(_, pin_st, pin_fret)) =
+                pins.iter().find(|&&(pitch, st, f)| {
+                    pitch == source && st < strings && spec.pitch_at(st, f) == Some(s.target[k])
+                })
+            {
+                s.sel[pin_st] = pin_fret;
+                s.sel_note[pin_st] = k as u8;
+            }
+        }
+        s.have_best = true;
+        s.best_cost = s.shape_cost();
+        s.best_tie = s.tie_key();
+        s.best_sel = s.sel;
+        s.best_note = s.sel_note;
+        s.leaves = 1;
+    } else {
+        s.rec(0, 0, 0);
+    }
 
     let stats = SolveStats { leaves: s.leaves, pruned: s.pruned, truncated: s.truncated };
     let winner = s.finalize(&entries, s.best_cost, s.best_sel, s.best_note);
@@ -1389,6 +1467,7 @@ pub struct VoicingSession {
     idle_ms: u32,
     stats: SolveStats,
     solves: u64,
+    pins: Vec<(u8, usize, u8)>,
 }
 
 impl VoicingSession {
@@ -1406,6 +1485,17 @@ impl VoicingSession {
             idle_ms: 0,
             stats: SolveStats::default(),
             solves: 0,
+            pins: Vec::new(),
+        }
+    }
+
+    /// Positions the user chose, as `(pitch, string, fret)`. Changing them
+    /// invalidates the cache, because the same held set now has a different
+    /// answer.
+    pub fn set_pins(&mut self, pins: Vec<(u8, usize, u8)>) {
+        if self.pins != pins {
+            self.pins = pins;
+            self.solved_for.clear();
         }
     }
 
@@ -1527,6 +1617,7 @@ impl VoicingSession {
             },
             arrival: Some(&self.seen_at),
             root_pc: None,
+            pins: (!self.pins.is_empty()).then_some(self.pins.as_slice()),
         };
         let (out, stats, _) = run(&self.spec, &self.scratch, &hist, &self.w, false);
         self.solves += 1;
@@ -1921,6 +2012,83 @@ mod tests {
     }
 
     // ── the drop policy ─────────────────────────────────────────────────────
+
+    #[test]
+    fn a_position_the_user_chose_is_the_position_it_keeps() {
+        // The solver is a good readout and a bad input: asked to redraw shapes
+        // a player had just clicked in, it moved them about 75% of the time.
+        // Correct when it is choosing, useless when the choosing is done.
+        let spec = std_spec();
+        let w = Weights::DEFAULT;
+        let mut rng = Lcg(0xc11c_c11c);
+        let mut checked = 0;
+        for _ in 0..600 {
+            // A plausible clicked shape: distinct strings, frets 0..=9.
+            let size = 1 + rng.next() as usize % 6;
+            let mut used: Vec<usize> = Vec::new();
+            let mut shape: Vec<(usize, u8)> = Vec::new();
+            while shape.len() < size {
+                let st = rng.next() as usize % 6;
+                if used.contains(&st) {
+                    continue;
+                }
+                used.push(st);
+                shape.push((st, (rng.next() % 10) as u8));
+            }
+            shape.sort_unstable();
+            let mut pitches: Vec<u8> =
+                shape.iter().filter_map(|&(st, f)| spec.pitch_at(st, f)).collect();
+            let sorted = {
+                let mut v = pitches.clone();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            if sorted.len() != size {
+                continue; // a doubled pitch is not a distinct click
+            }
+            pitches.sort_unstable();
+            let pins: Vec<(u8, usize, u8)> = shape
+                .iter()
+                .map(|&(st, f)| (spec.pitch_at(st, f).unwrap(), st, f))
+                .collect();
+            let hist = History { pins: Some(&pins), ..History::NONE };
+            let v = solve(&spec, &sorted, &hist, &w);
+            let drawn: Vec<(usize, u8)> = v
+                .strings
+                .iter()
+                .enumerate()
+                .filter_map(|(i, st)| match st {
+                    StringState::Sounding { fret, .. } => Some((i, *fret)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(drawn, shape, "a pinned shape moved");
+            checked += 1;
+        }
+        assert!(checked > 300, "the sweep skipped too much ({checked})");
+    }
+
+    #[test]
+    fn a_pin_that_is_a_lie_is_ignored_rather_than_obeyed() {
+        let spec = std_spec();
+        let w = Weights::DEFAULT;
+        // String 5 fret 0 is E4 (64), not middle C. A pin claiming otherwise
+        // must not be able to invent a position, or a stale pin left over from
+        // a tuning change would move notes somewhere they cannot sound.
+        let lie = [(60u8, 5usize, 0u8)];
+        let hist = History { pins: Some(&lie), ..History::NONE };
+        let v = solve(&spec, &[60], &hist, &w);
+        assert_eq!(v, solve_cold(&spec, &[60]), "a false pin changed the answer");
+        // Out of range for the tuning, same treatment.
+        let off = [(60u8, 99usize, 1u8)];
+        let hist = History { pins: Some(&off), ..History::NONE };
+        assert_eq!(solve(&spec, &[60], &hist, &w), solve_cold(&spec, &[60]));
+        // A pin for a pitch nobody is holding is simply irrelevant.
+        let other = [(72u8, 0usize, 20u8)];
+        let hist = History { pins: Some(&other), ..History::NONE };
+        assert_eq!(solve(&spec, &[60], &hist, &w), solve_cold(&spec, &[60]));
+    }
 
     #[test]
     fn a_note_with_nothing_doubling_it_is_never_shed_for_a_prettier_shape() {

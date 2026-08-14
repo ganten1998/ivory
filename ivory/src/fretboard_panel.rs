@@ -494,6 +494,64 @@ pub fn draw(
     }
 }
 
+/// Which MIDI pitch is under a click, or `None` for a miss.
+///
+/// The inverse of what `draw` does, and it has to stay that way: the piano's
+/// `hit_test` matches its drawing math line for line (spec 4.5) precisely so a
+/// key never lights somewhere you cannot click. Same rule here.
+///
+/// Two things are not simply "which fret space is this".
+///
+/// With no headstock there is nowhere left of the nut to click for an open
+/// string, so the first `2 * dot_r` of the board is the OPEN zone, which is
+/// where the open rings and mute crosses are actually drawn. It eats the left
+/// edge of the first fret's space, but the first fret's press point is far to
+/// the right of it, so nothing overlaps in practice.
+///
+/// And a click has to land NEAR a string, not merely inside the board. Halfway
+/// between two strings is not a note, and guessing one there means every miss
+/// silently adds something.
+pub fn hit_test(rect: Rect, spec: &FretboardSpec, pos: Pos2) -> Option<u8> {
+    let (string, fret) = position_at(rect, spec, pos)?;
+    spec.pitch_at(string, fret)
+}
+
+/// The same hit-test, reporting WHERE rather than what. The app records this
+/// so a note entered on the neck can be pinned to the position it was put in.
+pub fn position_at(rect: Rect, spec: &FretboardSpec, pos: Pos2) -> Option<(usize, u8)> {
+    if !rect.contains(pos) {
+        return None;
+    }
+    let g = Geom::new(rect, spec)?;
+
+    // Nearest string, but only if the click is actually on it.
+    let rel = (g.bottom - pos.y) / g.spacing;
+    let string = rel.round();
+    if string < 0.0 || string >= g.strings as f32 {
+        return None;
+    }
+    if (rel - string).abs() > 0.42 {
+        return None;
+    }
+    let string = string as usize;
+
+    // Fret. The open zone first, then the space between two wires.
+    let fret = if pos.x <= g.wire_x(0) + 2.0 * g.dot_r() {
+        spec.capo
+    } else {
+        let mut found = None;
+        for f in (spec.capo.max(1))..=spec.frets {
+            if pos.x <= g.wire_x(f) {
+                found = Some(f);
+                break;
+            }
+        }
+        found?
+    };
+
+    Some((string, fret))
+}
+
 /// The fingerboard slab.
 ///
 /// It starts at the band's left EDGE, not at the nut. The strip behind the nut
@@ -776,6 +834,100 @@ mod tests {
                 let gx = gutter_x(r, &g);
                 assert!(gx - g.dot_r() >= r.left() - 0.01, "an open ring is clipped");
                 assert!(gx < g.press_x(1), "a mark collided with the first fret");
+            }
+        }
+    }
+
+    /// A click must land on the note the eye sees, which means hit_test has to
+    /// be the exact inverse of draw. The piano has had this property since the
+    /// port (spec 4.5); the fretboard now needs it too, because keytoggle can
+    /// put notes in from either instrument.
+    #[test]
+    fn every_drawn_dot_is_clickable_at_the_place_it_is_drawn() {
+        let spec = FretboardSpec::default();
+        let r = rect();
+        let g = Geom::new(r, &spec).unwrap();
+        for string in 0..g.strings {
+            for fret in 0..=spec.frets {
+                let x = if fret == spec.capo { g.mark_x(r) } else { g.press_x(fret) };
+                let hit = hit_test(r, &spec, Pos2::new(x, g.y(string)));
+                assert_eq!(
+                    hit,
+                    spec.pitch_at(string, fret),
+                    "string {string} fret {fret} at x={x} did not hit its own dot"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_between_two_strings_is_a_miss_not_a_guess() {
+        let spec = FretboardSpec::default();
+        let r = rect();
+        let g = Geom::new(r, &spec).unwrap();
+        // Dead centre between strings 2 and 3.
+        let between = (g.y(2) + g.y(3)) * 0.5;
+        assert_eq!(hit_test(r, &spec, Pos2::new(g.press_x(5), between)), None);
+        // Outside the board entirely.
+        assert_eq!(hit_test(r, &spec, Pos2::new(g.press_x(5), r.top() - 5.0)), None);
+        assert_eq!(hit_test(r, &spec, Pos2::new(r.right() + 5.0, g.y(0))), None);
+        // Well below the lowest string.
+        assert_eq!(hit_test(r, &spec, Pos2::new(g.press_x(5), g.y(0) + g.spacing)), None);
+    }
+
+    #[test]
+    fn the_open_zone_is_at_the_nut_and_respects_a_capo() {
+        let r = rect();
+        let plain = FretboardSpec::default();
+        let g = Geom::new(r, &plain).unwrap();
+        // Hard against the nut is the open string, on every string.
+        for st in 0..g.strings {
+            assert_eq!(
+                hit_test(r, &plain, Pos2::new(r.left() + 1.0, g.y(st))),
+                plain.pitch_at(st, 0),
+                "the nut should give the open string on string {st}"
+            );
+        }
+        // With a capo the same click gives the capo'd pitch, not fret 0, and
+        // nothing below the capo is reachable at all.
+        let capo = FretboardSpec { capo: 3, ..Default::default() };
+        let gc = Geom::new(r, &capo).unwrap();
+        assert_eq!(hit_test(r, &capo, Pos2::new(r.left() + 1.0, gc.y(0))), capo.pitch_at(0, 3));
+        for st in 0..gc.strings {
+            for x in [r.left(), r.left() + 20.0, gc.press_x(1), gc.press_x(2), gc.press_x(3)] {
+                if let Some(p) = hit_test(r, &capo, Pos2::new(x, gc.y(st))) {
+                    assert!(
+                        p >= capo.pitch_at(st, 3).unwrap(),
+                        "clicked behind the capo on string {st}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hit_testing_holds_for_every_tuning_and_window_size() {
+        for t in TUNINGS {
+            for capo in [0u8, 4] {
+                for w in [650.0_f32, 1300.0, 2600.0] {
+                    let spec = FretboardSpec { tuning: t, frets: 22, capo };
+                    let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
+                    let Some(g) = Geom::new(r, &spec) else { continue };
+                    for st in 0..g.strings {
+                        for fret in [capo, capo + 1, 7, 12, 22] {
+                            if fret > spec.frets {
+                                continue;
+                            }
+                            let x = if fret == capo { g.mark_x(r) } else { g.press_x(fret) };
+                            assert_eq!(
+                                hit_test(r, &spec, Pos2::new(x, g.y(st))),
+                                spec.pitch_at(st, fret),
+                                "{} capo{capo} at {w}pt: string {st} fret {fret}",
+                                t.name
+                            );
+                        }
+                    }
+                }
             }
         }
     }

@@ -16,7 +16,7 @@ use crate::settings::{Rgb, Settings};
 use egui::{Pos2, Rect, Vec2, ViewportCommand};
 use ivory_core::voicing::{VoicingSession, Weights};
 use ivory_core::{ChordDetector, OverrideStore, TrainOutcome};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -137,6 +137,12 @@ pub struct IvoryApp {
 
     notes: NoteState,
     manual_notes: HashSet<u8>,
+    /// Where a note entered ON THE FRETBOARD was put, as pitch -> (string,
+    /// fret). The solver honours these so a clicked shape stays clicked: left
+    /// to choose, it redraws a hand-entered voicing somewhere else about three
+    /// times in four, which is right when it is choosing and wrong when the
+    /// choosing is already done.
+    manual_positions: HashMap<u8, (usize, u8)>,
 
     current_chord: Option<String>,
     last_detection: Option<Instant>,
@@ -250,6 +256,7 @@ impl IvoryApp {
             midi_conn,
             notes: NoteState::default(),
             manual_notes: HashSet::new(),
+            manual_positions: HashMap::new(),
             current_chord: None,
             last_detection: None,
             voicing,
@@ -316,7 +323,23 @@ impl IvoryApp {
     /// Point the solver at whatever the settings now describe. Both calls
     /// throw away the remembered hand, which is the point: a shape the new
     /// board could not have produced must never survive a tuning change.
+    /// Hand the solver the positions the user chose. Dropped whenever the
+    /// board changes, because a pin names a `(string, fret)` on the board it
+    /// was made on: keep them across a tuning or capo change and they name
+    /// pitches nobody is playing.
+    fn sync_pins(&mut self) {
+        let pins: Vec<(u8, usize, u8)> = self
+            .manual_positions
+            .iter()
+            .filter(|(p, _)| self.manual_notes.contains(p))
+            .map(|(&p, &(st, f))| (p, st, f))
+            .collect();
+        self.voicing.set_pins(pins);
+    }
+
     fn rebuild_voicing(&mut self) {
+        self.manual_positions.clear();
+        self.voicing.set_pins(Vec::new());
         let spec = self.settings.fretboard_spec();
         self.voicing.set_weights(Weights::for_tuning(spec.tuning));
         self.voicing.set_spec(spec);
@@ -436,6 +459,7 @@ impl IvoryApp {
         ui: &mut egui::Ui,
         piano_rect: Rect,
         chord_rect: Option<Rect>,
+        fret_rect: Option<Rect>,
     ) {
         let resp = ui.interact(
             ui.max_rect(),
@@ -489,18 +513,39 @@ impl IvoryApp {
                 }
                 // Keytoggle hit-test/toggle first (spec §4.5), then StartDrag
                 // (must be issued directly from the press handler).
-                if self.settings.keytoggle_enabled && piano_rect.contains(pos) {
-                    let local = pos - piano_rect.min;
-                    if let Some(note) = piano::hit_test(
-                        local.x,
-                        local.y,
-                        piano_rect.width(),
-                        piano_rect.height(),
-                    ) {
-                        if !self.manual_notes.remove(&note) {
+                if self.settings.keytoggle_enabled {
+                    // Either instrument can put a note in, and they toggle the
+                    // same set — so a shape entered on the neck lights up on the
+                    // keyboard, and a chord entered on the keys shows you where
+                    // a guitarist would play it. That symmetry is the point:
+                    // the fretboard stops being a readout and becomes an input.
+                    let hit = if piano_rect.contains(pos) {
+                        let local = pos - piano_rect.min;
+                        piano::hit_test(local.x, local.y, piano_rect.width(), piano_rect.height())
+                    } else {
+                        fret_rect.filter(|r| r.contains(pos)).and_then(|r| {
+                            fretboard_panel::hit_test(r, &self.settings.fretboard_spec(), pos)
+                        })
+                    };
+                    if let Some(note) = hit {
+                        if self.manual_notes.remove(&note) {
+                            self.manual_positions.remove(&note);
+                        } else {
                             self.manual_notes.insert(note);
+                            // Only a fretboard click pins. A piano click says
+                            // WHICH note, not where on the neck to draw it, so
+                            // the solver still chooses for those.
+                            if let Some(r) = fret_rect.filter(|r| r.contains(pos)) {
+                                if let Some(g) =
+                                    fretboard_panel::position_at(r, &self.settings.fretboard_spec(), pos)
+                                {
+                                    self.manual_positions.insert(note, g);
+                                }
+                            }
                         }
+                        self.sync_pins();
                         self.detection_tick(true); // immediate off-cadence update
+                        self.voicing_tick(true);
                     }
                 }
                 if self.settings.borderless_mode {
@@ -686,6 +731,8 @@ impl IvoryApp {
                 self.settings.keytoggle_enabled = !self.settings.keytoggle_enabled;
                 if !self.settings.keytoggle_enabled {
                     self.manual_notes.clear(); // disabling clears manual notes
+                    self.manual_positions.clear();
+                    self.voicing.set_pins(Vec::new());
                 }
                 self.settings.save();
                 self.detection_tick(true);
@@ -776,6 +823,7 @@ impl IvoryApp {
         }
         self.detector.set_note_preference(true);
         self.manual_notes.clear();
+        self.manual_positions.clear();
         self.fret_window_visible = false;
         self.fret_shown_at = None;
         self.rebuild_voicing();
@@ -1279,6 +1327,12 @@ impl IvoryApp {
             Vec2::new(w, piano_h),
         );
         let mut chord_rect_for_hit: Option<Rect> = None;
+        let fret_rect_for_hit: Option<Rect> = (fret_h > 0.0).then(|| {
+            Rect::from_min_size(
+                Pos2::new(origin.x, origin.y + chord_h + piano_h),
+                Vec2::new(w, fret_h),
+            )
+        });
         if chord_h > 0.0 {
             let chord_rect = Rect::from_min_size(origin, Vec2::new(w, chord_h));
             chord_rect_for_hit = Some(chord_rect);
@@ -1299,11 +1353,7 @@ impl IvoryApp {
             self.notes.sustain_down(),
             &self.settings,
         );
-        if fret_h > 0.0 {
-            let fret_rect = Rect::from_min_size(
-                Pos2::new(origin.x, piano_rect.bottom()),
-                Vec2::new(w, fret_h),
-            );
+        if let Some(fret_rect) = fret_rect_for_hit {
             let spec = self.settings.fretboard_spec();
             fretboard_panel::draw(
                 ui.painter(),
@@ -1316,7 +1366,7 @@ impl IvoryApp {
             fretboard_panel::draw_top_edge(ui.painter(), fret_rect, &self.settings);
         }
 
-        self.handle_main_interaction(&ctx, ui, piano_rect, chord_rect_for_hit);
+        self.handle_main_interaction(&ctx, ui, piano_rect, chord_rect_for_hit, fret_rect_for_hit);
 
         // The popped-out neck.
         if self.fret_window_visible {

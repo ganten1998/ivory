@@ -455,6 +455,38 @@ From the first hands-on session with the guitar view:
   overlapped its neighbours, which the popped-out window can reach at its
   minimum height.
 
+### D-UI-18 — the fretboard is an input, not just a readout
+
+Keytoggle now works on the neck as well as the keyboard. Click a fret and that
+note toggles, so a guitar voicing can be entered by shape and read off the
+piano with its name, instead of only the other way round. Both instruments
+toggle the same set, so it is symmetric.
+
+Two things this needed that were not obvious:
+
+- **`fretboard_panel::hit_test` is the exact inverse of `draw`**, the same rule
+  `piano::hit_test` follows (spec §4.5), so a dot can never light somewhere it
+  cannot be clicked. With no headstock there is nowhere left of the nut to
+  click, so the first `2 * dot_r` of the board is the open-string zone, which is
+  where the open rings are drawn. A click also has to land NEAR a string:
+  halfway between two is a miss, not a guess, or every near-miss silently adds
+  a note.
+- **A clicked position is PINNED** (`voicing::History::pins`). Left to choose,
+  the solver redraws a hand-entered shape somewhere else about three times in
+  four, measured: 25% to 58% of shapes survived depending on size. Correct when
+  it is choosing, useless when the choosing is done.
+
+  Narrowing the candidate list was not enough. When every held note is pinned
+  the search is **bypassed entirely**, because the monotone constraint is not
+  optional inside it and ordinary guitar shapes violate it: low E at fret 6
+  sounds Bb2 (46) against an open A (45), a higher pitch on a lower string,
+  entirely playable and structurally undrawable by the search, which simply
+  dropped one of the two. Pins for a partial set still go through the search.
+
+  A pin that does not name a real position for its pitch is ignored rather than
+  obeyed, and pins are dropped on any tuning or capo change, so a stale one can
+  never move a note somewhere it cannot sound.
+
 ### D-UI-17 — the white keys tile
 
 The piano drew each white key `trunc(width / 52)` wide while stepping by the
