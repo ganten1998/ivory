@@ -41,13 +41,17 @@ use std::sync::Arc;
 /// a dropped note-off, which sticks a key on screen until it is played again.
 const NOTE_QUEUE: usize = 1024;
 
-/// The editor size the host is told about before it has been told otherwise.
+/// The width a new instance opens at.
 ///
-/// The standalone's natural width is 1300 with a 150-point piano. A DAW rack
-/// is narrower than a desktop, so this opens at half that and lets the host
-/// resize: the layout is proportional, so it stays correct at any width.
+/// The standalone is 1300 at 100%. A DAW rack is narrower than a desktop, so
+/// this opens at about two thirds and lets the host resize from there — the
+/// layout is proportional, so it stays correct at any width.
+///
+/// The HEIGHT is not a constant, because it cannot be: it depends on how many
+/// bands the user has turned on, and the theory band alone is 300 points at
+/// full width. A fixed height would open a first instance showing a slice of
+/// the app, with nothing on screen to explain why.
 const EDITOR_W: u32 = 900;
-const EDITOR_H: u32 = 260;
 
 /// Everything the plugin keeps between the audio thread and the editor.
 struct Tangent {
@@ -83,11 +87,15 @@ struct TangentParams {
 
 impl Default for TangentParams {
     fn default() -> Self {
+        let settings = Settings::load();
         Self {
-            editor_state: EguiState::from_size(EDITOR_W, EDITOR_H),
             // Seeded from the user's own settings, so a first insert looks
             // like the app they already know. Read once, never written back.
-            settings: Mutex::new(Settings::load().to_json()),
+            editor_state: EguiState::from_size(EDITOR_W, {
+                let h = ivory_ui::app::natural_size(&settings, EDITOR_W as f32).y;
+                h.round().clamp(80.0, 2000.0) as u32
+            }),
+            settings: Mutex::new(settings.to_json()),
         }
     }
 }

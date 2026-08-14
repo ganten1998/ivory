@@ -1386,7 +1386,15 @@ pub fn initial_window_size(settings: &Settings) -> Vec2 {
 /// drift between them shows up as a window that visibly jumps at startup.
 /// Integer truncation per band, like Python (spec §3.2).
 fn band_sizes(settings: &Settings) -> Bands {
-    let w = main_width(settings);
+    band_sizes_at(settings, main_width(settings))
+}
+
+/// The same bands, for a window that is `w` wide.
+///
+/// Split out because a plugin does not choose its own width: the host does,
+/// and every band's height is a fixed fraction of the width, so laying out
+/// into a given rect is the same arithmetic with a different starting number.
+fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
     let piano_h = (w as f64 / (1300.0 / 150.0)).trunc() as f32;
     let chord_visible = settings.chord_detection_enabled && !settings.chord_window_detached;
     let chord_h = if chord_visible {
@@ -1407,6 +1415,33 @@ fn band_sizes(settings: &Settings) -> Bands {
         piano_h,
         fret_h,
     }
+}
+
+/// The natural size of the whole layout at a given width.
+///
+/// What a plugin editor should OPEN at. `initial_window_size` is the
+/// desktop's answer and bakes in the size percentage, which a plugin does not
+/// have; this takes the width as an argument and returns the height that goes
+/// with it, so an editor opens showing every band the user has turned on
+/// rather than a slice of them.
+pub fn natural_size(settings: &Settings, width: f32) -> Vec2 {
+    band_sizes_at(settings, width).total()
+}
+
+/// The biggest layout that fits inside `avail`, for a host that hands over a
+/// rect rather than being asked for one.
+///
+/// Every band's height is a fixed fraction of the width, so the whole layout
+/// is described by one number and fitting it is a matter of picking that
+/// number. Width alone is not enough: a wide, short editor would get a layout
+/// far taller than it, and the piano would be cut in half.
+fn fit_bands(settings: &Settings, avail: Vec2) -> Bands {
+    // Total height at a known width gives the ratio, whichever bands are on.
+    let probe = band_sizes_at(settings, 1300.0);
+    let h_at_1300 = probe.total().y.max(1.0);
+    let w_for_height = avail.y * 1300.0 / h_at_1300;
+    let w = avail.x.min(w_for_height).max(1.0).trunc();
+    band_sizes_at(settings, w)
 }
 
 /// The horizontal bands the window is made of, top to bottom, and its width.
@@ -1561,7 +1596,15 @@ impl IvoryApp {
 
         // Fixed-size enforcement: Min+Max+Inner triple whenever the target
         // changes (size %, chord toggle, detach/attach).
-        let bands = self.layout_sizes();
+        // The desktop asks for a size and gets it. A plugin is GIVEN one, and
+        // has to lay out inside it — `main_width` would otherwise put a
+        // 1300-point layout into whatever the host opened, and the piano would
+        // run off the right-hand edge.
+        let bands = if self.caps.window_sizing {
+            self.layout_sizes()
+        } else {
+            fit_bands(&self.settings, ctx.content_rect().size())
+        };
         let Bands {
             w,
             theory_h,
@@ -1593,7 +1636,15 @@ impl IvoryApp {
         // (spec §3.1, D-UI-17). Each band's top is the sum of the ones above
         // it, and a hidden band is zero tall, so nothing needs a special case.
         let display = self.display_notes();
-        let origin = ui.max_rect().min;
+        // Centred in whatever we were given. On the desktop the window IS the
+        // layout, so both terms are zero and no pixel moves; in a plugin it is
+        // what keeps the picture in the middle of an editor the user has
+        // resized to something else.
+        let pane = ui.max_rect();
+        let origin = Pos2::new(
+            pane.min.x + ((pane.width() - w) * 0.5).max(0.0).trunc(),
+            pane.min.y + ((pane.height() - target.y) * 0.5).max(0.0).trunc(),
+        );
         let band_at = |top: f32, h: f32| {
             Rect::from_min_size(Pos2::new(origin.x, origin.y + top), Vec2::new(w, h))
         };
@@ -1836,6 +1887,61 @@ mod tests {
             .flat_map(|v| v.commands.iter())
             .map(|c| format!("{c:?}"))
             .collect()
+    }
+
+    /// A plugin is handed a rect and has to lay out inside it. `main_width`
+    /// is the desktop's answer — 1300 points times a size percentage — and
+    /// using it in an editor the host opened at 900 would run the piano off
+    /// the right-hand edge, with no window command available to fix it.
+    ///
+    /// Checked in both directions, because "it fits" is also satisfied by a
+    /// layout that shrank to nothing.
+    #[test]
+    fn a_plugin_lays_out_inside_the_rect_it_is_given() {
+        let mut s = Settings::default();
+        for (fret, theory) in [(false, false), (true, false), (true, true)] {
+            s.show_fretboard = fret;
+            s.theory_circle = theory;
+            for avail in [
+                Vec2::new(900.0, 260.0),   // the editor's default
+                Vec2::new(400.0, 200.0),   // a narrow rack
+                Vec2::new(1800.0, 300.0),  // wide and short: height decides
+                Vec2::new(600.0, 1200.0),  // tall and narrow: width decides
+            ] {
+                let b = fit_bands(&s, avail);
+                let t = b.total();
+                assert!(
+                    t.x <= avail.x + 0.5 && t.y <= avail.y + 0.5,
+                    "{t:?} does not fit in {avail:?} (fretboard {fret}, theory {theory})"
+                );
+                assert!(
+                    b.w >= 1.0 && b.piano_h >= 1.0,
+                    "the layout collapsed to {b:?} in {avail:?}"
+                );
+                // It should USE the space, not sit in a corner of it: one of
+                // the two dimensions is the binding constraint and should be
+                // nearly filled.
+                let fill = (t.x / avail.x).max(t.y / avail.y);
+                assert!(
+                    fill > 0.90,
+                    "only filled {:.0}% of {avail:?} ({t:?})",
+                    fill * 100.0
+                );
+            }
+        }
+    }
+
+    /// ...and the desktop is untouched by all of that. Its layout is still
+    /// decided by the size percentage and nothing else.
+    #[test]
+    fn the_desktop_layout_is_unchanged() {
+        let mut s = Settings::default();
+        for pct in [50i64, 75, 100, 125, 150, 175, 200] {
+            s.window_size_percent = pct;
+            let w = main_width(&s);
+            assert_eq!(band_sizes(&s).w, w, "at {pct}%");
+            assert_eq!(band_sizes(&s), band_sizes_at(&s, w), "at {pct}%");
+        }
     }
 
     /// A plugin editor's window belongs to the DAW. Not one frame may ask to
