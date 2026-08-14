@@ -56,7 +56,11 @@ VIAddVersionKey "LegalCopyright" "MIT (application) / GPL-3.0-or-later (plugin)"
 !define MUI_FINISHPAGE_RUN_TEXT "Open Tangent now"
 !define MUI_FINISHPAGE_TEXT "Your DAW will find the plugin the next time it scans. It appears as Tangent, by ganten.$\r$\n$\r$\nHold H in either one to see every keyboard shortcut."
 
-!insertmacro MUI_PAGE_LICENSE "${SRCDIR}\LICENSE.txt"
+; Source paths are resolved by makensis on the BUILD host, which here is
+; macOS, so they use forward slashes. Destination paths below are Windows
+; paths and keep their backslashes — the two are not the same thing and
+; mixing them up produces "open failed" on a path with both.
+!insertmacro MUI_PAGE_LICENSE "${SRCDIR}/LICENSE.txt"
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
@@ -70,7 +74,7 @@ VIAddVersionKey "LegalCopyright" "MIT (application) / GPL-3.0-or-later (plugin)"
 Section "Tangent application" SEC_APP
   SectionIn 1
   SetOutPath "$INSTDIR"
-  File /r "${SRCDIR}\app\*.*"
+  File /r "${SRCDIR}/app/*.*"
 
   CreateDirectory "$SMPROGRAMS\Tangent"
   CreateShortCut "$SMPROGRAMS\Tangent\Tangent.lnk" "$INSTDIR\tangent.exe"
@@ -100,7 +104,7 @@ Section "Tangent VST3 plugin" SEC_VST3
   ; file, so anything that used to be there and is not any more simply stays.
   RMDir /r "$COMMONFILES64\VST3\Tangent.vst3"
   SetOutPath "$COMMONFILES64\VST3\Tangent.vst3"
-  File /r "${SRCDIR}\Tangent.vst3\*.*"
+  File /r "${SRCDIR}/Tangent.vst3/*.*"
 SectionEnd
 
 Section -Uninstaller

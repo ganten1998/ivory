@@ -32,7 +32,19 @@ cd "$ROOT"
 
 VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
 NAME="Tangent"
-WORK="build/installer"
+
+# Staging happens OUTSIDE the repository, and that is not tidiness.
+#
+# This repo lives in Dropbox, which cannot store extended attributes natively
+# and writes AppleDouble sidecars instead. `ditto` into a Dropbox directory
+# therefore produces `._Tangent.app`, `._Contents`, `._Info.plist` and one
+# `._` file per binary — and `pkgbuild` packages every one of them, so the
+# installer would put that litter into /Applications and into every user's
+# VST3 folder. (It is also why `target` is a symlink out of Dropbox; see
+# docs/HANDOFF.md.) A real APFS directory stores the attributes properly and
+# no sidecar is created at all.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tangent-installer.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
 
 PLATFORM="${1:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
 [ "$PLATFORM" = "darwin" ] && PLATFORM=macos
@@ -57,11 +69,34 @@ build_macos() {
   mkdir -p "$WORK/macos/pkgs" "$WORK/macos/root-app" "$WORK/macos/root-vst3" \
            "$WORK/macos/resources"
 
-  # `ditto` rather than `cp -R`: it preserves the code signature's extended
-  # attributes and resource forks. A `cp -R`'d .app is an .app whose signature
-  # no longer verifies, and the installer will happily package it anyway.
-  ditto "$app"  "$WORK/macos/root-app/$NAME.app"
-  ditto "$vst3" "$WORK/macos/root-vst3/$NAME.vst3"
+  # `ditto` rather than `cp -R`, and STRIPPED rather than faithful.
+  #
+  # These bundles live in Dropbox, so every file carries a `com.dropbox.attrs`
+  # extended attribute, and there is no reason for a user's /Applications to
+  # receive this machine's sync bookkeeping.
+  #
+  # Stripping is safe, and that is checked below rather than assumed: a
+  # bundle's signature lives in the Mach-O and in
+  # `_CodeSignature/CodeResources`, and the notarization ticket is stapled into
+  # `Contents/CodeResources` — all real files. Extended attributes only carry a
+  # signature for single-file (non-bundle) code, which this is not.
+  #
+  # (`lsbom` on the built package still lists `._` entries either way. Those
+  # are AppleDouble metadata records, not files: `pkgutil --expand-full`
+  # extracts a tree with zero of them, which is what the installer writes.
+  # Verified, because they look exactly like litter until you check.)
+  ditto --norsrc --noextattr --noacl "$app"  "$WORK/macos/root-app/$NAME.app"
+  ditto --norsrc --noextattr --noacl "$vst3" "$WORK/macos/root-vst3/$NAME.vst3"
+  find "$WORK/macos" \( -name '._*' -o -name '.DS_Store' \) -delete
+
+  # ...and prove it, because a broken signature inside a package is invisible
+  # until someone downloads it. `spctl` is the one that would catch a lost
+  # staple, which `codesign` alone would not.
+  codesign --verify --strict "$WORK/macos/root-app/$NAME.app"
+  codesign --verify --strict "$WORK/macos/root-vst3/$NAME.vst3"
+  if ! spctl --assess --type execute "$WORK/macos/root-app/$NAME.app" >/dev/null 2>&1; then
+    echo "!!  the staged app is not accepted by Gatekeeper — did build-macos.sh notarize?"
+  fi
 
   # The component plist, and the one field that has to be changed.
   #
@@ -121,8 +156,12 @@ build_macos() {
   # So this checks for the right kind and says exactly what is missing when
   # there is not one, rather than shipping something that looks signed.
   local installer_id
+  # `|| true` is load-bearing under `set -e`: an assignment takes the exit
+  # status of its command substitution, and `grep` with no match exits 1 — so
+  # the script would die at exactly the point it is trying to detect that
+  # something is absent, with no message at all.
   installer_id="${IVORY_INSTALLER_ID:-$(security find-identity -v 2>/dev/null \
-    | grep 'Developer ID Installer' | head -1 | sed -E 's/.*"(.*)"/\1/')}"
+    | grep 'Developer ID Installer' | head -1 | sed -E 's/.*"(.*)"/\1/' || true)}"
 
   if [ -n "$installer_id" ]; then
     echo "    signing as: $installer_id"
@@ -173,10 +212,14 @@ WARN
 
 # ── Windows ─────────────────────────────────────────────────────────────────
 build_windows() {
-  local stage="dist/tangent-$VERSION-windows-x86_64"
+  # The ZIP, not a staging directory: `build-cross.sh` removes the stage once
+  # it has packaged it, and the zip is also exactly what a user downloading
+  # the portable build receives — so the installed files and the unzipped
+  # files cannot drift apart.
+  local zip="dist/tangent-$VERSION-windows-x86_64.zip"
   local vst3="dist/plugin/windows/$NAME.vst3"
-  need "$stage/tangent.exe" "run scripts/build-cross.sh first"
-  need "$vst3"              "run scripts/build-plugin.sh windows first"
+  need "$zip"  "run scripts/build-cross.sh first"
+  need "$vst3" "run scripts/build-plugin.sh windows first"
   command -v makensis >/dev/null || {
     echo "makensis not found. Install it with: brew install makensis" >&2
     exit 1
@@ -185,16 +228,15 @@ build_windows() {
   echo "==> $NAME $VERSION — Windows installer"
   rm -rf "$WORK/windows"
   mkdir -p "$WORK/windows/app"
-  # Everything the zip ships goes into the installed program folder, so an
-  # installed copy and an unzipped copy have the same files next to them.
-  cp -R "$stage/." "$WORK/windows/app/"
+  unzip -q "$zip" -d "$WORK/windows/app"
+  need "$WORK/windows/app/tangent.exe" "the zip has no tangent.exe in it"
   cp -R "$vst3" "$WORK/windows/Tangent.vst3"
   cp LICENSING.md "$WORK/windows/LICENSE.txt"
 
   local out="dist/$NAME-$VERSION-windows-setup.exe"
   makensis -NOCD \
     "-DVERSION=$VERSION" \
-    "-DSRCDIR=$ROOT/$WORK/windows" \
+    "-DSRCDIR=$WORK/windows" \
     "-DOUTFILE=$ROOT/$out" \
     installer/windows/tangent.nsi | sed 's/^/    /'
 
@@ -246,7 +288,7 @@ build_linux() {
   echo "    binary, plugin and installer all present"
 }
 
-mkdir -p dist "$WORK"
+mkdir -p dist
 case "$PLATFORM" in
   macos)   build_macos ;;
   windows) build_windows ;;

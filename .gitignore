@@ -8,3 +8,12 @@ tests/golden/__pycache__/
 
 # Keygen build output (the tool is a separate workspace under tools/)
 tools/*/target/
+
+# The plugin is its own workspace, so its target directory is its own too.
+plugin/target/
+
+# Installer staging. Kept out of the repo AND out of Dropbox by
+# scripts/build-installer.sh, which stages in a temp dir; this catches the
+# case where someone points it somewhere else.
+build/
+build/

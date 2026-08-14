@@ -3,8 +3,8 @@
   The macOS installer's own UI.
 
   `customize="always"` is the whole reason this file exists rather than a bare
-  `productbuild --component`: it puts the Custom Install page in front of the
-  user by default, so choosing "just the plugin" or "just the app" is one
+  single-component productbuild: it puts the Custom Install page in front of
+  the user by default, so choosing "just the plugin" or "just the app" is one
   click rather than a hidden button. Both start selected, because someone who
   downloaded Tangent almost certainly wants Tangent.
 
