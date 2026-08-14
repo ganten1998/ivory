@@ -10,7 +10,10 @@ tests/golden/__pycache__/
 tools/*/target/
 
 # The plugin is its own workspace, so its target directory is its own too.
-plugin/target/
+# NO trailing slash: like the root one it is a SYMLINK out of Dropbox, and
+# `plugin/target/` matches a directory only — so the symlink itself was tracked,
+# and a fresh clone got a link pointing at a cache path on one particular Mac.
+plugin/target
 
 # Installer staging. Kept out of the repo AND out of Dropbox by
 # scripts/build-installer.sh, which stages in a temp dir; this catches the
