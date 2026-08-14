@@ -7,12 +7,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libs
     && rm -rf /var/lib/apt/lists/*
 # ivory-core inherits version/edition/license/rust-version/lints from the root
 # workspace manifest, so that manifest must be here or cargo fails with
-# "failed to find a workspace root". The root lists `ivory` as a member, and a
-# workspace will not load with a member missing — hence the GUI crate is copied
-# too, purely so the manifest parses. It is never built: tools/ivory-fulfil
+# "failed to find a workspace root". A workspace will not load with a member
+# missing, so EVERY member the root lists has to be copied — hence the GUI
+# crates, purely so the manifest parses. They are never built: tools/ivory-fulfil
 # declares its own empty [workspace], which is what keeps it standalone.
+#
+# If you add a workspace member, add it here. The failure is at the cargo step,
+# not the COPY, and it reads as a workspace error rather than a missing file.
 COPY Cargo.toml ./
 COPY ivory-core ./ivory-core
+COPY ivory-ui ./ivory-ui
 COPY ivory ./ivory
 COPY tools/ivory-fulfil ./tools/ivory-fulfil
 WORKDIR /src/tools/ivory-fulfil
