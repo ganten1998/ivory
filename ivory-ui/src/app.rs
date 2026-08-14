@@ -146,6 +146,9 @@ pub struct IvoryApp {
     /// against a host name, and captured once at construction so a frame
     /// cannot be half-drawn under one set of rules and half under another.
     caps: Caps,
+    /// A size the user asked for that the host has not been told about yet.
+    /// Only ever set when the host owns the window.
+    pending_resize: Option<Vec2>,
 
     notes: NoteState,
     manual_notes: HashSet<u8>,
@@ -269,6 +272,7 @@ impl IvoryApp {
             midi_rx,
             ports: None,
             caps,
+            pending_resize: None,
             notes: NoteState::default(),
             manual_notes: HashSet::new(),
             manual_positions: HashMap::new(),
@@ -329,6 +333,15 @@ impl IvoryApp {
     /// than merely hidden.
     pub fn set_ports(&mut self, ports: Option<Box<dyn MidiPorts>>) {
         self.ports = ports;
+    }
+
+    /// A size the user picked that the host has not been told about, if any.
+    ///
+    /// Taken, not read: the request goes out once. A host that refuses it will
+    /// simply not resize, and the layout fits whatever rect it ends up with,
+    /// so a refusal costs nothing but the size the user asked for.
+    pub fn take_pending_resize(&mut self) -> Option<Vec2> {
+        self.pending_resize.take()
     }
 
     /// Put the typeface back on a context that has never seen it.
@@ -576,13 +589,12 @@ impl IvoryApp {
             capo: self.settings.fretboard_spec().capo,
             next_font: {
                 use crate::fonts::FontChoice;
+                // The face the next click will actually give you. Same method
+                // the action uses, so the label cannot promise one thing and
+                // the click do another.
                 let cur = FontChoice::from_key(&self.settings.font_choice);
-                // Show the row only if some OTHER installed face can be reached.
-                FontChoice::ALL
-                    .iter()
-                    .copied()
-                    .find(|f| *f != cur && f.is_available())
-                    .map(|f| f.label())
+                let next = cur.next();
+                (next != cur).then(|| next.label())
             },
         }
     }
@@ -951,6 +963,14 @@ impl IvoryApp {
                 self.save_settings();
                 // The detached window deliberately does NOT follow: it is sized
                 // by the user now, not slaved to the keyboard's width.
+                //
+                // A host that owns the window has to be ASKED. The app cannot
+                // do that itself — the request goes out over the plugin API,
+                // which `ivory-ui` has never heard of — so it records what it
+                // wants and the binary that does know picks it up.
+                if !self.caps.window_sizing {
+                    self.pending_resize = Some(initial_window_size(&self.settings));
+                }
             }
             MenuAction::ToggleBorderless => {
                 self.settings.borderless_mode = !self.settings.borderless_mode;
@@ -994,17 +1014,11 @@ impl IvoryApp {
             }
             MenuAction::CycleFont => {
                 use crate::fonts::FontChoice;
-                let cur = FontChoice::from_key(&self.settings.font_choice);
-                if let Some(next) = FontChoice::ALL
-                    .iter()
-                    .copied()
-                    .find(|f| *f != cur && f.is_available())
-                {
-                    self.settings.font_choice = next.key().to_owned();
-                    self.save_settings();
-                    crate::fonts::install(ctx, next, self.settings.custom_font_path.as_deref());
-                    crate::fonts::apply_text_styles(ctx);
-                }
+                let next = FontChoice::from_key(&self.settings.font_choice).next();
+                self.settings.font_choice = next.key().to_owned();
+                self.save_settings();
+                crate::fonts::install(ctx, next, self.settings.custom_font_path.as_deref());
+                crate::fonts::apply_text_styles(ctx);
             }
             MenuAction::ToggleKeytoggle => {
                 self.settings.keytoggle_enabled = !self.settings.keytoggle_enabled;

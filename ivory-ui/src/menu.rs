@@ -208,9 +208,11 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         items,
     };
     let mut e = Vec::new();
-    // 1. Size submenu, and the borderless toggle: both are the app deciding
-    //    its own geometry, which a plugin editor does not get to do.
-    if view.caps.window_sizing {
+    // 1. Size. Offered wherever a size can be CHOSEN, which includes a plugin:
+    //    it cannot set its own window, but it can ask, and VST3 has a path for
+    //    exactly that. Leaving it out was the difference between an editor you
+    //    can read and one you cannot.
+    if view.caps.size_presets {
         e.push(submenu(
             "Size",
             SIZE_PERCENTS
@@ -219,9 +221,11 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 .collect(),
         ));
         e.push(Entry::Separator);
-        // 3. Borderless toggle (label shows what you would switch TO the
-        //    current state from: "Borderless" while bordered, "Bordered"
-        //    while borderless)
+    }
+    // 2. Borderless is a different question with a different answer: window
+    //    chrome belongs to whoever owns the window, and in a plugin that is
+    //    the host. Label shows what you would switch TO.
+    if view.caps.window_sizing {
         e.push(item(
             if view.borderless {
                 "Bordered"
@@ -1096,10 +1100,19 @@ mod tests {
                 "{label} needs something a plugin editor does not have"
             );
         }
-        // Size is the app choosing its own geometry, which the host owns.
+        // Size IS offered, and this assertion used to say the opposite —
+        // which is how a plugin shipped with no way to change its size at all.
+        // A plugin cannot SET its geometry, but it can ask the host for one,
+        // and refusing to offer the choice is not the same as being unable to
+        // make it. Borderless is the row that genuinely cannot survive: window
+        // chrome belongs to whoever owns the window.
         assert!(
-            !submenus(v).iter().any(|(name, ..)| name == "Size"),
-            "Size must not be offered where the host decides the size"
+            submenus(v).iter().any(|(name, ..)| name == "Size"),
+            "a plugin with no Size submenu has no way to be made readable"
+        );
+        assert!(
+            !rows(v).iter().any(|(_, a, _)| *a == MenuAction::ToggleBorderless),
+            "window chrome is the host's in a plugin"
         );
         // And what SHOULD survive still does: the whole point is a plugin that
         // can still teach a chord, change tuning and pick a colour.
@@ -1124,7 +1137,7 @@ mod tests {
                 .iter()
                 .map(|(n, ..)| n.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Theory", "Wood", "Tuning", "Capo"]
+            vec!["Size", "Theory", "Wood", "Tuning", "Capo"]
         );
     }
 

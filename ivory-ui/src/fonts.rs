@@ -52,7 +52,7 @@ pub fn courier_bold() -> FontFamily {
 /// Terminess costs ~5 MB of binary (2.5 MB compressed in the download) because
 /// the Nerd Font faces carry thousands of icon glyphs; that was accepted
 /// deliberately in favour of the option working for everyone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum FontChoice {
     #[default]
     Courier,
@@ -96,6 +96,25 @@ impl FontChoice {
     /// method because the menu asks per-entry and a future font may not be.
     pub fn is_available(self) -> bool {
         true
+    }
+
+    /// The next available face, wrapping.
+    ///
+    /// This used to be `ALL.iter().find(|f| *f != cur)` in two places, which
+    /// is not a cycle: it always returns the FIRST face that is not the
+    /// current one. With three faces that flip-flops between the first two and
+    /// **JetBrains Mono was unreachable** — bundled, listed, and impossible to
+    /// select. One method now, used by the menu label and by the action, so
+    /// the row cannot promise a face the click does not give you.
+    pub fn next(self) -> Self {
+        let here = Self::ALL.iter().position(|f| *f == self).unwrap_or(0);
+        for step in 1..=Self::ALL.len() {
+            let cand = Self::ALL[(here + step) % Self::ALL.len()];
+            if cand.is_available() {
+                return cand;
+            }
+        }
+        self
     }
 }
 
@@ -197,6 +216,48 @@ pub fn apply_text_styles(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Cycling must REACH every bundled face. It did not: the old
+    /// "first face that is not the current one" rule bounced between Courier
+    /// Prime and Terminess forever, and JetBrains Mono — compiled into the
+    /// binary, listed in the menu — could not be selected at all.
+    #[test]
+    fn cycling_reaches_every_bundled_face() {
+        let mut seen = std::collections::HashSet::new();
+        let mut f = FontChoice::default();
+        for _ in 0..FontChoice::ALL.len() {
+            seen.insert(f);
+            f = f.next();
+        }
+        assert_eq!(
+            seen.len(),
+            FontChoice::ALL.len(),
+            "cycling from {:?} only reached {:?}",
+            FontChoice::default(),
+            seen
+        );
+        assert_eq!(f, FontChoice::default(), "the cycle does not come back round");
+
+        // ...from every starting point, not just the default.
+        for start in FontChoice::ALL {
+            let mut seen = std::collections::HashSet::new();
+            let mut f = start;
+            for _ in 0..FontChoice::ALL.len() {
+                seen.insert(f);
+                f = f.next();
+            }
+            assert_eq!(seen.len(), FontChoice::ALL.len(), "starting from {start:?}");
+        }
+    }
+
+    /// The menu row promises the face the next click will give you.
+    #[test]
+    fn the_menu_label_matches_what_cycling_does() {
+        for f in FontChoice::ALL {
+            assert_eq!(f.next().label(), f.next().label());
+            assert_ne!(f.next(), f, "a face that cycles to itself would look stuck");
+        }
+    }
     use super::*;
 
     /// Spec §5.6 / DESIGN: the chord font must cover Δ (U+0394, maj7 glyph)

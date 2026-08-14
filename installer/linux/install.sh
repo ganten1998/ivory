@@ -23,6 +23,27 @@ set -eu
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 NAME="Tangent"
 
+# Written out rather than sed'd out of the header comment above. That trick
+# needs a line range, the range was 2..26, and the comment grew — so --help
+# printed the usage AND the first half of an essay about .deb packages.
+usage() {
+    cat <<'USAGE'
+Install Tangent — the application, the VST3 plugin, or both.
+
+  ./install.sh                 both, into your home directory (no root)
+  ./install.sh --app           the application only
+  ./install.sh --vst3          the plugin only
+  ./install.sh --system        into /usr/local and /usr/lib/vst3 (needs root)
+  ./install.sh --prefix DIR    somewhere else entirely
+  ./install.sh --uninstall     take it all back out
+  ./install.sh --dry-run       print what would happen and do nothing
+
+The default needs no root. It puts the application in ~/.local/bin and the
+plugin in ~/.vst3, which is one of the directories the VST3 specification
+tells hosts to scan.
+USAGE
+}
+
 WANT_APP=1
 WANT_VST3=1
 DRY=0
@@ -41,7 +62,7 @@ while [ $# -gt 0 ]; do
                      PREFIX="$1"; MODE=prefix ;;
         --uninstall) UNINSTALL=1 ;;
         --dry-run|-n) DRY=1 ;;
-        -h|--help)   sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)   usage; exit 0 ;;
         *) echo "unknown option: $1  (try --help)" >&2; exit 2 ;;
     esac
     shift
@@ -81,11 +102,32 @@ run() {
     fi
 }
 
+# The nearest ancestor of $1 that exists.
+#
+# `--prefix /tmp/somewhere-new` is a directory that is SUPPOSED not to exist
+# yet, so testing its parent for writability tested a directory that was also
+# absent — `-w` said no and the script refused to install anywhere it had been
+# asked to create. Walking up to something real is the question actually
+# worth asking: may I create this?
+nearest_existing() {
+    d="$1"
+    while [ ! -e "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
+        d="$(dirname "$d")"
+    done
+    printf '%s' "$d"
+}
+
 # Refuse early and clearly, rather than failing on the first copy.
 if [ "$DRY" = "0" ] && [ "$MODE" != "user" ]; then
-    if [ ! -w "$(dirname "$BIN_DIR")" ] && [ "$(id -u)" != "0" ]; then
-        echo "installing to $BIN_DIR needs root. Re-run with sudo, or drop --system" >&2
-        echo "to install into your home directory instead (no root needed)." >&2
+    if [ ! -w "$(nearest_existing "$BIN_DIR")" ] && [ "$(id -u)" != "0" ]; then
+        echo "cannot write to $BIN_DIR — the nearest existing directory" >&2
+        echo "($(nearest_existing "$BIN_DIR")) is not writable by you." >&2
+        if [ "$MODE" = "system" ]; then
+            echo "Re-run with sudo, or drop --system to install into your home" >&2
+            echo "directory instead (no root needed)." >&2
+        else
+            echo "Re-run with sudo, or choose a --prefix you own." >&2
+        fi
         exit 1
     fi
 fi
@@ -128,10 +170,12 @@ if [ "$WANT_APP" = "1" ]; then
     fi
 
     # Say so rather than leaving them to find out by typing `tangent`.
+    ON_PATH=1
     case ":${PATH}:" in
         *":$BIN_DIR:"*) ;;
-        *) echo "  NOTE: $BIN_DIR is not on your PATH."
-           echo "        Add it, or run $BIN_DIR/tangent directly." ;;
+        *) ON_PATH=0
+           echo "  NOTE: $BIN_DIR is not on your PATH."
+           echo "        Add it, or use the full path below." ;;
     esac
 fi
 
@@ -155,6 +199,15 @@ if [ "$DRY" = "1" ]; then
     echo "Nothing was written. Drop --dry-run to install."
     exit 0
 fi
-[ "$WANT_APP" = "1" ]  && echo "Run it with:  tangent"
+# The full path when `tangent` would not resolve. Printing "Run it with:
+# tangent" four lines under "that directory is not on your PATH" is telling
+# someone to do the thing you just told them would not work.
+if [ "$WANT_APP" = "1" ]; then
+    if [ "${ON_PATH:-1}" = "1" ]; then
+        echo "Run it with:  tangent"
+    else
+        echo "Run it with:  $BIN_DIR/tangent"
+    fi
+fi
 [ "$WANT_VST3" = "1" ] && echo "Your DAW will find the plugin the next time it scans for plugins."
 echo "Hold H in either one to see every keyboard shortcut."

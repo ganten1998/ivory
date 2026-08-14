@@ -28,9 +28,10 @@ use ivory_ui::app::IvoryApp;
 use ivory_ui::host::Caps;
 use ivory_ui::midi_event::MidiEvent;
 use ivory_ui::settings::Settings;
+use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::*;
-use nih_plug_egui::resizable_window::ResizableWindow;
 use nih_plug_egui::{create_egui_editor, EguiState};
+use baseview::PhySize;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -54,11 +55,12 @@ const NOTE_QUEUE: usize = 1024;
 /// the app, with nothing on screen to explain why.
 const EDITOR_W: u32 = 900;
 
-/// Below this the piano stops being a piano. The drag corner refuses to go
-/// smaller, which is friendlier than letting someone shrink the editor to a
-/// smear and then have to guess how to get back.
-const MIN_W: f32 = 420.0;
-const MIN_H: f32 = 90.0;
+/// Bounds on what the Size menu may ask the host for. Below the minimum the
+/// piano stops being a piano; above the maximum it stops fitting on a screen.
+const MIN_W: u32 = 420;
+const MIN_H: u32 = 90;
+const MAX_W: u32 = 4000;
+const MAX_H: u32 = 2400;
 
 /// Everything the plugin keeps between the audio thread and the editor.
 struct Tangent {
@@ -119,7 +121,7 @@ impl Default for Tangent {
 
 impl Plugin for Tangent {
     const NAME: &'static str = "Tangent";
-    const VENDOR: &'static str = "ganten";
+    const VENDOR: &'static str = "Ganten";
     const URL: &'static str = "https://ganten.neocities.org";
     const EMAIL: &'static str = "keys@ivorymidi.com";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -167,7 +169,7 @@ impl Plugin for Tangent {
                     }
                 }
             },
-            move |ctx, _setter, _queue, _| {
+            move |ctx, setter, queue, _| {
                 let mut slot = home.lock();
                 let Some(app) = slot.as_mut() else {
                     return;
@@ -177,21 +179,42 @@ impl Plugin for Tangent {
                 while let Some(ev) = notes.pop() {
                     app.feed(ev);
                 }
-                // A drag corner, because a plugin cannot resize itself any
-                // other way: nih-plug has no host-to-plugin resize path (its
-                // `Editor` trait still carries the TODO), so the editor has to
-                // ASK, and `ResizableWindow` is the piece that asks. Without
-                // it the window is whatever size it opened at forever, which
-                // is what "no resize helps" looks like from the outside.
+                app.frame(ctx);
+
+                // ── Size ───────────────────────────────────────────────────
                 //
-                // It opens its own CentralPanel, so the app paints into the
-                // `Ui` rather than through `frame()`, which would open a
-                // second one under the same id.
-                ResizableWindow::new("tangent-editor")
-                    .min_size(egui::Vec2::new(MIN_W, MIN_H))
-                    .show(ctx, params.editor_state.as_ref(), |ui| {
-                        app.paint_into(ui);
-                    });
+                // A plugin cannot resize its own window; it has to ASK, and
+                // the host decides. `nih_plug_egui` ships a drag corner for
+                // this, but its private `set_requested_size` is the only way
+                // in and the corner drew invisibly over a black background —
+                // so the editor opened at one size and stayed there forever.
+                //
+                // The Size submenu is the same control the standalone has, and
+                // the handshake below is exactly what the adapter's own corner
+                // performs, done with public API: tell `EguiState` the new
+                // size FIRST (the host reads it back through `Editor::size()`),
+                // then ask, and only touch the window once the host agrees.
+                if let Some(want) = app.take_pending_resize() {
+                    let w = (want.x.round() as u32).clamp(MIN_W, MAX_W);
+                    let h = (want.y.round() as u32).clamp(MIN_H, MAX_H);
+                    // `Arc::try_unwrap` rather than serde: `from_size` hands
+                    // back a fresh `Arc` with a count of one, so this always
+                    // succeeds, and `PersistentField::set` is the public way
+                    // to move a size into the state the host will read.
+                    if let Ok(v) = Arc::try_unwrap(EguiState::from_size(w, h)) {
+                        params.editor_state.set(v);
+                    }
+                    if setter.raw_context.request_resize() {
+                        let scale = ctx.pixels_per_point();
+                        queue.resize(PhySize::new(
+                            (w as f32 * scale).round() as u32,
+                            (h as f32 * scale).round() as u32,
+                        ));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                            egui::Vec2::new(w as f32, h as f32),
+                        ));
+                    }
+                }
                 // Write the settings back into the project every frame. It is
                 // a string compare and a lock the audio thread never takes,
                 // and the alternative is remembering to do it at each of the

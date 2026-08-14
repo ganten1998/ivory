@@ -58,6 +58,13 @@ nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "28b149e
 ] }
 nih_plug_egui = { git = "https://github.com/BillyDM/egui-baseview.git", rev = "11f487fe915d6208961064e619474b98f971594a" }
 
+# `PhySize` is baseview's, and `nih_plug_egui` does not re-export it — only
+# `baseview::gl::{GlConfig, Profile}`. The rev MUST equal the one
+# egui-baseview's workspace pins, for the same reason nih_plug's must: a
+# different rev is a second `baseview` crate, and the physical size you hand to
+# `Queue::resize` is then a different type with the same name.
+baseview = { git = "https://github.com/RustAudio/baseview.git", rev = "237d323c729f3aa99476ba3efa50129c5e86cad3" }
+
 # Lock-free audio -> GUI handoff. `process()` must never block, and the editor
 # holds its state behind a mutex for a whole frame at a time, so the note queue
 # cannot be that mutex.

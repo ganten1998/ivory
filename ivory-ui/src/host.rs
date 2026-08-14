@@ -31,9 +31,22 @@ pub struct Caps {
     /// The chord readout and the fretboard may be popped into their own
     /// windows. Requires `child_windows`; a plugin has neither.
     pub detachable: bool,
-    /// The UI may set its own size. A plugin editor is sized by the host, so
-    /// the Size submenu and the borderless toggle are meaningless there.
+    /// The UI may set its own size by sending viewport commands. A plugin
+    /// editor may NOT: `egui-baseview` honours `ViewportCommand::InnerSize`,
+    /// so an ungated one reaches into the DAW and resizes the editor behind
+    /// the host's back. This also gates the borderless toggle, the geometry
+    /// write-back and the offscreen rescue — everything that treats the window
+    /// as ours.
     pub window_sizing: bool,
+    /// A size percentage is a meaningful thing to offer.
+    ///
+    /// True for BOTH hosts, and the distinction from `window_sizing` is the
+    /// point. A plugin cannot set its own size, but it can ASK: VST3 has
+    /// `IPlugFrame::resizeView` and nih-plug wires it to
+    /// `GuiContext::request_resize`. So the Size submenu belongs in a plugin,
+    /// it just takes a different road to the same place — the host is told,
+    /// and the host decides.
+    pub size_presets: bool,
     /// The UI chooses its own MIDI input. A plugin is given notes by the host
     /// and has no device list to offer.
     pub midi_ports: bool,
@@ -49,6 +62,7 @@ impl Caps {
         child_windows: true,
         detachable: true,
         window_sizing: true,
+        size_presets: true,
         midi_ports: true,
         persist_global_settings: true,
     };
@@ -59,6 +73,7 @@ impl Caps {
         child_windows: false,
         detachable: false,
         window_sizing: false,
+        size_presets: true,
         midi_ports: false,
         persist_global_settings: false,
     };
@@ -94,6 +109,10 @@ mod tests {
         assert_eq!(Caps::default(), Caps::DESKTOP);
         let p = Caps::PLUGIN;
         assert!(!p.child_windows && !p.detachable && !p.window_sizing);
+        assert!(
+            p.size_presets,
+            "a plugin can still ASK the host for a size, and must be able to"
+        );
         assert!(!p.midi_ports, "a plugin is handed its notes");
         assert!(!p.persist_global_settings, "a plugin shares that file");
     }

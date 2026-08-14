@@ -265,13 +265,34 @@ build_linux() {
   dir="$(find "$WORK/linux" -maxdepth 1 -mindepth 1 -type d | head -1)"
   [ -n "$dir" ] || { echo "the tarball has no top-level directory" >&2; exit 1; }
 
+  # NOT IDEMPOTENT WITHOUT THIS. The output tarball has the same name as the
+  # input one, so the second run unpacks a tree that already contains
+  # `Tangent.vst3` — and `cp -R src dst` where dst EXISTS copies src INTO it,
+  # producing `Tangent.vst3/Tangent.vst3`. The result installs, loads, and
+  # quietly ships a second complete copy of a 10 MB plugin inside the first.
+  # Found on the third run, by looking at what actually landed on disk.
+  rm -rf "$dir/$NAME.vst3"
   cp -R "$vst3" "$dir/$NAME.vst3"
   cp installer/linux/install.sh "$dir/install.sh"
   chmod +x "$dir/install.sh"
   cp LICENSING.md LICENSE-GPL-3.0 "$dir/"
 
+  # Strip macOS extended attributes before repacking.
+  #
+  # This tarball is built on Linux, brought here, unpacked, added to, and
+  # repacked — and the files added here come out of a Dropbox working copy, so
+  # they carry `com.dropbox.attrs` and `com.apple.provenance`. bsdtar stores
+  # those as PAX extended headers, and GNU tar on the far side prints
+  #
+  #   tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr...'
+  #
+  # once PER FILE. Fifty lines of warnings is what a Linux user sees on their
+  # first contact with this project, and every one of them is this machine's
+  # sync bookkeeping leaking into a release.
+  xattr -cr "$dir" 2>/dev/null || true
+
   local out="dist/tangent-$VERSION-linux-x86_64.tar.gz"
-  ( cd "$WORK/linux" && tar -czf "$ROOT/$out" "$(basename "$dir")" )
+  ( cd "$WORK/linux" && tar --no-mac-metadata --no-xattrs -czf "$ROOT/$out" "$(basename "$dir")" )
 
   echo "==> $out"
   ls -lh "$out" | sed 's/^/    /'
@@ -285,6 +306,15 @@ build_linux() {
       exit 1
     fi
   done
+  # Exactly one plugin bundle, and it is not inside itself.
+  if [ "$(tar -tzf "$out" | grep -c 'Tangent\.vst3/Tangent\.vst3')" -ne 0 ]; then
+    echo "FAIL: $out contains a nested Tangent.vst3 (the cp -R trap)" >&2
+    exit 1
+  fi
+  if [ "$(tar -tzf "$out" | grep -cE 'Tangent\.vst3/Contents/x86_64-linux/Tangent\.so$')" -ne 1 ]; then
+    echo "FAIL: $out does not contain exactly one plugin binary" >&2
+    exit 1
+  fi
   echo "    binary, plugin and installer all present"
 }
 

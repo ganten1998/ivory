@@ -77,7 +77,7 @@ BEGIN
   BEGIN
     BLOCK "040904b0"
     BEGIN
-      VALUE "CompanyName", "ganten"
+      VALUE "CompanyName", "Ganten"
       VALUE "FileDescription", "Tangent - what you are playing, named"
       VALUE "FileVersion", "{version}"
       VALUE "InternalName", "tangent"

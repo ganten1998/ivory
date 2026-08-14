@@ -19,10 +19,26 @@
     <organization>com.ganten</organization>
     <options customize="always" require-scripts="false" hostArchitectures="arm64,x86_64"/>
 
-    <!-- System-wide only. /Applications and /Library/Audio/Plug-Ins/VST3 are
-         both root-owned, and a per-user install of a plugin into a folder no
-         DAW scans by default is a support ticket rather than a feature. -->
-    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <!--
+      Two destinations, not three, and the two decisions are different.
+
+      "For all users" is the default and what every other audio plugin on a
+      typical Mac does: /Applications and /Library/Audio/Plug-Ins/VST3. Needs
+      a password, because both are root-owned.
+
+      "For me only" is ON, and was wrongly off. macOS relocates both absolute
+      install-locations under the home directory — verified by installing one:
+      the app lands in ~/Applications and the plugin in
+      ~/Library/Audio/Plug-Ins/VST3, which is a VST3 specification search path
+      that Reaper and every other host scans by default. It needs no password.
+      On a single-user Mac there is no reason to demand one.
+
+      "On a specific disk" stays OFF, and that one is not conservatism. It
+      would put the plugin at /Volumes/Something/Library/Audio/Plug-Ins/VST3,
+      which no host looks in — an install that succeeds and produces a plugin
+      that cannot be found is worse than an option that is not offered.
+    -->
+    <domains enable_anywhere="false" enable_currentUserHome="true" enable_localSystem="true"/>
 
     <welcome file="welcome.html" mime-type="text/html"/>
     <license file="LICENSE.txt" mime-type="text/plain"/>

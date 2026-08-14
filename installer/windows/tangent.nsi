@@ -45,7 +45,7 @@ SetCompressor /SOLID lzma
 VIProductVersion "${VERSION}.0"
 VIAddVersionKey "ProductName" "Tangent"
 VIAddVersionKey "ProductVersion" "${VERSION}"
-VIAddVersionKey "CompanyName" "ganten"
+VIAddVersionKey "CompanyName" "Ganten"
 VIAddVersionKey "FileDescription" "Tangent installer"
 VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "LegalCopyright" "MIT (application) / GPL-3.0-or-later (plugin)"
@@ -54,7 +54,7 @@ VIAddVersionKey "LegalCopyright" "MIT (application) / GPL-3.0-or-later (plugin)"
 !define MUI_COMPONENTS_TEXT_TOP "Tangent comes in two pieces. Install either, or both."
 !define MUI_FINISHPAGE_RUN "$INSTDIR\tangent.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Open Tangent now"
-!define MUI_FINISHPAGE_TEXT "Your DAW will find the plugin the next time it scans. It appears as Tangent, by ganten.$\r$\n$\r$\nHold H in either one to see every keyboard shortcut."
+!define MUI_FINISHPAGE_TEXT "Your DAW will find the plugin the next time it scans. It appears as Tangent, by Ganten.$\r$\n$\r$\nHold H in either one to see every keyboard shortcut."
 
 ; Source paths are resolved by makensis on the BUILD host, which here is
 ; macOS, so they use forward slashes. Destination paths below are Windows
@@ -86,7 +86,7 @@ Section "Tangent application" SEC_APP
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Tangent" \
     "DisplayVersion" "${VERSION}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Tangent" \
-    "Publisher" "ganten"
+    "Publisher" "Ganten"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Tangent" \
     "DisplayIcon" "$INSTDIR\tangent.exe"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Tangent" \

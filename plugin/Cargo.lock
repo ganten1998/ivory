@@ -1796,6 +1796,7 @@ dependencies = [
 name = "tangent-vst3"
 version = "2.3.0"
 dependencies = [
+ "baseview",
  "crossbeam",
  "egui",
  "ivory-core",
