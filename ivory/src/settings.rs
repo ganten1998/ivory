@@ -437,7 +437,29 @@ impl Settings {
         }
         // serde_json pretty-printing indents with 2 spaces, like Python's indent=2.
         if let Ok(text) = serde_json::to_string_pretty(&Value::Object(self.to_map())) {
-            let _ = std::fs::write(path, text);
+            // Write-then-rename, the same shape `OverrideStore::save` already
+            // uses. A bare `fs::write` truncates first, so a crash or a full
+            // disk mid-write leaves a half-written file — and `load_from`
+            // answers a parse error with ALL DEFAULTS, which it then saves over
+            // the wreckage. One torn write costs every colour, size and
+            // remembered position the user ever chose.
+            //
+            // Rare with one writer. The plugin makes it routine: several
+            // instances plus the standalone can all be saving this file, and
+            // this is what stops one of them catching another mid-write.
+            //
+            // The temp file sits beside the target so the rename stays within
+            // one filesystem, which is what makes it atomic. Errors remain
+            // silent (parity), but a failure can no longer destroy the previous
+            // good file, and it must not leave debris behind either.
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, text).is_ok() {
+                if std::fs::rename(&tmp, path).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            } else {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
 
@@ -544,6 +566,48 @@ pub fn clamp_to_monitor(pos: egui::Pos2, size: egui::Vec2, monitor: Option<egui:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A torn write costs the user every setting they ever chose, because
+    /// `load_from` answers a parse error with all-defaults and then saves those
+    /// over the wreckage. The plugin turns "rare" into "routine".
+    #[test]
+    fn saving_is_atomic_and_leaves_no_debris() {
+        let dir = std::env::temp_dir().join(format!("tangent-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        s.window_size_percent = 175;
+        s.save_to(&path);
+
+        // It landed, it parses, and it is the file we meant.
+        let back = Settings::load_from(&path);
+        assert_eq!(back.window_size_percent, 175);
+
+        // No temp file left beside it, on success.
+        let debris: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(debris.is_empty(), "left temp files behind: {debris:?}");
+
+        // Overwriting an existing file works and does not corrupt it.
+        s.window_size_percent = 50;
+        s.save_to(&path);
+        assert_eq!(Settings::load_from(&path).window_size_percent, 50);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "exactly one file");
+
+        // The rename must not have reordered the keys: the file order is
+        // Python's insertion order and unknown keys keep their place.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let first = text.find("dark_mode").unwrap();
+        let later = text.find("window_size_percent").unwrap();
+        assert!(first < later, "key order did not survive the rename");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn defaults_match_spec_table() {

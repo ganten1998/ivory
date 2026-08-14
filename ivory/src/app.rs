@@ -16,7 +16,7 @@ use crate::settings::{Rgb, Settings};
 use egui::{Pos2, Rect, Vec2, ViewportCommand};
 use ivory_core::voicing::{VoicingSession, Weights};
 use ivory_core::{ChordDetector, OverrideStore, TrainOutcome};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -52,12 +52,75 @@ fn wm_overrode_size(observed: Vec2, requested: Vec2) -> bool {
 /// longer than this. Size alone cannot tell the two apart, only timing can.
 const WM_GRACE: Duration = Duration::from_millis(600);
 
-/// Per-note data (spec §4.3.5): velocity is stored but never affects
-/// rendering; kept for parity and for the future teach layer.
-#[allow(dead_code)]
-struct NoteData {
-    velocity: u8,
-    pressed_at: Instant,
+/// What is sounding, and why (spec §10 semantics).
+///
+/// Pulled out of `IvoryApp` so it can be TESTED: the rules here have four
+/// interacting branches and had no coverage at all, while being the thing every
+/// other display in the app reads from. It is also the piece the plugin build
+/// needs, since a plugin receives note events from the host rather than from a
+/// `midir` channel, and only this half is shared.
+///
+/// Velocity and press time used to be stored per note and were read by nothing
+/// (both were `#[allow(dead_code)]`). They are gone rather than carried: arrival
+/// ORDER is a property of the tick and not of the note, which is exactly the
+/// assumption that once made a ten-note voicing shed its bass (HANDOFF §2d), and
+/// a `pressed_at` sitting in the struct invites someone to rediscover that.
+#[derive(Default)]
+pub struct NoteState {
+    /// Sounding right now, whether the key is still down or the pedal is
+    /// holding it.
+    held: HashSet<u8>,
+    /// Keys already released, sounding only because the pedal is down. Always a
+    /// subset of `held`.
+    pedalled: HashSet<u8>,
+    sustain_down: bool,
+}
+
+impl NoteState {
+    pub fn sustain_down(&self) -> bool {
+        self.sustain_down
+    }
+
+    pub fn held(&self) -> &HashSet<u8> {
+        &self.held
+    }
+
+    /// One MIDI event. The four rules, in the order they interact:
+    pub fn apply(&mut self, ev: midi::MidiEvent) {
+        match ev {
+            // A note struck again cancels a pending pedal release. Without
+            // this, re-striking a key while the pedal is down would leave the
+            // note queued to die at the next pedal lift.
+            midi::MidiEvent::NoteOn { note, .. } => {
+                self.held.insert(note);
+                self.pedalled.remove(&note);
+            }
+            midi::MidiEvent::NoteOff { note } => {
+                if self.sustain_down {
+                    // Only a note that is actually sounding can be queued. A
+                    // note-off for something never held must not create one.
+                    if self.held.contains(&note) {
+                        self.pedalled.insert(note);
+                    }
+                } else {
+                    self.held.remove(&note);
+                    self.pedalled.remove(&note);
+                }
+            }
+            // Only the DOWN-to-UP edge releases. Pedal down while already down
+            // changes nothing, and pedal up while already up must not drain a
+            // set that a later note-off will refill.
+            midi::MidiEvent::Sustain { down } => {
+                let was = self.sustain_down;
+                self.sustain_down = down;
+                if was && !down {
+                    for note in self.pedalled.drain() {
+                        self.held.remove(&note);
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub struct IvoryApp {
@@ -72,9 +135,7 @@ pub struct IvoryApp {
     midi_rx: mpsc::Receiver<midi::MidiEvent>,
     midi_conn: Option<midi::MidiConnection>,
 
-    active_notes: HashMap<u8, NoteData>,
-    notes_to_release: HashSet<u8>,
-    sustain_down: bool,
+    notes: NoteState,
     manual_notes: HashSet<u8>,
 
     current_chord: Option<String>,
@@ -187,9 +248,7 @@ impl IvoryApp {
             midi_tx,
             midi_rx,
             midi_conn,
-            active_notes: HashMap::new(),
-            notes_to_release: HashSet::new(),
-            sustain_down: false,
+            notes: NoteState::default(),
             manual_notes: HashSet::new(),
             current_chord: None,
             last_detection: None,
@@ -268,37 +327,7 @@ impl IvoryApp {
 
     fn process_midi_events(&mut self) {
         while let Ok(ev) = self.midi_rx.try_recv() {
-            match ev {
-                midi::MidiEvent::NoteOn { note, velocity } => {
-                    self.active_notes.insert(
-                        note,
-                        NoteData {
-                            velocity,
-                            pressed_at: Instant::now(),
-                        },
-                    );
-                    self.notes_to_release.remove(&note);
-                }
-                midi::MidiEvent::NoteOff { note } => {
-                    if self.sustain_down {
-                        if self.active_notes.contains_key(&note) {
-                            self.notes_to_release.insert(note);
-                        }
-                    } else {
-                        self.active_notes.remove(&note);
-                        self.notes_to_release.remove(&note);
-                    }
-                }
-                midi::MidiEvent::Sustain { down } => {
-                    let was = self.sustain_down;
-                    self.sustain_down = down;
-                    if was && !down {
-                        for note in self.notes_to_release.drain() {
-                            self.active_notes.remove(&note);
-                        }
-                    }
-                }
-            }
+            self.notes.apply(ev);
         }
     }
 
@@ -318,7 +347,7 @@ impl IvoryApp {
                 return demo;
             }
         }
-        let mut set: HashSet<u8> = self.active_notes.keys().copied().collect();
+        let mut set: HashSet<u8> = self.notes.held().iter().copied().collect();
         if self.settings.keytoggle_enabled {
             set.extend(self.manual_notes.iter().copied());
         }
@@ -1267,7 +1296,7 @@ impl IvoryApp {
             ui.painter(),
             piano_rect,
             &display,
-            self.sustain_down,
+            self.notes.sustain_down(),
             &self.settings,
         );
         if fret_h > 0.0 {
@@ -1470,6 +1499,149 @@ mod tests {
             piano_and_fret.y - initial_window_size(&s).y,
             fretboard_panel::band_height(main_width(&s))
         );
+    }
+
+    // ── The MIDI state machine (spec §10) ─────────────────────────────
+    //
+    // Four interacting rules that had no coverage at all, in the one piece of
+    // the app every other display reads from. Written before the code moves to
+    // a shared crate, because "it still compiles" is not evidence that a state
+    // machine still behaves.
+
+    use midi::MidiEvent::{NoteOff, NoteOn, Sustain};
+
+    fn held(n: &NoteState) -> Vec<u8> {
+        let mut v: Vec<u8> = n.held().iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn feed(events: &[midi::MidiEvent]) -> NoteState {
+        let mut n = NoteState::default();
+        for e in events {
+            n.apply(*e);
+        }
+        n
+    }
+
+    #[test]
+    fn a_key_sounds_while_it_is_down_and_stops_when_it_is_not() {
+        let n = feed(&[NoteOn { note: 60, velocity: 100 }, NoteOn { note: 64, velocity: 80 }]);
+        assert_eq!(held(&n), vec![60, 64]);
+        let n = feed(&[NoteOn { note: 60, velocity: 100 }, NoteOff { note: 60 }]);
+        assert!(held(&n).is_empty());
+        // A note-off for something never held is not an event, it is noise.
+        let n = feed(&[NoteOff { note: 60 }]);
+        assert!(held(&n).is_empty());
+    }
+
+    #[test]
+    fn the_pedal_holds_notes_past_the_key_and_lets_go_on_release() {
+        let n = feed(&[
+            NoteOn { note: 60, velocity: 100 },
+            Sustain { down: true },
+            NoteOff { note: 60 },
+        ]);
+        assert_eq!(held(&n), vec![60], "the pedal is down, so it still sounds");
+        assert!(n.sustain_down());
+
+        let n = feed(&[
+            NoteOn { note: 60, velocity: 100 },
+            Sustain { down: true },
+            NoteOff { note: 60 },
+            Sustain { down: false },
+        ]);
+        assert!(held(&n).is_empty(), "lifting the pedal releases what the key let go of");
+        assert!(!n.sustain_down());
+    }
+
+    #[test]
+    fn a_key_struck_again_under_the_pedal_survives_the_next_lift() {
+        // The subtle one. Without cancelling the pending release, re-striking a
+        // key while the pedal is down leaves it queued to die at the next lift,
+        // so a re-articulated note vanishes while you are still holding it.
+        let n = feed(&[
+            NoteOn { note: 60, velocity: 100 },
+            Sustain { down: true },
+            NoteOff { note: 60 },
+            NoteOn { note: 60, velocity: 100 },
+            Sustain { down: false },
+        ]);
+        assert_eq!(held(&n), vec![60], "a re-struck key must not be released by the pedal");
+    }
+
+    #[test]
+    fn only_the_down_to_up_edge_releases_anything() {
+        // Pedal down while already down changes nothing.
+        let n = feed(&[
+            NoteOn { note: 60, velocity: 100 },
+            Sustain { down: true },
+            NoteOff { note: 60 },
+            Sustain { down: true },
+        ]);
+        assert_eq!(held(&n), vec![60]);
+        // Pedal up while already up must not drain a set a later note-off fills.
+        let n = feed(&[
+            Sustain { down: false },
+            NoteOn { note: 60, velocity: 100 },
+            Sustain { down: true },
+            NoteOff { note: 60 },
+        ]);
+        assert_eq!(held(&n), vec![60]);
+    }
+
+    #[test]
+    fn a_key_still_down_when_the_pedal_lifts_keeps_sounding() {
+        // The pedal releases what the KEY let go of, and nothing else.
+        let n = feed(&[
+            NoteOn { note: 60, velocity: 100 },
+            NoteOn { note: 64, velocity: 100 },
+            Sustain { down: true },
+            NoteOff { note: 60 },
+            Sustain { down: false },
+        ]);
+        assert_eq!(held(&n), vec![64], "64 is still physically down");
+    }
+
+    #[test]
+    fn the_state_machine_never_leaks_a_note() {
+        // Random event streams: whatever happens, a note sounding with the
+        // pedal up must be one whose key is genuinely down, so lifting the
+        // pedal twice can never leave something stuck on.
+        let mut seed = 0x1234_5678u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed >> 11
+        };
+        for _ in 0..2000 {
+            let mut n = NoteState::default();
+            let mut down: HashSet<u8> = HashSet::new();
+            for _ in 0..40 {
+                let note = 60 + (next() % 4) as u8;
+                match next() % 3 {
+                    0 => {
+                        n.apply(NoteOn { note, velocity: 100 });
+                        down.insert(note);
+                    }
+                    1 => {
+                        n.apply(NoteOff { note });
+                        down.remove(&note);
+                    }
+                    _ => n.apply(Sustain { down: next() % 2 == 0 }),
+                }
+                // Everything physically down is always sounding.
+                for k in &down {
+                    assert!(n.held().contains(k), "key {k} is down but silent");
+                }
+            }
+            // Lift the pedal: what remains must be exactly the keys still down.
+            n.apply(Sustain { down: false });
+            assert_eq!(held(&n), {
+                let mut v: Vec<u8> = down.iter().copied().collect();
+                v.sort_unstable();
+                v
+            });
+        }
     }
 
     #[test]
