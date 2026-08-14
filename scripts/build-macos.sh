@@ -133,9 +133,12 @@ case "$ARCH" in
     cargo build --release -p ivory --target aarch64-apple-darwin
     mkdir -p target/universal/release
     BIN="target/universal/release/tangent"
+    # `tangent`, not `ivory`: the [[bin]] name changed at 2.3.0 and this line
+    # did not. Only the universal path uses it, so the arm64 builds that ship
+    # never touched it and it stayed wrong through two releases.
     lipo -create -output "$BIN" \
-      target/x86_64-apple-darwin/release/ivory \
-      target/aarch64-apple-darwin/release/ivory
+      target/x86_64-apple-darwin/release/tangent \
+      target/aarch64-apple-darwin/release/tangent
     ;;
 esac
 
