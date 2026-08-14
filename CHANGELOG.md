@@ -28,6 +28,16 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   looking at what you are playing, any combination of which can be showing at
   once. Choose them under **Theory** in the right-click menu, or press `T` to
   walk through them.
+  - It shows what you **put there**, not what you are playing, so it stays put
+    while your hands are busy — the point of it is to look at a key or a chord
+    while working on something else. With Keytoggle on, click the piano, the
+    neck, or the diagrams themselves to place notes; clicking a chord vertex
+    places the whole triad. **Follow MIDI** in the same menu turns live
+    tracking on if you want it.
+  - One meaning, one mark, across all three: a note you are sounding is a
+    filled disc in the same colour the piano uses for a held key, the root is
+    that disc with a ring round it, and a key that contains everything you are
+    playing gets a soft wash. Each has a one-line legend.
   - **Circle of fifths** — every key shaded by how much of what you are playing
     fits it, so keys that are close light up together. A dot on the rim for
     each note you are sounding: a triad is a tight cluster, a tritone is a

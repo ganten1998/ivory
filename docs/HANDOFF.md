@@ -575,6 +575,41 @@ run had simply produced nothing. Fixed; it now stages and moves on success.
 metadata records; `pkgutil --expand-full` extracts a tree with zero of them.
 Checked, because they look exactly like litter.
 
+### The theory band, after a play-test
+
+It shipped following live MIDI and lighting two different things in one
+colour. Both were wrong and both were found by looking at a real window.
+
+**It no longer follows your playing by default** (`theory_follow_midi`, off).
+A diagram that redraws on every note cannot be read while playing notes, and
+reading it while playing is the entire use. It shows placed notes; "Follow
+MIDI" in the Theory submenu restores live tracking.
+
+**The diagrams are inputs.** `theory_panel::hit_test` is the exact inverse of
+the drawing and is tested as such, node by node and vertex by vertex. Clicking
+a chord vertex places the whole triad.
+
+**The highlighting follows one rule: one meaning, one mark.** Sounding note =
+filled disc in the piano's active colour. Root = that disc, ringed. Key that
+fits = a neutral wash, and no wash at all for a partial fit. Major vs minor
+triads differ by solid-vs-outlined in ONE hue, because orange used to be both
+"root" and "minor triad".
+
+The lattice is anchored at C rather than re-centred on the tonic: re-centring
+looked clever and became wrong the moment it was clickable, since placing a
+note moved the node out from under the pointer.
+
+### Two process lessons from this round
+
+**`kill %1` does nothing across tool calls.** Each Bash call is a new shell, so
+a backgrounded app survives and the next screenshot is of the OLD binary. A
+correct fix looked broken for three rounds because of it. Use `pkill -f`.
+
+**`screencapture -R` grabs whatever is on top.** To photograph a background
+window without stealing focus, get its CGWindowID and use `screencapture -l`.
+There is a 40-line helper for it in the session scratchpad; it is worth
+rewriting rather than re-deriving.
+
 ### What is NOT done
 
 1. **Nobody has opened the plugin in a DAW.** It loads, instantiates and
@@ -589,7 +624,9 @@ Checked, because they look exactly like litter.
    one that already signs and notarizes the app, same account, separate
    download. `productsign` refuses the application identity outright.
    `release.sh` correctly blocks publication until this is fixed.
-4. **No release cut.** Bump the workspace version, move `[Unreleased]` under
+4. **The macOS `.pkg` is not signed** — see above. Everything else in
+   `release.sh` passes.
+5. **No release cut.** Bump the workspace version, move `[Unreleased]` under
    the new heading, then `scripts/release.sh`. `publish-github.sh` must still
    upload the legacy `Ivory-*` names (§2c).
 

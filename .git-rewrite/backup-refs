@@ -1,0 +1,16 @@
+fd6454860c8ceefa658be62f16effaa3355770b1 commit	refs/heads/backup-before-filter
+fd6454860c8ceefa658be62f16effaa3355770b1 commit	refs/heads/main
+66d6b4a84eaaec03ce2160ebb3578ece15450f2b commit	refs/remotes/github/HEAD
+66d6b4a84eaaec03ce2160ebb3578ece15450f2b commit	refs/remotes/github/main
+66d6b4a84eaaec03ce2160ebb3578ece15450f2b commit	refs/remotes/origin/HEAD
+82d978248fb0fbd912672f51ca58109eea83cc85 commit	refs/remotes/origin/archive/python-v1.0
+66d6b4a84eaaec03ce2160ebb3578ece15450f2b commit	refs/remotes/origin/main
+1c1d29cf8533706725c93e26a61901c085258762 commit	refs/remotes/origin/python-legacy
+6c243e7ccb353fee47f326e56210fc0ec963d9f8 commit	refs/stash
+46a0afd20f74df997daa49e6fcedb58ad54da1b8 commit	refs/tags/v1.0.0
+4cc250ea4d0811dea6de617ca7ce40ac78214bb6 commit	refs/tags/v1.1
+368917d2fbe9a747f134538ca9ea12a8dc7bc80e commit	refs/tags/v2.2.0
+a3489a8d894ce8272d1c6cdcfb2a40bc880aae26 tag	refs/tags/v2.3.0
+14d6ca66be128494a552190c1d223ce09e05d83c tag	refs/tags/v2.3.0-beta.1
+f264af812e2ad37efa5a52d831cdfe384d0db63c tag	refs/tags/v2.3.0-beta.2
+48e1a0ee3275aa1fed6335c7b759cd4c168b9885 tag	refs/tags/v2.3.0-beta.3
