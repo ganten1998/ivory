@@ -18,7 +18,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   longer rearranged into the position Tangent would have chosen. Clicking a
   second fret on a string moves that note rather than adding one the guitar
   could never sound.
-- **Keyboard shortcuts.** Press **F1** for the list: `K` keytoggle, `R` clear
+- **Keyboard shortcuts.** Press **H** (or F1) for the list: `K` keytoggle, `R` clear
   the notes you placed, `G` guitar view, `D` dark mode, `C` chord detection.
 
 ## [2.3.0] - 2026-08-13

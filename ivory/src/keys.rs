@@ -30,8 +30,13 @@ pub enum KeyAction {
 
 /// (key, label, what it does, whether it appears on the card).
 /// The card is generated from this, so the two cannot disagree.
+/// `H` as well as `F1`, because macOS takes F1 for screen brightness unless
+/// "use F1, F2 etc. as standard function keys" is on, and it is off by default.
+/// An app never sees the keypress at all, so a help key that only answers to F1
+/// is a help key most Mac users cannot press.
 const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
-    (Key::F1, "F1", KeyAction::ToggleHelp, true),
+    (Key::H, "H", KeyAction::ToggleHelp, true),
+    (Key::F1, "F1", KeyAction::ToggleHelp, false),
     (Key::K, "K", KeyAction::ToggleKeytoggle, true),
     (Key::R, "R", KeyAction::ClearNotes, true),
     (Key::G, "G", KeyAction::ToggleFretboard, true),
@@ -45,7 +50,7 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
 /// they cannot drift apart.
 fn describe(a: KeyAction) -> &'static str {
     match a {
-        KeyAction::ToggleHelp => "this card",
+        KeyAction::ToggleHelp => "this card (or F1)",
         KeyAction::ToggleKeytoggle => "keytoggle: click the piano or the neck to place notes",
         KeyAction::ClearNotes => "clear every note you placed",
         KeyAction::ToggleFretboard => "guitar view",
@@ -158,8 +163,16 @@ mod tests {
         }
         // Everything the card shows is a real binding, and every binding the
         // card hides is deliberate.
-        let shown = BINDINGS.iter().filter(|(.., s)| *s).count();
-        assert_eq!(shown, BINDINGS.len() - 1, "only Esc should be hidden");
+        // Hidden rows are the ALTERNATES: Esc, and F1 as a second help key.
+        // Every hidden one must duplicate an action that is shown, or a
+        // shortcut exists that the card never mentions.
+        let shown: Vec<KeyAction> =
+            BINDINGS.iter().filter(|(.., s)| *s).map(|&(_, _, a, _)| a).collect();
+        for &(_, label, action, is_shown) in BINDINGS {
+            if !is_shown && action != KeyAction::CloseHelp {
+                assert!(shown.contains(&action), "{label} is bound but never listed");
+            }
+        }
     }
 
     /// Letters that are ordinary shortcuts must not fire with a modifier held.

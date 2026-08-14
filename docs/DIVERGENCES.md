@@ -492,9 +492,14 @@ Two things this needed that were not obvious:
 The 2.2.0 tester report asked for keyboard shortcuts without saying for what,
 which is why it was not done then. Now there is something to bind them to.
 
-`F1` shows a card listing every shortcut; `K` keytoggle, `R` clears the notes
-you placed, `G` guitar view, `D` dark mode, `C` chord detection, `Esc` closes
-the card.
+`H` (or `F1`) shows a card listing every shortcut; `K` keytoggle, `R` clears
+the notes you placed, `G` guitar view, `D` dark mode, `C` chord detection,
+`Esc` closes the card.
+
+`H` exists because **macOS takes F1 for screen brightness** unless "use F1, F2
+etc. as standard function keys" is enabled, which it is not by default. The app
+never receives the keypress at all, so a help key that answers only to F1 is one
+most Mac users cannot press. F1 still works where the system allows it.
 
 - **One table, in `keys.rs`, and the card is rendered FROM it.** A shortcut that
   works but is not listed, or is listed and does not work, is worse than no

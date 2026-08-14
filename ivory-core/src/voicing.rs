@@ -1563,7 +1563,13 @@ impl VoicingSession {
                 self.seen_at = [0; 256];
                 self.next_ord = 0;
             }
-            if !self.solved_for.is_empty() {
+            // Keyed on what is DRAWN, not on the memo key. `set_pins` clears
+            // `solved_for` to invalidate the cache, so keying off it meant
+            // "clear the notes you placed" left the neck exactly as it was:
+            // pins cleared, memo key cleared, and then this test found nothing
+            // to do and kept the stale shape. The piano emptied and the guitar
+            // did not.
+            if !self.out.notes.is_empty() || !self.solved_for.is_empty() {
                 self.solved_for.clear();
                 self.out = solve(&self.spec, &[], &History::NONE, &self.w);
                 self.stats = SolveStats::default();
@@ -2559,6 +2565,26 @@ mod tests {
             assert_eq!(*s.update(&held, 20), first);
         }
         assert_eq!(s.solves(), 1, "the cache is not doing its job");
+    }
+
+    #[test]
+    fn clearing_the_pins_and_the_notes_together_empties_the_board() {
+        // The exact sequence behind "R only resets the piano". `set_pins`
+        // invalidates the cache by clearing `solved_for`, and the empty-set
+        // branch used to ask `solved_for` whether anything needed doing — so
+        // clearing pins first and notes second left the neck untouched.
+        let spec = std_spec();
+        let mut s = VoicingSession::new(spec.clone(), Weights::DEFAULT);
+        let held: HashSet<u8> = [45u8, 52, 57, 61, 64].into_iter().collect();
+        s.set_pins(vec![(45, 1, 0), (52, 2, 2), (57, 3, 2), (61, 4, 2), (64, 5, 0)]);
+        assert_eq!(s.update(&held, 100).placed().count(), 5);
+
+        // Exactly what the shortcut does, in that order.
+        s.set_pins(Vec::new());
+        let after = s.update(&HashSet::new(), 100);
+        assert!(after.notes.is_empty(), "the board kept a shape after everything was cleared");
+        assert_eq!(after.placed().count(), 0);
+        assert!(after.strings.iter().all(|st| !matches!(st, StringState::Sounding { .. })));
     }
 
     #[test]
