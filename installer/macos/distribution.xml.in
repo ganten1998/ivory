@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The macOS installer's own UI.
+
+  `customize="always"` is the whole reason this file exists rather than a bare
+  `productbuild --component`: it puts the Custom Install page in front of the
+  user by default, so choosing "just the plugin" or "just the app" is one
+  click rather than a hidden button. Both start selected, because someone who
+  downloaded Tangent almost certainly wants Tangent.
+
+  Neither choice is `required`. A user who unticks both gets an installer that
+  installs nothing, which is a legitimate thing to want to find out.
+
+  @VERSION@ and @TITLE@ are substituted by scripts/build-installer.sh; this
+  file is not valid XML input to productbuild until it has been.
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>@TITLE@</title>
+    <organization>com.ganten</organization>
+    <options customize="always" require-scripts="false" hostArchitectures="arm64,x86_64"/>
+
+    <!-- System-wide only. /Applications and /Library/Audio/Plug-Ins/VST3 are
+         both root-owned, and a per-user install of a plugin into a folder no
+         DAW scans by default is a support ticket rather than a feature. -->
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="LICENSE.txt" mime-type="text/plain"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <choices-outline>
+        <line choice="choice.standalone"/>
+        <line choice="choice.vst3"/>
+    </choices-outline>
+
+    <choice id="choice.standalone"
+            title="Tangent (application)"
+            description="The standalone app, installed to /Applications. Opens its own window and connects to a MIDI keyboard by itself."
+            start_selected="true"
+            visible="true">
+        <pkg-ref id="com.ganten.tangent.app"/>
+    </choice>
+
+    <choice id="choice.vst3"
+            title="Tangent (VST3 plugin)"
+            description="The plugin, installed to /Library/Audio/Plug-Ins/VST3. Runs inside a DAW and reads the notes on the track it is on. It produces no audio."
+            start_selected="true"
+            visible="true">
+        <pkg-ref id="com.ganten.tangent.vst3"/>
+    </choice>
+
+    <pkg-ref id="com.ganten.tangent.app" version="@VERSION@">Tangent-app.pkg</pkg-ref>
+    <pkg-ref id="com.ganten.tangent.vst3" version="@VERSION@">Tangent-vst3.pkg</pkg-ref>
+</installer-gui-script>

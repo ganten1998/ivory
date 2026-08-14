@@ -54,11 +54,16 @@ fd-lock = "4"
 [dev-dependencies]
 ttf-parser = "0.25"
 
+# No build-dependencies. `build.rs` shells out to whichever resource compiler
+# is present rather than taking `winres`, because the dependency has to be
+# chosen by the TARGET and cargo selects build-dependencies by the HOST — which
+# is why the old `[target.'cfg(windows)'.build-dependencies] winres` never once
+# ran for a Windows build cross-compiled from macOS, and why every shipped
+# tangent.exe has no icon.
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
 
-[target.'cfg(windows)'.build-dependencies]
-winres = "0.1"
 
 [lints]
 workspace = true
