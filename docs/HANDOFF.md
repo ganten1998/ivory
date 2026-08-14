@@ -515,6 +515,92 @@ one — it must be GATED, not merely left to no-op.
    `nih_export_vst3!`, then the installer. `Caps::detachable = false` for the
    plugin; the fretboard panel needs no detached variant either.
 
+## 2f. 2026-08-14 (later) — the plugin exists, and so do the installers
+
+**The VST3 plugin is built, loads and instantiates.** Steps 5-8 of
+`docs/PLUGIN-PLAN.md` are done. Also landed: the theory band (a new user
+request), and a fix for a Windows bug that had shipped in every release.
+
+### What is on `main` and unreleased
+
+Everything below 2.3.0's tag: the fretboard as an input, keyboard shortcuts,
+JetBrains Mono, the About URL, **the theory band**, **the plugin**, **the
+installers**, and **the tangent.exe icon fix**. 261 tests, no warnings,
+firewall intact.
+
+### The plugin, in one paragraph
+
+`plugin/` is its own workspace (empty `[workspace]` table). `plugin/src/lib.rs`
+is a shell: everything on screen is `ivory_ui::app::IvoryApp`, the same code
+the standalone runs. Notes cross from the audio thread on a pre-allocated
+`crossbeam::ArrayQueue` — never a mutex, because the editor holds its state
+locked for a whole frame. State persists into the DAW project as the same JSON
+the settings file holds (`Settings::to_json`/`from_json`), one `#[persist]`
+blob rather than a parameter each. The app is kept alive ACROSS editor open and
+close, because `create_egui_editor` takes its state by value and closing a
+window must not reset the tuning.
+
+### Things that will bite the next person, all verified
+
+**`send_viewport_cmd` is `egui`, not `eframe`.** The plan assumed a `Shell`
+trait was needed to route it. It was not — `app.rs` moved into `ivory-ui`
+keeping every call, gated on `caps`. The seam was three things, not nine:
+`eframe::CreationContext` (now `&egui::Context`), `midir` (now behind
+`ports::MidiPorts`), and `impl eframe::App` (now `ivory/src/desktop.rs`).
+
+**`egui-baseview` HONOURS `ViewportCommand::InnerSize`** — it calls
+`window.resize()`, `src/window.rs:369-373` — while swallowing Min and Max via
+`_ => {}`. An ungated fixed-size triple resizes the DAW's editor on frame one
+and keeps exactly the third of the mechanism that does damage.
+`a_plugin_frame_never_commands_the_hosts_window` runs four frames under
+`Caps::PLUGIN` and asserts zero commands; it fails if any one gate is removed.
+
+**`llvm-rc` treats any argument starting with `/` as a switch.** An absolute
+Unix input path is therefore not an input: `/Users/...` parses as `/U` and it
+says "Exactly one input file should be provided" while pointing at nothing.
+`/private/tmp/...` happens to work, which is why it reproduces on a real build
+and not in a scratch directory. Run it from OUT_DIR with bare filenames.
+
+**Linux cannot be cross-built, for the plugin either.** baseview links X11
+through the `x11` crate, whose build script needs a pkg-config sysroot — the
+same shape as alsa-sys for the standalone. `scripts/build-linux-remote.sh`
+builds BOTH on the Linux host and rsyncs them back.
+
+**`build-cross.sh` used to delete the Linux tarball before building it.** On
+macOS that build always fails, so every run destroyed a good artifact that had
+been built remotely — silently, before the error that made it look as if the
+run had simply produced nothing. Fixed; it now stages and moves on success.
+
+**`._` entries in `lsbom` output are not files.** They are AppleDouble
+metadata records; `pkgutil --expand-full` extracts a tree with zero of them.
+Checked, because they look exactly like litter.
+
+### What is NOT done
+
+1. **Nobody has opened the plugin in a DAW.** It loads, instantiates and
+   reports one event input and no audio buses under `scripts/verify-plugin.c`,
+   which is real proof and is not the same as seeing it draw. Test it in
+   Reaper: MIDI track, add Tangent, play.
+2. **The Linux plugin has not been built.** No ssh key for the Void box exists
+   on this machine (`~/.ssh` has only `codeberg_ed25519`). One
+   `ssh-copy-id` and `scripts/build-linux-remote.sh <host>` does the rest.
+3. **The macOS .pkg is unsigned.** It needs a *Developer ID Installer*
+   certificate — a different certificate from the *Developer ID Application*
+   one that already signs and notarizes the app, same account, separate
+   download. `productsign` refuses the application identity outright.
+   `release.sh` correctly blocks publication until this is fixed.
+4. **No release cut.** Bump the workspace version, move `[Unreleased]` under
+   the new heading, then `scripts/release.sh`. `publish-github.sh` must still
+   upload the legacy `Ivory-*` names (§2c).
+
+### Commands added this round
+
+```
+scripts/build-plugin.sh macos|windows|linux    # the .vst3 bundle
+scripts/build-installer.sh macos|windows|linux # the installers
+cc -o /tmp/vp scripts/verify-plugin.c && /tmp/vp <bundle>/Contents/MacOS/Tangent
+```
+
 ## 3. Repo layout
 
 ```

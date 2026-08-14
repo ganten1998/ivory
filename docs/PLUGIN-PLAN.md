@@ -950,3 +950,50 @@ painting garbage over the piano. The seam therefore has to sit ABOVE
 `viewport_ui`, not at it. `Caps::child_windows` is the flag that already exists
 to decide it; `keys.rs`'s help card is the shape the in-canvas version takes,
 and it is already written and shipping.
+
+---
+
+## Progress log, 2026-08-14 (later): steps 5-8 are DONE
+
+The plugin builds, loads, instantiates, and is packaged into installers on
+macOS and Windows. See `docs/HANDOFF.md` §2f for the state and what is left.
+
+**Step 5 was smaller than this plan assumed, and the reason matters.**
+`send_viewport_cmd` is `egui`, not `eframe`, so no `Shell` trait was needed to
+route it — `app.rs` moved into `ivory-ui` keeping every call, gated on `caps`.
+The `Shell`/`SurfaceSpec` design in §2 was therefore NOT implemented as
+written. What replaced it is smaller and is already proven by the 4b work:
+`shell::surface(ctx, caps, spec, add)`, one function that draws a pane either
+as an OS viewport or as an in-canvas `Area`, used by the menu, the submenu and
+all eleven dialogs. `Caps` stayed at five fields, not eight.
+
+The real seam was three things:
+  * `eframe::CreationContext` -> `&egui::Context` (nothing else was used),
+  * `midir` -> the `ports::MidiPorts` trait, with `MidiEvent` and
+    `parse_message` moved to `ivory-ui`; the mpsc channel is deliberately NOT
+    behind the trait, because a plugin fills the same one from `process()`,
+  * `impl eframe::App` -> `ivory/src/desktop.rs`, which the orphan rule forces
+    and which is the compiler stating that eframe is the binary's business.
+
+**Step 6-7** landed as described: quarantined workspace, `nih_export_vst3!`,
+`#[persist]` state. The dependency recipe in the 2026-08-13 addendum was
+correct and needed no adjustment — it compiled first try, one copy of every
+crate, zero GPL crates in the root lock.
+
+**Step 8** produced `scripts/build-plugin.sh` (bundle layout taken verbatim
+from `nih_plug_xtask`, because its own bundler hardcodes
+`com.nih-plug.<package>` and version 1.0.0) and `scripts/build-installer.sh`
+plus `installer/{macos,windows,linux}/`.
+
+### Corrections to this document
+
+* §2's `Shell` trait, `SurfaceSpec`, `SurfaceReport`, `InlineShell`,
+  `ViewportShell` and `HeadlessShell` were **not built**. Read
+  `ivory-ui/src/shell.rs` instead; it is 300 lines including tests.
+* §6's MIDI section describes `self.active_notes` / `self.notes_to_release`,
+  which the `NoteState` extraction replaced before this round began.
+* The `moduleinfo.json` question is settled: nih-plug never writes one (zero
+  hits across the checkout) and no host required it.
+* `cargo xtask bundle` is not used, so §8's `chdir_workspace_root` trap — real,
+  and it would have fired the moment `plugin/` landed inside the repo — is
+  moot rather than worked around.

@@ -24,6 +24,45 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   `A` about, `S` supporter key.
 - **JetBrains Mono** as a third bundled typeface, alongside Courier Prime and
   Terminess. Cycle with `F` or from the menu.
+- **A theory band.** A tall section above everything else with three ways of
+  looking at what you are playing, any combination of which can be showing at
+  once. Choose them under **Theory** in the right-click menu, or press `T` to
+  walk through them.
+  - **Circle of fifths** — every key shaded by how much of what you are playing
+    fits it, so keys that are close light up together. A dot on the rim for
+    each note you are sounding: a triad is a tight cluster, a tritone is a
+    straight line across. Relative minors sit on the same spoke as their major,
+    because they have the same key signature.
+  - **Tonnetz** — the lattice where left-to-right is fifths and the diagonals
+    are thirds, so every major triad is a triangle pointing up, every minor
+    triad one pointing down, and two chords sharing two notes share an edge.
+    It re-centres on whatever you are playing.
+  - **Harmonic triangles** — I, IV and V pointing up with i, iv and v inverted
+    through the same centre, each lit when you play it. Between them those
+    three chords use every note of the key and no others, which is the reason
+    so many songs need no more than them.
+- **A VST3 plugin.** Tangent now runs inside a DAW as well as on its own, with
+  the same display: chord readout, guitar view and theory band, reading the
+  notes on the track it is on. It produces no audio, so it belongs on a MIDI or
+  instrument track rather than in an effect slot. Its settings live in the DAW
+  project, not in your global settings file, so two instances and the
+  standalone can be set up differently. macOS is a signed universal binary.
+- **Installers**, one per platform, with the app and the plugin as separate
+  choices — install either, or both. Each puts the plugin where the VST3
+  specification says it goes, so every host finds it without being configured:
+  `/Library/Audio/Plug-Ins/VST3` on macOS, `Common Files\VST3` on Windows, and
+  `~/.vst3` on Linux. The Linux tarball carries an `install.sh` that needs no
+  root and understands `--app`, `--vst3`, `--prefix`, `--uninstall` and
+  `--dry-run`.
+
+### Fixed
+
+- **`tangent.exe` has never had an icon.** Every Windows release was
+  cross-compiled from macOS, and the resource step was behind two gates that
+  both test the machine doing the building rather than the machine the program
+  is for — so it never ran once, and the shipped binary had no icon in
+  Explorer, none on the taskbar, and blank Properties. It now has both an icon
+  and a version block.
 
 ## [2.3.0] - 2026-08-13
 
