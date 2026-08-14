@@ -155,6 +155,10 @@ pub struct IvoryApp {
     /// Where the bands were actually drawn, which is centred in the pane.
     /// Child windows and in-canvas dialogs centre on this.
     last_drawn: Rect,
+    /// A barre the user drew by dragging along a fret, and the drag in
+    /// progress. Only ever set by that gesture.
+    manual_barre: Option<ivory_core::voicing::Barre>,
+    barre_drag: Option<(usize, u8)>,
     /// One-shot latch for the IVORY_INLINE=menu debug hook.
     demo_menu_done: bool,
     /// Whether the main window currently has focus. Detached windows are
@@ -303,6 +307,8 @@ impl IvoryApp {
             pending_resize: None,
             last_pane: Vec2::ZERO,
             last_drawn: Rect::NOTHING,
+            manual_barre: None,
+            barre_drag: None,
             demo_menu_done: false,
             // Assume focused: a window that has just opened is, and the first
             // frames report None.
@@ -473,6 +479,91 @@ impl IvoryApp {
     /// board changes, because a pin names a `(string, fret)` on the board it
     /// was made on: keep them across a tuning or capo change and they name
     /// pitches nobody is playing.
+    /// Fret every string between two, at one fret, and remember that it is a
+    /// barre rather than a coincidence.
+    ///
+    /// Idempotent: a drag fires this on every frame it moves, so it has to be
+    /// safe to run again with the same span, and cheap enough to run at frame
+    /// rate. Re-solving is gated behind an actual change for that reason.
+    fn place_barre(
+        &mut self,
+        spec: &ivory_core::fretboard::FretboardSpec,
+        a: usize,
+        b: usize,
+        fret: u8,
+    ) {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let mut changed = false;
+        for st in lo..=hi {
+            let Some(note) = spec.pitch_at(st, fret) else {
+                continue;
+            };
+            // One finger per string, exactly as a single click does: a barre
+            // that left an older note on the same string would be a hand with
+            // two fingers on one string.
+            let stale: Vec<u8> = self
+                .manual_positions
+                .iter()
+                .filter(|(_, &(s, _))| s == st)
+                .map(|(&n, _)| n)
+                .collect();
+            for n in stale {
+                if n != note {
+                    self.manual_positions.remove(&n);
+                    self.manual_notes.remove(&n);
+                    changed = true;
+                }
+            }
+            if self.manual_positions.insert(note, (st, fret)) != Some((st, fret)) {
+                changed = true;
+            }
+            changed |= self.manual_notes.insert(note);
+        }
+        let barre = (hi > lo).then_some(ivory_core::voicing::Barre {
+            fret,
+            lo_string: lo,
+            hi_string: hi,
+        });
+        if barre != self.manual_barre {
+            self.manual_barre = barre;
+            changed = true;
+        }
+        if changed {
+            self.sync_pins();
+            self.detection_tick(true);
+            self.voicing_tick(true);
+        }
+    }
+
+    /// The barre to draw, which is not always the one the solver derived.
+    ///
+    /// For a shape the SOLVER chose, its own barre is the right answer: it
+    /// decided to bar those strings and the diagram should say so.
+    ///
+    /// For a shape entered BY HAND, it is not. `barre_and_fingers` reads a
+    /// barre out of any adjacent strings that share their lowest fret, so
+    /// placing two notes that happen to line up drew a bar across them and
+    /// claimed a finger position nobody asked for. By hand, a barre is
+    /// something you make on purpose — by dragging along a fret — and nothing
+    /// else counts as one.
+    fn barre_to_draw(&self) -> Option<ivory_core::voicing::Barre> {
+        if self.manual_positions.is_empty() {
+            return self.voicing.current().shape.barre;
+        }
+        // Checked against the notes rather than trusted. A barre is only a
+        // barre while every string it spans is still fretted at that fret, and
+        // the user is free to click one of them off afterwards. Validating
+        // here rather than clearing at each of the places a note can go away
+        // means it cannot be left behind by one that was missed.
+        let b = self.manual_barre?;
+        let all_there = (b.lo_string..=b.hi_string).all(|st| {
+            self.manual_positions
+                .iter()
+                .any(|(n, &(s, f))| s == st && f == b.fret && self.manual_notes.contains(n))
+        });
+        all_there.then_some(b)
+    }
+
     fn sync_pins(&mut self) {
         let pins: Vec<(u8, usize, u8)> = self
             .manual_positions
@@ -697,9 +788,11 @@ impl IvoryApp {
         if self.dialog.is_some() {
             return; // Qt dialogs are modal: main window ignores input.
         }
-        let (primary_pressed, pointer, ctrl) = ctx.input(|i| {
+        let (primary_pressed, pointer_down, pointer_released, pointer, ctrl) = ctx.input(|i| {
             (
                 i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.primary_released(),
                 i.pointer.interact_pos(),
                 i.modifiers.ctrl,
             )
@@ -734,6 +827,32 @@ impl IvoryApp {
             }
             // Either way the click stops here rather than reaching a piano key.
             return;
+        }
+
+        // ── the barre gesture ─────────────────────────────────────────────
+        //
+        // Hold and drag along a fret and every string you cross is fretted
+        // there. This is the ONLY way to get a barre: a shape entered by hand
+        // gets one because you drew one, never because two notes happened to
+        // line up.
+        if self.settings.keytoggle_enabled {
+            if let (Some((start_st, fret)), Some(pos)) = (self.barre_drag, pointer) {
+                if pointer_down {
+                    if let Some(r) = fret_rect.filter(|r| r.contains(pos)) {
+                        let spec = self.settings.fretboard_spec();
+                        if let Some((st, f)) = fretboard_panel::position_at(r, &spec, pos) {
+                            // Same fret only. Dragging diagonally is someone
+                            // reaching for a different note, not barring.
+                            if f == fret && st != start_st {
+                                self.place_barre(&spec, start_st, st, fret);
+                            }
+                        }
+                    }
+                }
+            }
+            if pointer_released {
+                self.barre_drag = None;
+            }
         }
 
         if primary_pressed && !ctrl_as_context {
@@ -817,6 +936,10 @@ impl IvoryApp {
                                     &self.settings.fretboard_spec(),
                                     pos,
                                 ) {
+                                    // A press on the neck may become a drag
+                                    // along a fret, which is the only way to
+                                    // make a barre.
+                                    self.barre_drag = Some((st, fret));
                                     // One finger per string, because that is
                                     // how a guitar works. Clicking a second
                                     // fret on a string MOVES the note there
@@ -1047,6 +1170,7 @@ impl IvoryApp {
             K::ClearNotes => {
                 self.manual_notes.clear();
                 self.manual_positions.clear();
+                self.manual_barre = None;
                 self.voicing.set_pins(Vec::new());
                 self.detection_tick(true);
                 self.voicing_tick(true);
@@ -1123,6 +1247,7 @@ impl IvoryApp {
                 if !self.settings.keytoggle_enabled {
                     self.manual_notes.clear(); // disabling clears manual notes
                     self.manual_positions.clear();
+                    self.manual_barre = None;
                     self.voicing.set_pins(Vec::new());
                 }
                 self.save_settings();
@@ -1932,6 +2057,7 @@ impl IvoryApp {
                 &spec,
                 &self.settings,
                 self.settings.fretboard_wood(),
+                self.barre_to_draw(),
             );
             fretboard_panel::draw_top_edge(ui.painter(), fret_rect, &self.settings);
         }
@@ -1972,6 +2098,7 @@ impl IvoryApp {
                 &spec,
                 &self.settings,
                 self.settings.fretboard_wood(),
+                self.barre_to_draw(),
             );
             // Same tiling-WM guard as the chord window: inside the grace
             // period a size mismatch is the window manager's doing, not the
@@ -2226,6 +2353,76 @@ mod tests {
                 app.menu_state = None;
             }
         }
+    }
+
+    /// A barre comes from a drag along a fret, and from nothing else.
+    ///
+    /// The solver derives one from any adjacent strings sharing their lowest
+    /// fret, which is right for a shape IT chose and wrong for one entered by
+    /// hand: two notes that happen to line up are two notes, and a bar drawn
+    /// across them claims a finger position nobody asked for.
+    #[test]
+    fn a_hand_entered_barre_comes_only_from_a_drag() {
+        let (ctx, mut app) = headless_with(
+            Caps::DESKTOP,
+            Settings {
+                show_welcome: false,
+                show_fretboard: true,
+                keytoggle_enabled: true,
+                ..Settings::default()
+            },
+        );
+        let _ = &ctx;
+        let spec = app.settings.fretboard_spec();
+
+        // Two notes placed one at a time on the same fret, adjacent strings.
+        // The solver would call that a barre; by hand it is two notes.
+        for st in [0usize, 1] {
+            let note = spec.pitch_at(st, 5).unwrap();
+            app.manual_positions.insert(note, (st, 5));
+            app.manual_notes.insert(note);
+        }
+        app.sync_pins();
+        assert_eq!(
+            app.barre_to_draw(),
+            None,
+            "two hand-placed notes on one fret were drawn as a barre"
+        );
+
+        // Dragged, they are.
+        app.place_barre(&spec, 0, 3, 5);
+        let b = app.barre_to_draw().expect("a drag makes a barre");
+        assert_eq!(b.fret, 5);
+        assert_eq!((b.lo_string, b.hi_string), (0, 3));
+        // ...and every string it crosses is actually fretted.
+        for st in 0..=3usize {
+            let note = spec.pitch_at(st, 5).unwrap();
+            assert_eq!(app.manual_positions.get(&note), Some(&(st, 5)));
+        }
+
+        // Take one of them off and it stops being a barre, without anything
+        // having to remember to clear it.
+        let gone = spec.pitch_at(2, 5).unwrap();
+        app.manual_notes.remove(&gone);
+        assert_eq!(
+            app.barre_to_draw(),
+            None,
+            "a barre survived one of its own strings being removed"
+        );
+
+        // A drag that stays on one string is not a barre either.
+        app.manual_notes.clear();
+        app.manual_positions.clear();
+        app.manual_barre = None;
+        app.place_barre(&spec, 2, 2, 7);
+        assert_eq!(app.barre_to_draw(), None, "a one-string drag made a barre");
+
+        // With nothing placed by hand, the solver's own barre is shown again:
+        // it chose to bar those strings and the diagram should say so.
+        app.manual_positions.clear();
+        app.manual_notes.clear();
+        app.sync_pins();
+        assert_eq!(app.barre_to_draw(), app.voicing.current().shape.barre);
     }
 
     /// A host that cannot open windows must not believe something is detached.

@@ -31,7 +31,7 @@ use crate::fonts;
 use crate::settings::Settings;
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
 use ivory_core::fretboard::{self, FretboardSpec};
-use ivory_core::voicing::{Outcome, StringState, Voicing};
+use ivory_core::voicing::{Barre, Outcome, StringState, Voicing};
 
 /// Band height for a 1300pt-wide window, scaled with everything else. Six
 /// strings need enough room that a dot is a dot rather than a smear, and the
@@ -374,6 +374,7 @@ pub fn draw(
     spec: &FretboardSpec,
     s: &Settings,
     wood: Wood,
+    barre: Option<Barre>,
 ) {
     let p = palette(s, wood);
     painter.rect_filled(rect, 0.0, p.bg);
@@ -443,7 +444,14 @@ pub fn draw(
 
     // ── what is being played ────────────────────────────────────────────────
     // Barre first, so the dots sit on top of it.
-    if let Some(b) = voicing.shape.barre {
+    //
+    // TOLD, not inferred. The solver derives a barre from the shape — adjacent
+    // strings sharing their lowest fret — which is the right model for a shape
+    // IT chose, and the wrong one for a shape you entered by hand: two notes
+    // that happen to share a fret are two notes, and drawing a bar across them
+    // claims a finger position you did not ask for. The caller decides which
+    // of the two this is; this module only draws.
+    if let Some(b) = barre {
         if b.hi_string < g.strings {
             let x = g.press_x(b.fret);
             let w = g.dot_r() * 1.7;
@@ -858,6 +866,7 @@ pub fn show_detached_window(
     spec: &FretboardSpec,
     s: &Settings,
     wood: Wood,
+    barre: Option<Barre>,
 ) -> DetachedOutcome {
     let mut outcome = DetachedOutcome::default();
     let mut builder = egui::ViewportBuilder::default()
@@ -878,7 +887,7 @@ pub fn show_detached_window(
     ctx.show_viewport_immediate(viewport_id(), builder, |vp, _class| {
         crate::shell::viewport_ui(vp, |ui| {
             let rect = ui.max_rect();
-            draw(ui.painter(), rect, voicing, spec, s, wood);
+            draw(ui.painter(), rect, voicing, spec, s, wood, barre);
             painter_border(ui.painter(), rect);
 
             let (close, inner_rect, outer_rect, pressed, secondary, pointer) = ui.input(|i| {
@@ -1441,7 +1450,7 @@ mod tests {
                     for wood in Wood::ALL {
                         let _ = ctx.run(Default::default(), |ctx| {
                             egui::CentralPanel::default().show(ctx, |ui| {
-                                draw(ui.painter(), rect(), &v, &spec, &s, wood);
+                                draw(ui.painter(), rect(), &v, &spec, &s, wood, v.shape.barre);
                                 draw_top_edge(ui.painter(), rect(), &s);
                             });
                         });
