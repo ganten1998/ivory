@@ -898,3 +898,55 @@ plugin exists, so it lands after step 11 (`scripts/build-plugin.sh`) as step 12.
 But the DESTINATIONS should be decided now, because the bundle identifier, the
 `.vst3` bundle name and the CID are all frozen forever on first release and the
 installer is what makes them visible.
+
+
+---
+
+## Progress log
+
+Steps completed, with what each actually taught. Kept here rather than in the
+commit log because the next session reads this file first.
+
+**1-2. Freeze the seams (`c983678`).** The note/sustain state machine had ZERO
+coverage while being what every display reads from; extracted to `NoteState` and
+given six tests including a 2,000-stream property check. `Settings::save_to` was
+a bare `fs::write`, and `load_from` answers a parse error with all-defaults which
+it then saves over the wreckage — one torn write costs every setting the user
+ever chose. Now write-then-rename. Rare with one writer; routine once several
+plugin instances share the file.
+
+**3. `ivory-ui` extracted (`441bcfd`).** Nine modules moved by `git mv`,
+unchanged. The set was already closed: they reference each other and `ivory-core`
+and nothing else, and not one mentioned eframe, midir, rfd or fd-lock.
+**229 tests before, 229 after** — `ivory-ui` 53, the binary 11. `app.rs` stays in
+the binary for now because it still owns eframe.
+
+`scripts/check-firewall.sh` is the enforcement, and it was verified to FAIL:
+planting a `process::exit` in `ivory-ui` makes it exit non-zero and name the
+line. Two things it caught in passing:
+`gen-third-party-licenses.sh` had a hardcoded skip list, so `ivory-ui` would have
+shipped in the MIT app's `THIRD-PARTY-LICENSES` as a third-party dependency of
+itself; and `dialogs.rs`'s `env!("CARGO_PKG_VERSION")` now reads `ivory-ui`'s
+version, so `ivory_ui::VERSION` names that coupling.
+
+**4a. `Caps` (`host.rs`), and the menu consumes it.** Plain data, not a trait:
+every field is a fact the UI needs at a branch point, and a struct of bools can
+be built in a test for a host that does not exist yet. Fields name a CAPABILITY
+and never a host — `if caps.child_windows` still reads correctly the day someone
+writes a CLAP build; `if is_plugin` would need revisiting.
+
+Under `Caps::PLUGIN` the menu drops Size, Borderless, Select MIDI Input and both
+Detach pairs, and keeps everything that is pure state: dark mode, keytoggle,
+teach, correct, learning, guitar view, Wood, Tuning, Capo, colours, About,
+supporter key. Two tests hold the line — one asserts the DESKTOP menu is
+unchanged, one asserts no surviving PLUGIN row needs a window or a device.
+
+### Next: the surface seam (step 4b)
+
+The remaining five `show_viewport_immediate` sites, all of which funnel through
+`shell::viewport_ui`. **Read §0 before starting**: those calls do not fail in a
+plugin, they run EMBEDDED and open a second `CentralPanel` under an identical id,
+painting garbage over the piano. The seam therefore has to sit ABOVE
+`viewport_ui`, not at it. `Caps::child_windows` is the flag that already exists
+to decide it; `keys.rs`'s help card is the shape the in-canvas version takes,
+and it is already written and shipping.

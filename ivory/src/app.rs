@@ -416,6 +416,8 @@ impl IvoryApp {
             fretboard_on: self.settings.show_fretboard,
             wood: self.settings.fretboard_wood().key(),
             fretboard_detached: self.settings.fretboard_detached,
+            // The standalone owns its window, its device list and its config.
+            caps: ivory_ui::host::Caps::DESKTOP,
             tuning: self.settings.fretboard_spec().tuning.name,
             capo: self.settings.fretboard_spec().capo,
             next_font: {

@@ -8,6 +8,7 @@ pub mod chord_strip;
 pub mod dialogs;
 pub mod fonts;
 pub mod fretboard_panel;
+pub mod host;
 pub mod keys;
 pub mod menu;
 pub mod piano;

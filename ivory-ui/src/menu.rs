@@ -10,6 +10,7 @@
 //! themselves (no checkmarks anywhere).
 
 use crate::fonts;
+use crate::host::Caps;
 use crate::fretboard_panel;
 use ivory_core::fretboard;
 use egui::{
@@ -93,6 +94,11 @@ pub struct MenuView {
     pub wood: &'static str,
     /// D-UI-16: the guitar view is in its own window.
     pub fretboard_detached: bool,
+    /// What the host allows. Rows whose action needs a window, a device list,
+    /// or control of its own size are not shown where they cannot work — an
+    /// inert row is worse than an absent one, because the user cannot tell
+    /// whether they mis-clicked or the app is broken.
+    pub caps: Caps,
 }
 
 #[derive(Clone, Copy)]
@@ -195,24 +201,31 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         items,
     };
     let mut e = Vec::new();
-    // 1. Size submenu
-    e.push(submenu(
-        "Size",
-        SIZE_PERCENTS
-            .iter()
-            .map(|&p| (format!("{p}%"), MenuAction::SetSizePercent(p)))
-            .collect(),
-    ));
-    e.push(Entry::Separator);
-    // 3. Borderless toggle (label shows what you would switch TO the current
-    //    state from: "Borderless" while bordered, "Bordered" while borderless)
-    e.push(item(
-        if view.borderless { "Bordered" } else { "Borderless" },
-        MenuAction::ToggleBorderless,
-    ));
-    e.push(Entry::Separator);
-    e.push(item("Select MIDI Input...", MenuAction::SelectMidiInput));
-    e.push(Entry::Separator);
+    // 1. Size submenu, and the borderless toggle: both are the app deciding
+    //    its own geometry, which a plugin editor does not get to do.
+    if view.caps.window_sizing {
+        e.push(submenu(
+            "Size",
+            SIZE_PERCENTS
+                .iter()
+                .map(|&p| (format!("{p}%"), MenuAction::SetSizePercent(p)))
+                .collect(),
+        ));
+        e.push(Entry::Separator);
+        // 3. Borderless toggle (label shows what you would switch TO the
+        //    current state from: "Borderless" while bordered, "Bordered"
+        //    while borderless)
+        e.push(item(
+            if view.borderless { "Bordered" } else { "Borderless" },
+            MenuAction::ToggleBorderless,
+        ));
+        e.push(Entry::Separator);
+    }
+    // A plugin is handed its notes by the host and has no device to choose.
+    if view.caps.midi_ports {
+        e.push(item("Select MIDI Input...", MenuAction::SelectMidiInput));
+        e.push(Entry::Separator);
+    }
     e.push(item(
         "Set White Key Color...",
         MenuAction::PickColor(ColorTarget::WhiteIdle),
@@ -275,7 +288,7 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         MenuAction::ToggleNotePreference,
     ));
     e.push(Entry::Separator);
-    if view.detached {
+    if view.detached && view.caps.detachable {
         e.push(item("Attach Chord Window", MenuAction::AttachChordWindow));
     } else {
         e.push(item(
@@ -286,7 +299,7 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
             },
             MenuAction::ToggleChordDetection,
         ));
-        if view.detection_enabled {
+        if view.detection_enabled && view.caps.detachable {
             e.push(item("Detach Chord Window", MenuAction::DetachChordWindow));
         }
     }
@@ -338,14 +351,16 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     if view.fretboard_on {
         // Mirrors the chord window's Detach/Attach exactly, so there is one
         // set of habits rather than two.
-        e.push(item(
-            if view.fretboard_detached { "Attach Fretboard" } else { "Detach Fretboard" },
-            if view.fretboard_detached {
-                MenuAction::AttachFretboard
-            } else {
-                MenuAction::DetachFretboard
-            },
-        ));
+        if view.caps.detachable {
+            e.push(item(
+                if view.fretboard_detached { "Attach Fretboard" } else { "Detach Fretboard" },
+                if view.fretboard_detached {
+                    MenuAction::AttachFretboard
+                } else {
+                    MenuAction::DetachFretboard
+                },
+            ));
+        }
         e.push(submenu(
             "Wood",
             fretboard_panel::Wood::ALL
@@ -737,6 +752,7 @@ mod tests {
             capo: 0,
             wood: "rosewood",
             fretboard_detached: false,
+            caps: Caps::DESKTOP,
         }
     }
 
@@ -917,6 +933,75 @@ mod tests {
         // Comfortably inside: untouched.
         let inside = Pos2::new(300.0, 200.0);
         assert_eq!(clamp(inside, size, 200.0, mon), inside);
+    }
+
+    /// The desktop menu must be BYTE-IDENTICAL under `Caps::DESKTOP`. This
+    /// refactor is only safe if the shipping app cannot tell it happened.
+    #[test]
+    fn desktop_caps_change_nothing() {
+        let mut v = view();
+        v.fretboard_on = true;
+        v.detection_enabled = true;
+        let with = rows(v);
+        // The same view, built the way it was before Caps existed, is what
+        // `Caps::DESKTOP` has to reproduce: every row present.
+        assert!(with.iter().any(|(_, a, _)| *a == MenuAction::ToggleBorderless));
+        assert!(with.iter().any(|(_, a, _)| *a == MenuAction::SelectMidiInput));
+        assert!(with.iter().any(|(_, a, _)| *a == MenuAction::DetachChordWindow));
+        assert!(with.iter().any(|(_, a, _)| *a == MenuAction::DetachFretboard));
+        assert_eq!(submenus(v)[0].0, "Size");
+        assert_eq!(with.last().map(|(_, a, _)| *a), Some(MenuAction::ResetSettings));
+    }
+
+    /// In a plugin, every row that survives must be one the host can actually
+    /// honour. An inert row is worse than an absent one: the user cannot tell
+    /// whether they mis-clicked or the app is broken.
+    #[test]
+    fn no_surviving_plugin_row_needs_a_window_or_a_device() {
+        let v = MenuView {
+            caps: Caps::PLUGIN,
+            fretboard_on: true,
+            detection_enabled: true,
+            detached: true,
+            fretboard_detached: true,
+            ..view()
+        };
+        let forbidden = [
+            MenuAction::SelectMidiInput,
+            MenuAction::ToggleBorderless,
+            MenuAction::DetachChordWindow,
+            MenuAction::AttachChordWindow,
+            MenuAction::DetachFretboard,
+            MenuAction::AttachFretboard,
+        ];
+        for (label, action, _) in rows(v) {
+            assert!(
+                !forbidden.contains(&action),
+                "{label} needs something a plugin editor does not have"
+            );
+        }
+        // Size is the app choosing its own geometry, which the host owns.
+        assert!(
+            !submenus(v).iter().any(|(name, ..)| name == "Size"),
+            "Size must not be offered where the host decides the size"
+        );
+        // And what SHOULD survive still does: the whole point is a plugin that
+        // can still teach a chord, change tuning and pick a colour.
+        let kept = rows(v);
+        for want in [
+            MenuAction::ToggleDarkMode,
+            MenuAction::ToggleKeytoggle,
+            MenuAction::TeachChordName,
+            MenuAction::ManageTaughtChords,
+            MenuAction::ToggleFretboard,
+            MenuAction::ShowAbout,
+        ] {
+            assert!(kept.iter().any(|(_, a, _)| *a == want), "{want:?} went missing");
+        }
+        // Tuning, Capo and Wood are pure state and must all remain.
+        let subs = submenus(v);
+        assert_eq!(subs.len(), 3, "expected Wood, Tuning, Capo");
+        assert_eq!(subs[0].0, "Wood");
     }
 
     /// The learning block sits with the teach block, after it, and the menu
