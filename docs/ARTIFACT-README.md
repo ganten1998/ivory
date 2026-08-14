@@ -159,5 +159,10 @@ Font License 1.1 — see OFL.txt.
   Windows   next to tangent.exe
   Linux     in this folder; OFL.txt is in fonts/
 
+THANKS
+
+  Omer, for the rounded macOS app icon.
+  Hatsu, for extensive Windows testing and feedback.
+
 Tangent is pay-what-you-can, and nothing is a perfectly good amount. Thanks for
 playing.

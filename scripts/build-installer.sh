@@ -291,8 +291,16 @@ build_linux() {
   # sync bookkeeping leaking into a release.
   xattr -cr "$dir" 2>/dev/null || true
 
+  # Written beside the real name and moved into place only on success.
+  #
+  # The input and the output are the SAME FILE — this unpacks the tarball, adds
+  # the plugin and the installer, and repacks it — so a failure anywhere in
+  # between used to destroy the artifact it was given, which took a remote
+  # rebuild to get back. `package_linux` in build-cross.sh learned this the
+  # same way.
   local out="dist/tangent-$VERSION-linux-x86_64.tar.gz"
-  ( cd "$WORK/linux" && tar --no-mac-metadata --no-xattrs -czf "$ROOT/$out" "$(basename "$dir")" )
+  ( cd "$WORK/linux" && tar --no-mac-metadata --no-xattrs -czf "$ROOT/$out.new" "$(basename "$dir")" )
+  mv -f "$ROOT/$out.new" "$ROOT/$out"
 
   echo "==> $out"
   ls -lh "$out" | sed 's/^/    /'

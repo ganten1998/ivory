@@ -162,6 +162,29 @@ for a in "${ARTIFACTS[@]}"; do
   fi
 done
 
+# ── arm64-named aliases for the universal build ──────────────────────────────
+# The macOS app was Apple Silicon only until 3.0.0 and shipped as
+# `Tangent-macos-arm64.{zip,dmg}`. Those exact names are the permanent links in
+# the README, in every supporter email already sent, and on the store page.
+# Going universal renames the artifact, so without this they 404 for everyone
+# who has ever been given a link — the same failure the legacy Ivory-* block
+# exists to prevent, one rename later.
+#
+# The file is the same file. A universal binary IS an arm64 binary, so an old
+# link keeps working and now happens to run on an Intel Mac too.
+for a in "${ARTIFACTS[@]}"; do
+  [ "$PRERELEASE" = 1 ] && break
+  base="${a#dist/}"
+  case "$base" in *-universal.*) ;; *) continue ;; esac
+  for name in "${base/-${VERSION}-/-}" ; do
+    for spelled in "${name}" "${name/#Tangent-/Ivory-}"; do
+      arm="${spelled/-universal./-arm64.}"
+      cp "$a" "$STAGE/$arm"
+      UPLOADS+=("$STAGE/$arm")
+    done
+  done
+done
+
 echo "==> ${#UPLOADS[@]} assets (${#ARTIFACTS[@]} artifacts, each in both spellings)"
 for u in "${UPLOADS[@]}"; do echo "    $(basename "$u")"; done
 

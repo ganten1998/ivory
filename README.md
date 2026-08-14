@@ -4,29 +4,48 @@
 
 ### [⬇ Download](https://github.com/ganten1998/ivory/releases/latest) &nbsp;·&nbsp; [♥ Support Tangent](https://ganten.gumroad.com/l/ivory)
 
-![Tangent showing an F major 9 chord](docs/img/screenshot-maj9.png)
+![Tangent naming a C major 13, with the circle of fifths, a Tonnetz and the harmonic triangles above it](docs/img/screenshot-theory.png)
 
 Tangent is a MIDI keyboard monitor with advanced chord detection. Plug in a MIDI
 keyboard and Tangent renders all 88 keys (A0 to C8) in real time while a
 weighted-scoring chord engine names what you are playing, from plain triads to
 altered dominants, rootless jazz voicings, slash chords, and scales.
 
-![Tangent showing an altered dominant](docs/img/screenshot-alt.png)
+It also shows you the same notes **on a guitar neck**, where a player would
+actually put their fingers, and **as geometry** — on the circle of fifths, on a
+Tonnetz, and as the I-IV-V triangles.
 
-Tangent 2.x is a ground-up Rust rewrite of the Python app (final Python release:
-1.1.0), keeping the same look, behaviors, and settings file. It runs on
-macOS 11 (Big Sur) and later, on Windows, and on Linux (glibc 2.32+, ALSA,
-Wayland or X11).
+![Tangent in dark mode naming an altered dominant, on an ebony fingerboard](docs/img/screenshot-dark-alt.png)
+
+Since 3.0.0 it runs **inside a DAW as well**, as a VST3 plugin with the same
+display. Tangent 2.x and later are a ground-up Rust rewrite of the Python app
+(final Python release: 1.1.0), keeping the same look, behaviors, and settings
+file. It runs on macOS 11 (Big Sur) and later, on Windows, and on Linux
+(glibc 2.32+, ALSA, Wayland or X11).
 
 ## Download
 
-| Platform | File |
-|---|---|
-| macOS 11+ (Apple Silicon) | [`.dmg`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.dmg) or [`.zip`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.zip) |
-| Windows 10+ | [`.zip`](https://github.com/ganten1998/ivory/releases/latest/download/tangent-windows-x86_64.zip) |
-| Linux x86_64 | [`.tar.gz`](https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz) |
+The **installer** is the easy option: it offers the app and the VST3 plugin as
+separate choices, so you can take either or both, and it puts the plugin where
+your DAW already looks.
 
-Intel Macs are not covered yet. The macOS build is Apple Silicon only.
+| Platform | Installer | Or unpack it yourself |
+|---|---|---|
+| macOS 11+ | [`.pkg`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos.pkg) | [`.dmg`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.dmg) · [`.zip`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.zip) |
+| Windows 10+ | [`setup.exe`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-windows-setup.exe) | [`.zip`](https://github.com/ganten1998/ivory/releases/latest/download/tangent-windows-x86_64.zip) |
+| Linux x86_64 | `install.sh`, inside the tarball | [`.tar.gz`](https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz) |
+
+macOS builds are universal from 3.0.0 — Apple Silicon and Intel — and signed
+and notarized. The Linux `install.sh` needs no root by default and takes
+`--app`, `--vst3`, `--system`, `--prefix`, `--uninstall` and `--dry-run`.
+
+### The plugin
+
+Tangent.vst3 shows everything the app does, reading the notes on the track it
+is on. **It produces no audio** — it is a monitor, not an instrument — so put
+it on a MIDI or instrument track rather than in an effect slot. Its settings
+live in the DAW project, so two instances and the standalone can each be set
+up differently.
 
 ## Features
 
@@ -44,6 +63,28 @@ Intel Macs are not covered yet. The macOS build is Apple Silicon only.
 - **Readable labels** in parenthetical notation: `C(add9)`, `C7(b9,#11)`,
   `Cm(add9)/G`, `CΔ7`, `6/9`, with lead sheet symbols `Δ`, `°`, `ø` and `+`.
   Flats and sharps preference toggle.
+- **A theory band.** A tall section above everything else with three ways of
+  seeing what you are playing — any combination of them, side by side.
+  - **Circle of fifths** — each key shaded by how much of what you are playing
+    belongs to it, so keys that are close light up together. A filled disc for
+    every note you are sounding: a triad is a tight cluster, a tritone is a
+    line straight across. Relative minors sit on the same spoke as their major,
+    because they share a key signature.
+  - **Tonnetz** — the lattice where left-to-right is fifths and the diagonals
+    are thirds, so every major triad is a triangle pointing up, every minor
+    triad one pointing down, and two chords that share two notes share an edge.
+  - **Harmonic triangles** — I, IV and V pointing up with i, iv and v inverted
+    through the same centre. Between them those three chords use every note of
+    the key and no others, which is why so many songs need no more.
+
+  It shows what you **put there** rather than what you are playing, so it holds
+  still while your hands are busy — click the piano, the neck or the diagrams
+  themselves. *Follow MIDI* makes it live if you would rather.
+- **Keyboard shortcuts.** Hold **H** for the list. **N** names the chord you are
+  holding — the box opens with the current name selected, so you just type.
+  **E** corrects a reading, **M** opens what you have taught, **T** cycles the
+  theory band, **G** the guitar view, and **K**, **R**, **C**, **D**, **B**,
+  **F**, **L**, **P**, **A**, **S** the rest.
 - **Teach Tangent your names.** Right-click, then *Teach Chord Name…* pins your
   own name to the voicing you are holding. Tick *Apply in all keys* to make the
   name follow the shape through every transposition. *Manage Taught Chords…*
@@ -55,7 +96,7 @@ Intel Macs are not covered yet. The macOS build is Apple Silicon only.
   too, a measured ~1 chord in 10 across a 13,133-voicing corpus, often in other
   keys. *Forget Learning* in *Manage Taught Chords…* restores stock naming
   exactly. *Disable Chord Learning* silences it without erasing anything.
-- **Guitar view.** *Show Fretboard* adds a neck under the piano and puts the
+- **Guitar view, both ways.** *Show Fretboard* adds a neck under the piano and puts the
   notes you are holding where a guitarist would actually play them. One MIDI
   note can be six places on a guitar. Middle C is five of them, and the high E
   string cannot reach it at all, so Tangent picks the shape a player would use,
@@ -65,7 +106,18 @@ Intel Macs are not covered yet. The macOS build is Apple Silicon only.
   out-of-range note shows as a hollow dot with the octave it moved, a note the
   guitar cannot sound alongside the others shows as a faint ring where it wanted
   to go, and anything left off is counted underneath. Three fingerboard woods
-  (rosewood, maple, ebony), and the neck pops out into its own window.
+  (rosewood, maple, ebony), and the neck pops out into its own window. The capo
+  cycles black, brushed silver and wood when you click it.
+
+  It is an **input** too: with Keytoggle on, click the neck to place notes and
+  read the chord off the piano above, instead of only the other way round.
+  Shapes stay where you put them. Hold and drag along a fret to lay a barre —
+  which is the only way to get one by hand, so two notes that happen to share a
+  fret stay two notes.
+- **A VST3 plugin.** The same display inside your DAW, reading the notes on the
+  track it is on. It produces no audio — put it on a MIDI or instrument track.
+  Settings live in the project, so instances can differ from each other and
+  from the standalone. macOS is a signed universal binary.
 - **Detachable chord display.** Pop the chord strip into its own independent
   window, and close it to reattach.
 - **Dark mode** with theme-aware context menus (ivory-on-black and
@@ -216,6 +268,13 @@ never touches.
 
 Release history, including the Python lineage, is in
 [CHANGELOG.md](CHANGELOG.md).
+
+## Thanks
+
+- **Omer**, for the rounded macOS app icon — the one Tangent wears in the Dock
+  and in Finder.
+- **Hatsu**, for extensive Windows testing and feedback, on a platform the
+  author does not develop on and could not have got right alone.
 
 ## License
 

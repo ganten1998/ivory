@@ -62,20 +62,36 @@ DOWNLOAD TANGENT
 
 These links always give you the current version, so they are worth keeping.
 
-macOS 11 or later, Apple Silicon
-https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.dmg
+Each installer offers the app and the VST3 plugin as separate choices, so you
+can take either or both. The plugin goes where your DAW already looks.
 
-Prefer a .zip:
-https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.zip
+macOS 11 or later, Apple Silicon or Intel
+https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos.pkg
 
 Windows 10 or later
-https://github.com/ganten1998/ivory/releases/latest/download/tangent-windows-x86_64.zip
+https://github.com/ganten1998/ivory/releases/latest/download/Tangent-windows-setup.exe
 
-Linux x86_64
+Linux x86_64 - the tarball has an install.sh that needs no root
 https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz
+
+Rather unpack it yourself:
+https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.dmg
+https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.zip
+https://github.com/ganten1998/ivory/releases/latest/download/tangent-windows-x86_64.zip
 
 Checksums:
 https://github.com/ganten1998/ivory/releases/latest/download/SHA256SUMS
+
+THE PLUGIN
+
+Tangent.vst3 shows everything the app does, reading the notes on the track it
+is on. It makes no sound of its own - it is a monitor, not an instrument - so
+put it on a MIDI or instrument track rather than in an effect slot. Its
+settings live in the DAW project, so two instances and the standalone can each
+be set up differently.
+
+Your DAW will find it the next time it scans for plugins. It appears as
+Tangent, by Ganten.
 
 YOUR SUPPORTER KEY
 
@@ -91,21 +107,21 @@ The key has no expiry, contacts no server, and works on every machine you own.
 
 FIRST LAUNCH
 
-macOS: open the .dmg and drag Tangent into your Applications folder. The app is
-signed with a Developer ID certificate and notarized by Apple, so it opens on a
-double-click with no security prompt.
+macOS: run the .pkg and choose what you want installed. The app is signed with
+a Developer ID certificate and notarized by Apple. You can install for all
+users, which needs your password, or just for yourself, which does not.
 
-Windows: unzip it anywhere and run tangent.exe. There is no installer. The
-executable is not code-signed, so SmartScreen shows "Windows protected your PC"
-the first time. Click "More info", then "Run anyway". Windows remembers the
-choice.
+Windows: run the setup and choose what you want installed. It is not
+code-signed, so SmartScreen shows "Windows protected your PC" the first time.
+Click "More info", then "Run anyway". Windows remembers the choice.
 
-Linux: extract the archive, then chmod +x tangent and ./tangent. MIDI goes
-through
-ALSA, so libasound.so.2 needs to be present. Requires glibc 2.32 or newer.
+Linux: extract the archive and run ./install.sh. It needs no root by default,
+and takes --app, --vst3, --system, --prefix, --uninstall and --dry-run. MIDI
+goes through ALSA, so libasound.so.2 needs to be present. Requires glibc 2.32
+or newer.
 
-Plug your MIDI keyboard in before you start Tangent. Everything in the app lives
-in the right-click menu.
+Plug your MIDI keyboard in before you start Tangent. Everything in the app
+lives in the right-click menu, and holding H shows every keyboard shortcut.
 
 Source code and release notes:
 https://github.com/ganten1998/ivory
