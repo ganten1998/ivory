@@ -100,7 +100,8 @@ executable is not code-signed, so SmartScreen shows "Windows protected your PC"
 the first time. Click "More info", then "Run anyway". Windows remembers the
 choice.
 
-Linux: extract the archive, then chmod +x tangent and ./ivory. MIDI goes through
+Linux: extract the archive, then chmod +x tangent and ./tangent. MIDI goes
+through
 ALSA, so libasound.so.2 needs to be present. Requires glibc 2.32 or newer.
 
 Plug your MIDI keyboard in before you start Tangent. Everything in the app lives

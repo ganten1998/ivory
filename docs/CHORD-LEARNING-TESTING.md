@@ -24,7 +24,7 @@ accept the warning, then go to **System Settings → Privacy & Security**, scrol
 to Security, and click **Open Anyway** next to Ivory. (The old right-click →
 Open trick no longer works on macOS 15 and later.)
 
-**Linux** — untar anywhere and run `./ivory` (`chmod +x ivory` first if your
+**Linux** — untar anywhere and run `./tangent` (`chmod +x tangent` first if your
 unpacker dropped the executable bit). It needs ALSA plus X11 or Wayland. To get
 it into your application menu: copy `ivory` somewhere on your `PATH` (e.g.
 `~/.local/bin/`), `ivory.png` to

@@ -35,7 +35,7 @@ Linux
     tar -xzf tangent-<version>-linux-<arch>.tar.gz
     cd tangent-<version>-linux-<arch>
     chmod +x tangent
-    ./ivory
+    ./tangent
 
   MIDI goes through ALSA, so libasound.so.2 needs to be present — package
   libasound2 on Debian/Ubuntu, alsa-lib elsewhere. It already is on essentially

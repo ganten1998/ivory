@@ -44,15 +44,14 @@ pub fn band_height(w: f32) -> f32 {
     (BAND_H_AT_1300 * w as f64 / 1300.0).trunc() as f32
 }
 
-/// Left margin, as a fraction of the band width, holding the open-string rings
-/// and the damped-string crosses. They live BEHIND the nut, where a chord
-/// chart puts them.
+/// No headstock. The nut sits on the window's left edge and every fret of the
+/// neck gets the width instead.
 ///
-/// It is NOT a margin in the background colour: that drew a pale strip down
-/// the left of a dark neck, which read as the panel not filling its own space.
-/// The board runs the full width and this is its headstock end, so the marks
-/// sit on wood like everything else.
-const GUTTER: f32 = 0.026;
+/// This was 2.6% of the band, holding the open-string rings and the damped
+/// string crosses behind the nut the way a paper chord chart does. On a chart
+/// that space is free; here it was 2.6% of the fretboard, spent on two symbols.
+/// Those now sit ON the nut, which is where the open string physically is.
+const GUTTER: f32 = 0.0;
 /// Vertical breathing room above the top string and below the bottom one.
 const PAD_Y: f32 = 0.10;
 
@@ -143,6 +142,13 @@ impl Geom {
     /// reachable, not theoretical.
     fn dot_r(&self) -> f32 {
         (self.spacing * 0.30).max(1.0).min(self.spacing * 0.45)
+    }
+
+    /// Where an open-string ring or a damped-string cross goes, now that there
+    /// is no margin to put them in: centred one radius in from the left edge,
+    /// so the mark straddles the nut and is still drawn whole.
+    fn mark_x(&self, rect: Rect) -> f32 {
+        rect.left() + self.dot_r()
     }
 }
 
@@ -329,11 +335,13 @@ pub fn draw(
     }
     // The nut. Bone-coloured and heavier than a fret wire, because that is
     // what tells you at a glance which end of the neck you are looking at.
+    // Flush with the left edge, not centred on it: with no margin left, half a
+    // centred nut would be clipped away.
     let nut = g.wire_x(0);
     painter.rect_filled(
         Rect::from_min_max(
-            Pos2::new(nut - 2.0, board.top()),
-            Pos2::new(nut + 2.0, board.bottom()),
+            Pos2::new(nut, board.top()),
+            Pos2::new(nut + 3.0, board.bottom()),
         ),
         0.0,
         p.nut,
@@ -502,7 +510,7 @@ fn board_rect(rect: Rect, g: &Geom) -> Rect {
 
 /// x of the open/damped marker column, behind the nut.
 fn gutter_x(rect: Rect, g: &Geom) -> f32 {
-    rect.left() + (g.left - rect.left()) * 0.5
+    g.mark_x(rect)
 }
 
 /// Over the board, bottom right, past the last inlay. Small and dim: it is
@@ -696,8 +704,14 @@ mod tests {
             let x = g.press_x(f);
             assert!(x > g.wire_x(f - 1) && x < g.wire_x(f), "fret {f} escaped its space");
         }
-        assert!(g.press_x(0) < g.left, "an open marker belongs behind the nut");
-        assert!(gutter_x(rect(), &g) < g.left);
+        // `press_x(0)` still resolves behind the nut — the geometry says so —
+        // but nothing draws there any more: with no headstock there is no
+        // "behind" on screen, so open and damped marks straddle the nut
+        // instead. That is what `mark_x` is for.
+        assert!(g.press_x(0) < g.left, "fret 0 is still behind the nut in geometry");
+        let gx = gutter_x(rect(), &g);
+        assert!(gx >= g.left, "a mark must not be drawn off the left edge");
+        assert!(gx < g.press_x(1), "a mark must not reach the first fret");
     }
 
     /// The neck must not move when a caption appears. It used to: the caption
@@ -756,9 +770,12 @@ mod tests {
                 assert_eq!(b.left(), r.left(), "{}: pale strip at {w}pt", t.name);
                 assert!(b.right() >= r.right() - 2.0, "{}: gap at the far end", t.name);
                 assert!(b.top() >= r.top() - 0.01 && b.bottom() <= r.bottom() + 0.01);
-                // The open/damped marks still sit behind the nut, on the board.
+                // No headstock: the nut is ON the left edge and the marks
+                // straddle it, drawn whole rather than clipped.
+                assert_eq!(g.wire_x(0), r.left(), "the nut should be flush left");
                 let gx = gutter_x(r, &g);
-                assert!(gx > b.left() && gx < g.wire_x(0), "markers left the headstock");
+                assert!(gx - g.dot_r() >= r.left() - 0.01, "an open ring is clipped");
+                assert!(gx < g.press_x(1), "a mark collided with the first fret");
             }
         }
     }

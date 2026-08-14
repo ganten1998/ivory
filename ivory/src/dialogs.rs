@@ -210,6 +210,12 @@ impl Placement {
     /// Centred on the parent, kept fully on the monitor. None when the parent
     /// geometry is not known yet, in which case the OS places the window, which
     /// on Windows means the top-left corner of the screen.
+    ///
+    /// "Not known yet" has to mean exactly that. A viewport cannot see its own
+    /// position on the first frames, so the app used to hand over a rect at
+    /// (0, 0) rather than nothing — and the welcome dialog, which opens on the
+    /// very first frame, centred itself on the top-left of the SCREEN. It was
+    /// centred, on the wrong thing.
     fn position_for(self, size: Vec2) -> Option<Pos2> {
         let parent = self.parent?;
         Some(crate::settings::clamp_to_monitor(
@@ -235,7 +241,14 @@ fn show_dialog_viewport(
         .with_inner_size(size)
         .with_min_inner_size(min_size)
         .with_resizable(true)
-        .with_decorations(true);
+        .with_decorations(true)
+        // These dialogs are MODAL — `handle_main_interaction` drops every event
+        // while one is open — so a dialog that ends up behind the main window
+        // is not merely untidy, it is an app that has stopped responding with
+        // no visible reason why. The welcome note and the supporter key are the
+        // two that open on top of a window the user is already looking at.
+        .with_always_on_top()
+        .with_active(true);
     // Rounded and clamped, so a pixel of jitter in the reported parent rect
     // cannot produce a new position every frame and drag the window around.
     if let Some(p) = placement.position_for(size) {
@@ -1045,4 +1058,40 @@ pub fn show(
         *dialog_opt = None;
     }
     action
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dialog must centre on the WINDOW, and must refuse to guess when the
+    /// window's position is not known yet. The welcome note opens on the first
+    /// frame, before the platform has reported the main window's rect; handing
+    /// it a rect at (0, 0) made it centre on the corner of the screen, which
+    /// looks like a placement bug and is really a "we did not know" bug.
+    #[test]
+    fn a_dialog_centres_on_the_window_or_declines_to_place_itself() {
+        let size = Vec2::new(400.0, 300.0);
+        let monitor = Some(Vec2::new(2560.0, 1440.0));
+
+        // Parent unknown: no position, so the platform places it.
+        assert_eq!(Placement { parent: None, monitor }.position_for(size), None);
+
+        // Parent known: dead centre of the parent.
+        let parent = Rect::from_min_size(Pos2::new(600.0, 400.0), Vec2::new(1300.0, 200.0));
+        let p = Placement { parent: Some(parent), monitor }
+            .position_for(size)
+            .expect("a known parent must yield a position");
+        let dialog_centre = p + size * 0.5;
+        assert!((dialog_centre.x - parent.center().x).abs() < 0.5, "off-centre in x");
+        assert!((dialog_centre.y - parent.center().y).abs() < 0.5, "off-centre in y");
+
+        // A window near an edge still puts the whole dialog on the monitor.
+        let edge = Rect::from_min_size(Pos2::new(2400.0, 1380.0), Vec2::new(1300.0, 200.0));
+        let p = Placement { parent: Some(edge), monitor }.position_for(size).unwrap();
+        assert!(p.x >= 0.0 && p.y >= 0.0, "pushed off the top-left: {p:?}");
+        assert!(p.x + size.x <= 2560.0 + 0.5, "hangs off the right: {p:?}");
+        assert!(p.y + size.y <= 1440.0 + 0.5, "hangs off the bottom: {p:?}");
+    }
 }

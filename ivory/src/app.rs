@@ -119,6 +119,10 @@ pub struct IvoryApp {
     last_sent_size: Option<Vec2>,
     decorations_sent: Option<bool>,
     main_inner_origin: Pos2,
+    /// Whether `main_inner_origin` has ever been reported by the platform.
+    /// Until it has, it is (0, 0) — which is a real position, not a missing
+    /// one, so anything that centres on it lands in the corner of the screen.
+    main_origin_known: bool,
     monitor_size: Option<Vec2>,
     /// The restored-off-screen rescue runs once, not every frame.
     offscreen_checked: bool,
@@ -211,6 +215,7 @@ impl IvoryApp {
             last_sent_size: None,
             decorations_sent: None,
             main_inner_origin: Pos2::ZERO,
+            main_origin_known: false,
             monitor_size: None,
             offscreen_checked: false,
             main_live_pos: None,
@@ -1191,6 +1196,7 @@ impl IvoryApp {
         });
         if let Some(r) = inner_rect {
             self.main_inner_origin = r.min;
+            self.main_origin_known = true;
         }
         self.monitor_size = monitor;
         // Rescue a window restored onto a monitor that is no longer there.
@@ -1412,7 +1418,9 @@ impl IvoryApp {
         // position the OS places them, which on Windows is the top-left of the
         // screen no matter where the user has put the piano.
         let placement = dialogs::Placement {
-            parent: Some(Rect::from_min_size(self.main_inner_origin, target)),
+            parent: self
+                .main_origin_known
+                .then(|| Rect::from_min_size(self.main_inner_origin, target)),
             monitor: self.monitor_size,
         };
         if let Some(action) =

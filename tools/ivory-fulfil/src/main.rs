@@ -168,10 +168,17 @@ fn sale_is_genuine(token: &str, sale_id: &str) -> bool {
 // to 2.2.0 in 2029 is worse than no link at all.
 const DOWNLOAD_MACOS: &str =
     "https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-arm64.dmg";
+// tangent-*, matching the macOS line above, which had already been updated.
+// Both spellings resolve — `publish-github.sh` uploads the legacy `ivory-*`
+// names on every stable release precisely so the links in emails already sent
+// keep working — but a NEW email should hand out the product's own name.
+// Changing these requires the aliases to exist on the current stable release
+// FIRST: this email was once redeployed ahead of the assets and 404'd for ten
+// minutes. They exist on 2.2.0.
 const DOWNLOAD_WINDOWS: &str =
-    "https://github.com/ganten1998/ivory/releases/latest/download/ivory-windows-x86_64.zip";
+    "https://github.com/ganten1998/ivory/releases/latest/download/tangent-windows-x86_64.zip";
 const DOWNLOAD_LINUX: &str =
-    "https://github.com/ganten1998/ivory/releases/latest/download/ivory-linux-x86_64.tar.gz";
+    "https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz";
 
 /// Split out from `send_email` purely so it can be rendered and asserted on in
 /// a test. The one email a buyer ever receives is not a good place to discover
