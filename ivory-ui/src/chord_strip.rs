@@ -202,11 +202,21 @@ pub struct DetachedOutcome {
 /// detachment. egui diffs this builder against the previous frame's builder,
 /// not against the window's real geometry, so a value that changes every frame
 /// would fight the user's own resizes and drags.
+/// `main_focused` decides the window LEVEL. A detached window is a piece of
+/// the same app, so it rises and falls WITH the piano rather than being left
+/// wherever the window stack last put it — which is what "the children don't
+/// follow" looks like: focus the piano and its own readouts stay buried under
+/// whatever you were doing before.
+///
+/// By level rather than by raising: always-on-top while we are frontmost is
+/// exactly "above our own window", and dropping to Normal when we are not
+/// means it never floats over other applications.
 pub fn show_detached_window(
     ctx: &egui::Context,
     builder_size: egui::Vec2,
     builder_pos: Option<Pos2>,
     borderless: bool,
+    main_focused: bool,
     chord: Option<&str>,
     color: Color32,
     heart: Option<Color32>,
@@ -217,7 +227,12 @@ pub fn show_detached_window(
         .with_inner_size(builder_size)
         .with_min_inner_size([220.0, 80.0])
         .with_resizable(true)
-        .with_decorations(!borderless);
+        .with_decorations(!borderless)
+        .with_window_level(if main_focused {
+            egui::viewport::WindowLevel::AlwaysOnTop
+        } else {
+            egui::viewport::WindowLevel::Normal
+        });
     if let Some(p) = builder_pos {
         builder = builder.with_position(p);
     }

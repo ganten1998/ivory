@@ -157,6 +157,9 @@ pub struct IvoryApp {
     last_drawn: Rect,
     /// One-shot latch for the IVORY_INLINE=menu debug hook.
     demo_menu_done: bool,
+    /// Whether the main window currently has focus. Detached windows are
+    /// raised with it and dropped with it, so the app moves as one thing.
+    main_focused: bool,
 
     notes: NoteState,
     manual_notes: HashSet<u8>,
@@ -301,6 +304,9 @@ impl IvoryApp {
             last_pane: Vec2::ZERO,
             last_drawn: Rect::NOTHING,
             demo_menu_done: false,
+            // Assume focused: a window that has just opened is, and the first
+            // frames report None.
+            main_focused: true,
             notes: NoteState::default(),
             manual_notes: HashSet::new(),
             manual_positions: HashMap::new(),
@@ -750,6 +756,21 @@ impl IvoryApp {
                 }
                 // Keytoggle hit-test/toggle first (spec §4.5), then StartDrag
                 // (must be issued directly from the press handler).
+                // The capo cycles what it is made of. Checked BEFORE the
+                // keytoggle hit-test, and deliberately: the capo sits on a
+                // fret, so the two would otherwise contend and the note would
+                // win — you would be unable to click the thing you are
+                // pointing at. It is on top visually; it is on top here.
+                if let Some(r) = fret_rect.filter(|r| r.contains(pos)) {
+                    let spec = self.settings.fretboard_spec();
+                    if fretboard_panel::capo_rect(r, &spec).is_some_and(|cr| cr.contains(pos)) {
+                        self.settings.capo_style =
+                            self.settings.capo_style().next().key().to_owned();
+                        self.save_settings();
+                        return;
+                    }
+                }
+
                 // The theory band is a third instrument. Clicking a name on
                 // the circle or a node on the lattice places that note;
                 // clicking a chord vertex places the whole triad. Handled
@@ -1751,6 +1772,15 @@ impl IvoryApp {
         // not fail — they return the ROOT viewport's values, which are the
         // host's, so an unguarded version would quietly file the DAW's window
         // position into the user's settings file as if it were the piano's.
+        if self.caps.child_windows {
+            // Whether WE are frontmost, so the detached windows can follow.
+            // `focused` is None on the frames before the window manager has
+            // said, and treating that as "not focused" would drop the
+            // children behind on every startup.
+            if let Some(f) = ctx.input(|i| i.viewport().focused) {
+                self.main_focused = f;
+            }
+        }
         let (inner_rect, outer_rect, monitor) = if self.caps.window_sizing {
             ctx.input(|i| {
                 (
@@ -1937,6 +1967,7 @@ impl IvoryApp {
                 self.fret_builder_size,
                 self.fret_builder_pos,
                 self.settings.borderless_mode,
+                self.main_focused,
                 self.voicing.current(),
                 &spec,
                 &self.settings,
@@ -1979,6 +2010,7 @@ impl IvoryApp {
                 self.detached_builder_size,
                 self.detached_builder_pos,
                 self.settings.borderless_mode,
+                self.main_focused,
                 self.current_chord.as_deref(),
                 self.settings.chord_text_color.to_color32(),
                 self.heart_color(),
@@ -2169,7 +2201,7 @@ mod tests {
                     let roomy = {
                         let mut a = app.menu_view();
                         a.caps = Caps::DESKTOP;
-                        menu::row_height_for_test(&menu::MenuState::open(
+                        menu::row_height_for_test(&MenuState::open(
                             &ctx,
                             a,
                             Pos2::ZERO,

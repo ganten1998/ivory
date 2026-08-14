@@ -54,6 +54,86 @@ fn pc_name(pc: u8, prefer_flats: bool) -> &'static str {
     }
 }
 
+/// The real accidental characters. JetBrains Mono carries both and sits at the
+/// bottom of every font chain, so they always render.
+const FLAT: char = '\u{266D}';
+const SHARP: char = '\u{266F}';
+
+/// Draw a note name with its accidental raised to the top right, the way
+/// music is set rather than the way a string concatenates.
+///
+/// `♭` and `♯` on the baseline at full size read as a second letter — which
+/// is exactly the complaint that started this: a lower-case "Bb" was two b's,
+/// one a note and one a flat, and no reader should have to work out which.
+/// Raised and smaller, the accidental is unmistakably a modifier.
+///
+/// The pair is centred as a WHOLE: the letter shifts left by half the
+/// accidental's width so "B♭" sits where "B" would, or a ring of note names
+/// wobbles.
+///
+/// `suffix` is appended after the accidental at full size — the "m" of a
+/// minor chord, which is part of the NAME rather than a modifier of the
+/// letter, and so is not raised with it.
+fn draw_note(
+    painter: &Painter,
+    center: Pos2,
+    pc: u8,
+    prefer_flats: bool,
+    size: f32,
+    color: Color32,
+    lower: bool,
+    suffix: &str,
+) {
+    let name = pc_name(pc, prefer_flats);
+    let letter = if lower {
+        name[..1].to_lowercase()
+    } else {
+        name[..1].to_owned()
+    };
+    let acc = match name.as_bytes().get(1) {
+        Some(b'b') => Some(FLAT),
+        Some(b'#') => Some(SHARP),
+        _ => None,
+    };
+    let Some(acc) = acc else {
+        painter.text(
+            center,
+            Align2::CENTER_CENTER,
+            &format!("{letter}{suffix}"),
+            font(size),
+            color,
+        );
+        return;
+    };
+    let acc_size = size * 0.72;
+    // Monospace-ish advance; close enough to centre the pair by eye and it
+    // cannot be measured without laying the text out first.
+    let acc_w = acc_size * 0.6 + suffix.chars().count() as f32 * size * 0.6;
+    let r = painter.text(
+        center - Vec2::new(acc_w * 0.5, 0.0),
+        Align2::CENTER_CENTER,
+        &letter,
+        font(size),
+        color,
+    );
+    let a = painter.text(
+        Pos2::new(r.right(), r.top() + acc_size * 0.34),
+        Align2::LEFT_CENTER,
+        acc.to_string(),
+        font(acc_size),
+        color,
+    );
+    if !suffix.is_empty() {
+        painter.text(
+            Pos2::new(a.right(), center.y),
+            Align2::LEFT_CENTER,
+            suffix,
+            font(size),
+            color,
+        );
+    }
+}
+
 /// The twelve major keys in ascending fifths from C. Index is also the number
 /// of sharps, up to the enharmonic seam at six.
 const FIFTHS: [u8; 12] = [0, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10, 5];
@@ -215,12 +295,19 @@ struct Palette {
 
 fn palette(s: &Settings) -> Palette {
     let lit = s.white_key_active_color.to_color32();
+    // `faint` and `line` carry the outlines, the roman numerals and the key
+    // signatures — everything that says what the shapes MEAN. They were
+    // pitched as background texture and were hard to read in both modes: a
+    // 0x55 grey on near-black, and a 0xC8 on cream, are both about 2:1
+    // against their background where text wants 4.5:1. Darkened on light and
+    // lightened on dark until the numerals read at a glance, while staying
+    // clearly below the note names in weight.
     if s.dark_mode {
         Palette {
             bg: Color32::from_rgb(0x0a, 0x0a, 0x0a),
             ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            faint: Color32::from_rgb(0x55, 0x50, 0x46),
-            line: Color32::from_rgb(0x33, 0x30, 0x2a),
+            faint: Color32::from_rgb(0x9a, 0x92, 0x80),
+            line: Color32::from_rgb(0x62, 0x5c, 0x50),
             lit,
             lit_text: Color32::BLACK,
             root: s.sustain_color.to_color32(),
@@ -229,8 +316,8 @@ fn palette(s: &Settings) -> Palette {
         Palette {
             bg: Color32::from_rgb(0xE8, 0xDC, 0xC0),
             ink: Color32::from_rgb(0x1a, 0x1a, 0x1a),
-            faint: Color32::from_rgb(0xa8, 0x9e, 0x88),
-            line: Color32::from_rgb(0xc8, 0xbd, 0xa4),
+            faint: Color32::from_rgb(0x6b, 0x60, 0x4a),
+            line: Color32::from_rgb(0x9c, 0x8f, 0x74),
             lit,
             lit_text: Color32::WHITE,
             root: s.sustain_color.to_color32(),
@@ -482,12 +569,15 @@ fn draw_circle(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Set
                 painter.circle_stroke(at, name_size * 0.95, Stroke::new(2.5_f32, p.root));
             }
         }
-        painter.text(
+        draw_note(
+            painter,
             at,
-            Align2::CENTER_CENTER,
-            pc_name(pc, s.prefer_flats),
-            font(name_size),
+            pc,
+            s.prefer_flats,
+            name_size,
             if sounding { p.lit_text } else { p.ink },
+            false,
+            "",
         );
 
         // The relative minor, lower case, which is how a circle of fifths has
@@ -499,12 +589,15 @@ fn draw_circle(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Set
         // four-note chord and said nothing the outer ring had not already
         // said. The wedge behind it still shades when that key fits.
         let rel = (pc + 9) % 12;
-        painter.text(
+        draw_note(
+            painter,
             c + dir * ((r_min + r_hub) * 0.5),
-            Align2::CENTER_CENTER,
-            &pc_name(rel, s.prefer_flats).to_lowercase(),
-            font_light(r * 0.10),
-            p.ink.gamma_multiply(0.7),
+            rel,
+            s.prefer_flats,
+            r * 0.115,
+            p.ink.gamma_multiply(0.8),
+            true,
+            "",
         );
 
         // Key signature, outermost. ASCII accidentals: neither U+266F nor
@@ -512,8 +605,8 @@ fn draw_circle(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Set
         let (sharps, flats) = signature(i);
         let sig = match (sharps, flats) {
             (0, 0) => String::new(),
-            (n, 0) => format!("{n}#"),
-            (0, n) => format!("{n}b"),
+            (n, 0) => format!("{n}{SHARP}"),
+            (0, n) => format!("{n}{FLAT}"),
             _ => String::new(),
         };
         if !sig.is_empty() {
@@ -530,16 +623,15 @@ fn draw_circle(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Set
     // ── the hub: what the picture is of ────────────────────────────────────
     if input.pcs != 0 {
         let tonic = input.tonic();
-        painter.text(
+        draw_note(
+            painter,
             Pos2::new(c.x, c.y - r_hub * 0.28),
-            Align2::CENTER_CENTER,
-            &format!(
-                "{}{}",
-                pc_name(tonic, s.prefer_flats),
-                if input.minor { "m" } else { "" }
-            ),
-            font(r * 0.19),
+            tonic,
+            s.prefer_flats,
+            r * 0.19,
             p.ink,
+            false,
+            if input.minor { "m" } else { "" },
         );
         // Zero is the useful reading, not an error: it means what you are
         // playing belongs to no single major key.
@@ -759,7 +851,7 @@ fn draw_tonnetz(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Se
         for u in -1..=cols {
             let from = at(u, v);
             for (du, dv) in [(1, 0), (0, 1), (-1, 1)] {
-                painter.line_segment([from, at(u + du, v + dv)], Stroke::new(1.0_f32, p.line));
+                painter.line_segment([from, at(u + du, v + dv)], Stroke::new(1.3_f32, p.line));
             }
         }
     }
@@ -777,19 +869,22 @@ fn draw_tonnetz(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Se
                 c,
                 node_r,
                 fill,
-                Stroke::new(1.0_f32, if lit { fill } else { p.faint }),
+                Stroke::new(1.4_f32, if lit { fill } else { p.faint }),
             );
             // The root, ringed rather than recoloured — the same mark it gets
             // on the circle of fifths, so one glance learns it once.
             if input.root == Some(pc) || (input.root.is_none() && lit && pc == origin) {
                 painter.circle_stroke(c, node_r, Stroke::new(2.5_f32, p.root));
             }
-            painter.text(
+            draw_note(
+                painter,
                 c,
-                Align2::CENTER_CENTER,
-                pc_name(pc, s.prefer_flats),
-                font(node_r * 0.95),
+                pc,
+                s.prefer_flats,
+                node_r * 0.95,
                 if lit { p.lit_text } else { p.ink },
+                false,
+                "",
             );
         }
     }
@@ -872,7 +967,7 @@ fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &
     let tri = |f: &dyn Fn(usize) -> Pos2| [f(0), f(1), f(2)];
 
     for (pts, minor) in [(tri(&up), false), (tri(&down), true)] {
-        let stroke = Stroke::new(if minor { 1.0_f32 } else { 1.5 }, p.faint);
+        let stroke = Stroke::new(if minor { 1.4_f32 } else { 2.0 }, p.faint);
         for k in 0..3 {
             painter.line_segment([pts[k], pts[(k + 1) % 3]], stroke);
         }
@@ -903,23 +998,26 @@ fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &
         if input.root == Some(root) && input.minor == minor {
             painter.circle_stroke(pos, node_r, Stroke::new(2.5_f32, p.root));
         }
-        painter.text(
+        draw_note(
+            painter,
             Pos2::new(pos.x, pos.y - node_r * 0.22),
-            Align2::CENTER_CENTER,
-            &format!(
-                "{}{}",
-                pc_name(root, s.prefer_flats),
-                if minor { "m" } else { "" }
-            ),
-            font(node_r * 0.62),
+            root,
+            s.prefer_flats,
+            node_r * 0.62,
             if lit { p.lit_text } else { p.ink },
+            false,
+            if minor { "m" } else { "" },
         );
         painter.text(
             Pos2::new(pos.x, pos.y + node_r * 0.42),
             Align2::CENTER_CENTER,
             numeral,
-            font_light(node_r * 0.44),
-            if lit { p.lit_text } else { p.faint },
+            font(node_r * 0.46),
+            if lit {
+                p.lit_text
+            } else {
+                p.ink.gamma_multiply(0.85)
+            },
         );
     };
 
@@ -931,12 +1029,15 @@ fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &
     }
 
     // The key in the middle of its own triangle.
-    painter.text(
+    draw_note(
+        painter,
         c,
-        Align2::CENTER_CENTER,
-        pc_name(tonic, s.prefer_flats),
-        font(r * 0.24),
+        tonic,
+        s.prefer_flats,
+        r * 0.24,
         p.ink.gamma_multiply(0.55),
+        false,
+        "",
     );
 }
 
@@ -1306,6 +1407,11 @@ mod tests {
         // EVERY bundled face, not just the default: the typeface is a user
         // choice, so a glyph missing from one of them is a glyph missing for
         // whoever picked it.
+        //
+        // The two music accidentals are the exception, and deliberately: only
+        // JetBrains Mono has them, and `fonts::install` puts JetBrains at the
+        // bottom of BOTH families for exactly that reason. They are checked
+        // separately below, against that one face.
         let bundled: &[(&str, &[u8])] = &[
             ("Courier Prime", fonts::COURIER_PRIME_REGULAR),
             ("Courier Prime Bold", fonts::COURIER_PRIME_BOLD),
@@ -1325,7 +1431,7 @@ mod tests {
             drawn.extend(format!("{sharps}#{flats}b").chars());
         }
         drawn.extend("CIRCLE OF FIFTHS TONNETZ HARMONIC TRIANGLES".chars());
-        drawn.extend("I IV V i iv v no key fits keys 0123456789".chars());
+        drawn.extend("I IV V i iv v no key fits keys 0123456789m".chars());
         drawn.sort_unstable();
         drawn.dedup();
 
@@ -1339,6 +1445,20 @@ mod tests {
                     c as u32
                 );
             }
+        }
+
+        // The accidentals, which reach the screen through the JetBrains
+        // fallback rather than the chosen face. If this face ever loses them
+        // the circle silently goes back to drawing tofu boxes, which is how
+        // this started.
+        for c in [FLAT, SHARP] {
+            assert!(
+                ttf_parser::Face::parse(fonts::JETBRAINS_REGULAR, 0)
+                    .map(|f| f.glyph_index(c).is_some())
+                    .unwrap_or(false),
+                "JetBrains Mono has no {c:?} (U+{:04X}), so nothing does",
+                c as u32
+            );
         }
     }
 

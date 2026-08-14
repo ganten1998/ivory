@@ -23,6 +23,7 @@
 //! a sound. In most hosts that means loading it on a MIDI or instrument track
 //! and routing your keyboard to it.
 
+use baseview::PhySize;
 use crossbeam::queue::ArrayQueue;
 use ivory_ui::app::IvoryApp;
 use ivory_ui::host::Caps;
@@ -31,7 +32,6 @@ use ivory_ui::settings::Settings;
 use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, EguiState};
-use baseview::PhySize;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -62,11 +62,37 @@ const MIN_H: u32 = 90;
 const MAX_W: u32 = 4000;
 const MAX_H: u32 = 2400;
 
+/// The size the editor is supposed to be, and a cooldown so a host that keeps
+/// refusing is asked politely rather than every frame forever.
+#[derive(Default)]
+struct Want {
+    size: Option<(u32, u32)>,
+    cooldown: u32,
+}
+
+/// Frames to wait between re-asserting a size the host did not honour. At the
+/// 50ms repaint cadence this is about a second and a half — long enough that a
+/// user dragging the edge sees it settle rather than fight them mid-gesture.
+const RESIZE_COOLDOWN: u32 = 30;
+
 /// Everything the plugin keeps between the audio thread and the editor.
 struct Tangent {
     params: Arc<TangentParams>,
     /// Audio thread pushes, GUI thread pops. Never locked, never allocated in.
     notes: Arc<ArrayQueue<MidiEvent>>,
+    /// The size we last asked the host for, and how many frames ago we asked.
+    ///
+    /// The host is not supposed to offer a drag at all — nih-plug's
+    /// `can_resize` says `kResultFalse` — but its `check_size_constraint`
+    /// accepts ANY rect with positive area, so a permissive host lets the user
+    /// drag anyway and then `on_size` refuses anything that is not the exact
+    /// editor size. The frame moves, the editor does not, and the two disagree
+    /// about how big the plugin is.
+    ///
+    /// We cannot stop the drag from here without forking nih-plug. We can
+    /// notice the disagreement and ask for our size back, which is what "only
+    /// resizable by percentage" means from the inside.
+    want: Arc<Mutex<Want>>,
     /// The running app, kept ALIVE across editor open and close.
     ///
     /// A DAW opens and closes a plugin window freely, and `create_egui_editor`
@@ -114,6 +140,7 @@ impl Default for Tangent {
         Self {
             params: Arc::new(TangentParams::default()),
             notes: Arc::new(ArrayQueue::new(NOTE_QUEUE)),
+            want: Arc::new(Mutex::new(Want::default())),
             editor: Arc::new(Mutex::new(None)),
         }
     }
@@ -145,6 +172,7 @@ impl Plugin for Tangent {
         let home = self.editor.clone();
         let notes = self.notes.clone();
         let params = self.params.clone();
+        let want = self.want.clone();
 
         create_egui_editor(
             self.params.editor_state.clone(),
@@ -153,7 +181,11 @@ impl Plugin for Tangent {
             {
                 let home = home.clone();
                 let params = params.clone();
+                let want = want.clone();
                 move |ctx, _queue, _| {
+                    // Whatever the editor opened at is what it should stay at
+                    // until someone picks a size.
+                    want.lock().size = Some(params.editor_state.size());
                     // Built once per window, but only constructed once per
                     // instance: reopening finds the app already there.
                     let mut slot = home.lock();
@@ -194,9 +226,32 @@ impl Plugin for Tangent {
                 // performs, done with public API: tell `EguiState` the new
                 // size FIRST (the host reads it back through `Editor::size()`),
                 // then ask, and only touch the window once the host agrees.
-                if let Some(want) = app.take_pending_resize() {
-                    let w = (want.x.round() as u32).clamp(MIN_W, MAX_W);
-                    let h = (want.y.round() as u32).clamp(MIN_H, MAX_H);
+                // Snap back to the size that was actually chosen.
+                //
+                // Only when the host has moved us somewhere we did not ask
+                // for, and only after a cooldown, so a host that simply
+                // refuses is not asked sixty times a second.
+                let mut asked = None;
+                {
+                    let mut w = want.lock();
+                    if w.cooldown > 0 {
+                        w.cooldown -= 1;
+                    }
+                    if let Some((ww, wh)) = w.size {
+                        let now = ctx.content_rect().size();
+                        let drifted =
+                            (now.x - ww as f32).abs() > 2.0 || (now.y - wh as f32).abs() > 2.0;
+                        if drifted && w.cooldown == 0 {
+                            w.cooldown = RESIZE_COOLDOWN;
+                            asked = Some(egui::Vec2::new(ww as f32, wh as f32));
+                        }
+                    }
+                }
+
+                if let Some(want_size) = app.take_pending_resize().or(asked) {
+                    let w = (want_size.x.round() as u32).clamp(MIN_W, MAX_W);
+                    let h = (want_size.y.round() as u32).clamp(MIN_H, MAX_H);
+                    want.lock().size = Some((w, h));
                     // `Arc::try_unwrap` rather than serde: `from_size` hands
                     // back a fresh `Arc` with a count of one, so this always
                     // succeeds, and `PersistentField::set` is the public way
@@ -210,9 +265,9 @@ impl Plugin for Tangent {
                             (w as f32 * scale).round() as u32,
                             (h as f32 * scale).round() as u32,
                         ));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                            egui::Vec2::new(w as f32, h as f32),
-                        ));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(
+                            w as f32, h as f32,
+                        )));
                     }
                 }
                 // Write the settings back into the project every frame. It is

@@ -38,6 +38,89 @@ use ivory_core::voicing::{Outcome, StringState, Voicing};
 /// piano above it is 150 at the same width.
 pub const BAND_H_AT_1300: f64 = 132.0;
 
+/// What the capo is made of.
+///
+/// Its own choice rather than part of `Wood`, because a capo is an accessory
+/// clamped onto the neck and not part of the instrument's finish — the same
+/// capo goes on rosewood, maple and ebony. Cycled by clicking it, which is
+/// the only control it needs: there is exactly one on screen and it is
+/// unmistakably the thing you are pointing at.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum CapoStyle {
+    /// Black, because the default fingerboard is rosewood and a wooden capo
+    /// on a wooden neck is a bar you have to look for. It is also what most
+    /// capos actually are.
+    #[default]
+    Black,
+    Silver,
+    Wood,
+}
+
+pub(crate) struct CapoColors {
+    pub body: Color32,
+    pub sheen: Color32,
+    pub arm: Color32,
+    /// Fine cross-ticks, for brushed metal.
+    pub texture: Option<Color32>,
+    /// Long lines along the bar, for wood grain.
+    pub grain: Option<Color32>,
+}
+
+impl CapoStyle {
+    pub const ALL: [CapoStyle; 3] = [CapoStyle::Black, CapoStyle::Silver, CapoStyle::Wood];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            CapoStyle::Wood => "wood",
+            CapoStyle::Black => "black",
+            CapoStyle::Silver => "silver",
+        }
+    }
+
+    /// Unknown values fall back at the point of use, like the fingerboard
+    /// wood and the typeface: a settings file written by a later build keeps
+    /// its own value rather than being rewritten.
+    pub fn from_key(s: &str) -> Self {
+        match s {
+            "wood" => CapoStyle::Wood,
+            "silver" => CapoStyle::Silver,
+            _ => CapoStyle::Black,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|c| *c == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    pub(crate) fn colors(self) -> CapoColors {
+        match self {
+            CapoStyle::Wood => CapoColors {
+                body: Color32::from_rgb(0x6b, 0x45, 0x28),
+                sheen: Color32::from_rgb(0x9a, 0x6d, 0x44),
+                arm: Color32::from_rgb(0x8a, 0x8d, 0x92),
+                texture: None,
+                grain: Some(Color32::from_rgb(0x53, 0x34, 0x1c)),
+            },
+            CapoStyle::Black => CapoColors {
+                body: Color32::from_rgb(0x1c, 0x1c, 0x1e),
+                sheen: Color32::from_rgb(0x6e, 0x6e, 0x74),
+                arm: Color32::from_rgb(0x8a, 0x8d, 0x92),
+                texture: None,
+                grain: None,
+            },
+            CapoStyle::Silver => CapoColors {
+                body: Color32::from_rgb(0xa8, 0xac, 0xb2),
+                sheen: Color32::from_rgb(0xe6, 0xe9, 0xee),
+                arm: Color32::from_rgb(0x6f, 0x73, 0x79),
+                // Brushed: fine ticks across the bar, barely darker.
+                texture: Some(Color32::from_rgb(0x8d, 0x92, 0x99)),
+                grain: None,
+            },
+        }
+    }
+}
+
 /// Height of the fretboard band for a window `w` points wide. Truncated like
 /// every other band in the layout (spec §3.2).
 pub fn band_height(w: f32) -> f32 {
@@ -355,16 +438,7 @@ pub fn draw(
         );
     }
     if g.capo > 0 && g.capo <= g.frets {
-        let x = g.press_x(g.capo);
-        let w = (g.spacing * 0.30).max(3.0);
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(x - w * 0.5, g.y(g.strings - 1) - g.spacing * 0.35),
-                Pos2::new(x + w * 0.5, g.y(0) + g.spacing * 0.35),
-            ),
-            w * 0.5,
-            p.nut,
-        );
+        draw_capo(painter, rect, &g, s.capo_style());
     }
 
     // ── what is being played ────────────────────────────────────────────────
@@ -598,6 +672,127 @@ fn draw_caption(painter: &Painter, rect: Rect, text: &str, p: &Palette, _s: &Set
 
 /// One-pixel top edge so the fretboard reads as its own band rather than as
 /// more piano. Drawn by the caller, which knows what is above it.
+/// The capo, drawn as the clamp it is.
+///
+/// It used to be a thin rounded bar barely wider than a fret wire, which read
+/// as another fret rather than as a thing attached to the neck. A real capo is
+/// a chunky rubber-sleeved bar that grips ACROSS all the strings and overhangs
+/// them at both ends, with the mechanism sitting off the edge of the board.
+///
+/// Drawn just behind the fret it holds, which is where a player puts one: on
+/// the fret itself it would cover the wire and look like a very fat fret.
+/// Where the capo is, so a click can find it. `None` when none is fitted.
+pub fn capo_rect(rect: Rect, spec: &FretboardSpec) -> Option<Rect> {
+    let g = Geom::new(rect, spec)?;
+    if g.capo == 0 || g.capo > g.frets {
+        return None;
+    }
+    let (x, w, top, bot) = capo_geom(rect, &g);
+    // Widened for the hit test only: the bar is a few points across and
+    // nobody aims at a few points. Not so wide that it swallows the frets
+    // either side, which are notes.
+    let grab = w.max(10.0);
+    Some(Rect::from_min_max(
+        Pos2::new(x - grab, top),
+        Pos2::new(x + grab, bot),
+    ))
+}
+
+/// The bar's x, width, top and bottom.
+///
+/// Shared by the drawing and the hit test, so a click cannot land beside the
+/// thing it looks like it is on.
+fn capo_geom(band: Rect, g: &Geom) -> (f32, f32, f32, f32) {
+    let x = g.press_x(g.capo);
+    // A third of the gap to the fret behind it. Chunky enough to read as a
+    // thing clamped ONTO the neck rather than as another fret wire, and tied
+    // to fret spacing rather than string spacing because that is what sets the
+    // scale of everything else along the neck.
+    let gap = (g.press_x(g.capo) - g.press_x(g.capo.saturating_sub(1))).abs();
+    let w = (gap / 3.0).max(6.0);
+    // CONTAINED. A capo that pokes out of the top is a black bar standing in
+    // the piano above it, which is not what a capo does to a guitar. The
+    // overhang is whatever room is left after the outer strings, so it shrinks
+    // on a crowded twelve-string rather than escaping.
+    let head = (band.top() + 1.0).min(g.y(g.strings - 1));
+    let foot = (band.bottom() - 1.0).max(g.y(0));
+    let overhang = (g.spacing * 0.9)
+        .min(g.y(g.strings - 1) - head)
+        .min(foot - g.y(0))
+        .max(0.0);
+    (x, w, g.y(g.strings - 1) - overhang, g.y(0) + overhang)
+}
+
+fn draw_capo(painter: &Painter, band: Rect, g: &Geom, style: CapoStyle) {
+    let (x, w, top, bot) = capo_geom(band, g);
+    let r = w * 0.42;
+    let c = style.colors();
+
+    // A soft shadow on the bridge side, so it sits ON the board rather than
+    // being painted into it.
+    painter.rect_filled(
+        Rect::from_min_max(
+            Pos2::new(x - w * 0.5 + w * 0.22, top + w * 0.18),
+            Pos2::new(x + w * 0.5 + w * 0.22, bot + w * 0.18),
+        ),
+        r,
+        Color32::from_black_alpha(60),
+    );
+
+    // ONE bar, the whole length. It used to have a fatter circle stuck on each
+    // end, meaning to read as the rubber pads that overhang the outer strings;
+    // at this size they read as two blobs on a stick.
+    let body = Rect::from_min_max(Pos2::new(x - w * 0.5, top), Pos2::new(x + w * 0.5, bot));
+    painter.rect_filled(body, r, c.body);
+
+    // The light down the nut side. One thin rect rather than a gradient, which
+    // egui has no cheap way to draw and which nobody would see at this size.
+    painter.rect_filled(
+        Rect::from_min_max(
+            Pos2::new(x - w * 0.5 + w * 0.16, top + r * 0.8),
+            Pos2::new(x - w * 0.5 + w * 0.30, bot - r * 0.8),
+        ),
+        w * 0.06,
+        c.sheen,
+    );
+
+    // Texture, where the material has any: fine cross-ticks for brushed metal,
+    // a few long grain lines for wood. Spaced off the bar's own length so it
+    // scales with the window instead of getting denser as the board grows.
+    if let Some(tex) = c.texture {
+        let n = ((bot - top) / (w * 0.55)).round().max(2.0) as i32;
+        for i in 1..n {
+            let y = top + (bot - top) * i as f32 / n as f32;
+            painter.line_segment(
+                [Pos2::new(x - w * 0.34, y), Pos2::new(x + w * 0.34, y)],
+                Stroke::new(1.0_f32, tex),
+            );
+        }
+    }
+    if let Some(grain) = c.grain {
+        for k in [-0.22_f32, 0.10, 0.30] {
+            painter.line_segment(
+                [Pos2::new(x + w * k, top + r), Pos2::new(x + w * k, bot - r)],
+                Stroke::new(1.0_f32, grain),
+            );
+        }
+    }
+
+    // The arm, off the treble edge, where the screw or spring lives.
+    let arm_top = bot + r * 0.2;
+    let arm_bot = (arm_top + g.spacing * 0.55).min(band.bottom() - 1.0);
+    if arm_bot > arm_top + 1.0 {
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(x - w * 0.30, arm_top),
+                Pos2::new(x + w * 0.30, arm_bot),
+            ),
+            w * 0.22,
+            c.arm,
+        );
+    }
+}
+
 pub fn draw_top_edge(painter: &Painter, rect: Rect, s: &Settings) {
     let c = if s.dark_mode {
         Color32::from_rgb(60, 60, 60)
@@ -644,11 +839,21 @@ pub struct DetachedOutcome {
 /// borderless drag-anywhere — so the two popouts behave identically and there
 /// is only one set of habits to learn.
 #[allow(clippy::too_many_arguments)]
+/// `main_focused` decides the window LEVEL. A detached window is a piece of
+/// the same app, so it rises and falls WITH the piano rather than being left
+/// wherever the window stack last put it — which is what "the children don't
+/// follow" looks like: focus the piano and its own readouts stay buried under
+/// whatever you were doing before.
+///
+/// By level rather than by raising: always-on-top while we are frontmost is
+/// exactly "above our own window", and dropping to Normal when we are not
+/// means it never floats over other applications.
 pub fn show_detached_window(
     ctx: &egui::Context,
     builder_size: Vec2,
     builder_pos: Option<Pos2>,
     borderless: bool,
+    main_focused: bool,
     voicing: &Voicing,
     spec: &FretboardSpec,
     s: &Settings,
@@ -660,7 +865,12 @@ pub fn show_detached_window(
         .with_inner_size(builder_size)
         .with_min_inner_size([320.0, 90.0])
         .with_resizable(true)
-        .with_decorations(!borderless);
+        .with_decorations(!borderless)
+        .with_window_level(if main_focused {
+            egui::viewport::WindowLevel::AlwaysOnTop
+        } else {
+            egui::viewport::WindowLevel::Normal
+        });
     if let Some(pos) = builder_pos {
         builder = builder.with_position(pos);
     }
@@ -710,6 +920,87 @@ fn painter_border(painter: &Painter, rect: Rect) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Clicking the capo must find the capo, at every fret and every size —
+    /// and clicking where there is no capo must not.
+    #[test]
+    fn the_capo_can_be_clicked_where_it_is_drawn() {
+        for w in [400.0_f32, 900.0, 1300.0, 2600.0] {
+            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
+            // No capo, nothing to hit.
+            let none = FretboardSpec {
+                capo: 0,
+                ..Default::default()
+            };
+            assert_eq!(capo_rect(r, &none), None);
+
+            for capo in 1..=9u8 {
+                let spec = FretboardSpec {
+                    capo,
+                    ..Default::default()
+                };
+                let hit = capo_rect(r, &spec).expect("a fitted capo has a rect");
+                let g = Geom::new(r, &spec).unwrap();
+                let (x, _, top, bot) = capo_geom(r, &g);
+
+                // Its own centre is on it.
+                assert!(
+                    hit.contains(Pos2::new(x, (top + bot) * 0.5)),
+                    "capo {capo} at width {w}: the middle of the bar is not on it"
+                );
+                // It stays inside the band: a capo that pokes out is a bar
+                // standing in the piano above the neck.
+                assert!(
+                    r.expand(0.5).contains_rect(hit),
+                    "capo {capo} at width {w} escapes the band: {hit:?} vs {r:?}"
+                );
+                // And it does not swallow the neighbouring frets, which are
+                // notes people mean to click.
+                for other in [capo.saturating_sub(2), capo + 2] {
+                    if other == 0 || other == capo {
+                        continue;
+                    }
+                    let px = g.press_x(other);
+                    assert!(
+                        !hit.contains(Pos2::new(px, (top + bot) * 0.5)),
+                        "the capo at {capo} swallows fret {other} at width {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Cycling reaches every capo style and comes back round, and an unknown
+    /// value from a later build falls back rather than being rewritten.
+    #[test]
+    fn capo_styles_cycle_and_unknown_values_fall_back() {
+        let mut seen = std::collections::HashSet::new();
+        let mut c = CapoStyle::default();
+        for _ in 0..CapoStyle::ALL.len() {
+            seen.insert(c);
+            c = c.next();
+        }
+        assert_eq!(seen.len(), CapoStyle::ALL.len());
+        assert_eq!(
+            c,
+            CapoStyle::default(),
+            "the cycle does not come back round"
+        );
+        assert_eq!(
+            CapoStyle::default(),
+            CapoStyle::Black,
+            "black is the default: a wooden capo on the default rosewood neck \
+             is a bar you have to look for"
+        );
+        assert_eq!(CapoStyle::from_key("teak-from-2027"), CapoStyle::Black);
+        for st in CapoStyle::ALL {
+            assert_eq!(
+                CapoStyle::from_key(st.key()),
+                st,
+                "{st:?} does not round-trip"
+            );
+        }
+    }
     use super::*;
     use ivory_core::fretboard::{Tuning, TUNINGS};
     use ivory_core::voicing::solve_cold;

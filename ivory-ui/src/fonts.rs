@@ -179,6 +179,24 @@ pub fn install(ctx: &egui::Context, choice: FontChoice, custom_font_path: Option
         }
     }
 
+    // JetBrains Mono sits at the BOTTOM of both chains, always, whichever
+    // face the user picked.
+    //
+    // It is the only bundled face with the music accidentals — U+266D and
+    // U+266F, verified by reading the cmaps — and neither Courier Prime nor
+    // Terminess has them, nor does egui's default fallback. Without this the
+    // circle of fifths had to spell a flat as the letter "b", so the relative
+    // minor of D flat read "bb" and a key signature read "2b". It costs
+    // nothing: the face is compiled in already for the third typeface option.
+    if !matches!(choice, FontChoice::JetBrains) {
+        defs.font_data.insert(
+            "JetBrainsMono-Fallback".to_owned(),
+            Arc::new(FontData::from_static(JETBRAINS_REGULAR)),
+        );
+        regular.push("JetBrainsMono-Fallback".to_owned());
+        bold.push("JetBrainsMono-Fallback".to_owned());
+    }
+
     regular.extend(default_fallback.iter().cloned());
     bold.extend(default_fallback.iter().cloned());
 

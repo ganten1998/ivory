@@ -413,7 +413,7 @@ mod tests {
             egui::Event::PointerMoved(Pos2::new(200.0, 100.0)),
             egui::Event::MouseWheel {
                 unit: egui::MouseWheelUnit::Point,
-                delta: egui::Vec2::new(0.0, -240.0),
+                delta: Vec2::new(0.0, -240.0),
                 modifiers: egui::Modifiers::NONE,
             },
         ]);

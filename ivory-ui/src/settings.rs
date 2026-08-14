@@ -121,6 +121,10 @@ pub struct Settings {
     /// Fingerboard wood: "rosewood" (default), "maple", "ebony". Stored
     /// verbatim; an unknown value falls back at use, like `font_choice`.
     pub fretboard_wood: String,
+    /// What the capo is made of: "wood" (default), "black", "silver". Stored
+    /// verbatim; an unknown value falls back at use, like `fretboard_wood`.
+    /// Cycled by clicking the capo itself.
+    pub capo_style: String,
     /// D-UI-16: the guitar view is in its own window.
     pub fretboard_detached: bool,
     /// Remembered popout geometry. Absent until the window has been placed,
@@ -192,6 +196,9 @@ impl Default for Settings {
             fretboard_tuning: "Standard".to_owned(),
             fretboard_capo: 0,
             fretboard_wood: crate::fretboard_panel::Wood::default().key().to_owned(),
+            capo_style: crate::fretboard_panel::CapoStyle::default()
+                .key()
+                .to_owned(),
             fretboard_detached: false,
             theory_circle: false,
             theory_tonnetz: false,
@@ -214,7 +221,38 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        Self::load_from(&Self::path())
+        // A settings file that has never existed means nobody has arranged
+        // anything yet, so show the app off rather than hiding two thirds of
+        // it behind a menu nobody has opened.
+        //
+        // This is NOT the same question as the one `show_fretboard: false`
+        // answers. That default exists because a window that grows on its own
+        // AFTER AN UPDATE is a geometry surprise, and that was a real tester
+        // complaint in 2.2.0. It is about people who already have a layout.
+        // Someone opening Tangent for the first time has no layout to
+        // surprise, and every band off means the guitar view and the theory
+        // band are invisible features.
+        //
+        // The two cases really are distinguishable: an absent file, not an
+        // unreadable one. Garbage still yields plain defaults, because a
+        // corrupt file is not a first launch and quietly rearranging someone's
+        // window because their settings failed to parse would be worse.
+        let path = Self::path();
+        if !path.exists() {
+            return Self::first_launch();
+        }
+        Self::load_from(&path)
+    }
+
+    /// What a brand-new install opens with: everything on.
+    pub fn first_launch() -> Self {
+        Self {
+            show_fretboard: true,
+            theory_circle: true,
+            theory_tonnetz: true,
+            theory_triangles: true,
+            ..Self::default()
+        }
     }
 
     fn load_from(path: &std::path::Path) -> Self {
@@ -381,6 +419,11 @@ impl Settings {
         take_bool(&mut map, "theory_tonnetz", &mut s.theory_tonnetz);
         take_bool(&mut map, "theory_triangles", &mut s.theory_triangles);
         take_bool(&mut map, "theory_follow_midi", &mut s.theory_follow_midi);
+        if let Some(v) = map.remove("capo_style") {
+            if let Some(t) = v.as_str() {
+                s.capo_style = t.to_owned();
+            }
+        }
         if let Some(v) = map.remove("fretboard_tuning") {
             if let Some(t) = v.as_str() {
                 s.fretboard_tuning = t.to_owned();
@@ -496,6 +539,7 @@ impl Settings {
             "theory_follow_midi".into(),
             Value::Bool(self.theory_follow_midi),
         );
+        map.insert("capo_style".into(), Value::String(self.capo_style.clone()));
         map.insert(
             "fretboard_tuning".into(),
             Value::String(self.fretboard_tuning.clone()),
@@ -626,6 +670,12 @@ impl Settings {
     /// written by a later build (a tuning this one has never heard of, a capo
     /// of 40) still opens, still draws something sensible, and still keeps its
     /// own values when it goes back to the build that understands them.
+    /// What the capo is made of. Unknown values fall back to wood here rather
+    /// than on load, so a file from a later build keeps its own value.
+    pub fn capo_style(&self) -> crate::fretboard_panel::CapoStyle {
+        crate::fretboard_panel::CapoStyle::from_key(&self.capo_style)
+    }
+
     /// D-UI-17: the selected theory diagrams, as one value.
     pub fn theory_views(&self) -> crate::theory_panel::Views {
         crate::theory_panel::Views {
@@ -682,6 +732,44 @@ pub fn clamp_to_monitor(
 
 #[cfg(test)]
 mod tests {
+
+    /// A first launch shows the whole app; a corrupt file does not get
+    /// rearranged behind the user's back. Both matter, and they are one line
+    /// apart in `load()`.
+    #[test]
+    fn a_first_launch_shows_everything_and_a_broken_file_does_not() {
+        let first = Settings::first_launch();
+        assert!(
+            first.show_fretboard,
+            "the guitar view is invisible on a fresh install"
+        );
+        assert!(
+            first.theory_views().count() == 3,
+            "the theory band is invisible on a fresh install"
+        );
+        // Nothing else moves: a first launch is the DEFAULTS plus visibility,
+        // not a second set of preferences to keep in step.
+        let same = Settings {
+            show_fretboard: false,
+            theory_circle: false,
+            theory_tonnetz: false,
+            theory_triangles: false,
+            ..first.clone()
+        };
+        assert_eq!(same, Settings::default());
+
+        // An unreadable file is not a first launch.
+        let dir = std::env::temp_dir().join(format!("tangent-firstrun-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let broken = dir.join("settings.json");
+        std::fs::write(&broken, b"{ not json").unwrap();
+        assert_eq!(
+            Settings::load_from(&broken),
+            Settings::default(),
+            "a corrupt settings file rearranged the window"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The settings a plugin carries in its project file are the same text the
     /// standalone writes, unknown keys included. Anything else and a project
