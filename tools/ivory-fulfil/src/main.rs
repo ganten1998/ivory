@@ -22,6 +22,7 @@
 //!   GUMROAD_SELLER_ID    your seller id, cheap first-pass rejection
 //!   RESEND_API_KEY       email provider key
 //!   MAIL_FROM            e.g. "Tangent <keys@yourdomain>"
+//!   MAIL_REPLY_TO        an inbox that RECEIVES; see below. default below
 //!   LEDGER_PATH          default /data/ledger.jsonl (persist this volume!)
 //!   PORT                 default 8080
 
@@ -221,6 +222,18 @@ fn email_body(key: &str) -> String {
     )
 }
 
+/// Where a buyer's reply goes.
+///
+/// NOT `MAIL_FROM`. That address sends and cannot receive, so using it as
+/// Reply-To meant every buyer who simply hit Reply got silence — the one
+/// message they keep, with a dead address on it. The page tells them to reply
+/// to their Gumroad receipt instead, which mitigated it and hid it.
+///
+/// Overridable, but it defaults to a real inbox rather than to `from`, because
+/// the failure is invisible from this end: nothing bounces, nothing logs, the
+/// reply just never arrives.
+const DEFAULT_REPLY_TO: &str = "ganten7@gmail.com";
+
 fn send_email(api_key: &str, from: &str, to: &str, name: &str, key: &str) -> Result<(), String> {
     let body = email_body(key);
     let payload = serde_json::json!({
@@ -228,7 +241,7 @@ fn send_email(api_key: &str, from: &str, to: &str, name: &str, key: &str) -> Res
         "to": [to],
         "subject": "Your Tangent supporter key",
         "text": body,
-        "reply_to": from,
+        "reply_to": env_opt("MAIL_REPLY_TO", DEFAULT_REPLY_TO),
     });
     let _ = name; // reserved: personalised subject lines
     ureq::post("https://api.resend.com/emails")
@@ -268,7 +281,146 @@ fn mint(kp: &KeyPair, name: Option<&str>) -> Result<(String, [u8; 5]), String> {
     }
 }
 
+/// Every distinct buyer address in the ledger, in the order first seen.
+///
+/// Deduped: the ledger is one row per SALE, and a repeat customer is several
+/// rows. Announcing to it row-by-row mails the same person three times.
+fn ledger_recipients(path: &str) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let row: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| format!("{path}: bad ledger row: {e}"))?;
+        if let Some(addr) = row.get("email").and_then(|v| v.as_str()) {
+            let addr = addr.trim().to_lowercase();
+            if !addr.is_empty() && seen.insert(addr.clone()) {
+                out.push(addr);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `announce --subject S --body FILE [--send]` — mail every buyer at once.
+///
+/// The download links never change (they resolve by name against whatever
+/// release is latest), so an announcement does not need new links each time —
+/// it needs to REACH the people who already have the old ones. That list only
+/// exists in the ledger, so it lives here rather than in a script.
+///
+/// **Dry run by default.** `--send` is the only thing that puts mail on the
+/// wire; without it this prints the recipients and the exact body and exits.
+/// One wrong keystroke here reaches every customer at once and cannot be
+/// recalled, so the safe mode is the default and the dangerous one is typed
+/// out in full.
+fn announce(args: &[String]) -> i32 {
+    let mut subject = None;
+    let mut body_file = None;
+    let mut ledger = None;
+    let mut send = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--subject" => subject = it.next().cloned(),
+            "--body" => body_file = it.next().cloned(),
+            "--ledger" => ledger = it.next().cloned(),
+            "--send" => send = true,
+            other => {
+                eprintln!("announce: unknown argument {other}");
+                return 2;
+            }
+        }
+    }
+    let (Some(subject), Some(body_file)) = (subject, body_file) else {
+        eprintln!(
+            "usage: ivory-fulfil announce --subject <text> --body <file> [--ledger <path>] [--send]\n\
+             \n\
+             Dry run unless --send is given. Fetch the ledger first with:\n\
+             \x20 flyctl ssh sftp get /data/ledger.jsonl -a ivory-fulfil"
+        );
+        return 2;
+    };
+    let ledger = ledger.unwrap_or_else(|| env_opt("LEDGER_PATH", "/data/ledger.jsonl"));
+    let body = match std::fs::read_to_string(&body_file) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("announce: {body_file}: {e}");
+            return 1;
+        }
+    };
+    // The rule that has already drawn a real accusation. Cheap to check here,
+    // and this is the one message that goes to everybody at once.
+    if body.contains('\u{2014}') || subject.contains('\u{2014}') {
+        eprintln!("announce: em dash in the subject or body. Not sending.");
+        return 1;
+    }
+    let recipients = match ledger_recipients(&ledger) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("announce: {e}");
+            return 1;
+        }
+    };
+    if recipients.is_empty() {
+        eprintln!("announce: no recipients in {ledger}");
+        return 1;
+    }
+
+    println!("Subject: {subject}");
+    println!("From:    {}", env_opt("MAIL_FROM", "<MAIL_FROM unset>"));
+    println!(
+        "Reply-To: {}",
+        env_opt("MAIL_REPLY_TO", DEFAULT_REPLY_TO)
+    );
+    println!("{} recipient(s) from {ledger}:", recipients.len());
+    for r in &recipients {
+        println!("    {r}");
+    }
+    println!("\n--- body ---\n{body}--- end ---\n");
+
+    if !send {
+        println!("DRY RUN. Nothing was sent. Add --send to actually mail these people.");
+        return 0;
+    }
+
+    let api_key = env("RESEND_API_KEY");
+    let from = env("MAIL_FROM");
+    let reply_to = env_opt("MAIL_REPLY_TO", DEFAULT_REPLY_TO);
+    let (mut sent, mut failed) = (0usize, 0usize);
+    for to in &recipients {
+        let payload = serde_json::json!({
+            "from": from,
+            "to": [to],
+            "subject": subject,
+            "text": body,
+            "reply_to": reply_to,
+        });
+        match ureq::post("https://api.resend.com/emails")
+            .set("Authorization", &format!("Bearer {api_key}"))
+            .timeout(std::time::Duration::from_secs(20))
+            .send_json(payload)
+        {
+            Ok(_) => {
+                sent += 1;
+                println!("    sent    {to}");
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("    FAILED  {to}: {e}");
+            }
+        }
+    }
+    println!("\n{sent} sent, {failed} failed.");
+    i32::from(failed > 0)
+}
+
 fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("announce") {
+        std::process::exit(announce(&argv[1..]));
+    }
+
     let seed_hex = env("IVORY_SIGNING_SEED");
     let hook_secret = env("IVORY_HOOK_SECRET");
     let gumroad_token = env("GUMROAD_TOKEN");
@@ -416,6 +568,36 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ledger is one row per SALE. A repeat customer is several rows, and
+    /// the live ledger already contains one who bought three times — announcing
+    /// row-by-row would mail them three copies of the same message.
+    #[test]
+    fn announce_recipients_are_one_per_person() {
+        let path = std::env::temp_dir().join("ivory-fulfil-ledger-test.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"email":"a@example.com","key":"K1"}"#,
+                "\n",
+                r#"{"email":"b@example.com","key":"K2"}"#,
+                "\n",
+                r#"{"email":"a@example.com","key":"K3"}"#,
+                "\n",
+                "\n", // blank lines are skipped, not treated as bad rows
+                r#"{"email":"A@Example.com","key":"K4"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let got = ledger_recipients(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            got,
+            vec!["a@example.com".to_owned(), "b@example.com".to_owned()],
+            "each buyer exactly once, case-folded, in the order first seen"
+        );
+        std::fs::remove_file(&path).ok();
+    }
 
     /// Eyeball the real thing: `cargo test -- --ignored --nocapture print_email`
     #[test]

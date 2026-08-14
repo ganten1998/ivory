@@ -69,6 +69,32 @@ Ganten
 
 ---
 
+## How to actually send it
+
+The buyer list exists in exactly one place, the fulfil ledger, so sending lives
+there too:
+
+```sh
+flyctl ssh sftp get /data/ledger.jsonl -a ivory-fulfil     # 1. fetch the list
+sed -n '/^Hello,$/,/^Ganten$/p' docs/RELEASE-EMAIL-3.0.0.md > /tmp/body.txt
+
+cd tools/ivory-fulfil                                       # 2. DRY RUN first
+cargo run -- announce --subject "..." --body /tmp/body.txt --ledger ~/ledger.jsonl
+
+RESEND_API_KEY=... MAIL_FROM='Tangent <keys@ivorymidi.com>' \
+  cargo run -- announce --subject "..." --body /tmp/body.txt \
+    --ledger ~/ledger.jsonl --send                          # 3. and only then
+```
+
+It is a **dry run unless `--send`** is given: it prints the recipients and the
+exact body and stops. It dedupes, because the ledger is one row per SALE and a
+repeat customer is several rows (one person in there has bought three times).
+It refuses to send if it finds an em dash.
+
+**The download links do not need updating per release.** They resolve by asset
+name against whatever release is latest, so the three URLs below are the same
+three URLs every future announcement uses. What changes is the prose.
+
 ## Checklist before sending
 
 - [ ] 3.0.0 is published and all three installer links resolve (click each one)
