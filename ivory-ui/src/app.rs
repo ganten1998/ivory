@@ -1992,6 +1992,70 @@ mod tests {
             .collect()
     }
 
+    /// A dialog and a menu must OPEN and DRAW inside a plugin, and still send
+    /// the host nothing.
+    ///
+    /// The two frame tests above run an idle app. This one drives it through
+    /// the paths that used to open OS windows — `A` raises the About box, `H`
+    /// the shortcut card — and keeps running frames while they are up. In a
+    /// plugin `show_viewport_immediate` does not fail, it opens a second
+    /// `CentralPanel` under the same id and paints garbage over the piano, so
+    /// "it did not crash" is not the assertion. The assertion is that the host
+    /// still receives no viewport command and the app is still standing.
+    #[test]
+    fn dialogs_and_menus_open_inside_a_plugin_without_reaching_the_host() {
+        let (ctx, mut app) = headless(Caps::PLUGIN);
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let size = Vec2::new(900.0, 435.0);
+
+        let press = |k: egui::Key| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let frame = |ctx: &egui::Context, app: &mut IvoryApp, events: Vec<egui::Event>| {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            out.viewport_output
+                .values()
+                .flat_map(|v| v.commands.iter())
+                .map(|c| format!("{c:?}"))
+                .collect::<Vec<_>>()
+        };
+
+        // Settle, then open the About box and hold it open for several frames.
+        for _ in 0..2 {
+            assert!(frame(&ctx, &mut app, vec![]).is_empty());
+        }
+        assert!(frame(&ctx, &mut app, vec![press(egui::Key::A)]).is_empty());
+        assert!(
+            app.dialog.is_some(),
+            "A did not open a dialog, so this test proves nothing"
+        );
+        for i in 0..4 {
+            let cmds = frame(&ctx, &mut app, vec![]);
+            assert!(cmds.is_empty(), "an open dialog commanded the host on frame {i}: {cmds:?}");
+        }
+
+        // Escape closes it, inline as well as in a window.
+        frame(&ctx, &mut app, vec![press(egui::Key::Escape)]);
+        assert!(app.dialog.is_none(), "Escape did not close the in-canvas dialog");
+
+        // ...and the held shortcut card, which is drawn over everything.
+        for i in 0..3 {
+            let cmds = frame(&ctx, &mut app, vec![press(egui::Key::H)]);
+            assert!(cmds.is_empty(), "the shortcut card commanded the host on frame {i}: {cmds:?}");
+        }
+    }
+
     /// A plugin is handed a rect and has to lay out inside it. `main_width`
     /// is the desktop's answer — 1300 points times a size percentage — and
     /// using it in an editor the host opened at 900 would run the piano off

@@ -1,14 +1,36 @@
 <!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
-body { font: 13px -apple-system, sans-serif; margin: 0; color: #1a1a1a; }
+/*
+  NO hardcoded colours for text or background.
+
+  macOS renders these pages in a WebView that follows the SYSTEM appearance,
+  and it will happily show a page written for a light background on a dark one.
+  The first version set `color: #1a1a1a` on the body and a cream background on
+  `code`; in dark mode the body text came out light while the code background
+  stayed light, so every path in this page — the two things it exists to tell
+  you — was light on light and unreadable.
+
+  So: inherit the system's text colour, and give inline code a background that
+  is a translucent grey. It darkens a light page and lightens a dark one, and
+  it cannot be wrong in either.
+*/
+body { font: 13px -apple-system, sans-serif; margin: 0; }
 h2 { font-size: 15px; margin: 0 0 8px; }
 p { margin: 0 0 10px; line-height: 1.45; }
-code { font: 12px ui-monospace, Menlo, monospace; background: #f0ece2; padding: 1px 3px; }
+li { margin-bottom: 6px; line-height: 1.4; }
+code {
+  font: 12px ui-monospace, Menlo, monospace;
+  color: inherit;
+  background: rgba(128, 128, 128, 0.28);
+  border-radius: 3px;
+  padding: 1px 4px;
+  white-space: nowrap;
+}
 </style></head><body>
 <h2>Installed</h2>
 <p>If you installed the application, it is in <code>/Applications</code>.</p>
 <p>If you installed the plugin, your DAW will find it the next time it scans
-for plugins — most rescan on launch, some need to be told. It appears as
+for plugins &mdash; most rescan on launch, some need to be told. It appears as
 <b>Tangent</b> by <b>ganten</b>.</p>
 <p>Hold <b>H</b> in either one to see every keyboard shortcut.</p>
 </body></html>
