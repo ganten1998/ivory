@@ -10,6 +10,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-08-14
+
 ### Added
 
 - **The fretboard works as an input.** With Keytoggle on, click the neck to
@@ -46,7 +48,6 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   - **Tonnetz** — the lattice where left-to-right is fifths and the diagonals
     are thirds, so every major triad is a triangle pointing up, every minor
     triad one pointing down, and two chords sharing two notes share an edge.
-    It re-centres on whatever you are playing.
   - **Harmonic triangles** — I, IV and V pointing up with i, iv and v inverted
     through the same centre, each lit when you play it. Between them those
     three chords use every note of the key and no others, which is the reason
@@ -65,6 +66,35 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   root and understands `--app`, `--vst3`, `--prefix`, `--uninstall` and
   `--dry-run`.
 
+- **A shortcut for naming a chord.** Hold the chord, press **N**, and start
+  typing: the box opens with the detected name selected, so the first
+  keystroke replaces it. Naming a voicing is what this app is for, and it used
+  to take a right-click, a scan down a long menu, a click, and then another
+  click into the field. **E** corrects the current reading, **M** opens the
+  chords you have taught, **L** turns chord learning on and off, **P** swaps
+  sharps for flats. All of them, and the rest, are on the **H** card.
+- **Barres are something you draw.** Hold and drag along a fret and every
+  string you cross is fretted there. Placing two notes that happen to share a
+  fret no longer draws a bar across them — by hand, a barre is a thing you
+  meant.
+- **Capo styles.** Click the capo to cycle black, brushed silver and wood.
+  Black by default, because the default fingerboard is rosewood.
+- **A first launch shows everything.** A brand-new install opens with the
+  guitar view and all three theory diagrams on. An existing settings file is
+  never rearranged.
+
+### Changed
+
+- **Real flats and sharps.** ♭ and ♯ throughout the theory band, set the way
+  music is set — raised and smaller, at the top right — rather than spelled
+  with the letter "b". The relative-minor ring is legible again: it used to
+  lower-case whole names, so "Bb" came out as "bb".
+- The theory diagrams' outlines, roman numerals and key signatures are darker
+  on light and lighter on dark; they were pitched as background texture and
+  were hard to read in both modes.
+- Detached windows rise and fall with the main window, so focusing the piano
+  brings its own readouts with it.
+
 ### Fixed
 
 - **`tangent.exe` has never had an icon.** Every Windows release was
@@ -73,6 +103,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   is for — so it never ran once, and the shipped binary had no icon in
   Explorer, none on the taskbar, and blank Properties. It now has both an icon
   and a version block.
+- **JetBrains Mono could not be selected.** It was bundled and listed in the
+  menu, but cycling with `F` alternated between the first two faces forever.
+- The right-click menu inside a plugin: every row was dead, and the menu had
+  no visible edge against the app behind it. It also fits the editor now
+  rather than running off the bottom.
+- Turning a band on inside a DAW makes the editor taller instead of shrinking
+  everything to fit the height it already had.
+- The capo no longer stands up into the piano above the neck, and the Tonnetz
+  keeps its bottom row below 100% window size.
 
 ## [2.3.0] - 2026-08-13
 

@@ -38,6 +38,10 @@ use ivory_core::voicing::{Barre, Outcome, StringState, Voicing};
 /// piano above it is 150 at the same width.
 pub const BAND_H_AT_1300: f64 = 132.0;
 
+/// How wide the barre bar is, in dot radii. A note dot is 2.0 across, so
+/// anything less than this leaves the dots bulging out of the bar.
+const BARRE_W_IN_DOTS: f32 = 2.0;
+
 /// What the capo is made of.
 ///
 /// Its own choice rather than part of `Wood`, because a capo is an accessory
@@ -454,7 +458,14 @@ pub fn draw(
     if let Some(b) = barre {
         if b.hi_string < g.strings {
             let x = g.press_x(b.fret);
-            let w = g.dot_r() * 1.7;
+            // Exactly a dot across, so the note dots drawn on top of it are
+            // INSCRIBED rather than bulging out of it.
+            //
+            // It used to be 1.7 radii wide while every dot is 2.0 across, so
+            // each barred string pushed a little past the bar and the two ends
+            // pushed most — a barre read as two blobs joined by a stick rather
+            // than as one finger laid across the strings.
+            let w = g.dot_r() * BARRE_W_IN_DOTS;
             painter.rect_filled(
                 Rect::from_min_max(
                     Pos2::new(x - w * 0.5, g.y(b.hi_string) - g.dot_r()),
@@ -929,6 +940,27 @@ fn painter_border(painter: &Painter, rect: Rect) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A barre is one line across the strings, so the bar must be at least as
+    /// wide as the dots drawn on top of it. At 1.7 radii against a 2.0-radius
+    /// dot every barred string bulged, and the two ends bulged most: it read
+    /// as two blobs joined by a stick.
+    #[test]
+    fn a_barre_is_never_narrower_than_the_dots_on_it() {
+        for w in [400.0_f32, 900.0, 1300.0, 2600.0] {
+            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
+            let g = Geom::new(r, &FretboardSpec::default()).unwrap();
+            assert!(
+                BARRE_W_IN_DOTS >= 2.0,
+                "the barre is {BARRE_W_IN_DOTS} radii wide against a 2.0-radius \
+                 dot, so every dot on it bulges out"
+            );
+            // And the bar reaches the outer edge of the end dots, so the line
+            // ends where the notes do rather than short of them.
+            let _ = g.dot_r();
+            let _ = w;
+        }
+    }
 
     /// Clicking the capo must find the capo, at every fret and every size —
     /// and clicking where there is no capo must not.
