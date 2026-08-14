@@ -160,7 +160,14 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   # checked by hand — otherwise a failed cargo build sails on and tar cheerfully
   # ships an archive containing licences and fonts but no program. That is
   # exactly what happened before 2.1.0.
-  rm -rf "$stage" "${stage}.tar.gz"
+  # Clear the STAGE, never the tarball. On a macOS host the Linux build is
+  # EXPECTED to fail (alsa-sys has no sysroot), so removing the artifact up
+  # front meant every single `build-cross.sh` run on this machine destroyed a
+  # perfectly good Linux release that had been built on the Linux box and
+  # rsynced back — silently, and before the failure that made it look like the
+  # run had simply not produced one. The replacement happens at the end, and
+  # only on success.
+  rm -rf "$stage"
   cargo zigbuild --release --target "${target}.${GLIBC}" -p ivory || return 1
   if [ ! -f "target/${target}/release/tangent" ]; then
     echo "!! no binary at target/${target}/release/tangent"
@@ -180,8 +187,13 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   # The same user-facing readme the macOS and Windows artifacts carry.
   cp docs/ARTIFACT-README.md "$stage/README.txt" \
     || { rm -rf "$stage"; return 1; }
-  tar -C dist -czf "${stage}.tar.gz" "tangent-${VERSION}-linux-${arch}" || {
-    rm -rf "$stage" "${stage}.tar.gz"; return 1;
+  # Written beside the real name and moved into place, so a tar that fails
+  # half way leaves the previous artifact intact rather than a truncated one.
+  tar -C dist -czf "${stage}.tar.gz.new" "tangent-${VERSION}-linux-${arch}" || {
+    rm -rf "$stage" "${stage}.tar.gz.new"; return 1;
+  }
+  mv -f "${stage}.tar.gz.new" "${stage}.tar.gz" || {
+    rm -rf "$stage" "${stage}.tar.gz.new"; return 1;
   }
   rm -rf "$stage"
   echo "==> ${stage}.tar.gz"

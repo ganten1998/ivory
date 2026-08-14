@@ -93,7 +93,8 @@ ARTIFACTS=()
 # build-macos.sh stopped producing that name, so the script exited "no
 # artifacts in dist/" on the first release it was asked to publish.
 for f in dist/Tangent-"${VERSION}"-macos-*.zip dist/Tangent-"${VERSION}"-macos-*.dmg \
-         dist/tangent-"${VERSION}"-linux-*.tar.gz dist/tangent-"${VERSION}"-windows-*.zip; do
+         dist/tangent-"${VERSION}"-linux-*.tar.gz dist/tangent-"${VERSION}"-windows-*.zip \
+         dist/Tangent-"${VERSION}"-macos.pkg dist/Tangent-"${VERSION}"-windows-setup.exe; do
   [ -f "$f" ] && ARTIFACTS+=("$f")
 done
 shopt -u nullglob

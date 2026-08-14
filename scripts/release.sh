@@ -66,7 +66,8 @@ if [ "${KEEP_STALE:-0}" != "1" ]; then
   shopt -s nullglob
   STALE=()
   for f in dist/Tangent-*-macos-*.zip dist/Tangent-*-macos-*.dmg \
-           dist/tangent-*-linux-*.tar.gz dist/tangent-*-windows-*.zip; do
+           dist/tangent-*-linux-*.tar.gz dist/tangent-*-windows-*.zip \
+           dist/Tangent-*-macos.pkg dist/Tangent-*-windows-setup.exe; do
     case "$f" in *"-${VERSION}-"*) continue ;; esac
     STALE+=("$f")
   done
@@ -116,6 +117,51 @@ fi
 
 echo "==> Checking ${#ARTIFACTS[@]} artifact(s)"
 for a in "${ARTIFACTS[@]}"; do
+  # ── Installers, which carry BOTH payloads and are checked for both ────────
+  # An installer that quietly ships only the app is the same class of failure
+  # as the empty Linux tarball: it installs, it looks right, and the thing the
+  # user came for is not there.
+  case "$a" in
+    *.pkg)
+      exp="$(mktemp -d)"
+      if pkgutil --expand "$a" "$exp/x" 2>/dev/null; then
+        [ -d "$exp/x/Tangent-app.pkg" ]  || note "$a: no application component"
+        [ -d "$exp/x/Tangent-vst3.pkg" ] || note "$a: no VST3 component"
+        grep -q 'choice.standalone' "$exp/x/Distribution" 2>/dev/null \
+          || note "$a: the installer offers no standalone choice"
+        grep -q 'choice.vst3' "$exp/x/Distribution" 2>/dev/null \
+          || note "$a: the installer offers no plugin choice"
+        # relocatable="true" would let a stray copy elsewhere on the disk
+        # receive the update instead of /Applications.
+        grep -q 'relocatable="false"' "$exp/x/Tangent-app.pkg/PackageInfo" 2>/dev/null \
+          || note "$a: the app component is RELOCATABLE (it must not be)"
+        grep -q 'install-location="/Library/Audio/Plug-Ins/VST3"' \
+          "$exp/x/Tangent-vst3.pkg/PackageInfo" 2>/dev/null \
+          || note "$a: the plugin does not install to the VST3 folder"
+        pkgutil --check-signature "$a" 2>/dev/null | grep -q 'Status: signed' \
+          || note "$a: UNSIGNED (needs a Developer ID Installer certificate)"
+      else
+        note "$a: could not be expanded — it is not a valid flat package"
+      fi
+      rm -rf "$exp"
+      continue
+      ;;
+    *setup.exe)
+      if command -v 7zz >/dev/null 2>&1; then
+        wl="$(7zz l "$a" 2>/dev/null)"
+        printf '%s\n' "$wl" | grep -q 'tangent\.exe' \
+          || note "$a: no tangent.exe"
+        printf '%s\n' "$wl" | grep -q 'VST3/Tangent\.vst3/Contents/x86_64-win/Tangent\.vst3' \
+          || note "$a: no VST3 payload, or it is not going to the VST3 folder"
+        printf '%s\n' "$wl" | grep -q 'Uninstall\.exe' \
+          || note "$a: no uninstaller"
+      else
+        note "$a: not inspected (install 7-zip to check: brew install sevenzip)"
+      fi
+      continue
+      ;;
+  esac
+
   case "$a" in
     *.zip)    list="$(unzip -Z1 "$a")" ;;
     *.tar.gz) list="$(tar -tzf "$a")" ;;
