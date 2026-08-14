@@ -4,7 +4,7 @@
 #   scripts/build-plugin.sh                 # host platform
 #   scripts/build-plugin.sh macos           # universal (x86_64 + arm64), signed
 #   scripts/build-plugin.sh windows         # cross-compiled from macOS
-#   scripts/build-plugin.sh linux           # cross-compiled from macOS
+#   scripts/build-plugin.sh linux           # ON Linux only (see build_linux)
 #
 # Output: dist/plugin/<platform>/Tangent.vst3
 #
@@ -29,7 +29,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-PKG="tangent-vst3"          # cargo package
 LIB="libtangent_vst3"       # cdylib basename cargo emits
 NAME="Tangent"              # what the bundle and the host call it
 VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
@@ -151,14 +150,34 @@ build_windows() {
 }
 
 build_linux() {
+  # Linux CANNOT be cross-built from macOS, and the reason is worth stating so
+  # nobody spends an afternoon on it again. `baseview` links X11 through the
+  # `x11` crate, whose build script calls `pkg-config`, which refuses to
+  # cross-compile without a target sysroot:
+  #
+  #   pkg-config has not been configured to support cross-compilation
+  #
+  # That is the same class of blocker as ALSA for the standalone
+  # (docs/RELEASE.md, "Cross-build blocker"), and the same answer applies:
+  # build it on Linux. `scripts/build-linux-remote.sh` does that in one
+  # command and brings the result back.
+  if [ "$(uname -s)" != "Linux" ]; then
+    cat >&2 <<'MSG'
+The Linux plugin cannot be cross-built from macOS: baseview links X11 and the
+x11 crate's build script needs a target sysroot for pkg-config.
+
+  Build it on a Linux host instead, in one command:
+
+      scripts/build-linux-remote.sh <ssh-host>
+
+  which builds BOTH the standalone tarball and this bundle over there and
+  rsyncs them back into dist/.
+MSG
+    exit 1
+  fi
+
   echo "==> $NAME $VERSION — Linux VST3 (x86_64)"
-  ( cd plugin
-    rustup target add x86_64-unknown-linux-gnu >/dev/null 2>&1 || true
-    if command -v cargo-zigbuild >/dev/null 2>&1 && [ "$(uname -s)" != "Linux" ]; then
-      cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.32
-    else
-      cargo build --release --target x86_64-unknown-linux-gnu
-    fi )
+  ( cd plugin && cargo build --release --target x86_64-unknown-linux-gnu )
 
   rm -rf "$BUNDLE"
   mkdir -p "$BUNDLE/Contents/x86_64-linux" "$BUNDLE/Contents/Resources"

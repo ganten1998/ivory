@@ -123,8 +123,21 @@ rsync -az --delete ${SSH_OPTS:+-e "ssh $SSH_OPTS"} \
 ssh_ "$HOST" "[ -L $REMOTE_DIR/target ] && rm -f $REMOTE_DIR/target || true"
 
 # ── Build ────────────────────────────────────────────────────────────────────
-echo "==> Building (first run compiles everything; later runs reuse the cache)"
+echo "==> Building the standalone (first run compiles everything)"
 ssh_ "$HOST" "cd $REMOTE_DIR && chmod +x scripts/*.sh && scripts/build-linux-native.sh"
+
+# ── The VST3, over there for the same reason ────────────────────────────────
+# baseview links X11 and the x11 crate's build script needs a target sysroot
+# for pkg-config, so the plugin cannot be cross-built from macOS either. It is
+# a separate workspace with its own lock file, so this is a second cargo build
+# and not a second target of the first one.
+#
+# NON-FATAL on purpose. The standalone is the release; a plugin that fails to
+# build here should not take the tarball down with it, and the message says
+# which of the two you are missing.
+echo "==> Building the VST3"
+PLUGIN_OK=1
+ssh_ "$HOST" "cd $REMOTE_DIR && scripts/build-plugin.sh linux" || PLUGIN_OK=0
 
 # ── Bring it home ────────────────────────────────────────────────────────────
 echo "==> Fetching the tarball"
@@ -151,5 +164,29 @@ fi
 echo "==> OK  $TARBALL"
 ls -lh "$TARBALL" | sed 's/^/    /'
 echo "    $(tar -tzf "$TARBALL" | wc -l | tr -d ' ') entries, binary present"
+
+# ── Bring the plugin home too ───────────────────────────────────────────────
+if [ "$PLUGIN_OK" = "1" ]; then
+  echo "==> Fetching the VST3"
+  mkdir -p dist/plugin/linux
+  rsync -az --delete ${SSH_OPTS:+-e "ssh $SSH_OPTS"} \
+    "$HOST:$REMOTE_DIR/dist/plugin/linux/" dist/plugin/linux/
+  SO="dist/plugin/linux/Tangent.vst3/Contents/x86_64-linux/Tangent.so"
+  if [ ! -f "$SO" ]; then
+    echo "FAIL: no $SO came back" >&2
+    exit 1
+  fi
+  # Same lesson as the tarball check above: an existing file proves nothing.
+  # A VST3 with no GetPluginFactory is a file a host silently ignores.
+  if [ "$(strings -a "$SO" | grep -cx 'GetPluginFactory')" -eq 0 ]; then
+    echo "FAIL: $SO exports no GetPluginFactory — no host would load it" >&2
+    exit 1
+  fi
+  echo "==> OK  $SO"
+  ls -lh "$SO" | sed 's/^/    /'
+else
+  echo "!! the VST3 did not build on $HOST — the standalone tarball above is fine"
+fi
+
 echo
 echo "Next: scripts/release.sh --sums-only, then scripts/publish-github.sh"
