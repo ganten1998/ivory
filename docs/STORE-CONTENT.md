@@ -40,6 +40,56 @@ re-uploaded by hand, which is exactly the step that gets forgotten. The cost is
 that downloads depend on GitHub being reachable, which is the same dependency
 the public README already has.
 
+## Product description
+
+Gumroad → Products → Tangent → **Description**. This is the public page, the
+one people read before paying, and it is separate from the Content tab below.
+
+Kept here because it has been lost once already. If you rewrite it on the web,
+paste it back into this file.
+
+NO EM DASHES anywhere in it. They read as machine-written and have drawn a
+real accusation before.
+
+---
+
+Play a chord. Tangent names it.
+
+Tangent is a MIDI keyboard monitor for people who want to see what they are
+playing. Plug in a keyboard and all 88 keys light up in real time, while the
+chord engine reads what you are holding: plain triads, sevenths, extensions,
+altered dominants, sus and add chords, slash chords, rootless jazz voicings,
+and 28 scales and modes. 95 chord patterns against all 12 roots.
+
+It shows the same notes three more ways.
+
+On a guitar neck, where a player would actually put their fingers. One MIDI
+note can be six places on a guitar, so Tangent picks the shape a hand would
+use, weighing span, open strings and barres, and holds it steady as you add
+notes instead of jumping around the neck. Seven tunings, a capo, and the neck
+works backwards too: click it to build a shape and read the chord off the
+piano.
+
+As geometry, on the circle of fifths, on a Tonnetz, and as the I, IV and V
+triangles. Every key shaded by how much of your chord belongs to it, so keys
+that are close light up together.
+
+And inside your DAW. Tangent 3.0 ships a VST3 plugin with the same display,
+reading the notes on the track it is on.
+
+Teach it your own names. If you call something a Hendrix chord, right-click,
+type it, and that is what it says from then on, in every key if you want.
+
+Tangent is free and it stays free. There is no trial, no locked feature and no
+account. It talks to no server and collects nothing. Paying gets you a
+supporter key, which turns on a small pixel heart and nothing else, and my
+thanks.
+
+macOS 11 or later (Apple Silicon or Intel), Windows 10 or later, Linux x86_64.
+Signed and notarized on macOS. Installers include the app, the plugin, or both.
+
+---
+
 ## Post-purchase page
 
 Gumroad → Products → Tangent → **Content** tab → paste, then **Save changes**.
