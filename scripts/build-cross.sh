@@ -3,6 +3,7 @@
 #
 #   scripts/build-cross.sh        # builds + packages everything into dist/
 #   scripts/build-cross.sh ico    # regenerate assets/ivory.ico only (dry-test hook)
+#   scripts/build-cross.sh check-linux   # TYPE-CHECK the Linux target from macOS
 #
 # Requirements (all via Homebrew/cargo):
 #   brew install zig
@@ -22,6 +23,52 @@ ICON_SRC="assets/ivory.png"
 
 TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
 [ -n "$TOOLCHAIN_BIN" ] && export PATH="$TOOLCHAIN_BIN:$HOME/.cargo/bin:$PATH"
+
+# check_linux — compile the Linux target from macOS WITHOUT an ALSA sysroot.
+#
+# Linux release binaries still cannot be cross-built here (see the note above
+# package_linux), but a release build is not what is usually wanted: what is
+# wanted is to know whether the Linux target still COMPILES before pushing, and
+# for that the answer is yes.
+#
+# `cargo check` never links, so libasound.so does not have to exist — only
+# `pkg-config --exists alsa` has to succeed, because that is all alsa-sys's
+# build script tests. A three-line stub .pc file satisfies it.
+#
+# ALSA_NO_PKG_CONFIG does NOT work for this: alsa-sys panics on it deliberately
+# ("Aborted because ALSA_NO_PKG_CONFIG is set", build.rs:13).
+#
+# Without this, Rust code that is Linux-only — the `#[cfg(unix)]` statvfs
+# branch, the non-macOS camera stub — is never type-checked on this machine at
+# all, and the first thing that finds a mistake in it is the Linux box.
+check_linux() {
+  local target="${1:-x86_64-unknown-linux-gnu}" pcdir
+  pcdir="$(mktemp -d)"
+  cat > "$pcdir/alsa.pc" <<'PC'
+prefix=/usr
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: alsa
+Description: stub for cross TYPE-CHECKING only; never linked against
+Version: 1.2.11
+Libs: -L${libdir} -lasound
+Cflags: -I${includedir}
+PC
+  echo "==> type-checking $target (stub alsa.pc, no sysroot)"
+  PKG_CONFIG_ALLOW_CROSS=1 \
+  PKG_CONFIG_PATH="$pcdir" \
+  PKG_CONFIG_SYSROOT_DIR=/ \
+    cargo check --workspace --target "$target"
+  local rc=$?
+  rm -rf "$pcdir"
+  return $rc
+}
+
+if [ "${1:-}" = "check-linux" ]; then
+  check_linux "${2:-x86_64-unknown-linux-gnu}"
+  exit $?
+fi
 
 # gen_ico — produce assets/ivory.ico from assets/ivory.png so ivory/build.rs
 # (winres) can embed it in ivory.exe. ImageMagick when available (BMP frames
