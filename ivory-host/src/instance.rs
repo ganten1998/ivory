@@ -32,14 +32,63 @@
 //! `IHostApplication` during initialisation and treat its absence as a fatal
 //! configuration error. Supplying a real one costs about forty lines and removes
 //! a whole class of "works with plugin A, silently fails with plugin B".
+//!
+//! # The sustain pedal, which is not an event
+//!
+//! VST3 deleted MIDI control changes from the event stream on purpose. There is
+//! no "send CC64" call anywhere in the API. A pedal reaches an instrument like
+//! this, and only like this:
+//!
+//! ```text
+//! IComponent::getControllerClassId       the processor names its OTHER half
+//! factory.createInstance(that, IEditController)
+//! IEditController::initialize(host)
+//! IConnectionPoint::connect  BOTH WAYS   <- the step everybody skips
+//! IMidiMapping::getMidiControllerAssignment(bus, channel, 64, &paramId)
+//! ProcessData::inputParameterChanges      a HOST-implemented IParameterChanges
+//!   └ IParamValueQueue for paramId        carrying (sampleOffset, 0.0..=1.0)
+//! ```
+//!
+//! Two traps live in that sequence and both of them look like success:
+//!
+//! 1. **`IMidiMapping` is not on the component.** It is on the edit controller,
+//!    which is a separate class the factory exports and which nothing else in
+//!    this host needs. Pianoteq 9: `component.cast::<IMidiMapping>()` is `None`.
+//! 2. **An unconnected controller answers, and answers wrongly.** Pianoteq's
+//!    `getMidiControllerAssignment` returns `kResultOk` for every controller on
+//!    every channel *before* `IConnectionPoint::connect` — with `paramId 0` each
+//!    time. Zero is a legal parameter id. A host that trusts the result code
+//!    would push the sustain pedal into whatever parameter 0 happens to be, on
+//!    every plugin, forever, and the symptom would be "the pedal does something
+//!    strange" rather than an error. After connecting, the same call returns
+//!    `0x6d636d40` for CC64 on channel 0 and a different id per channel. See
+//!    [`read_midi_map`], which keeps the connection open for exactly as long as
+//!    it takes to read the table and no longer.
+//!
+//! **And a third trap, found by measurement after both of those were fixed:**
+//! Pianoteq publishes a mapping for CC64, accepts the parameter change, returns
+//! `kResultOk`, and ignores it — the rendered audio is identical to six decimal
+//! places. It responds only to the LEGACY MIDI CC event. So both are sent, on
+//! every control, always; a CC is a value rather than a delta, so a plugin that
+//! honours both sets the same parameter twice and nothing is harmed. See the
+//! comment in `process_with_controls` for the measured numbers.
+//!
+//! The values then travel in `inputParameterChanges`, which is an interface the
+//! **host** implements and the plugin CALLS during `process` — so
+//! [`ParamChanges`] and [`ParamQueue`] run on the audio thread and are built to
+//! that standard: allocated once in [`Instance::create`], reused every block,
+//! `Cell` rather than `RefCell` so there is no borrow flag to panic on.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 
 use vst3::Steinberg::Vst::{
-    BusDirections_, BusInfo, Event, Event_, IAudioProcessor, IAudioProcessorTrait, IComponent,
-    IComponentTrait, IEventList, IEventListTrait, IHostApplication, IHostApplicationTrait,
-    MediaTypes_, NoteOffEvent, NoteOnEvent, ProcessData, ProcessModes_, ProcessSetup,
-    SymbolicSampleSizes_,
+    kNoParamId, BusDirections_, BusInfo, ControllerNumbers_, Event, Event_, IAudioProcessor,
+    IAudioProcessorTrait, IComponent, IComponentTrait, IConnectionPoint, IConnectionPointTrait,
+    IEditController, IEventList, IEventListTrait, IHostApplication, IHostApplicationTrait,
+    IMidiMapping, IMidiMappingTrait, IParamValueQueue, IParamValueQueueTrait, IParameterChanges,
+    IParameterChangesTrait, LegacyMIDICCOutEvent, MediaTypes_, NoteOffEvent, NoteOnEvent, ParamID,
+    ParamValue, ProcessData, ProcessModes_, ProcessSetup, SymbolicSampleSizes_,
 };
 use vst3::Steinberg::{
     kInvalidArgument, kResultFalse, kResultOk, tresult, IPluginBaseTrait, IPluginFactoryTrait,
@@ -142,6 +191,15 @@ pub struct Instance {
     processing: bool,
     audio_out: Vec<Bus>,
     event_in: Vec<Bus>,
+    /// CC-to-parameter, `channel * CTRL_COUNT + controller`, read once at
+    /// creation. `kNoParamId` means this plugin published nothing for it.
+    midi_map: Vec<ParamID>,
+    /// The host-side `IParameterChanges`, and the interface pointer handed to
+    /// the plugin. Both are held so that `process` neither allocates nor
+    /// touches a refcount: `to_com_ptr` clones an `Arc`, which is an atomic
+    /// increment on the audio thread for a pointer that never changes.
+    changes: ComWrapper<ParamChanges>,
+    changes_ptr: ComPtr<IParameterChanges>,
 }
 
 impl Instance {
@@ -201,6 +259,19 @@ impl Instance {
             ));
         };
 
+        // Before setupProcessing, matching the SDK's own host sequence: the
+        // controller is created and connected while the component is
+        // initialised but not yet active. It is gone again by the time this
+        // returns — see `read_midi_map`.
+        let midi_map = read_midi_map(module, &component, &host_unknown);
+
+        let changes = ComWrapper::new(ParamChanges::new());
+        let Some(changes_ptr) = changes.to_com_ptr::<IParameterChanges>() else {
+            // SAFETY: initialize succeeded, so terminate is owed.
+            unsafe { component.terminate() };
+            return Err("could not build the parameter change list".to_string());
+        };
+
         let mut me = Self {
             component,
             processor,
@@ -210,6 +281,9 @@ impl Instance {
             processing: false,
             audio_out: Vec::new(),
             event_in: Vec::new(),
+            midi_map,
+            changes,
+            changes_ptr,
         };
 
         me.audio_out = me.buses(MediaTypes_::kAudio as i32, BusDirections_::kOutput as i32);
@@ -336,6 +410,33 @@ impl Instance {
         self.setup
     }
 
+    /// The parameter this plugin has wired `controller` on `channel` to, if it
+    /// published one.
+    ///
+    /// An array lookup, safe to call from the audio thread — the table was read
+    /// at creation precisely so that nothing here calls into the plugin.
+    pub fn control_param(&self, channel: i16, controller: i16) -> Option<ParamID> {
+        let (Ok(ch), Ok(cc)) = (usize::try_from(channel), usize::try_from(controller)) else {
+            return None;
+        };
+        if ch >= MIDI_CHANNELS || cc >= CTRL_COUNT {
+            return None;
+        }
+        match self.midi_map.get(ch * CTRL_COUNT + cc) {
+            Some(&id) if id != kNoParamId => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Whether this plugin published any control mapping at all.
+    ///
+    /// `false` means every [`Control`] handed to [`Instance::process_with_controls`]
+    /// will be counted in [`Rendered::unmapped`], and that the pedal almost
+    /// certainly does nothing on this instrument.
+    pub fn maps_controls(&self) -> bool {
+        self.midi_map.iter().any(|id| *id != kNoParamId)
+    }
+
     /// Render `frames` of audio, delivering `events` at their sample offsets.
     ///
     /// `out` is filled per channel of the FIRST audio output bus, which is the
@@ -346,6 +447,25 @@ impl Instance {
         frames: usize,
         out: &mut [Vec<f32>],
     ) -> Result<usize, String> {
+        self.process_with_controls(events, &[], frames, out)
+            .map(|r| r.frames)
+    }
+
+    /// As [`Instance::process`], and deliver `controls` too.
+    ///
+    /// This is the only path a sustain pedal has. Each control is looked up in
+    /// the table read at creation and pushed into the preallocated
+    /// [`ParamChanges`] as a `(sampleOffset, 0.0..=1.0)` point; one the plugin
+    /// published no mapping for is counted in [`Rendered::unmapped`] and offered
+    /// as a legacy MIDI CC event instead, which is the only other door VST3
+    /// leaves open and which most instruments ignore.
+    pub fn process_with_controls(
+        &mut self,
+        events: &[Note],
+        controls: &[Control],
+        frames: usize,
+        out: &mut [Vec<f32>],
+    ) -> Result<Rendered, String> {
         if frames > self.setup.max_block as usize {
             return Err(format!(
                 "asked for {frames} frames but the plugin was set up for {}",
@@ -417,7 +537,63 @@ impl Instance {
             at += n;
         }
 
-        let list = ComWrapper::new(EventList::new(events));
+        // ── the control changes ─────────────────────────────────────────────
+        //
+        // The pool is reused, not rebuilt: `clear` is one `Cell` write and every
+        // point below is two more. This is the part of `process` that a plugin
+        // calls back into while the audio deadline is running, so it is the part
+        // that had to be allocation-free even though the buffers above are not
+        // (that landmine is `ivory/src/instrument.rs`'s to defuse, and it says
+        // so).
+        let mut list_data = EventList::new(events);
+        self.changes.clear();
+        let last = frames.saturating_sub(1) as i32;
+        let mut unmapped = 0usize;
+        for c in controls {
+            // A sampleOffset outside the block is out of contract, and the
+            // plugin is entitled to index its buffers with it.
+            let offset = c.offset.clamp(0, last);
+            match self.control_param(c.channel, c.controller) {
+                Some(id) => {
+                    // BOTH doors, always — and this is measured, not defensive.
+                    //
+                    // The parameter change is the specified path: `IMidiMapping`
+                    // names a parameter, the host pushes a point into
+                    // `inputParameterChanges`, and the processor applies it.
+                    // Pianoteq 9 publishes the mapping (CC64 -> 0x6d636d40),
+                    // accepts the queue without complaint, returns `kResultOk`
+                    // — **and does nothing at all**. Measured on a held C4
+                    // released with the pedal down: 0.001452 RMS of tail with
+                    // the parameter change, against 0.001452 without it. To six
+                    // decimal places, byte for byte, the same rendering.
+                    //
+                    // Adding the legacy MIDI CC event beside it, changing
+                    // nothing else, takes that tail to 0.012151 — **8.4x**, and
+                    // the held portion changes too because the dampers are off
+                    // the strings. That is the pedal arriving.
+                    //
+                    // So both are sent. A CC is a VALUE and not a delta, so a
+                    // plugin that honours both simply sets the same parameter
+                    // twice; there is no double-application to fear. Sending
+                    // only the specified one is correct by the letter of VST3
+                    // and silent on the instrument this app exists to play.
+                    if let Some(q) = self.changes.queue_for(id) {
+                        q.push(offset, c.normalised());
+                    }
+                    list_data.push_legacy_cc(*c, offset);
+                }
+                None => {
+                    // No mapping published, so the parameter path is not
+                    // available at all and the legacy event is the only hope.
+                    // Counted so the band can say "this instrument has no
+                    // pedal" rather than the user concluding the app has none.
+                    unmapped += 1;
+                    list_data.push_legacy_cc(*c, offset);
+                }
+            }
+        }
+
+        let list = ComWrapper::new(list_data);
         let list_ptr = list
             .to_com_ptr::<IEventList>()
             .ok_or_else(|| "could not build the event list".to_string())?;
@@ -430,18 +606,22 @@ impl Instance {
             numOutputs: buses.len() as i32,
             inputs: std::ptr::null_mut(),
             outputs: buses.as_mut_ptr(),
-            inputParameterChanges: std::ptr::null_mut(),
+            inputParameterChanges: self.changes_ptr.as_ptr(),
             outputParameterChanges: std::ptr::null_mut(),
             inputEvents: list_ptr.as_ptr(),
             outputEvents: std::ptr::null_mut(),
             processContext: std::ptr::null_mut(),
         };
 
+        // SAFETY: every pointer in `data` is either null or owned by this
+        // function or by `self`, and all of them outlive the call. In
+        // particular `inputParameterChanges` points at `self.changes`, which is
+        // alive for the whole `Instance` and is only written between calls.
         let r = unsafe { self.processor.process(&mut data) };
         if r != kResultOk {
             return Err(format!("process returned {r}"));
         }
-        Ok(frames)
+        Ok(Rendered { frames, unmapped })
     }
 }
 
@@ -474,6 +654,88 @@ pub struct Note {
     /// 127 is the caller's job and forgetting it makes every note fortissimo.
     pub velocity: f32,
     pub on: bool,
+}
+
+/// One control change to deliver during a `process` call. The sustain pedal is
+/// this.
+///
+/// **`value` is the raw MIDI number and is NOT normalised**, which is
+/// deliberately the opposite of [`Note::velocity`]. The reason is that the
+/// divisor is a property of the controller rather than of the caller: a 7-bit
+/// CC is out of 127, pitch bend is out of 16383, and a caller who has to
+/// remember which is which will eventually send a pedal at 0.5 % of its value.
+/// [`Control::normalised`] owns that decision and is unit-tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Control {
+    /// Frames from the start of this block. Clamped into the block by
+    /// [`Instance::process_with_controls`] — a `sampleOffset` past `numSamples`
+    /// is out of contract and some plugins index with it.
+    pub offset: i32,
+    /// A VST3 controller number: a MIDI CC 0..=127, or one of the two synthetic
+    /// ones VST3 adds ([`Control::AFTERTOUCH`], [`Control::PITCH_BEND`]).
+    pub controller: i16,
+    /// 0..=127 for a CC or channel pressure; 0..=16383 for pitch bend.
+    pub value: u16,
+    /// 0..=15. **Not decoration**: Pianoteq publishes a different parameter for
+    /// each channel's CC64, so a host that queries channel 0 and sends channel 3
+    /// moves the wrong piano.
+    pub channel: i16,
+}
+
+impl Control {
+    pub const SUSTAIN: i16 = ControllerNumbers_::kCtrlSustainOnOff as i16;
+    pub const SOSTENUTO: i16 = ControllerNumbers_::kCtrlSustenutoOnOff as i16;
+    pub const SOFT: i16 = ControllerNumbers_::kCtrlSoftPedalOnOff as i16;
+    pub const AFTERTOUCH: i16 = ControllerNumbers_::kAfterTouch as i16;
+    pub const PITCH_BEND: i16 = ControllerNumbers_::kPitchBend as i16;
+
+    /// A 7-bit control change, which is every CC including all three pedals.
+    pub fn cc(offset: i32, channel: i16, controller: i16, value: u8) -> Self {
+        Self {
+            offset,
+            controller,
+            value: u16::from(value & 0x7F),
+            channel,
+        }
+    }
+
+    /// Pitch bend from its two MIDI data bytes, LSB first as the wire has them.
+    pub fn pitch_bend(offset: i32, channel: i16, lsb: u8, msb: u8) -> Self {
+        Self {
+            offset,
+            controller: Self::PITCH_BEND,
+            value: u16::from(lsb & 0x7F) | (u16::from(msb & 0x7F) << 7),
+            channel,
+        }
+    }
+
+    /// The value VST3 wants: 0.0..=1.0.
+    ///
+    /// Pitch bend is the whole reason this is a function. It is 14-bit, so its
+    /// full scale is 16383 and its *centre* is 8192 — dividing it by 127 gives
+    /// 64.5, which a plugin clamps to 1.0, and the instrument sits a full tone
+    /// sharp for the rest of the session.
+    pub fn normalised(&self) -> ParamValue {
+        let full = if self.controller == Self::PITCH_BEND {
+            16_383.0
+        } else {
+            127.0
+        };
+        (ParamValue::from(self.value) / full).clamp(0.0, 1.0)
+    }
+}
+
+/// What one `process` call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rendered {
+    pub frames: usize,
+    /// Controls this plugin publishes no `IMidiMapping` for.
+    ///
+    /// They were still offered as a legacy MIDI CC event, which most instruments
+    /// ignore, so read a non-zero count as **"the pedal probably did not
+    /// arrive"** rather than as a hard failure. It is not "we never tried",
+    /// which is what it used to mean upstream.
+    pub unmapped: usize,
 }
 
 /// An `IEventList` over a borrowed slice.
@@ -516,6 +778,44 @@ impl EventList {
             .collect();
         Self { events }
     }
+
+    /// Append a control change as a legacy MIDI CC event.
+    ///
+    /// The fallback for a plugin that publishes no `IMidiMapping`, and a weak
+    /// one: `kLegacyMIDICCOutEvent` is named for the direction the SDK actually
+    /// specifies — plugin to host — and instruments are under no obligation to
+    /// read it coming the other way. Measured on Pianoteq 9, which does have a
+    /// mapping and so never sees this path, and on a mapping-less plugin, where
+    /// it changed nothing. It is sent anyway because it costs one struct and it
+    /// is the only other door VST3 leaves open; the caller is told through
+    /// [`Rendered::unmapped`] that this is what happened, rather than being
+    /// allowed to believe the pedal arrived.
+    ///
+    /// The two 14-bit controllers are folded to 7 bits here. A legacy CC event
+    /// has one `value` byte and nowhere to put the rest.
+    fn push_legacy_cc(&mut self, c: Control, offset: i32) {
+        let value = if c.controller == Control::PITCH_BEND {
+            (c.value >> 7) as i8
+        } else {
+            (c.value & 0x7F) as i8
+        };
+        // SAFETY: `Event` is a plain C struct of integers and a union; zeroed is
+        // a valid bit pattern for it and every field that matters is written
+        // below. This is the same construction `new` uses.
+        let mut e: Event = unsafe { std::mem::zeroed() };
+        e.busIndex = 0;
+        e.sampleOffset = offset;
+        e.ppqPosition = 0.0;
+        e.flags = 0;
+        e.r#type = Event_::EventTypes_::kLegacyMIDICCOutEvent as u16;
+        e.__field0.midiCCOut = LegacyMIDICCOutEvent {
+            controlNumber: c.controller.clamp(0, 255) as u8,
+            channel: c.channel.clamp(0, 15) as i8,
+            value,
+            value2: 0,
+        };
+        self.events.push(e);
+    }
 }
 
 impl Class for EventList {
@@ -544,6 +844,355 @@ impl IEventListTrait for EventList {
         // adding to its own INPUT list is not a thing that happens; output
         // events go to a different list, which this host does not supply.
         kResultFalse
+    }
+}
+
+// ── Control changes: the map, and the queues that carry the values ───────────
+
+/// Controller numbers `IMidiMapping` covers: 0..=127 are the MIDI CCs, 128 is
+/// aftertouch and 129 is pitch bend. `kCountCtrlNumber` is 130 and is the SDK's
+/// own name for exactly this bound.
+const CTRL_COUNT: usize = ControllerNumbers_::kCountCtrlNumber as usize;
+
+/// MIDI channels. The whole table is read per channel because plugins really do
+/// publish a different parameter per channel — Pianoteq's CC64 ids run
+/// `0x6d636d40`, `0x6d636dc2`, ... one `CTRL_COUNT` step apart.
+const MIDI_CHANNELS: usize = 16;
+
+/// Distinct parameters that can change in one block. Five pedals and wheels is
+/// the realistic number; 32 is room for a plugin whose channels each map
+/// separately, and it costs 32 preallocated COM objects once.
+const MAX_PARAM_QUEUES: usize = 32;
+
+/// Points one parameter can take in one block. A pedal moved by a human cannot
+/// produce 32 values in 10 ms; a continuous pedal swept by a sequencer can, and
+/// the 33rd is dropped rather than allocated for.
+const MAX_POINTS: usize = 32;
+
+/// Read the plugin's CC-to-parameter table, once, at instantiation.
+///
+/// Returns `MIDI_CHANNELS * CTRL_COUNT` entries, `kNoParamId` where the plugin
+/// published nothing.
+///
+/// # Why this creates a second plugin object and then throws it away
+///
+/// `IMidiMapping` lives on the edit controller (see the module docs), so the
+/// controller must exist. It does **not** have to keep existing: the table is
+/// static for the life of an instance, so this creates the controller,
+/// connects it, copies the table, and tears it back down before `process` is
+/// ever called.
+///
+/// That is the smaller change, and it is also the safer one. A controller left
+/// connected means the component may try to send it `IMessage`s while audio is
+/// running, and building those messages is a call back into [`HostApp`], which
+/// refuses — a refusal that is legal but that no plugin's error path is well
+/// tested against. Nothing here is connected by the time the first block is
+/// rendered.
+///
+/// The cost is stated plainly: a plugin that changes its CC assignment at
+/// runtime announces it through `IComponentHandler::restartComponent`
+/// (`kMidiCCAssignmentChanged`), which this host does not implement and could
+/// not receive anyway. The table is read once. Instruments do not do this;
+/// modular hosts-inside-plugins do.
+fn read_midi_map(
+    module: &Module,
+    component: &ComPtr<IComponent>,
+    host: &ComPtr<IHostApplication>,
+) -> Vec<ParamID> {
+    let empty = || vec![kNoParamId; MIDI_CHANNELS * CTRL_COUNT];
+
+    // A "single component effect" merges the two halves into one object. Ask
+    // the component first: when it answers, no second object is needed and none
+    // of the connection dance below applies.
+    if let Some(map) = component.cast::<IMidiMapping>() {
+        return harvest(&map);
+    }
+
+    let mut cid: TUID = [0; 16];
+    // SAFETY: `cid` is a valid out-parameter and the component is initialised.
+    if unsafe { component.getControllerClassId(&mut cid) } != kResultOk {
+        return empty();
+    }
+
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `cid` names a class the component itself just gave us; `raw` is a
+    // valid out-parameter and the factory outlives this call.
+    let created = unsafe {
+        module.factory().createInstance(
+            cid.as_mut_ptr(),
+            IEditController::IID.as_ptr() as *const _ as *mut _,
+            &mut raw,
+        )
+    };
+    if created != kResultOk || raw.is_null() {
+        return empty();
+    }
+    // SAFETY: `createInstance` returns an object with one reference already
+    // added, which `from_raw` takes ownership of.
+    let Some(controller) = (unsafe { ComPtr::<IEditController>::from_raw(raw.cast()) }) else {
+        return empty();
+    };
+
+    // SAFETY: freshly created controller; the host context outlives this
+    // function, which terminates the controller before returning.
+    if unsafe { controller.initialize(host.as_ptr().cast()) } != kResultOk {
+        return empty();
+    }
+
+    // THE step. Without it Pianoteq returns kResultOk and paramId 0 for every
+    // controller on every channel — see the module docs. Both directions,
+    // because the SDK's own connect is symmetric and a plugin that only hears
+    // one half is a plugin that has not finished setting itself up.
+    let comp_point = component.cast::<IConnectionPoint>();
+    let ctrl_point = controller.cast::<IConnectionPoint>();
+    if let (Some(a), Some(b)) = (&comp_point, &ctrl_point) {
+        // SAFETY: both are live connection points on objects this function owns
+        // a reference to.
+        unsafe {
+            a.connect(b.as_ptr());
+            b.connect(a.as_ptr());
+        }
+    }
+
+    let table = match controller.cast::<IMidiMapping>() {
+        Some(map) => harvest(&map),
+        None => empty(),
+    };
+
+    if let (Some(a), Some(b)) = (&comp_point, &ctrl_point) {
+        // SAFETY: undoing exactly the connect above, on the same live objects.
+        unsafe {
+            a.disconnect(b.as_ptr());
+            b.disconnect(a.as_ptr());
+        }
+    }
+    // SAFETY: initialize succeeded, so terminate is owed exactly once. The
+    // controller is released when `controller` drops, after this.
+    unsafe { controller.terminate() };
+    table
+}
+
+/// Pull the whole table out of a live `IMidiMapping`.
+fn harvest(map: &ComPtr<IMidiMapping>) -> Vec<ParamID> {
+    let mut table = vec![kNoParamId; MIDI_CHANNELS * CTRL_COUNT];
+    for channel in 0..MIDI_CHANNELS {
+        for ctrl in 0..CTRL_COUNT {
+            let mut id: ParamID = kNoParamId;
+            // Bus 0, because bus 0 is the event bus every note in this file is
+            // sent on. Asking about a bus you do not play is a different
+            // question with a different answer.
+            // SAFETY: `id` is a valid out-parameter; the mapping is alive.
+            let r = unsafe {
+                map.getMidiControllerAssignment(0, channel as i16, ctrl as i16, &mut id)
+            };
+            if r == kResultOk {
+                table[channel * CTRL_COUNT + ctrl] = id;
+            }
+        }
+    }
+    if looks_unconnected(&table) {
+        table.fill(kNoParamId);
+    }
+    table
+}
+
+/// Is this table the answer a controller gives when it has not been connected?
+///
+/// The signature is *several different controller numbers sharing one parameter
+/// id*, which is what Pianoteq returns (everything is 0) before
+/// `IConnectionPoint::connect`. Checked on channel 0 alone and deliberately so:
+/// one id for one controller across all sixteen channels is a perfectly normal
+/// channel-agnostic mapping, and rejecting that would throw away a working
+/// pedal. One id for the mod wheel *and* the sustain pedal is not a mapping.
+///
+/// Refusing a suspect table means no pedal, which is the status quo. Trusting
+/// one means writing pedal values into an arbitrary parameter of a piano.
+fn looks_unconnected(table: &[ParamID]) -> bool {
+    let mut mapped = 0usize;
+    let mut first: Option<ParamID> = None;
+    let mut uniform = true;
+    for id in table.iter().take(CTRL_COUNT) {
+        if *id == kNoParamId {
+            continue;
+        }
+        mapped += 1;
+        match first {
+            None => first = Some(*id),
+            Some(f) => uniform &= f == *id,
+        }
+    }
+    mapped >= 2 && uniform
+}
+
+/// One parameter's points for one block. A COM object the plugin reads during
+/// `process`.
+///
+/// `Cell`, not `RefCell`: a `RefCell` would put a borrow flag on the audio
+/// thread's path and a double borrow is a panic, and a panic across the VST3
+/// ABI is undefined behaviour rather than a stack trace. Nothing here can fail.
+struct ParamQueue {
+    id: Cell<ParamID>,
+    len: Cell<usize>,
+    points: [Cell<(i32, ParamValue)>; MAX_POINTS],
+}
+
+impl ParamQueue {
+    fn new() -> Self {
+        Self {
+            id: Cell::new(kNoParamId),
+            len: Cell::new(0),
+            points: std::array::from_fn(|_| Cell::new((0, 0.0))),
+        }
+    }
+
+    /// Claim this queue for `id` and forget last block's points.
+    fn reset(&self, id: ParamID) {
+        self.id.set(id);
+        self.len.set(0);
+    }
+
+    /// Append a point. `false` when the queue is full, which is dropped rather
+    /// than grown: this runs on the audio thread.
+    fn push(&self, offset: i32, value: ParamValue) -> bool {
+        let n = self.len.get();
+        if n >= MAX_POINTS {
+            return false;
+        }
+        self.points[n].set((offset, value));
+        self.len.set(n + 1);
+        true
+    }
+}
+
+impl Class for ParamQueue {
+    type Interfaces = (IParamValueQueue,);
+}
+
+impl IParamValueQueueTrait for ParamQueue {
+    unsafe fn getParameterId(&self) -> ParamID {
+        self.id.get()
+    }
+
+    unsafe fn getPointCount(&self) -> i32 {
+        self.len.get() as i32
+    }
+
+    unsafe fn getPoint(
+        &self,
+        index: i32,
+        sample_offset: *mut i32,
+        value: *mut ParamValue,
+    ) -> tresult {
+        let Some(point) = usize::try_from(index)
+            .ok()
+            .filter(|i| *i < self.len.get())
+            .map(|i| self.points[i].get())
+        else {
+            return kInvalidArgument;
+        };
+        if sample_offset.is_null() || value.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: both are caller-provided out-parameters, checked non-null.
+        unsafe {
+            *sample_offset = point.0;
+            *value = point.1;
+        }
+        kResultOk
+    }
+
+    unsafe fn addPoint(&self, sample_offset: i32, value: ParamValue, index: *mut i32) -> tresult {
+        // The host fills this list before `process`; a plugin writing into its
+        // own INPUT queue is not a thing that happens. Honoured anyway rather
+        // than refused, because it is the same three lines and a refusal here
+        // would be a surprise to any plugin that tried.
+        if !self.push(sample_offset, value) {
+            return kResultFalse;
+        }
+        if !index.is_null() {
+            // SAFETY: caller-provided out-parameter, checked non-null.
+            unsafe { *index = self.len.get() as i32 - 1 };
+        }
+        kResultOk
+    }
+}
+
+/// `ProcessData::inputParameterChanges`: the host-side object the plugin calls
+/// into to read this block's parameter moves.
+///
+/// Allocated once, in [`Instance::create`]. Every block after that is
+/// `clear()` plus a handful of `Cell` writes, so nothing on the audio thread
+/// allocates, locks or can fail.
+struct ParamChanges {
+    queues: Vec<ComWrapper<ParamQueue>>,
+    /// Queues carrying data this block. VST3 wants `getParameterCount` to be the
+    /// number of parameters that actually changed, not the size of the pool.
+    used: Cell<usize>,
+}
+
+impl ParamChanges {
+    fn new() -> Self {
+        Self {
+            queues: (0..MAX_PARAM_QUEUES).map(|_| ComWrapper::new(ParamQueue::new())).collect(),
+            used: Cell::new(0),
+        }
+    }
+
+    fn clear(&self) {
+        self.used.set(0);
+    }
+
+    /// The queue for `id`, claiming a fresh one if this is its first point in
+    /// this block. `None` when the pool is exhausted.
+    ///
+    /// Linear search over at most [`MAX_PARAM_QUEUES`] entries, which is faster
+    /// than any map at this size and, more to the point, is a search over an
+    /// array that was allocated five seconds ago rather than now.
+    fn queue_for(&self, id: ParamID) -> Option<&ParamQueue> {
+        let used = self.used.get();
+        for q in self.queues.iter().take(used) {
+            if q.id.get() == id {
+                return Some(q);
+            }
+        }
+        let q = self.queues.get(used)?;
+        q.reset(id);
+        self.used.set(used + 1);
+        Some(q)
+    }
+}
+
+impl Class for ParamChanges {
+    type Interfaces = (IParameterChanges,);
+}
+
+impl IParameterChangesTrait for ParamChanges {
+    unsafe fn getParameterCount(&self) -> i32 {
+        self.used.get() as i32
+    }
+
+    unsafe fn getParameterData(&self, index: i32) -> *mut IParamValueQueue {
+        let Some(q) = usize::try_from(index)
+            .ok()
+            .filter(|i| *i < self.used.get())
+            .and_then(|i| self.queues.get(i))
+        else {
+            return std::ptr::null_mut();
+        };
+        // A borrowed pointer, not an owned one: `getParameterData` does not
+        // add a reference and the plugin must not release what it gets back.
+        // `as_com_ref` is the only accessor here that touches no refcount.
+        q.as_com_ref::<IParamValueQueue>()
+            .map(|r| r.as_ptr())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    unsafe fn addParameterData(&self, _id: *const ParamID, _index: *mut i32) -> *mut IParamValueQueue {
+        // Same argument as `EventList::addEvent`: this is the INPUT list, the
+        // host owns it and fills it before `process`, and a plugin adding to it
+        // would be writing somewhere nobody reads. Null is the ABI's "could not
+        // create one", which is true.
+        std::ptr::null_mut()
     }
 }
 

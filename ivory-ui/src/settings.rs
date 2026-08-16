@@ -219,9 +219,35 @@ pub struct Settings {
     /// `input`, `plugin` or `both`. Stored verbatim; an unknown value resolves
     /// to `input` at the point of use, like `font_choice`.
     pub record_audio_source: String,
-    /// Pre-roll countdown in seconds. Clamped to
-    /// [`recorder::PREROLL_CHOICES`](crate::recorder::PREROLL_CHOICES) on read.
-    pub record_preroll_s: i64,
+    /// Count-in length in BEATS, at the take's tempo. Clamped to
+    /// [`recorder::COUNT_IN_CHOICES`](crate::recorder::COUNT_IN_CHOICES) on
+    /// read.
+    ///
+    /// Beats rather than seconds because a count-in is a musical instruction
+    /// and the click is playing beats — a countdown in seconds beside a click
+    /// in beats is two clocks disagreeing in front of the person trying to come
+    /// in on time. (The old `record_preroll_s` key is simply left in `extra`,
+    /// preserved but unread: three seconds does not convert into a number of
+    /// beats without knowing a tempo it was never measured against.)
+    pub record_count_in_beats: i64,
+    /// The VST3 bundle to load as the instrument. Absent means none.
+    ///
+    /// A path and not a name: a plugin's display name is not unique, changes
+    /// between versions, and cannot be turned back into a file.
+    pub plugin_path: Option<String>,
+    /// Linear gains for the three monitor sources. Stored linear because that
+    /// is what the audio path multiplies by; the band converts to dB to draw.
+    pub plugin_gain: f64,
+    pub metronome_gain: f64,
+    pub input_gain: f64,
+    /// The click is running.
+    pub metronome_on: bool,
+    /// The click is mixed into the RECORDING as well as the monitors.
+    ///
+    /// **False by default and that is the important one.** A click bleeding
+    /// into the take is a ruined take, and it is the mistake nobody notices
+    /// until they open the file a week later.
+    pub metronome_in_take: bool,
     /// Hide the running clock while recording. §5: after a blinking light, a
     /// running timer is the most-cited performance distraction, and no
     /// competitor offers the checkbox.
@@ -236,6 +262,13 @@ pub struct Settings {
     /// Unknown keys from the file, preserved verbatim on save (file order).
     pub extra: Map<String, Value>,
 }
+
+/// The most a stored gain may be, as a linear multiplier.
+///
+/// `GAIN_MAX_DB` is +12 dB, which is about 4.0. The ceiling here is generous
+/// rather than exact: it exists to stop a hand-edited or corrupt file putting
+/// 1e9 into a monitor path, not to second-guess a future build's fader range.
+const MAX_GAIN: f64 = 16.0;
 
 /// Default detached-window size when nothing has been remembered yet.
 /// Deliberately NOT the piano's 8.6667:1 strip: a chord readout in its own
@@ -309,7 +342,13 @@ impl Default for Settings {
             record_camera_uid: None,
             record_audio_device: None,
             record_audio_source: "input".to_owned(),
-            record_preroll_s: 3,
+            record_count_in_beats: 4,
+            plugin_path: None,
+            plugin_gain: 1.0,
+            metronome_gain: 0.5,
+            input_gain: 1.0,
+            metronome_on: false,
+            metronome_in_take: false,
             record_hide_elapsed: false,
             record_export: crate::recorder::ExportSpec::default(),
             extra: Map::new(),
@@ -592,11 +631,28 @@ impl Settings {
                 s.record_audio_source = t.to_owned();
             }
         }
-        if let Some(v) = map.remove("record_preroll_s") {
+        if let Some(v) = map.remove("record_count_in_beats") {
             if let Some(n) = v.as_i64() {
-                s.record_preroll_s = n;
+                s.record_count_in_beats = n;
             }
         }
+        take_opt_str(&mut map, "plugin_path", &mut s.plugin_path);
+        // Gains are sanitised HERE rather than at the point of use, unlike the
+        // tuning and the capo, because a NaN or a negative multiplied into an
+        // audio buffer is not a display glitch — it is a burst of noise into
+        // somebody's monitors at whatever level the interface is set to.
+        let take_gain = |map: &mut Map<String, Value>, key: &str, dst: &mut f64| {
+            if let Some(g) = map.remove(key).and_then(|v| v.as_f64()) {
+                if g.is_finite() && (0.0..=MAX_GAIN).contains(&g) {
+                    *dst = g;
+                }
+            }
+        };
+        take_gain(&mut map, "plugin_gain", &mut s.plugin_gain);
+        take_gain(&mut map, "metronome_gain", &mut s.metronome_gain);
+        take_gain(&mut map, "input_gain", &mut s.input_gain);
+        take_bool(&mut map, "metronome_on", &mut s.metronome_on);
+        take_bool(&mut map, "metronome_in_take", &mut s.metronome_in_take);
         take_bool(&mut map, "record_hide_elapsed", &mut s.record_hide_elapsed);
         if let Some(v) = map.remove("record_export") {
             s.record_export = crate::recorder::ExportSpec::from_value(&v);
@@ -772,8 +828,25 @@ impl Settings {
             Value::String(self.record_audio_source.clone()),
         );
         map.insert(
-            "record_preroll_s".into(),
-            Value::Number(self.record_preroll_s.into()),
+            "record_count_in_beats".into(),
+            Value::Number(self.record_count_in_beats.into()),
+        );
+        if let Some(p) = &self.plugin_path {
+            map.insert("plugin_path".into(), Value::String(p.clone()));
+        }
+        for (key, gain) in [
+            ("plugin_gain", self.plugin_gain),
+            ("metronome_gain", self.metronome_gain),
+            ("input_gain", self.input_gain),
+        ] {
+            if let Some(n) = serde_json::Number::from_f64(gain) {
+                map.insert(key.into(), Value::Number(n));
+            }
+        }
+        map.insert("metronome_on".into(), Value::Bool(self.metronome_on));
+        map.insert(
+            "metronome_in_take".into(),
+            Value::Bool(self.metronome_in_take),
         );
         map.insert(
             "record_hide_elapsed".into(),
@@ -942,17 +1015,34 @@ impl Settings {
         base.join("Tangent")
     }
 
-    /// Pre-roll, clamped to what the UI can actually offer.
+    /// Count-in length, clamped to what the UI can actually offer.
     ///
     /// Sanitised at the point of use, like the tuning and the capo: a file from
-    /// a later build with a 10-second pre-roll keeps its 10 in the file and
-    /// counts down from the nearest thing this build has.
-    pub fn preroll_seconds(&self) -> u8 {
-        let want = self.record_preroll_s.clamp(0, 255) as u8;
-        crate::recorder::PREROLL_CHOICES
+    /// a later build with a 12-beat count-in keeps its 12 in the file and
+    /// counts in with the nearest thing this build has.
+    pub fn count_in_beats(&self) -> u32 {
+        let want = self.record_count_in_beats.clamp(0, i64::from(u32::MAX)) as u32;
+        crate::recorder::COUNT_IN_CHOICES
             .into_iter()
             .min_by_key(|c| c.abs_diff(want))
-            .unwrap_or(3)
+            .unwrap_or(4)
+    }
+
+    /// Everything the band renders but does not own, in one value.
+    pub fn knobs(&self) -> crate::recorder::Knobs {
+        crate::recorder::Knobs {
+            gains: crate::recorder::Gains {
+                plugin: self.plugin_gain as f32,
+                metronome: self.metronome_gain as f32,
+                input: self.input_gain as f32,
+            },
+            metronome_on: self.metronome_on,
+            metronome_in_take: self.metronome_in_take,
+            // ONE tempo, shared with the SMF's tempo mark. A click at 90
+            // against a file that says 120 is a take nobody can edit later.
+            tempo_bpm: self.record_export.tempo_bpm,
+            count_in_beats: self.count_in_beats(),
+        }
     }
 
     /// The board the fretboard view draws, from whatever is in the file.

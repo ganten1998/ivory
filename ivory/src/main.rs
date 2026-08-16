@@ -5,6 +5,11 @@
 mod desktop;
 #[cfg(feature = "recorder")]
 mod devices;
+/// The monitor engine: the audio OUTPUT stream that plays a hosted VST3
+/// instrument and the metronome. Absent from a Minimal build for the same
+/// reason `record` is (docs/RECORDER-PLAN.md §12a).
+#[cfg(feature = "recorder")]
+mod instrument;
 mod midi;
 /// The recording session. Absent from a Minimal build, where `ivory-record` is
 /// not linked at all — the exclusion the compiler enforces rather than a flag
@@ -72,6 +77,17 @@ fn parse_cli() -> CliArgs {
             #[cfg(feature = "recorder")]
             "--record-test" => {
                 record::record_test(args.next());
+                std::process::exit(0);
+            }
+            // And the same for the monitor side: load a VST3 by name, play it a
+            // few notes, click a bar of metronome, and report what the output
+            // device did. The only way to check the plugin path against real
+            // hardware, and the way a missing `disable-library-validation`
+            // entitlement shows up as a refusal to load rather than as a
+            // mystery.
+            #[cfg(feature = "recorder")]
+            "--plugin-test" => {
+                instrument::plugin_test(args.next());
                 std::process::exit(0);
             }
             "-h" | "--help" => print_usage_and_exit(0),

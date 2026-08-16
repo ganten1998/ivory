@@ -110,6 +110,20 @@ impl MidiPorts for DeviceMidi {
 #[cfg(feature = "recorder")]
 struct Recorder {
     session: crate::record::Session,
+    /// The monitor output: the hosted instrument and the click, summed in one
+    /// callback.
+    ///
+    /// Its life is tied to the BAND rather than to the app, for the same reason
+    /// the input stream's is: an output device held open by a chord display
+    /// nobody is recording with is a device another app cannot get exclusive
+    /// access to. `None` when the band is closed, or when the device would not
+    /// open at all.
+    engine: Option<crate::instrument::Engine>,
+    /// Why the output device would not open, if it would not.
+    engine_error: Option<String>,
+    /// The bundle path the engine currently has loaded, so a change in settings
+    /// can be noticed on the edge rather than re-decided every frame.
+    plugin_loaded: Option<String>,
     audio: crate::devices::Shared,
     camera: crate::devices::Shared,
     /// Why enumeration failed last time, so the band can say "permission" and
@@ -240,6 +254,7 @@ impl DesktopApp {
                     .to_owned()
             })
             .or_else(|| self.recorder.session.audio_error().map(str::to_owned))
+            .or_else(|| self.recorder.engine_error.clone())
             .or_else(|| self.recorder.session.camera_error().map(str::to_owned))
             .or_else(|| {
                 // Only once it has had a moment: every camera delivers nothing
@@ -267,6 +282,31 @@ impl DesktopApp {
             texture: h.id(),
             size: self.recorder.preview_px,
         });
+        // Computed BEFORE the mutable borrow of the app: `chosen_plugin()`
+        // borrows it immutably and `recorder_state_mut()` holds it mutably.
+        let plugin_name = self
+            .recorder
+            .engine
+            .as_ref()
+            .and_then(|e| e.plugin())
+            .map(|p| p.class.clone())
+            .or_else(|| {
+                // Chosen but not loaded: show the bundle's file name so the
+                // band says WHICH instrument is missing.
+                self.app.chosen_plugin().map(|p| {
+                    std::path::Path::new(p)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.to_owned())
+                })
+            });
+        let plugin_missing = plugin_name.is_some()
+            && self
+                .recorder
+                .engine
+                .as_ref()
+                .is_none_or(|e| e.plugin().is_none());
+
         let state = self.app.recorder_state_mut();
         state.preview = preview;
         state.camera_name = self
@@ -290,6 +330,8 @@ impl DesktopApp {
             .recorder
             .disk_bytes
             .and_then(|b| ivory_ui::recorder::minutes_on_disk(b, &spec));
+        state.plugin_name = plugin_name;
+        state.plugin_missing = plugin_missing;
         state.message = message;
         state.clip_warning = self.recorder.session.clipped();
     }
@@ -299,8 +341,16 @@ impl DesktopApp {
     fn after_frame(&mut self, ctx: &egui::Context) {
         use ivory_ui::recorder::RecorderRequest as R;
 
-        // The always-on MIDI tap, drained whether or not a take is running.
-        self.recorder.session.pump_midi();
+        // The always-on MIDI tap, drained whether or not a take is running, and
+        // fanned out to the monitor engine in the SAME drain — the tap is a
+        // queue, so two independent drains would give each message to one
+        // consumer and starve the other.
+        let engine = self.recorder.engine.as_ref();
+        self.recorder.session.pump_midi(|t, bytes| {
+            if let Some(e) = engine {
+                e.send_midi(t, bytes);
+            }
+        });
 
         // Opening the BAND opens the input, not pressing Record — the meter
         // has to be live before arming, which is what kills the "I recorded
@@ -309,23 +359,45 @@ impl DesktopApp {
         if open != self.recorder.band_was_open {
             self.recorder.band_was_open = open;
             if open {
+                self.start_engine();
                 self.reconcile_audio(true);
                 self.reconcile_camera(true, ctx);
             } else {
                 self.recorder.session.close_input();
                 self.recorder.session.close_camera();
                 self.recorder.camera_opening = false;
+                // Dropping it stops the output stream and unloads the plugin,
+                // which is what "the band is closed" should mean: no device
+                // held, no third-party code resident.
+                self.recorder.engine = None;
+                self.recorder.plugin_loaded = None;
             }
         } else if open {
             self.reconcile_audio(false);
             self.reconcile_camera(false, ctx);
+            self.reconcile_plugin();
+            self.push_monitor_settings();
+            self.push_take_source();
         }
 
         let root = self.app.record_root();
         let name = self.app.take_name().map(str::to_owned);
 
-        // The pre-roll countdown, which is the one thing here that animates
-        // with no input at all — so it also has to ask for the next frame.
+        // The count-in ends on the beat the player HEARD, not on the frame that
+        // noticed it had. The audio thread knows that instant exactly — it
+        // scheduled the click and it knows the device's output delay — and the
+        // UI thread can only ever be a frame late and a buffer short.
+        if let Some(downbeat) = self
+            .recorder
+            .engine
+            .as_ref()
+            .filter(|e| e.count_in_done())
+            .and_then(|e| e.count_in_downbeat_ns())
+        {
+            self.recorder.session.arm_at(downbeat);
+        }
+        // The count-in, which is the one thing here that animates with no input
+        // at all — so it also has to ask for the next frame.
         if self.recorder.session.tick(&root, name.as_deref()) {
             ctx.request_repaint();
         }
@@ -354,11 +426,29 @@ impl DesktopApp {
         while let Some(request) = self.app.take_recorder_request() {
             match request {
                 R::Toggle => {
+                    // The click counts the take in, on the audio thread's own
+                    // sample clock. Started here, at the press, so the first
+                    // beat lands immediately rather than a frame later.
+                    let beats = self.app.count_in_beats();
+                    if let Some(e) = self.recorder.engine.as_ref() {
+                        if !self.recorder.session.is_recording() && beats > 0 {
+                            e.start_count_in(beats, self.app.tempo_bpm());
+                        } else {
+                            e.cancel_count_in();
+                        }
+                    }
+                    // A fresh take starts with a clean clip latch on the
+                    // instrument's meter, exactly as `LevelTracker::arm` does
+                    // for the input's — a clip from the last take reported
+                    // against this one is worse than no indicator.
+                    if let Some(e) = self.recorder.engine.as_ref() {
+                        e.clear_clip();
+                    }
                     let spec = self.app.export_spec();
                     self.recorder.session.toggle(
                         &root,
                         name.as_deref(),
-                        self.app.preroll_seconds(),
+                        self.app.count_in_beats(),
                         spec,
                     );
                 }
@@ -366,6 +456,110 @@ impl DesktopApp {
             }
             ctx.request_repaint();
         }
+    }
+
+    /// Start the monitor output, once, when the band opens.
+    ///
+    /// A failure here is not fatal and must not be: a machine with no output
+    /// device, or one another app holds exclusively, still has a perfectly good
+    /// chord display and a perfectly good recorder. The band says what happened
+    /// and everything else carries on.
+    fn start_engine(&mut self) {
+        if self.recorder.engine.is_some() {
+            return;
+        }
+        match crate::instrument::Engine::start_with(None, self.recorder.session.timebase()) {
+            Ok(e) => {
+                self.recorder.engine = Some(e);
+                self.recorder.engine_error = None;
+                self.recorder.plugin_loaded = None;
+                self.push_monitor_settings();
+                self.reconcile_plugin();
+            }
+            Err(e) => {
+                self.recorder.engine_error = Some(format!("no audio output: {e}"));
+            }
+        }
+    }
+
+    /// Copy the faders, the click and the tempo into the audio thread.
+    ///
+    /// Every frame, unconditionally. These are all atomic stores of a float or
+    /// a bool behind a smoothing ramp, so writing an unchanged value costs
+    /// nothing — and a change-detection cache here would be a second copy of
+    /// the settings to get out of step with the first.
+    fn push_monitor_settings(&mut self) {
+        let Some(e) = self.recorder.engine.as_ref() else {
+            return;
+        };
+        let gains = self.app.gains();
+        e.set_plugin_gain(gains.plugin);
+        e.set_metronome_gain(gains.metronome);
+        e.set_metronome_enabled(self.app.metronome_on());
+        e.set_metronome_in_take(self.app.metronome_in_take());
+        e.set_tempo(self.app.tempo_bpm());
+    }
+
+    /// Decide what the next take is made of, from what is actually available.
+    fn push_take_source(&mut self) {
+        let plugin = self
+            .recorder
+            .engine
+            .as_ref()
+            .is_some_and(|e| e.plugin().is_some());
+        let input = self.recorder.session.audio_device_name().is_some();
+        let want = crate::record::TakeSource::resolve(
+            self.app.audio_source_setting(),
+            plugin,
+            input,
+        );
+        if want != self.recorder.session.source() {
+            self.recorder.session.set_source(want);
+        }
+    }
+
+    /// Load or unload the instrument the settings name.
+    ///
+    /// **Blocking**, like the camera: `Module::open` runs a third-party
+    /// library's initialiser and `Instance::create` can take seconds on a
+    /// sampler. Hence after the frame, never inside one.
+    fn reconcile_plugin(&mut self) {
+        let wanted = self.app.chosen_plugin().map(str::to_owned);
+        if wanted == self.recorder.plugin_loaded {
+            return;
+        }
+        let Some(e) = self.recorder.engine.as_mut() else {
+            return;
+        };
+        match &wanted {
+            None => {
+                e.unload_plugin();
+                self.recorder.engine_error = None;
+            }
+            Some(path) => match e.load_plugin(std::path::Path::new(path), None) {
+                Ok(_) => {
+                self.recorder.engine_error = None;
+                // The take has to be able to RECORD what it can now hear.
+                // Handed over on load rather than at Record, because the tap is
+                // moved once and the writer thread keeps it for the session.
+                if let Some(tap) = self.recorder.engine.as_mut().and_then(|e| e.take_recorder_tap())
+                {
+                    self.recorder.session.set_plugin_tap(Some(tap));
+                }
+            }
+                Err(err) => {
+                    // The path is REMEMBERED even though it failed. A plugin
+                    // that will not load today because its licence server was
+                    // unreachable should still be the chosen one tomorrow, and
+                    // the band shows it as `Missing` rather than forgetting it.
+                    self.recorder.engine_error =
+                        Some(format!("could not load the instrument: {err}"));
+                }
+            },
+        }
+        // Settled either way, so a plugin that refuses to load is not retried
+        // sixty times a second for the rest of the session.
+        self.recorder.plugin_loaded = wanted;
     }
 
     /// Open the camera the user asked for, if it is not already open.
@@ -520,11 +714,20 @@ impl DesktopApp {
             crate::devices::restore(&camera, app.chosen_camera_uid(), false);
             app.set_capture_devices(Some(Box::new(inputs)));
             app.set_cameras(Some(Box::new(cams)));
+            // Every installed VST3, by path and file name. This is a DIRECTORY
+            // LISTING, not a scan: nothing is opened, so it costs milliseconds
+            // even with 112 of them, and no plugin gets the chance to crash the
+            // process before the window has appeared. A bundle is opened only
+            // when the user picks it.
+            app.set_plugin_list(ivory_host::discover());
             Recorder {
                 session: crate::record::Session::new(tap, timebase),
                 audio,
                 camera,
                 camera_denied,
+                engine: None,
+                engine_error: None,
+                plugin_loaded: None,
                 camera_opening: false,
                 camera_silent_since: None,
                 preview: None,

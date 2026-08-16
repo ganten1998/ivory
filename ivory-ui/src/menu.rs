@@ -120,7 +120,16 @@ pub enum MenuAction {
     /// place — the whole category goes, not this row.
     ShowExportDialog,
     /// §5: pre-roll countdown in seconds; one of `recorder::PREROLL_CHOICES`.
-    SetPreRoll(u8),
+    /// Count-in length in beats (0 / 4 / 8).
+    SetCountIn(u32),
+    /// Open the VST3 instrument picker.
+    ShowPluginPicker,
+    /// Unload whatever instrument is loaded.
+    UnloadPlugin,
+    /// The click.
+    ToggleMetronome,
+    /// Whether the click is mixed into the FILE as well as the monitors.
+    ToggleMetronomeInTake,
     /// §5: hide the running clock while recording.
     ///
     /// After a blinking light, a running timer is the most-cited performance
@@ -188,10 +197,18 @@ pub struct MenuView {
     /// Needed for the same reason `theory_detached` is: the Detach row renames
     /// itself to Attach, so the label IS the state readout.
     pub recorder_detached: bool,
-    /// §5: the live pre-roll, in seconds. Comes from
-    /// `Settings::preroll_seconds()`, which has already clamped a stray value
-    /// from a later build's file to something this menu can mark.
-    pub preroll_s: u8,
+    /// §5: the live count-in, in beats. Comes from `Settings::count_in_beats()`,
+    /// which has already clamped a stray value from a later build's file to
+    /// something this menu can mark.
+    pub count_in_beats: u32,
+    /// The hosted instrument's name, if one is loaded. `None` renames the row
+    /// from "Change Instrument..." to "Load Instrument...", so the row is the
+    /// state readout — the chrome rule again.
+    pub plugin_name: Option<String>,
+    /// The click is running.
+    pub metronome_on: bool,
+    /// The click is mixed into the recording as well as the monitors.
+    pub metronome_in_take: bool,
     /// §5: the running clock is hidden while recording.
     pub hide_elapsed: bool,
     /// What the host allows. Rows whose action needs a window, a device list,
@@ -785,6 +802,41 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                     },
                 ));
             }
+            // The instrument. Named "Instrument" and not "Plugin" because that
+            // is what it is FOR — the user is choosing a piano, and "plugin" is
+            // a fact about how it is implemented.
+            recorder.push(row(
+                match view.plugin_name.as_deref() {
+                    Some(_) => "Change Instrument...",
+                    None => "Load Instrument...",
+                },
+                MenuAction::ShowPluginPicker,
+            ));
+            if let Some(name) = view.plugin_name.as_deref() {
+                // Named rather than a bare "Unload", so the row says what is
+                // about to go away. A user with six pianos installed cannot
+                // otherwise tell which one is loaded without opening the picker.
+                recorder.push(row(&format!("Unload {name}"), MenuAction::UnloadPlugin));
+            }
+            recorder.push(row(
+                if view.metronome_on {
+                    "Stop the Click"
+                } else {
+                    "Start the Click"
+                },
+                MenuAction::ToggleMetronome,
+            ));
+            recorder.push(row(
+                // Worded as what it DOES rather than as a state, because the
+                // consequence is the whole point: a click in the file is a
+                // ruined take and the default is off for that reason.
+                if view.metronome_in_take {
+                    "Keep the Click Out of Recordings"
+                } else {
+                    "Record the Click Into Takes"
+                },
+                MenuAction::ToggleMetronomeInTake,
+            ));
             recorder.push(row("Export...", MenuAction::ShowExportDialog));
             recorder.push(row(
                 if view.hide_elapsed {
@@ -798,31 +850,36 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         push_category(&mut e, "Recorder", recorder);
         if view.recorder_on {
             // A SIBLING hover, for exactly the reason Wood/Tuning/Capo are:
-            // pre-roll is a list of choices, so it is already a submenu, and a
+            // the count-in is a list of choices, so it is already a submenu, and a
             // submenu cannot hold another one (see `Entry::Submenu`). Offered
             // only while the band is showing — a countdown length for a
             // recorder you cannot see is a control with no visible effect.
             push_category(
                 &mut e,
-                "Pre-roll",
-                crate::recorder::PREROLL_CHOICES
+                "Count-in",
+                crate::recorder::COUNT_IN_CHOICES
                     .into_iter()
                     .map(|s| {
+                        // Bars in brackets because "8 beats" is what the click
+                        // plays and "two bars" is what a musician asks for, and
+                        // saying only one of them makes the other a sum you do
+                        // in your head. 4/4 is assumed and stated, because the
+                        // app has no time signature to consult.
                         let label = if s == 0 {
-                            "No countdown".to_owned()
+                            "No count-in".to_owned()
                         } else {
-                            format!("{s} seconds")
+                            format!("{s} beats  ({} bars of 4)", s / 4)
                         };
                         SubItem {
                             // Marked rather than hidden, like Tuning and Capo: a
                             // submenu that never says what is selected makes you
                             // close it again to find out.
-                            label: if s == view.preroll_s {
+                            label: if s == view.count_in_beats {
                                 format!("{label}  \u{2022}")
                             } else {
                                 label
                             },
-                            action: MenuAction::SetPreRoll(s),
+                            action: MenuAction::SetCountIn(s),
                             enabled: true,
                         }
                     })
@@ -1350,7 +1407,10 @@ mod tests {
             // has already been bitten by twice.
             recorder_on: false,
             recorder_detached: false,
-            preroll_s: 3,
+            count_in_beats: 4,
+            plugin_name: None,
+            metronome_on: false,
+            metronome_in_take: false,
             hide_elapsed: false,
             caps: Caps::DESKTOP,
         }
@@ -1939,7 +1999,7 @@ mod tests {
         // Built from the table rather than spelled out, so a fourth pre-roll
         // choice cannot be added to `PREROLL_CHOICES` and quietly arrive in a
         // plugin unlisted here.
-        forbidden.extend(crate::recorder::PREROLL_CHOICES.map(MenuAction::SetPreRoll));
+        forbidden.extend(crate::recorder::COUNT_IN_CHOICES.map(MenuAction::SetCountIn));
         for (label, action, _) in all_rows(v.clone()) {
             assert!(
                 !forbidden.contains(&action),
@@ -2117,7 +2177,7 @@ mod tests {
                 "{absent:?} is a control for a band the user cannot see"
             );
         }
-        assert!(!category_names(v.clone()).iter().any(|n| n == "Pre-roll"));
+        assert!(!category_names(v.clone()).iter().any(|n| n == "Count-in"));
 
         v.recorder_on = true;
         assert_eq!(
@@ -2148,6 +2208,9 @@ mod tests {
             vec![
                 "Hide Recorder",
                 "Detach Recorder",
+                "Load Instrument...",
+                "Start the Click",
+                "Record the Click Into Takes",
                 "Export...",
                 "Hide Elapsed Time",
             ]
@@ -2181,7 +2244,7 @@ mod tests {
                 "Tuning",
                 "Capo",
                 "Recorder",
-                "Pre-roll",
+                "Count-in",
             ]
         );
     }
@@ -2204,7 +2267,7 @@ mod tests {
             assert!(
                 !category_names(v.clone())
                     .iter()
-                    .any(|n| n == "Recorder" || n == "Pre-roll"),
+                    .any(|n| n == "Recorder" || n == "Count-in"),
                 "a Recorder hover survived {caps:?}"
             );
             for gone in [
@@ -2213,7 +2276,7 @@ mod tests {
                 MenuAction::AttachRecorder,
                 MenuAction::ShowExportDialog,
                 MenuAction::ToggleHideElapsed,
-                MenuAction::SetPreRoll(3),
+                MenuAction::SetCountIn(3),
             ] {
                 assert_eq!(
                     find(v.clone(), gone.clone()),
@@ -2246,41 +2309,48 @@ mod tests {
         assert_eq!(find(v.clone(), MenuAction::AttachRecorder), None);
         assert_eq!(
             sub(v.clone(), "Recorder").1,
-            vec!["Hide Recorder", "Export...", "Hide Elapsed Time"],
+            vec![
+                "Hide Recorder",
+                "Load Instrument...",
+                "Start the Click",
+                "Record the Click Into Takes",
+                "Export...",
+                "Hide Elapsed Time"
+            ],
             "everything that does not need a window stays"
         );
-        assert!(category_names(v).iter().any(|n| n == "Pre-roll"));
+        assert!(category_names(v).iter().any(|n| n == "Count-in"));
     }
 
-    /// The pre-roll hover says what it is set to rather than making you close
+    /// The count-in hover says what it is set to rather than making you close
     /// it again to find out — and says it exactly once. Two marks is a menu
     /// that has lost track of its own state; none is a menu that never had it.
     #[test]
-    fn the_preroll_hover_marks_exactly_one_choice() {
-        for &want in &crate::recorder::PREROLL_CHOICES {
+    fn the_count_in_hover_marks_exactly_one_choice() {
+        for &want in &crate::recorder::COUNT_IN_CHOICES {
             let v = MenuView {
                 recorder_on: true,
-                preroll_s: want,
+                count_in_beats: want,
                 ..view()
             };
             let (labels, actions) = {
-                let s = sub(v.clone(), "Pre-roll");
+                let s = sub(v.clone(), "Count-in");
                 (s.1, s.2)
             };
-            assert_eq!(labels.len(), crate::recorder::PREROLL_CHOICES.len());
+            assert_eq!(labels.len(), crate::recorder::COUNT_IN_CHOICES.len());
             let marked: Vec<&String> =
                 labels.iter().filter(|l| l.ends_with('\u{2022}')).collect();
-            assert_eq!(marked.len(), 1, "{want}s marked {marked:?}");
+            assert_eq!(marked.len(), 1, "{want} beats marked {marked:?}");
             let expect = if want == 0 {
-                "No countdown".to_owned()
+                "No count-in".to_owned()
             } else {
-                format!("{want} seconds")
+                format!("{want} beats")
             };
             assert!(marked[0].starts_with(&expect), "{marked:?} is not {expect}");
             assert_eq!(
                 actions,
-                crate::recorder::PREROLL_CHOICES
-                    .map(MenuAction::SetPreRoll)
+                crate::recorder::COUNT_IN_CHOICES
+                    .map(MenuAction::SetCountIn)
                     .to_vec()
             );
         }
@@ -2290,8 +2360,12 @@ mod tests {
             ..view()
         };
         assert_eq!(
-            sub(v, "Pre-roll").1,
-            vec!["No countdown", "3 seconds  \u{2022}", "5 seconds"]
+            sub(v, "Count-in").1,
+            vec![
+                "No count-in",
+                "4 beats  (1 bars of 4)  \u{2022}",
+                "8 beats  (2 bars of 4)"
+            ]
         );
     }
 }

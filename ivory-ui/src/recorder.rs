@@ -41,9 +41,13 @@ pub enum RecordState {
     /// destination controls are all reachable.
     #[default]
     Idle,
-    /// Counting down before the take starts. Carries seconds remaining as a
-    /// float so the ring can animate rather than tick.
-    PreRoll { remaining_s: f32 },
+    /// Counting the take in, in BEATS.
+    ///
+    /// Beats and not seconds because a count-in is a musical instruction: "two
+    /// bars" is what a musician asks for and what the click is playing, and a
+    /// countdown in seconds against a click in beats is two clocks disagreeing
+    /// in front of the person trying to come in on time.
+    CountIn { beat: u32, of: u32 },
     /// Rolling. The take started at the instant this was entered.
     Rolling,
     /// Stop was pressed and the files are being closed.
@@ -54,14 +58,14 @@ pub enum RecordState {
 }
 
 impl RecordState {
-    /// Whether the take is live — pre-roll included, because the clock has
-    /// already started and the layout has already switched.
+    /// Whether the take is live — the count-in included, because the layout has
+    /// already switched and Record has already been pressed.
     pub fn is_active(self) -> bool {
         !matches!(self, RecordState::Idle)
     }
 
-    /// Whether audio is actually being written. Pre-roll is not: the whole
-    /// point of it is that nothing is captured while the user walks back.
+    /// Whether audio is actually being written. The count-in is not: the whole
+    /// point of it is that the bars before the downbeat are not in the file.
     pub fn is_writing(self) -> bool {
         matches!(self, RecordState::Rolling | RecordState::Finishing)
     }
@@ -187,6 +191,25 @@ pub struct RecorderView<'a> {
     pub name_focused: bool,
     /// What the folder will be called, computed by `ivory_record::take`.
     pub folder_preview: &'a str,
+    /// The hosted instrument, if one is loaded. `Missing` means a plugin the
+    /// settings file names that would not load this time.
+    pub plugin: DeviceLabel<'a>,
+    /// The four faders, as LINEAR gains (not fader positions). See
+    /// [`gain_to_fader`] for turning one into a knob angle.
+    pub gains: Gains,
+    /// The click is on. Independent of `metronome_in_take`.
+    pub metronome_on: bool,
+    /// The click is mixed into the recording as well as the monitors.
+    ///
+    /// **Off by default, and that is the important default in this struct.** A
+    /// click bleeding into the take is a ruined take, and it is the mistake
+    /// nobody notices until they open the file.
+    pub metronome_in_take: bool,
+    /// Beats and tempo, shared by the click, the count-in and the SMF's tempo
+    /// mark — one number, because a click at 90 against a file that says 120
+    /// is a take nobody can edit afterwards.
+    pub tempo_bpm: f64,
+    pub count_in_beats: u32,
     pub camera: DeviceLabel<'a>,
     pub audio: DeviceLabel<'a>,
     pub preview: Option<Preview>,
@@ -196,8 +219,7 @@ pub struct RecorderView<'a> {
     /// A duration and not bytes, deliberately: "214 GB free" means nothing to a
     /// pianist and "~58 min" means everything.
     pub disk_minutes: Option<f64>,
-    /// 0, 3 or 5.
-    pub preroll_s: u8,
+
     /// The user asked not to see a clock while playing. §5: a running timer is
     /// the second most-cited performance distraction after a blinking light.
     pub hide_elapsed: bool,
@@ -220,14 +242,52 @@ impl RecorderView<'_> {
             take_name: "",
             name_focused: false,
             folder_preview: "",
+            plugin: DeviceLabel::None,
+            gains: Gains::default(),
+            metronome_on: false,
+            metronome_in_take: false,
+            tempo_bpm: DEFAULT_BPM,
+            count_in_beats: 4,
             camera: DeviceLabel::None,
             audio: DeviceLabel::None,
             preview: None,
             disk_minutes: None,
-            preroll_s: 3,
             hide_elapsed: false,
             message: None,
             clip_warning: false,
+        }
+    }
+}
+
+/// The four things with a volume control, as linear gains.
+///
+/// Linear rather than dB because that is what the audio path multiplies by;
+/// the band converts for display and for the fader's travel. A struct rather
+/// than four loose floats so that adding a fifth source is one field and not
+/// five call sites.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gains {
+    /// The hosted instrument.
+    pub plugin: f32,
+    /// The click. Applies to what you hear; whether it reaches the FILE is
+    /// `metronome_in_take`, which is a separate question with a separate
+    /// answer.
+    pub metronome: f32,
+    /// The audio input being recorded.
+    pub input: f32,
+}
+
+impl Default for Gains {
+    /// Unity for the sources, and the click **under** them.
+    ///
+    /// -6 dB on the metronome is not timidity: a click at the same level as a
+    /// piano is all you can hear, and every one of these gets turned down by
+    /// hand within a minute otherwise.
+    fn default() -> Self {
+        Self {
+            plugin: 1.0,
+            metronome: 0.5,
+            input: 1.0,
         }
     }
 }
@@ -254,6 +314,10 @@ pub struct RecorderState {
     pub camera_name: Option<String>,
     /// The camera named in settings is not present right now.
     pub camera_missing: bool,
+    /// The loaded instrument's display name.
+    pub plugin_name: Option<String>,
+    /// Named in settings but did not load this time.
+    pub plugin_missing: bool,
     pub audio_name: Option<String>,
     pub audio_missing: bool,
     pub preview: Option<Preview>,
@@ -272,7 +336,7 @@ impl RecorderState {
         &'a self,
         take_name: &'a str,
         name_focused: bool,
-        preroll_s: u8,
+        knobs: Knobs,
         hide_elapsed: bool,
     ) -> RecorderView<'a> {
         let label = |name: &'a Option<String>, missing: bool| match name.as_deref() {
@@ -288,14 +352,45 @@ impl RecorderState {
             take_name,
             name_focused,
             folder_preview: &self.folder_preview,
+            plugin: label(&self.plugin_name, self.plugin_missing),
+            gains: knobs.gains,
+            metronome_on: knobs.metronome_on,
+            metronome_in_take: knobs.metronome_in_take,
+            tempo_bpm: knobs.tempo_bpm,
+            count_in_beats: knobs.count_in_beats,
             camera: label(&self.camera_name, self.camera_missing),
             audio: label(&self.audio_name, self.audio_missing),
             preview: self.preview,
             disk_minutes: self.disk_minutes,
-            preroll_s,
             hide_elapsed,
             message: self.message.as_deref(),
             clip_warning: self.clip_warning,
+        }
+    }
+}
+
+/// The settings the band renders but does not own.
+///
+/// Passed in rather than stored on [`RecorderState`] because every one of them
+/// is a persisted user preference the app already holds, and a second copy is a
+/// second thing to keep in step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Knobs {
+    pub gains: Gains,
+    pub metronome_on: bool,
+    pub metronome_in_take: bool,
+    pub tempo_bpm: f64,
+    pub count_in_beats: u32,
+}
+
+impl Default for Knobs {
+    fn default() -> Self {
+        Self {
+            gains: Gains::default(),
+            metronome_on: false,
+            metronome_in_take: false,
+            tempo_bpm: DEFAULT_BPM,
+            count_in_beats: 4,
         }
     }
 }
@@ -798,8 +893,58 @@ pub const MAX_BPM: f64 = 300.0;
 /// passages ask for, and everything else is a support question.
 pub const FPS_CHOICES: [u32; 3] = [24, 30, 60];
 
-/// Pre-roll choices, in seconds. §5: enough to walk back to the bench.
-pub const PREROLL_CHOICES: [u8; 3] = [0, 3, 5];
+/// Count-in choices, in BEATS.
+///
+/// Nothing, one bar, two bars — at 4/4, which is what "4" and "8" mean here.
+/// Expressed in beats rather than bars because the app has no time signature
+/// and inventing one to describe a click would be a bigger lie than counting
+/// beats.
+pub const COUNT_IN_CHOICES: [u32; 3] = [0, 4, 8];
+
+/// Gain range for every fader in the band, in dB, plus what 1.0 means.
+///
+/// A linear 0..=1 fader is unusable for audio — the whole useful range of a
+/// monitor level is squeezed into the top fifth of the travel. These are the
+/// endpoints the band's faders map onto.
+pub const GAIN_MIN_DB: f32 = -60.0;
+pub const GAIN_MAX_DB: f32 = 12.0;
+
+/// A fader position (0..=1, left to right) as a linear gain.
+///
+/// Below the bottom of the scale is silence rather than -60 dB: a fader pulled
+/// all the way down has to be OFF, and 0.001 is not off when the thing it is
+/// attenuating is a piano recorded at full scale.
+pub fn fader_to_gain(position: f32) -> f32 {
+    let p = position.clamp(0.0, 1.0);
+    if p <= 0.0 {
+        return 0.0;
+    }
+    let db = GAIN_MIN_DB + p * (GAIN_MAX_DB - GAIN_MIN_DB);
+    10f32.powf(db / 20.0)
+}
+
+/// The inverse, for drawing a stored gain back as a fader position.
+pub fn gain_to_fader(gain: f32) -> f32 {
+    if gain <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * gain.log10();
+    ((db - GAIN_MIN_DB) / (GAIN_MAX_DB - GAIN_MIN_DB)).clamp(0.0, 1.0)
+}
+
+/// "-6.0 dB", "0.0 dB", "OFF" — what the number beside a fader says.
+pub fn gain_text(gain: f32) -> String {
+    if gain <= 0.0 {
+        return "OFF".to_owned();
+    }
+    format!("{:+.1} dB", 20.0 * gain.log10())
+}
+
+/// Tempo the metronome and the SMF tempo mark share.
+///
+/// One number, deliberately: a click at 90 against a file that says 120 is a
+/// take nobody can edit afterwards.
+pub const DEFAULT_BPM: f64 = 120.0;
 
 /// Format a duration the way a transport does: `M:SS` under an hour,
 /// `H:MM:SS` over it.
@@ -1065,14 +1210,67 @@ mod tests {
         assert_eq!(DeviceLabel::Missing("Scarlett").text(), "Scarlett");
     }
 
-    /// Pre-roll is not writing. If it were, every take would open with three
-    /// seconds of the user walking across the room.
+    /// The count-in is not writing. If it were, every take would open with two
+    /// bars of clicking.
     #[test]
-    fn preroll_is_active_but_not_writing() {
-        let p = RecordState::PreRoll { remaining_s: 2.4 };
+    fn the_count_in_is_active_but_not_writing() {
+        let p = RecordState::CountIn { beat: 2, of: 4 };
         assert!(p.is_active() && !p.is_writing());
         assert!(RecordState::Rolling.is_writing());
         assert!(RecordState::Finishing.is_writing());
         assert!(!RecordState::Idle.is_active());
+    }
+}
+
+#[cfg(test)]
+mod fader_tests {
+    use super::*;
+
+    /// A fader pulled all the way down has to be OFF. `-60 dB` is not off when
+    /// what it is attenuating is a piano recorded at full scale — it is quiet,
+    /// audible, and on the recording.
+    #[test]
+    fn the_bottom_of_a_fader_is_silence_and_not_merely_quiet() {
+        assert_eq!(fader_to_gain(0.0), 0.0);
+        assert_eq!(fader_to_gain(-1.0), 0.0, "and below the bottom, too");
+        assert_eq!(gain_text(0.0), "OFF");
+    }
+
+    #[test]
+    fn a_fader_round_trips_through_its_position() {
+        for p in [0.05_f32, 0.25, 0.5, 0.8333333, 1.0] {
+            let back = gain_to_fader(fader_to_gain(p));
+            assert!(
+                (back - p).abs() < 1e-4,
+                "position {p} came back as {back}"
+            );
+        }
+    }
+
+    /// The one position anybody actually looks for.
+    #[test]
+    fn unity_gain_is_reachable_and_reads_as_zero_db() {
+        let unity = gain_to_fader(1.0);
+        assert!((fader_to_gain(unity) - 1.0).abs() < 1e-4);
+        assert_eq!(gain_text(1.0), "+0.0 dB");
+        assert!(
+            unity > 0.0 && unity < 1.0,
+            "0 dB has to be somewhere on the travel, not at an end"
+        );
+    }
+
+    #[test]
+    fn a_gain_above_unity_is_reachable_because_quiet_sources_exist() {
+        assert!(fader_to_gain(1.0) > 1.0, "the scale runs past 0 dB");
+        assert_eq!(gain_text(fader_to_gain(1.0)), "+12.0 dB");
+    }
+
+    /// The default that ruins takes if it is wrong.
+    #[test]
+    fn the_click_starts_under_the_music_and_out_of_the_file() {
+        let k = Knobs::default();
+        assert!(k.gains.metronome < k.gains.plugin);
+        assert!(!k.metronome_in_take, "a click in the file is a ruined take");
+        assert!(!k.metronome_on, "and it does not start clicking on its own");
     }
 }

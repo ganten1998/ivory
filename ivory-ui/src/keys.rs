@@ -39,6 +39,7 @@ pub enum KeyAction {
     ///
     /// The first binding here that is not always live — see [`Gates`].
     ToggleRecording,
+    ToggleRecorder,
     CloseHelp,
 }
 
@@ -71,6 +72,12 @@ pub struct Gates {
     /// focus — the same reasoning that already keeps it away from dialogs and
     /// the open menu.
     pub recorder_shown: bool,
+    /// This host can record at all — `Caps::capture_devices`.
+    ///
+    /// Gates the key that OPENS the band, which obviously cannot be gated on
+    /// the band being open. False in a plugin and in a Minimal build, where
+    /// there is no recorder to show and the menu category is absent too.
+    pub recorder_available: bool,
 }
 
 /// Whether a binding is live right now.
@@ -80,6 +87,7 @@ pub struct Gates {
 fn available(action: KeyAction, gates: Gates) -> bool {
     match action {
         KeyAction::ToggleRecording => gates.recorder_shown,
+        KeyAction::ToggleRecorder => gates.recorder_available,
         _ => true,
     }
 }
@@ -121,6 +129,11 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // it each time the band opens. It is also the first listed key that is not
     // a single letter, which is why the key column is measured now rather than
     // assumed — see `key_col_w`.
+    // `V` for the Recorder VIEW — the owner's own name for the feature. `R` is
+    // the obvious mnemonic and is long since taken by "clear the notes you
+    // placed", which is a thing people press by reflex mid-practice; rebinding
+    // it to something that opens a 200-point band would be a nasty surprise.
+    (Key::V, "V", KeyAction::ToggleRecorder, true),
     (Key::Space, "Space", KeyAction::ToggleRecording, true),
     // Escape only closes the card; it is not worth a row of its own.
     (Key::Escape, "Esc", KeyAction::CloseHelp, false),
@@ -147,6 +160,7 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ToggleChordLearning => "chord learning",
         KeyAction::ToggleNotePreference => "sharps or flats",
         KeyAction::ToggleRecording => "start or stop recording",
+        KeyAction::ToggleRecorder => "the recorder",
         KeyAction::CloseHelp => "close this card",
     }
 }
@@ -251,32 +265,72 @@ fn key_col_w(size: f32, widest_key: usize) -> f32 {
     (size * 3.2).max(size * (widest_key as f32 * 0.62 + 1.0))
 }
 
+/// One column count's font size and card size: `(size, width, height)`.
+///
+/// Split out of [`layout`] so the test that checks "we chose the biggest
+/// arrangement that fits" can measure the alternatives with the SAME
+/// arithmetic. A second copy in the test would agree with this one only by
+/// accident, and would go on agreeing after this one changed.
+fn measure_card(
+    rect: Rect,
+    rows: usize,
+    widest: usize,
+    widest_key: usize,
+    cols: usize,
+) -> (f32, f32, f32) {
+    let per_col = rows.max(1).div_ceil(cols);
+    let by_height = rect.height() * 0.92 / (per_col as f32 * 1.75 + 3.36);
+    // The floor is 6.0 rather than 8.0, and the gap between them is an
+    // anti-clipping fallback rather than slack: 22 rows at 650x125 want three
+    // columns of eight, which needs 125.4 points of a 120-point card, and there
+    // is no legible four-column layout at 650 wide to escape into. Small and
+    // complete beats crisp and cut off.
+    let size = by_height.min(rect.height() * 0.075).clamp(6.0, 20.0);
+    let pad = size * 1.4;
+    let col_w = key_col_w(size, widest_key) + widest as f32 * size * 0.62;
+    let w = col_w * cols as f32 + pad * 2.0 + pad * (cols - 1) as f32;
+    let h = per_col as f32 * size * 1.75 + pad * 2.4;
+    (size, w, h)
+}
+
 fn layout(rect: Rect, rows: usize, widest: usize, widest_key: usize) -> (Rect, f32, usize) {
     let rows = rows.max(1);
+    // The BIGGEST text that fits, not the first arrangement that does.
+    //
+    // This used to return on the first fitting column count, which was fine
+    // while the font floor was 8.0: a one-column layout that did not fit simply
+    // failed the height test and the loop moved on. Lowering the floor to 6.0
+    // (so a very full card shrinks rather than clipping) broke that, because a
+    // one-column layout then always "fits" — at 6pt — and the loop returned it
+    // even where three columns at 13pt were available. The card went from
+    // readable to a thread of tiny text in a large window.
+    let measure = |cols: usize| measure_card(rect, rows, widest, widest_key, cols);
+
+    let mut best: Option<(usize, f32, f32, f32)> = None;
     for cols in 1..=3usize {
-        let per_col = rows.div_ceil(cols);
-        let by_height = rect.height() * 0.92 / (per_col as f32 * 1.75 + 3.36);
-        let size = by_height.min(rect.height() * 0.075).clamp(8.0, 20.0);
-
-        let row_h = size * 1.75;
-        let pad = size * 1.4;
-        let col_w = key_col_w(size, widest_key) + widest as f32 * size * 0.62;
-        let w = col_w * cols as f32 + pad * 2.0 + pad * (cols - 1) as f32;
-        let h = per_col as f32 * row_h + pad * 2.4;
-
-        if (w <= rect.width() * 0.94 && h <= rect.height()) || cols == 3 {
-            // Never flush against the window edges: a card touching them reads
-            // as clipped even when it is not, and exact-equality containment is
-            // a float coin toss.
-            let card = Vec2::new(w.min(rect.width() * 0.94), h.min(rect.height() * 0.96));
-            return (
-                Rect::from_min_size(rect.center() - card * 0.5, card),
-                size,
-                cols,
-            );
+        let (size, w, h) = measure(cols);
+        if w <= rect.width() * 0.94 && h <= rect.height() {
+            if best.is_none_or(|(_, bs, ..)| size > bs) {
+                best = Some((cols, size, w, h));
+            }
         }
     }
-    unreachable!("the loop always returns on its last iteration")
+    // Nothing fits at all — a window shorter than any legible card. Take the
+    // widest arrangement and let the clamp below trim it, which clips inside
+    // the window rather than painting outside it.
+    let (cols, size, w, h) = best.unwrap_or_else(|| {
+        let (size, w, h) = measure(3);
+        (3, size, w, h)
+    });
+    // Never flush against the window edges: a card touching them reads as
+    // clipped even when it is not, and exact-equality containment is a float
+    // coin toss.
+    let card = Vec2::new(w.min(rect.width() * 0.94), h.min(rect.height() * 0.96));
+    (
+        Rect::from_min_size(rect.center() - card * 0.5, card),
+        size,
+        cols,
+    )
 }
 
 /// The help card, drawn over the app.
@@ -380,7 +434,7 @@ mod tests {
         // A gated binding must be a LISTED one, or the gate hides a shortcut
         // the card was never going to mention in the first place.
         for &(_, label, action, is_shown) in BINDINGS {
-            if !available(action, Gates { recorder_shown: true }) {
+            if !available(action, Gates { recorder_shown: true, recorder_available: true }) {
                 panic!("{label} is dead even with every gate open");
             }
             if !available(action, Gates::default()) {
@@ -417,7 +471,7 @@ mod tests {
             let mut got = Some(KeyAction::ClearNotes);
             // Every gate open, so this is testing the modifier and nothing else.
             let _ = ctx.run(input, |ctx| {
-                got = pressed(ctx, Gates { recorder_shown: true });
+                got = pressed(ctx, Gates { recorder_shown: true, recorder_available: true });
             });
             assert_eq!(got, None, "R fired with {mods:?} held");
         }
@@ -463,7 +517,7 @@ mod tests {
             "Space started a take on a recorder the user has never opened"
         );
         assert_eq!(
-            press(Key::Space, Gates { recorder_shown: true }),
+            press(Key::Space, Gates { recorder_shown: true, recorder_available: true }),
             Some(KeyAction::ToggleRecording)
         );
         // The gate is Space's alone: nothing else changes with it.
@@ -471,7 +525,7 @@ mod tests {
             (Key::K, KeyAction::ToggleKeytoggle),
             (Key::G, KeyAction::ToggleFretboard),
         ] {
-            for gates in [Gates::default(), Gates { recorder_shown: true }] {
+            for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true }] {
                 assert_eq!(press(key, gates), Some(want), "{key:?} under {gates:?}");
             }
         }
@@ -482,12 +536,21 @@ mod tests {
     /// unlisted" are the same bug told two ways, and one `available` kills both.
     #[test]
     fn the_card_does_not_list_space_while_the_recorder_is_hidden() {
-        let hidden = card_rows(Gates::default());
+        // `recorder_available` is held CONSTANT and only `recorder_shown`
+        // varies, or this measures two changes and calls it one.
+        let can_record = Gates {
+            recorder_shown: false,
+            recorder_available: true,
+        };
+        let hidden = card_rows(can_record);
         assert!(
             !hidden.iter().any(|(label, _)| *label == "Space"),
             "the card offers a shortcut the app would ignore"
         );
-        let shown = card_rows(Gates { recorder_shown: true });
+        let shown = card_rows(Gates {
+            recorder_shown: true,
+            ..can_record
+        });
         assert_eq!(
             shown.len(),
             hidden.len() + 1,
@@ -499,7 +562,7 @@ mod tests {
             "Space is last, so appearing does not reflow every row above it"
         );
         // And every listed row is a live binding, in both states.
-        for gates in [Gates::default(), Gates { recorder_shown: true }] {
+        for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true }] {
             for (label, _) in card_rows(gates) {
                 let (_, _, action, _) = BINDINGS
                     .iter()
@@ -519,7 +582,7 @@ mod tests {
         let size = 14.0_f32;
         // ~0.62 em per glyph is what the card's own column maths assumes.
         let glyph = size * 0.62;
-        for label in card_rows(Gates { recorder_shown: true })
+        for label in card_rows(Gates { recorder_shown: true, recorder_available: true })
             .iter()
             .map(|(l, _)| *l)
         {
@@ -544,7 +607,7 @@ mod tests {
     fn the_card_fits_the_window_at_every_size_and_row_count() {
         // The real maximum, taken through the gate rather than off the table:
         // the card is longest with every binding live.
-        let shown = card_rows(Gates { recorder_shown: true }).len();
+        let shown = card_rows(Gates { recorder_shown: true, recorder_available: true }).len();
         for w in [650.0_f32, 975.0, 1300.0, 1950.0, 2600.0] {
             for h in [w / 8.667, w / 8.667 + 50.0, w / 8.667 + 182.0, 90.0] {
                 let rect = Rect::from_min_size(Pos2::new(7.0, 11.0), Vec2::new(w, h));
@@ -552,7 +615,30 @@ mod tests {
                     // 5 is "Space", the widest key label the card carries.
                     let (card, size, cols) = layout(rect, rows, 46, 5);
                     // ALWAYS: nothing is ever painted outside the app.
-                    assert!(size >= 8.0, "text shrank below legible at {w}x{h}");
+                    //
+                    // The floor is 6.0 rather than 8.0, and the gap between
+                    // them is the anti-clipping fallback rather than slack.
+                    // `by_height` only asks for less than 8 when 8 genuinely
+                    // does not fit: 22 rows at 650x125 want three columns of
+                    // eight, which needs 125.4 points of a 120-point card, and
+                    // there is no legible four-column layout at 650 wide to
+                    // escape into. Small and complete beats crisp and cut off.
+                    assert!(size >= 6.0, "text shrank below legible at {w}x{h}");
+                    // And it is the BEST arrangement available, not merely a
+                    // working one. This is the invariant that broke when the
+                    // font floor dropped to 6.0: a one-column layout suddenly
+                    // "fit" at 6pt and was returned in windows where three
+                    // columns at 13pt were sitting right there.
+                    for other in 1..=3usize {
+                        let (alt_size, aw, ah) = measure_card(rect, rows, 46, 5, other);
+                        if aw <= rect.width() * 0.94 && ah <= rect.height() {
+                            assert!(
+                                alt_size <= size + 1e-3,
+                                "{other} columns fits at {alt_size} and we chose \
+                                 {size} at {w}x{h} with {rows} rows"
+                            );
+                        }
+                    }
                     assert!(
                         rect.contains_rect(card),
                         "card {card:?} escapes window {rect:?}, {rows} rows"
@@ -586,7 +672,7 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     // Both gate states: they are two different row counts, and
                     // the shorter one is the card most users will ever see.
-                    for gates in [Gates::default(), Gates { recorder_shown: true }] {
+                    for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true }] {
                         for t in [0.0, 0.01, 0.5, 0.999, 1.0] {
                             draw_help(ui.painter(), rect, false, t, gates);
                             draw_help(ui.painter(), rect, true, t, gates);

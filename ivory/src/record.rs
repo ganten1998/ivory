@@ -97,6 +97,13 @@ enum Cmd {
     Start(Box<StartArgs>),
     /// Close the file and send a report.
     Stop,
+    /// Install or remove the monitor engine's recorder tap.
+    ///
+    /// Boxed and sent rather than shared: the tap is the read end of a
+    /// lock-free ring and belongs to exactly one thread, which is this one.
+    Plugin(Option<Box<crate::instrument::RecorderTap>>),
+    /// Which sources the next take is made of.
+    Source(TakeSource),
     Quit,
 }
 
@@ -136,6 +143,66 @@ struct AudioReport {
     error: Option<String>,
 }
 
+/// Which sources a take is made of.
+///
+/// Not `graph::SourceMode` (yet). That type carries the full mixer with its
+/// per-source gains and delay compensation, and this is the subset that is
+/// actually wired: the recorder writes ONE rate master and optionally sums a
+/// second source into it. When the graph is made real this collapses into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeSource {
+    /// The audio input device. What a microphone take is.
+    Input,
+    /// The hosted instrument. What a piano take is, and the default whenever a
+    /// plugin is loaded — the plugin IS the sound the user is playing.
+    Plugin,
+    /// Both, summed.
+    ///
+    /// **The two run on independent device clocks**, so this is only exactly
+    /// right when the input and the output are the same interface — which is
+    /// the ordinary setup for a piano rig with one box, and the reason it is
+    /// offered at all. On two separate devices the sum drifts by their relative
+    /// crystal error, and `take.json` says which source was the rate master so
+    /// the drift is at least attributable.
+    Both,
+}
+
+impl TakeSource {
+    pub fn to_setting(self) -> &'static str {
+        match self {
+            TakeSource::Input => "input",
+            TakeSource::Plugin => "plugin",
+            TakeSource::Both => "both",
+        }
+    }
+
+    /// Forgiving, and it resolves the one case the UI cannot: "plugin" with no
+    /// plugin loaded records the input rather than recording silence, because a
+    /// take of nothing is never what anybody meant.
+    pub fn resolve(setting: &str, plugin_loaded: bool, input_open: bool) -> Self {
+        let want = match setting {
+            "plugin" => TakeSource::Plugin,
+            "both" => TakeSource::Both,
+            _ => TakeSource::Input,
+        };
+        match (want, plugin_loaded, input_open) {
+            (TakeSource::Plugin, false, _) => TakeSource::Input,
+            (TakeSource::Both, false, _) => TakeSource::Input,
+            (TakeSource::Both, true, false) => TakeSource::Plugin,
+            (TakeSource::Input, _, false) if plugin_loaded => TakeSource::Plugin,
+            (other, ..) => other,
+        }
+    }
+
+    fn uses_plugin(self) -> bool {
+        matches!(self, TakeSource::Plugin | TakeSource::Both)
+    }
+
+    fn uses_input(self) -> bool {
+        matches!(self, TakeSource::Input | TakeSource::Both)
+    }
+}
+
 /// The writer thread's own state.
 struct Writer {
     sink: audio::CaptureSink,
@@ -146,6 +213,11 @@ struct Writer {
     wav: Option<WavWriter>,
     error: Option<String>,
     buf: Vec<f32>,
+    /// Scratch for the plugin's audio, kept so the steady state allocates
+    /// nothing.
+    plugin_buf: Vec<f32>,
+    plugin: Option<crate::instrument::RecorderTap>,
+    source: TakeSource,
     silence: Vec<f32>,
     /// Timebase instant of the first frame written to the current file.
     /// `None` until the take's first mark arrives. See `pump`.
@@ -164,6 +236,10 @@ struct Writer {
     /// state must survive being re-armed.
     dropped_at_arm: u64,
     unstamped_at_arm: u64,
+    /// The instrument ring's own loss counter at arm. Same reasoning as
+    /// `dropped_at_arm`, and it needs its own baseline because the two rings
+    /// fill for completely different reasons.
+    plugin_dropped_at_arm: u64,
 }
 
 impl Writer {
@@ -202,6 +278,31 @@ impl Writer {
                 } else {
                     0
                 };
+                // Recording the instrument and not the room: the input's
+                // samples are still POPPED (the ring has to keep moving) and
+                // its marks still drive the clock and the rate fit, but its
+                // audio does not reach the file.
+                //
+                // **The input device stays the clock even when it is not the
+                // content.** It is the only source with device timestamps, so
+                // it is the only one that can measure the crystal — and a take
+                // of a plugin is still a take that has to not drift.
+                if !self.source.uses_input() {
+                    self.buf.iter_mut().for_each(|s| *s = 0.0);
+                }
+                // The instrument, summed into the same block.
+                //
+                // The INPUT is the rate master here and the plugin follows it:
+                // the file's length is decided by the device whose timestamps
+                // built the timeline, and the plugin is fitted to it. When the
+                // two are the same interface — the ordinary one-box piano rig —
+                // they share a crystal and this is exact. On two separate
+                // devices they drift, which is why `take.json` records which
+                // source was the master.
+                if self.source.uses_plugin() {
+                    let frames = self.buf.len() / self.tracker.channels().max(1);
+                    self.mix_plugin(frames);
+                }
                 self.tracker.absorb(&self.buf);
                 // The ring can hold fewer frames than the mark promised — the
                 // idle path drains marks and samples in two statements, so a
@@ -220,6 +321,22 @@ impl Writer {
             self.buf.clear();
             self.sink.drain_samples(&mut self.buf);
             self.tracker.absorb(&self.buf);
+            // Keep the instrument's ring moving while idle, and throw the
+            // audio away.
+            //
+            // Nothing drained it between takes, so it filled within a few
+            // seconds of the engine starting and then counted every frame as
+            // dropped for the rest of the session — 440,832 of them in one
+            // probe run. The next take would then report "440832 frames were
+            // lost to the system", which is both alarming and false.
+            //
+            // Draining also means a take starts with the audio being played
+            // NOW rather than with whatever was in the ring when it filled up.
+            if let Some(tap) = self.plugin.as_mut() {
+                self.plugin_buf.clear();
+                tap.drain(&mut self.plugin_buf);
+                self.plugin_buf.clear();
+            }
         }
         if let Ok(mut m) = self.meters.lock() {
             self.tracker.publish(&mut m);
@@ -260,6 +377,45 @@ impl Writer {
         self.buf.clear();
         self.sink.drain_samples(&mut self.buf);
         self.buf.clear();
+    }
+
+    /// Sum `frames` of instrument audio into `self.buf`, in place.
+    ///
+    /// Channel counts are reconciled here rather than upstream because they can
+    /// differ and both are outside our control: a mono interface with a stereo
+    /// piano is an ordinary setup. A mono source is sent to every output
+    /// channel; a wider source is folded down to the channels there are, which
+    /// keeps a stereo piano audible on a mono take instead of silently dropping
+    /// its right hand.
+    fn mix_plugin(&mut self, frames: usize) {
+        let Some(tap) = self.plugin.as_mut() else {
+            return;
+        };
+        let out_ch = self.tracker.channels().max(1);
+        let in_ch = tap.channels().max(1);
+        self.plugin_buf.clear();
+        let got = tap.drain_frames(frames, &mut self.plugin_buf);
+        // Short is not an error: the output device is free-running and may not
+        // have produced this block yet. The missing frames stay silent rather
+        // than shifting everything after them, which is the same rule the input
+        // path's dropout padding follows.
+        for f in 0..got.min(frames) {
+            for c in 0..out_ch {
+                let src = if in_ch == 1 {
+                    self.plugin_buf[f * in_ch]
+                } else if c < in_ch {
+                    self.plugin_buf[f * in_ch + c]
+                } else {
+                    // More output channels than the plugin has: repeat the last
+                    // one rather than leaving silence in it.
+                    self.plugin_buf[f * in_ch + in_ch - 1]
+                };
+                let dst = f * out_ch + c;
+                if dst < self.buf.len() {
+                    self.buf[dst] += src;
+                }
+            }
+        }
     }
 
     fn write_samples(&mut self, samples: &[f32]) {
@@ -325,7 +481,11 @@ impl Writer {
                 .stats()
                 .frames_dropped()
                 .saturating_sub(self.dropped_at_arm)
-                + self.short_frames,
+                + self.short_frames
+                + self
+                    .plugin
+                    .as_ref()
+                    .map_or(0, |t| t.dropped().saturating_sub(self.plugin_dropped_at_arm)),
             first_frame_ns: self.first_frame_ns,
             running: self.sink.stats().device_state().is_running(),
             clipped_samples: m.clipped_samples,
@@ -389,10 +549,14 @@ impl Audio {
             meters: Arc::clone(&meters),
             wav: None,
             error: None,
+            plugin_buf: Vec::new(),
+            plugin: None,
+            source: TakeSource::Input,
             first_frame_ns: None,
             short_frames: 0,
             dropped_at_arm: 0,
             unstamped_at_arm: 0,
+            plugin_dropped_at_arm: 0,
             buf: Vec::with_capacity(channels * 4096),
             // One block of zeros, reused. Allocating a pad the size of the
             // dropout would allocate megabytes on the worst possible thread at
@@ -419,6 +583,18 @@ impl Audio {
                             writer.first_frame_ns = None;
                             writer.short_frames = 0;
                             writer.dropped_at_arm = writer.sink.stats().frames_dropped();
+                            // `arm()`, not just a baseline: the instrument's
+                            // ring has been filling since the device opened —
+                            // right through the five-second plugin warm-up —
+                            // so it starts a take holding audio from before
+                            // anybody played anything. Arming discards that AND
+                            // resets the counter, so the take begins with the
+                            // note being played now.
+                            if let Some(t) = writer.plugin.as_mut() {
+                                t.arm();
+                            }
+                            writer.plugin_dropped_at_arm =
+                                writer.plugin.as_ref().map_or(0, |t| t.dropped());
                             writer.unstamped_at_arm = writer.clock.unstamped();
                             writer.tracker.arm();
                             match WavWriter::create(&args.path, args.spec, &args.bext) {
@@ -433,6 +609,8 @@ impl Audio {
                             let report = writer.stop();
                             let _ = report_tx.send(report);
                         }
+                        Ok(Cmd::Plugin(tap)) => writer.plugin = tap.map(|t| *t),
+                        Ok(Cmd::Source(mode)) => writer.source = mode,
                         Ok(Cmd::Quit) | Err(mpsc::TryRecvError::Disconnected) => break,
                         Err(mpsc::TryRecvError::Empty) => {}
                     }
@@ -579,7 +757,9 @@ pub struct Session {
     /// Wall-clock at the same moment, for the folder name and the BWF chunk.
     started_at: WallTime,
     started_instant: Option<Instant>,
-    preroll_ends: Option<Instant>,
+    /// When the count-in started, and how many beats it runs for.
+    count_in_from: Option<Instant>,
+    count_in_of: u32,
     take: Option<Take>,
     /// The spec the RUNNING take was started with.
     ///
@@ -587,6 +767,13 @@ pub struct Session {
     /// opened mid-take and a take that changed what it was writing halfway
     /// through would produce a directory matching neither answer.
     spec: ExportSpec,
+    /// What the take is made of. Mirrored to the writer thread by
+    /// [`set_source`](Session::set_source).
+    source: TakeSource,
+    /// Something noticed at `begin` that the summary at `stop` should say.
+    pending_note: Option<String>,
+    /// A T0 supplied from outside; see [`arm_at`](Session::arm_at).
+    arm_override: Option<Nanos>,
     last: Option<Summary>,
     /// Latched across the take, because the meter's own latch is reset when the
     /// next one is armed and the user may not have looked yet.
@@ -612,12 +799,26 @@ impl Session {
             t0: 0,
             started_at: WallTime::now_utc(),
             started_instant: None,
-            preroll_ends: None,
+            count_in_from: None,
+            count_in_of: 0,
             take: None,
             spec: ExportSpec::default(),
+            source: TakeSource::Input,
+            pending_note: None,
+            arm_override: None,
             last: None,
             clipped: false,
         }
+    }
+
+    /// The app's single time origin, shared with the monitor engine.
+    ///
+    /// One `Timebase` across the MIDI tap, the input stream and the output
+    /// stream. Two would put the click, the notes and the recording in
+    /// different worlds and every take would carry an offset nobody could
+    /// account for.
+    pub fn timebase(&self) -> Timebase {
+        self.timebase
     }
 
     pub fn state(&self) -> RecordState {
@@ -676,6 +877,33 @@ impl Session {
             }
             Err(e) => self.audio_error = Some(e),
         }
+    }
+
+    /// Hand the monitor engine's recorder tap to the writer thread.
+    ///
+    /// Taken once and moved, because it is the read end of a lock-free ring and
+    /// belongs to exactly one thread. `None` removes it.
+    pub fn set_plugin_tap(&mut self, tap: Option<crate::instrument::RecorderTap>) {
+        if let Some(audio) = &self.audio {
+            let _ = audio.cmds.send(Cmd::Plugin(tap.map(Box::new)));
+        }
+    }
+
+    /// Which sources the next take is made of. Ignored mid-take: a take that
+    /// changed what it was recording halfway through would produce a file
+    /// matching neither answer.
+    pub fn set_source(&mut self, source: TakeSource) {
+        if self.state.is_active() {
+            return;
+        }
+        self.source = source;
+        if let Some(audio) = &self.audio {
+            let _ = audio.cmds.send(Cmd::Source(source));
+        }
+    }
+
+    pub fn source(&self) -> TakeSource {
+        self.source
     }
 
     pub fn close_input(&mut self) {
@@ -770,7 +998,13 @@ impl Session {
     /// seals a connection's callback the moment the port opens, so there is no
     /// way to arm it later (see `midi.rs`) — and that turns out to be what a
     /// correct `.mid` needs anyway.
-    pub fn pump_midi(&mut self) {
+    /// `on_event` sees every message as it is drained, in the timebase.
+    ///
+    /// A fan-out rather than a second drain, because the tap is a QUEUE: two
+    /// consumers means one of them gets each message and the other gets none.
+    /// The monitor engine needs the same notes the take does — that is the
+    /// whole point of hosting an instrument — so they come from one drain.
+    pub fn pump_midi(&mut self, mut on_event: impl FnMut(Nanos, &[u8])) {
         let now = self.timebase.now();
         for (stamp, arrived, bytes) in self.tap.drain() {
             // Pair the device stamp with the arrival reading taken in the midir
@@ -783,6 +1017,7 @@ impl Session {
                 .midi_clock
                 .to_timebase(stamp)
                 .unwrap_or_else(|| self.timebase.at(arrived));
+            on_event(t, &bytes);
             self.midi.push(Captured::new(t, bytes));
         }
         // A rolling window BEHIND the present, and — critically — behind T0 as
@@ -807,26 +1042,27 @@ impl Session {
         &mut self,
         root: &std::path::Path,
         name: Option<&str>,
-        preroll_s: u8,
+        count_in_beats: u32,
         spec: ExportSpec,
     ) {
         match self.state {
             RecordState::Idle => {
                 self.spec = spec;
-                if preroll_s == 0 {
+                if count_in_beats == 0 {
                     self.begin(root, name);
                 } else {
-                    self.preroll_ends =
-                        Some(Instant::now() + Duration::from_secs(u64::from(preroll_s)));
-                    self.state = RecordState::PreRoll {
-                        remaining_s: f32::from(preroll_s),
+                    self.count_in_from = Some(Instant::now());
+                    self.count_in_of = count_in_beats;
+                    self.state = RecordState::CountIn {
+                        beat: 1,
+                        of: count_in_beats,
                     };
                 }
             }
-            // Pressing it during the countdown cancels, which is what anyone
-            // who has just realised they left the metronome on will try.
-            RecordState::PreRoll { .. } => {
-                self.preroll_ends = None;
+            // Pressing it during the count-in cancels, which is what anyone who
+            // has just realised they came in wrong will try.
+            RecordState::CountIn { .. } => {
+                self.count_in_from = None;
                 self.state = RecordState::Idle;
             }
             RecordState::Rolling => self.stop(),
@@ -834,29 +1070,60 @@ impl Session {
         }
     }
 
-    /// Advance the pre-roll. Called once a frame.
+    /// How long one beat lasts at the take's tempo.
+    fn beat(&self) -> Duration {
+        Duration::from_secs_f64(60.0 / self.spec.tempo_bpm.clamp(20.0, 300.0))
+    }
+
+    /// Advance the count-in. Called once a frame.
     ///
     /// Returns true when something changed, so the caller knows to repaint —
-    /// the countdown is the one part of this that animates without any input.
+    /// the count is the one part of this that animates without any input.
+    ///
+    /// **The beat number comes from the wall clock, not from the audio
+    /// thread's sample count**, and the click the user hears comes from the
+    /// audio thread. They are two clocks, so in principle they can disagree —
+    /// in practice a count-in is at most eight beats, four seconds at 120, and
+    /// the two differ by well under a millisecond over that. Worth knowing
+    /// about; not worth a lock-free beat channel to fix.
     pub fn tick(&mut self, root: &std::path::Path, name: Option<&str>) -> bool {
-        let Some(ends) = self.preroll_ends else {
+        let Some(from) = self.count_in_from else {
             return false;
         };
-        let now = Instant::now();
-        if now >= ends {
-            self.preroll_ends = None;
+        let beat = self.beat();
+        let elapsed = Instant::now().saturating_duration_since(from);
+        let done = elapsed.as_secs_f64() / beat.as_secs_f64();
+        if done >= f64::from(self.count_in_of) {
+            self.count_in_from = None;
             self.begin(root, name);
             return true;
         }
-        let remaining_s = (ends - now).as_secs_f32();
-        let changed = self.state != (RecordState::PreRoll { remaining_s });
-        self.state = RecordState::PreRoll { remaining_s };
+        // 1-based: the first beat of a four-beat count-in is "1", not "0". The
+        // number shown is the one the player is counting out loud.
+        let now = RecordState::CountIn {
+            beat: (done as u32) + 1,
+            of: self.count_in_of,
+        };
+        let changed = self.state != now;
+        self.state = now;
         changed
+    }
+
+    /// T0 for the next `begin`, when something knows better than "now".
+    ///
+    /// The count-in sets it to the instant the downbeat is HEARD, which the
+    /// audio thread knows exactly and the UI thread can only estimate — a frame
+    /// late, plus the output device's own delay. Recording from the beat the
+    /// player heard is the difference between a take that starts on the bar and
+    /// one that starts a few milliseconds after it.
+    pub fn arm_at(&mut self, t0: Nanos) {
+        self.arm_override = Some(t0);
     }
 
     fn begin(&mut self, root: &std::path::Path, name: Option<&str>) {
         self.clipped = false;
         self.last = None;
+        self.pending_note = None;
         let at = WallTime::now_utc();
         let slug = name.and_then(take::sanitise_slug);
         if let Err(e) = take::prepare_root(root) {
@@ -874,7 +1141,7 @@ impl Session {
         // T0 is read AFTER the directory exists. Creating a folder can block on
         // a slow or networked volume, and a T0 taken before it would put that
         // delay at the head of the file as silence the MIDI does not know about.
-        self.t0 = self.timebase.now();
+        self.t0 = self.arm_override.take().unwrap_or_else(|| self.timebase.now());
         self.started_at = at;
         self.started_instant = Some(Instant::now());
         // Keep the minute BEFORE T0: that is where the pedal-down and the
@@ -885,6 +1152,17 @@ impl Session {
         // it has to be honoured HERE. Sending Start regardless meant unticking
         // audio still produced a microphone recording — and the summary still
         // said "audio + MIDI", so nothing revealed it.
+        // No input device means no writer thread, and the writer thread is
+        // what writes the WAV — even for a plugin-only take, because the input
+        // is the only source with a device clock to measure. Somebody who
+        // turned the input off and loaded a piano would otherwise get a take
+        // with a .mid and no audio, and nothing saying why.
+        if self.spec.audio && self.audio.is_none() && self.source.uses_plugin() {
+            self.pending_note = Some(
+                "no audio input is open, so there is no clock to record the                  instrument against — the take is MIDI only. Choose an input                  in the Recorder band to record its sound."
+                    .to_owned(),
+            );
+        }
         if let (Some(audio), true) = (&self.audio, self.spec.audio) {
             let spec = audio.spec();
             let args = StartArgs {
@@ -900,7 +1178,7 @@ impl Session {
 
     fn fail(&mut self, problem: String) {
         self.state = RecordState::Idle;
-        self.preroll_ends = None;
+        self.count_in_from = None;
         self.last = Some(Summary {
             folder: String::new(),
             seconds: 0.0,
@@ -931,7 +1209,7 @@ impl Session {
         // makes it an audio-versus-MIDI asymmetry rather than a rounding error.
         // `MidiTake::build` already filters to `<= t1`, so nothing past the end
         // can leak in.
-        self.pump_midi();
+        self.pump_midi(|_, _| {});
         let Some(take) = self.take.take() else {
             self.state = RecordState::Idle;
             return;
@@ -940,7 +1218,7 @@ impl Session {
         let spec = self.spec;
         let mut problem: Option<String> = None;
         // Something worth saying about a take that nonetheless worked.
-        let mut note: Option<String> = None;
+        let mut note: Option<String> = self.pending_note.take();
 
         // ── audio ───────────────────────────────────────────────────────────
         let mut report: Option<AudioReport> = None;
@@ -1075,6 +1353,14 @@ impl Session {
                         .to_owned(),
                 );
             }
+        }
+        // Which sources this take was made of, so a file that sounds like a
+        // piano and a file that sounds like a room can be told apart later.
+        manifest
+            .sources
+            .push(take::SourceReport::from_clock("take_source", &self.midi_clock));
+        if let Some(last) = manifest.sources.last_mut() {
+            last.name = format!("sources: {}", self.source.to_setting());
         }
         manifest.midi = take::MidiReport {
             tempo_bpm: spec.tempo_bpm,
@@ -1284,7 +1570,7 @@ pub fn record_test(seconds: Option<String>) {
     let until = Instant::now() + Duration::from_secs_f64(seconds);
     while Instant::now() < until {
         std::thread::sleep(Duration::from_millis(50));
-        session.pump_midi();
+        session.pump_midi(|_, _| {});
     }
     session.stop();
 
@@ -1341,10 +1627,14 @@ mod tests {
             meters: Arc::new(Mutex::new(AudioMeters::new(channels))),
             wav: None,
             error: None,
+            plugin_buf: Vec::new(),
+            plugin: None,
+            source: TakeSource::Input,
             first_frame_ns: None,
             short_frames: 0,
             dropped_at_arm: 0,
             unstamped_at_arm: 0,
+            plugin_dropped_at_arm: 0,
             buf: Vec::new(),
             silence: vec![0.0; channels * 1024],
         };
@@ -1436,10 +1726,14 @@ mod tests {
             meters: Arc::new(Mutex::new(AudioMeters::new(CH))),
             wav: None,
             error: None,
+            plugin_buf: Vec::new(),
+            plugin: None,
+            source: TakeSource::Input,
             first_frame_ns: None,
             short_frames: 0,
             dropped_at_arm: 0,
             unstamped_at_arm: 0,
+            plugin_dropped_at_arm: 0,
             buf: Vec::new(),
             silence: vec![0.0; CH * 1024],
         };
@@ -1506,19 +1800,19 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_roll_delays_the_take_and_can_be_cancelled() {
-        let dir = std::env::temp_dir().join("tangent-session-test-preroll");
+    fn a_count_in_delays_the_take_and_can_be_cancelled() {
+        let dir = std::env::temp_dir().join("tangent-session-test-countin");
         let _ = std::fs::remove_dir_all(&dir);
         let mut s = session();
         s.toggle(&dir, None, 3, ExportSpec::default());
         assert!(
-            matches!(s.state(), RecordState::PreRoll { .. }),
-            "a pre-roll must not start writing immediately"
+            matches!(s.state(), RecordState::CountIn { .. }),
+            "a count-in must not start writing immediately"
         );
         assert!(
             !dir.exists(),
             "nothing may be created until the countdown finishes — a cancelled \
-             pre-roll must leave no empty folder behind"
+             count-in must leave no empty folder behind"
         );
         s.toggle(&dir, None, 3, ExportSpec::default());
         assert_eq!(s.state(), RecordState::Idle, "pressing again cancels");
@@ -1529,7 +1823,7 @@ mod tests {
     /// a record button that does nothing, and it would pass any test that only
     /// checked the state right after pressing it.
     #[test]
-    fn a_pre_roll_that_elapses_starts_the_take() {
+    fn a_count_in_that_elapses_starts_the_take() {
         let dir = std::env::temp_dir().join("tangent-session-test-elapse");
         let _ = std::fs::remove_dir_all(&dir);
         let mut s = session();
@@ -1539,8 +1833,8 @@ mod tests {
 
         // And through the countdown path, forced to expire.
         s.toggle(&dir, None, 3, ExportSpec::default());
-        s.preroll_ends = Some(Instant::now());
-        assert!(s.tick(&dir, None), "an expiring pre-roll is a change");
+        s.count_in_from = Some(Instant::now() - Duration::from_secs(60));
+        assert!(s.tick(&dir, None), "an expiring count-in is a change");
         assert_eq!(s.state(), RecordState::Rolling);
         s.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1687,7 +1981,7 @@ mod tests {
         s.state = RecordState::Rolling;
         s.t0 = 5_000_000_000;
         s.midi.push(Captured::new(6_000_000_000, [0x90, 60, 90]));
-        s.pump_midi();
+        s.pump_midi(|_, _| {});
         assert_eq!(
             s.midi.len(),
             2,
@@ -1708,11 +2002,57 @@ mod tests {
         // And one second before it, which is inside the window.
         s.midi
             .push(Captured::new(s.t0 - 1_000_000_000, [0xB0, 64, 127]));
-        s.pump_midi();
+        s.pump_midi(|_, _| {});
         assert_eq!(
             s.midi.len(),
             1,
             "the window is bounded behind T0, not unbounded"
         );
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::TakeSource;
+
+    /// "Record the plugin" with no plugin loaded must not record silence. A
+    /// take of nothing is never what anybody meant, and it is a setting that
+    /// survives from a session where a plugin WAS loaded.
+    #[test]
+    fn asking_for_a_plugin_that_is_not_loaded_records_the_input_instead() {
+        assert_eq!(
+            TakeSource::resolve("plugin", false, true),
+            TakeSource::Input
+        );
+        assert_eq!(TakeSource::resolve("both", false, true), TakeSource::Input);
+    }
+
+    /// And the mirror: with a plugin loaded and no input device open, the
+    /// plugin is the only thing there is to record.
+    #[test]
+    fn with_no_input_open_a_loaded_plugin_is_the_take() {
+        assert_eq!(
+            TakeSource::resolve("input", true, false),
+            TakeSource::Plugin
+        );
+        assert_eq!(TakeSource::resolve("both", true, false), TakeSource::Plugin);
+    }
+
+    #[test]
+    fn an_ordinary_setup_gets_what_it_asked_for() {
+        assert_eq!(TakeSource::resolve("input", true, true), TakeSource::Input);
+        assert_eq!(TakeSource::resolve("plugin", true, true), TakeSource::Plugin);
+        assert_eq!(TakeSource::resolve("both", true, true), TakeSource::Both);
+        assert_eq!(
+            TakeSource::resolve("nonsense from a later build", false, true),
+            TakeSource::Input
+        );
+    }
+
+    #[test]
+    fn the_setting_round_trips() {
+        for s in ["input", "plugin", "both"] {
+            assert_eq!(TakeSource::resolve(s, true, true).to_setting(), s);
+        }
     }
 }

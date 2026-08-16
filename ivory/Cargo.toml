@@ -30,7 +30,7 @@ path = "src/main.rs"
 # switches it off through `Caps::MINIMAL`, exactly as the plugin already
 # switches off everything it cannot do.
 default = ["recorder"]
-recorder = ["dep:ivory-record", "dep:ivory-host"]
+recorder = ["dep:ivory-record", "dep:ivory-host", "dep:cpal", "dep:rtrb"]
 
 [dependencies]
 # The GUI always enables the engine's `learning` feature — the re-ranker is a
@@ -58,6 +58,19 @@ ivory-ui = { path = "../ivory-ui" }
 # Minimal ships no entitlements, exactly as 3.0.0 does.
 ivory-record = { path = "../ivory-record", optional = true }
 ivory-host = { path = "../ivory-host", optional = true }
+# The monitor OUTPUT stream (`src/instrument.rs`), which is a different thing
+# from `ivory-record`'s input stream and cannot be borrowed from it: cpal's
+# `Stream` is `!Send`, so the one that plays the hosted instrument has to be
+# built and held right here, on the thread that owns the plugin. Same versions
+# `ivory-record` already pins, so neither adds a crate to the lock file.
+#
+# OPTIONAL, and part of `recorder` for the same reason the other two are: a
+# Minimal build has no plugin to monitor and no click to play, and must not link
+# an audio backend to prove it.
+cpal = { version = "0.16", optional = true }
+# The lock-free SPSC rings the output callback uses for MIDI in, rendered audio
+# out, and the plugin hot-swap handoff. See `instrument.rs`.
+rtrb = { version = "0.3", optional = true }
 # Same crate eframe already links; direct dep so modules can `use egui::...`.
 egui = { version = "0.33", default-features = false }
 eframe = { version = "0.33", default-features = false, features = [

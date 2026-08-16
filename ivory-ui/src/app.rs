@@ -245,6 +245,22 @@ pub struct IvoryApp {
     /// practice session should not have to turn it off again before every
     /// single take. The tick is what makes it outlive the session.
     export_override: Option<recorder::ExportSpec>,
+    /// A settings write owed once the user stops dragging a fader.
+    settings_save_at: Option<Instant>,
+    /// Every VST3 bundle the host found, for the picker.
+    ///
+    /// Supplied by the host rather than discovered here: `ivory-ui` cannot
+    /// reach `ivory-host`, and it is a directory listing rather than a scan —
+    /// nothing is LOADED to build this list, which matters when there are 112
+    /// of them and any one could crash the process on open.
+    plugin_list: Vec<std::path::PathBuf>,
+    /// The band control the pointer grabbed, and where it grabbed it.
+    ///
+    /// The faders and the tempo are DRAGGED, and `recorder_panel::hit_test` is
+    /// a pure function of position with no memory — so the app is what
+    /// remembers which control is being held. Without this, dragging a fader
+    /// past the edge of its own track hands the next control the value.
+    grabbed: Option<(recorder_panel::Hit, Pos2)>,
     /// The take-name field has keyboard focus.
     ///
     /// While this is true every single-letter shortcut is suppressed, or typing
@@ -426,6 +442,9 @@ impl IvoryApp {
             recorder_request: None,
             dir_request: None,
             export_override: None,
+            settings_save_at: None,
+            grabbed: None,
+            plugin_list: Vec::new(),
             name_focused: false,
 
             detach_window_visible: false,
@@ -851,6 +870,7 @@ impl IvoryApp {
     fn key_gates(&self) -> keys::Gates {
         keys::Gates {
             recorder_shown: self.settings.show_recorder,
+            recorder_available: self.caps.capture_devices,
         }
     }
 
@@ -874,7 +894,10 @@ impl IvoryApp {
             fretboard_detached: self.settings.fretboard_detached,
             recorder_on: self.settings.show_recorder,
             recorder_detached: self.settings.recorder_detached,
-            preroll_s: self.settings.preroll_seconds(),
+            count_in_beats: self.settings.count_in_beats(),
+            plugin_name: self.recorder.plugin_name.clone(),
+            metronome_on: self.settings.metronome_on,
+            metronome_in_take: self.settings.metronome_in_take,
             hide_elapsed: self.settings.record_hide_elapsed,
             caps: self.caps,
             tuning: self.settings.fretboard_spec().tuning.name.to_string(),
@@ -1011,11 +1034,17 @@ impl IvoryApp {
                         &self.recorder.view(
                             self.settings.record_take_name.as_deref().unwrap_or_default(),
                             self.name_focused,
-                            self.settings.preroll_seconds(),
+                            self.settings.knobs(),
                             self.settings.record_hide_elapsed,
                         ),
                         pos,
                     );
+                    // Remember a dragged control for as long as the button is
+                    // held. Only the value-carrying hits are grabbable; a
+                    // button does not want a drag.
+                    self.grabbed = hit
+                        .filter(recorder_panel::Hit::is_draggable)
+                        .map(|h| (h, pos));
                     // A press anywhere in the band that is not the name field
                     // takes focus off it, which is what makes clicking away
                     // commit the name the way every other text field does.
@@ -1314,20 +1343,45 @@ impl IvoryApp {
             Hit::NameField => self.name_focused = true,
             Hit::PickCamera => self.open_device_picker(dialogs::DeviceKind::Camera),
             Hit::PickAudio => self.open_device_picker(dialogs::DeviceKind::AudioInput),
-            Hit::CyclePreRoll => {
-                let choices = recorder::PREROLL_CHOICES;
-                let now = self.settings.preroll_seconds();
+            Hit::CycleCountIn => {
+                let choices = recorder::COUNT_IN_CHOICES;
+                let now = self.settings.count_in_beats();
                 let next = choices
                     .iter()
                     .position(|c| *c == now)
                     .map_or(choices[0], |i| choices[(i + 1) % choices.len()]);
-                self.settings.record_preroll_s = i64::from(next);
+                self.settings.record_count_in_beats = i64::from(next);
                 self.save_settings();
             }
             Hit::Export => self.open_export_dialog(),
-            Hit::ToggleHideElapsed => {
-                self.settings.record_hide_elapsed = !self.settings.record_hide_elapsed;
+            Hit::PickPlugin => self.open_plugin_picker(),
+            Hit::ToggleMetronome => {
+                self.settings.metronome_on = !self.settings.metronome_on;
                 self.save_settings();
+            }
+            Hit::ToggleMetronomeInTake => {
+                self.settings.metronome_in_take = !self.settings.metronome_in_take;
+                self.save_settings();
+            }
+            // The faders. Saved through the same debounce the window geometry
+            // uses rather than on every frame of a drag — a fader written to
+            // disk sixty times a second is sixty file rewrites per gesture.
+            Hit::SetPluginGain(p) => {
+                self.settings.plugin_gain = f64::from(recorder::fader_to_gain(p));
+                self.save_settings_soon();
+            }
+            Hit::SetMetronomeGain(p) => {
+                self.settings.metronome_gain = f64::from(recorder::fader_to_gain(p));
+                self.save_settings_soon();
+            }
+            Hit::SetInputGain(p) => {
+                self.settings.input_gain = f64::from(recorder::fader_to_gain(p));
+                self.save_settings_soon();
+            }
+            Hit::SetTempo(bpm) => {
+                self.settings.record_export.tempo_bpm =
+                    bpm.clamp(recorder::MIN_BPM, recorder::MAX_BPM);
+                self.save_settings_soon();
             }
         }
     }
@@ -1359,8 +1413,31 @@ impl IvoryApp {
         self.settings.record_take_name.as_deref()
     }
 
-    pub fn preroll_seconds(&self) -> u8 {
-        self.settings.preroll_seconds()
+    pub fn count_in_beats(&self) -> u32 {
+        self.settings.count_in_beats()
+    }
+
+    /// The tempo the click, the count-in and the SMF tempo mark all share.
+    pub fn tempo_bpm(&self) -> f64 {
+        self.settings.record_export.tempo_bpm
+    }
+
+    /// `input` / `plugin` / `both`, verbatim from the file.
+    pub fn audio_source_setting(&self) -> &str {
+        &self.settings.record_audio_source
+    }
+
+    pub fn metronome_on(&self) -> bool {
+        self.settings.metronome_on
+    }
+
+    pub fn metronome_in_take(&self) -> bool {
+        self.settings.metronome_in_take
+    }
+
+    /// The three monitor gains, linear.
+    pub fn gains(&self) -> recorder::Gains {
+        self.settings.knobs().gains
     }
 
     /// The stable uid of the audio input the user chose, if any.
@@ -1409,6 +1486,38 @@ impl IvoryApp {
     /// rather than saving unconditionally.
     pub fn export_spec(&self) -> recorder::ExportSpec {
         self.export_override.unwrap_or(self.settings.record_export)
+    }
+
+    /// Debounce a settings write. See `settings_save_at`.
+    fn save_settings_soon(&mut self) {
+        self.settings_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
+    }
+
+    /// Hand the app the list of installed VST3 bundles.
+    ///
+    /// Called once at startup by the host. Paths and names only — building it
+    /// opens nothing.
+    pub fn set_plugin_list(&mut self, bundles: Vec<std::path::PathBuf>) {
+        self.plugin_list = bundles;
+    }
+
+    /// The instrument the user chose, for the host to load after the frame.
+    pub fn chosen_plugin(&self) -> Option<&str> {
+        self.settings.plugin_path.as_deref()
+    }
+
+    fn open_plugin_picker(&mut self) {
+        if !self.caps.capture_devices {
+            return;
+        }
+        // The dialog's own constructor rather than building the variant here:
+        // it sorts, it derives the rows from the paths, and it preselects the
+        // loaded one. Three things that would otherwise be duplicated and
+        // would drift.
+        self.dialog = Some(Dialog::plugin_picker(
+            &self.plugin_list,
+            self.settings.plugin_path.clone(),
+        ));
     }
 
     fn open_export_dialog(&mut self) {
@@ -1710,6 +1819,7 @@ impl IvoryApp {
             // menu row that starts a take would be reachable from a right-click
             // over the piano with the recorder hidden.
             K::ToggleRecording => self.request_recorder(recorder::RecorderRequest::Toggle),
+            K::ToggleRecorder => self.apply_menu_action(ctx, MenuAction::ToggleRecorder),
             K::ToggleDarkMode => self.apply_menu_action(ctx, MenuAction::ToggleDarkMode),
             K::ToggleDetection => self.apply_menu_action(ctx, MenuAction::ToggleChordDetection),
             K::ToggleBorderless => self.apply_menu_action(ctx, MenuAction::ToggleBorderless),
@@ -1913,8 +2023,21 @@ impl IvoryApp {
             MenuAction::DetachRecorder => self.detach_recorder(),
             MenuAction::AttachRecorder => self.reattach_recorder(),
             MenuAction::ShowExportDialog => self.open_export_dialog(),
-            MenuAction::SetPreRoll(seconds) => {
-                self.settings.record_preroll_s = i64::from(seconds);
+            MenuAction::SetCountIn(beats) => {
+                self.settings.record_count_in_beats = i64::from(beats);
+                self.save_settings();
+            }
+            MenuAction::ShowPluginPicker => self.open_plugin_picker(),
+            MenuAction::UnloadPlugin => {
+                self.settings.plugin_path = None;
+                self.save_settings();
+            }
+            MenuAction::ToggleMetronome => {
+                self.settings.metronome_on = !self.settings.metronome_on;
+                self.save_settings();
+            }
+            MenuAction::ToggleMetronomeInTake => {
+                self.settings.metronome_in_take = !self.settings.metronome_in_take;
                 self.save_settings();
             }
             MenuAction::ToggleHideElapsed => {
@@ -2221,6 +2344,14 @@ impl IvoryApp {
         match action {
             DialogAction::SetShowWelcome(show) => {
                 self.settings.show_welcome = show;
+                self.save_settings();
+            }
+            DialogAction::LoadPlugin { path } => {
+                // Written to settings and nothing else: loading is the host's
+                // job, done after the frame, because `Module::open` runs
+                // third-party code and `Instance::create` can take seconds.
+                // The host notices the change by watching `chosen_plugin()`.
+                self.settings.plugin_path = path;
                 self.save_settings();
             }
             DialogAction::ChooseDevice { kind, uid } => {
@@ -2792,7 +2923,7 @@ impl IvoryApp {
                 &self.recorder.view(
                     self.settings.record_take_name.as_deref().unwrap_or_default(),
                     self.name_focused,
-                    self.settings.preroll_seconds(),
+                    self.settings.knobs(),
                     self.settings.record_hide_elapsed,
                 ),
                 &self.settings,
@@ -2849,6 +2980,33 @@ impl IvoryApp {
             theory_rect_for_hit,
             recorder_rect_for_hit,
         );
+
+        // A fader being dragged. `hit_test` has no memory, so the app supplies
+        // it: the probe's Y is pinned to where the grab started, which keeps a
+        // few pixels of vertical drift on the track instead of dropping the
+        // gesture, and the X is clamped into the band so dragging past the end
+        // pins the value rather than losing it.
+        if let (Some(rect), Some((held, from))) = (recorder_rect_for_hit, self.grabbed) {
+            let (down, pos) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos()));
+            if !down {
+                self.grabbed = None;
+            } else if let Some(pos) = pos {
+                let probe = Pos2::new(pos.x.clamp(rect.left(), rect.right() - 0.5), from.y);
+                let view = self.recorder.view(
+                    self.settings.record_take_name.as_deref().unwrap_or_default(),
+                    self.name_focused,
+                    self.settings.knobs(),
+                    self.settings.record_hide_elapsed,
+                );
+                if let Some(now) = recorder_panel::hit_test(rect, &view, probe) {
+                    // Same CONTROL, not the same value: the whole point is that
+                    // the value changed.
+                    if now.is_same_control(held) {
+                        self.apply_recorder_hit(now);
+                    }
+                }
+            }
+        }
 
         // The take-name field, edited from raw input rather than with an egui
         // widget. The band is a pure painter — that is what will let the
@@ -2966,7 +3124,7 @@ impl IvoryApp {
             let view = self.recorder.view(
                 self.settings.record_take_name.as_deref().unwrap_or_default(),
                 self.name_focused,
-                self.settings.preroll_seconds(),
+                self.settings.knobs(),
                 self.settings.record_hide_elapsed,
             );
             let outcome = recorder_panel::show_detached_window(
@@ -3046,6 +3204,18 @@ impl IvoryApp {
                 if self.dialog.is_none() {
                     self.open_menu_at(&ctx, pos);
                 }
+            }
+        }
+
+        // Debounced write-back for the faders, which are the only settings in
+        // the app changed by DRAGGING. Same reasoning as the geometry below and
+        // a separate deadline, because the two are unrelated gestures and one
+        // resetting the other's timer would let a long drag postpone a save
+        // indefinitely.
+        if let Some(deadline) = self.settings_save_at {
+            if Instant::now() >= deadline {
+                self.settings_save_at = None;
+                self.save_settings();
             }
         }
 

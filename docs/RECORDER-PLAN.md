@@ -2044,3 +2044,97 @@ primary source.
 | "Requirement 3 is never addressed" (filed twice, by two reviewers) | §8 addresses it explicitly and §1 states the scheduling consequence in a callout. Both filings mistook "deferred and labelled" for "dropped". |
 | "egui_glow has no PBO helper and the Painter leaks unless explicitly destroyed" | The FBO bet is sound; the absence of a PBO *helper* is not a defect, and `Painter::destroy` is a documented, ordinary requirement. |
 | "'All three platforms at once' is not delivered" | Sequencing is not descoping. §2 carries all three dependency blocks, §4 all three camera backends, §7 all three encoders, and §12 step 8 delivers Windows and Linux **ahead of** the plugin host. |
+
+---
+
+## 16. Addendum, 2026-08-16: what using it changed
+
+Everything above §15 was written before anybody had used the band. This section
+records the decisions that came from the first session with it in hand, and
+supersedes the parts of §5 it contradicts.
+
+### The count-in is in beats, not seconds
+
+§5 specified "a settable pre-roll countdown (0/3/5 s, default 3) so the user can
+walk back to the bench". That was the wrong model, and the owner said so in four
+words: *"counts of beats not seconds"*.
+
+A count-in is a **musical instruction**. "Two bars" is what a musician asks for
+and what a click plays; a countdown in seconds beside a click in beats is two
+clocks disagreeing in front of the person trying to come in on time. So
+`COUNT_IN_CHOICES` is `[0, 4, 8]` beats at the take's tempo, the big readout
+during `RecordState::CountIn { beat, of }` shows the beat number the player is
+counting out loud, and `record_preroll_s` is left in the settings file unread —
+three seconds does not convert into a number of beats without a tempo it was
+never measured against.
+
+*The bench-walking case is not lost*: eight beats at 60 BPM is eight seconds.
+
+### There is a metronome, and it is in the output engine
+
+The click is `assets/click.wav`, a 48 kHz mono 24-bit UREI click the owner
+supplied. It is embedded with `include_bytes!` rather than read from disk, so
+the app does not depend on a path on one particular machine. (It has a `JUNK`
+chunk before `fmt `, which is why `wav::read_pcm` walks the chunk list instead
+of assuming offsets — a reader that assumes would decode noise.)
+
+It lives in the **same output stream as the plugin**, and that is not an
+implementation convenience. Two `cpal` output streams on one device fight for
+it, and a click is only sample-accurate against the instrument if the two are
+summed in the same callback.
+
+**The click is not recorded by default.** The device gets plugin + click; the
+recorder's tap gets plugin only. Two different sums, built as two sums from the
+start rather than by tapping the final bus, because a click bleeding into a take
+is a ruined take and it is the mistake nobody notices until they open the file a
+week later. `metronome_in_take` turns it on for people who want it.
+
+### One tempo
+
+The metronome, the count-in and the SMF tempo mark are the same number
+(`record_export.tempo_bpm`). A click at 90 against a file that says 120 is a
+take nobody can edit afterwards.
+
+### Faders, and why they are not linear
+
+The owner asked for "clear volume knobs for everything — vst and met". Three
+faders — instrument, click, input — labelled, with their value in dB beside
+them.
+
+A linear 0..=1 fader is unusable for audio: the whole useful range of a monitor
+level is squeezed into the top fifth of the travel. `fader_to_gain` maps the
+travel across `GAIN_MIN_DB..=GAIN_MAX_DB` (-60 to +12), and **the bottom of the
+travel is silence rather than -60 dB** — a fader pulled all the way down has to
+be OFF, and -60 dB is not off when what it is attenuating is a piano recorded at
+full scale. Above unity exists because quiet sources do.
+
+The click defaults to -6 dB against unity elsewhere. Not timidity: a click at the
+same level as a piano is all you can hear, and it gets turned down by hand within
+a minute otherwise.
+
+### The CLOCK button is gone
+
+§5 specified a settings option *"Hide elapsed time while recording"* and the
+band grew a control for it. The owner's verdict was *"not sure that we need the
+'clock' button — not sure what it does"*, which is the whole review. A box
+labelled CLOCK with a strike-through is a rebus, not a control.
+
+The setting survives, reached from the right-click menu where the row reads
+"Hide Elapsed Time" and says what it does. **A control whose label has to be
+decoded belongs in the menu, where there is room for a sentence.**
+
+### Plugin hosting is a standalone feature, not a step 9
+
+§12 scheduled the host last, as lane 1's tail. In practice "I can't load VSTs, I
+don't see that option" is what a pianist hits first: without an instrument the
+app has nothing to record. The picker is a directory LISTING (`ivory_host::discover`),
+never a scan — 112 bundles are listed in milliseconds and a bundle is opened only
+when it is chosen, so no plugin gets to crash the process before the window has
+appeared. Vendor is therefore usually blank in the list, and that is correct
+rather than a gap.
+
+### Still not done
+
+Video encode and the compositor (§6, §7, §12 steps 6-7). The Export dialog draws
+its video section and greys it behind `VIDEO_EXPORT_READY`, so the app does not
+promise an `.mp4` it cannot produce. Everything else in §5 is live.

@@ -4,8 +4,8 @@
 //! other recorder knows that its user is a pianist:
 //!
 //!   * **idle**, which is about FRAMING and destination — a wide camera
-//!     preview, a live meter, and every control that decides what the next take
-//!     will be, and
+//!     preview, a live meter, the monitor levels, and every control that
+//!     decides what the next take will be, and
 //!   * **rolling**, which is about being readable from a piano bench two metres
 //!     away — the preview collapses, the timecode and the meter become huge,
 //!     and everything that could change the destination mid-take goes away.
@@ -13,6 +13,40 @@
 //! While playing, the pianist is looking at their hands. The preview's job is
 //! finished before the take starts, which is the whole reason those are two
 //! layouts and not one that dims.
+//!
+//! # Four groups, left to right
+//!
+//! The band was once a single row of controls at one size, and the owner's
+//! verdict on it was that nothing said what it was. So it is now grouped, and
+//! the groups are ordered by how often a hand goes near them:
+//!
+//!   1. **preview** — framing. Looked at before the first take of a session and
+//!      then never again, so it is the one thing that shrinks when the take
+//!      starts.
+//!   2. **transport** — record, stop, meter, timecode. The biggest things in
+//!      the band, because they are the ones read from the bench.
+//!   3. **destination** — folder, name, devices, count-in, tempo, export. Set
+//!      once and left alone, so it is the smallest type in the band and it
+//!      disappears entirely while rolling.
+//!   4. **monitor** — three labelled faders (instrument, click, input) and the
+//!      click switch. Touched every take, and the only group besides the
+//!      transport that survives a live take: turning the click down halfway
+//!      through is exactly when you need to.
+//!
+//! The monitor is last, at the right edge, and it is **pinned there** — same
+//! rectangle in both layouts, down to the point. Everything else in the band
+//! moves when a take starts: the preview collapses, the timecode triples, the
+//! whole destination column vanishes. A fader that survives a take and then
+//! slides a third of the window sideways at the moment it becomes the only
+//! thing you might still want to touch is only half a survivor, so the monitor
+//! is measured from the right edge of the band rather than from anything that
+//! changes. See `MONITOR_W`.
+//!
+//! There is no in-band control for hiding the elapsed clock. There was, it was
+//! a box marked `CLOCK` with a line through it, and no one could tell what it
+//! did. The setting lives in the right-click menu, where the row reads "Hide
+//! Elapsed Time" and says so in words. [`RecorderView::hide_elapsed`] still
+//! suppresses the readout; only the mystery box is gone.
 //!
 //! Like `piano.rs`, `fretboard_panel.rs` and `theory_panel.rs`, this module is
 //! dumb: it is handed a [`RecorderView`] snapshot and it paints it, and a click
@@ -31,14 +65,14 @@
 
 use crate::fonts;
 use crate::recorder::{
-    disk_text, timecode, DeviceLabel, ExportSpec, Level, Meters, RecordState, RecorderView,
-    PREROLL_CHOICES,
+    disk_text, gain_text, gain_to_fader, timecode, DeviceLabel, ExportSpec, Level, Meters,
+    RecordState, RecorderView, COUNT_IN_CHOICES, MAX_BPM, MIN_BPM,
 };
 use crate::settings::Settings;
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
 
-/// Band height for a 1300pt-wide window. At that width it gives a ~280x150
-/// preview and still leaves ~950pt for controls, which is the one dimension
+/// Band height for a 1300pt-wide window. At that width it gives a ~230x150
+/// preview and still leaves ~1000pt for controls, which is the one dimension
 /// this window has in abundance. Scaled with everything else (spec §3.2).
 pub const BAND_H_AT_1300: f64 = 200.0;
 
@@ -66,15 +100,18 @@ const REC_RED: Color32 = Color32::from_rgb(0xE8, 0x3A, 0x4E);
 struct Palette {
     /// Also the letterbox bars. See [`fit_preview`].
     bg: Color32,
-    /// Recessed fills: the preview well and the meter troughs.
+    /// Recessed fills: the preview well, the meter troughs and the fader
+    /// tracks. A fader has to look like a slot with something in it, which is
+    /// the same picture as a meter and gets the same colour.
     well: Color32,
     /// Control fills, so a thing you can click looks unlike a thing you read.
     field: Color32,
     ink: Color32,
     faint: Color32,
     line: Color32,
-    /// The meter. Whatever a held key looks like on the piano — the user chose
-    /// that colour once and this is the same "sound is happening" signal.
+    /// The meter and the fader fills. Whatever a held key looks like on the
+    /// piano — the user chose that colour once and this is the same "sound is
+    /// happening" signal.
     accent: Color32,
     rec: Color32,
     /// A chosen device that is not plugged in, which is neither an error nor
@@ -161,9 +198,9 @@ const MIN_TEXT: f32 = 5.0;
 /// **`draw` and `hit_test` both go through this and neither computes a
 /// rectangle of its own.** That is what keeps a click landing on the thing it
 /// looks like it is on: the two cannot drift, because there is only one set of
-/// numbers. It is also what makes the two properties that matter testable
-/// without a screen — that the destination controls are gone mid-take, and that
-/// the clock is not drawn when the user asked for no clock.
+/// numbers. It is also what makes the properties that matter testable without a
+/// screen — that the destination controls are gone mid-take, that the faders
+/// are not, and that the clock is not drawn when the user asked for no clock.
 ///
 /// A rectangle that is not offered is [`Rect::NOTHING`], which contains no
 /// point and intersects nothing, so an absent control cannot be clicked by
@@ -176,6 +213,8 @@ struct Layout {
     /// The box the camera image is fitted INTO. Fixed by the band; never by
     /// the camera.
     preview: Rect,
+
+    // ── transport ──
     record: Rect,
     /// The steady red dot, which takes the record button's place while rolling.
     /// An indicator and not a control, so it is not a hit.
@@ -184,21 +223,43 @@ struct Layout {
     meter: Rect,
     /// The big readout. [`Rect::NOTHING`] when the clock is suppressed.
     timecode: Rect,
-    clock: Rect,
-    /// One line of status, and the clip warning beside it.
-    status: Rect,
-    clip: Rect,
+
+    // ── monitor ──
+    //
+    // The whole ROW, caption and number included. The clickable part of it is
+    // the track alone — see [`fader_zones`] — because a press anywhere in the
+    // row would mean that clicking the word "INSTRUMENT" sets it to silence.
+    plugin_row: Rect,
+    metronome_row: Rect,
+    input_row: Rect,
+    click: Rect,
+    click_in_take: Rect,
+
+    // ── destination ──
     dest: Rect,
     default_tick: Rect,
     name: Rect,
     /// Live grey text under the name field. Teaches the naming scheme without
     /// a help page, and is not clickable.
     folder: Rect,
+    /// How long the disk will last, beside the folder preview. Also not
+    /// clickable: it is an answer, not a question.
+    disk: Rect,
+    plugin: Rect,
     camera: Rect,
     audio: Rect,
-    preroll: Rect,
+    count_in: Rect,
+    tempo: Rect,
     export: Rect,
-    disk: Rect,
+
+    /// One line of status, and the clip warning beside it.
+    status: Rect,
+    clip: Rect,
+
+    /// Hairlines in the gaps between the groups. Not controls, and not hits —
+    /// they are the cheapest way to make four groups look like four groups
+    /// rather than like eighteen boxes in a row.
+    rules: [Rect; 2],
 }
 
 /// A horizontal slice of `r`, by fraction of its width.
@@ -217,6 +278,46 @@ fn slice_v(r: Rect, from: f32, to: f32) -> Rect {
     )
 }
 
+/// A one-point vertical hairline down `r` at absolute `x`.
+fn rule_x(r: Rect, x: f32) -> Rect {
+    if !r.is_positive() {
+        return Rect::NOTHING;
+    }
+    Rect::from_min_max(Pos2::new(x - 0.5, r.top()), Pos2::new(x + 0.5, r.bottom()))
+}
+
+/// The monitor column's width, as a fraction of the whole body.
+///
+/// Of the BODY, and measured from its right edge — not of whatever is left
+/// after the preview, and not of whatever is left after the destination. Both
+/// of those change when a take starts, and the whole point of this column is
+/// that it does not. See the module docs.
+const MONITOR_W: f32 = 0.28;
+
+/// The three zones of a fader row: caption, track, value.
+///
+/// A function rather than nine more [`Layout`] fields, because only one of the
+/// three is a hit region and all three have to be the same rectangles in the
+/// painter and in the test that proves `-60.0 dB` still fits in its box at the
+/// smallest band the app will draw.
+///
+/// **The middle one is the hit region**, and its two ends are the two ends of
+/// the fader's travel. See [`along`].
+fn fader_zones(row: Rect) -> (Rect, Rect, Rect) {
+    if !row.is_positive() {
+        return (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING);
+    }
+    (
+        slice_h(row, 0.00, 0.29),
+        slice_h(row, 0.31, 0.75),
+        slice_h(row, 0.77, 1.00),
+    )
+}
+
+/// Text height in a fader row, as a fraction of the row. Shared by the painter
+/// and by the test that asserts the dB reading fits.
+const FADER_TEXT: f32 = 0.62;
+
 impl Layout {
     /// Nothing at all, for a rect too small to hold a band. Every field absent
     /// rather than degenerate: negative rectangles produce NaN centres, and a
@@ -230,18 +331,25 @@ impl Layout {
             stop: Rect::NOTHING,
             meter: Rect::NOTHING,
             timecode: Rect::NOTHING,
-            clock: Rect::NOTHING,
-            status: Rect::NOTHING,
-            clip: Rect::NOTHING,
+            plugin_row: Rect::NOTHING,
+            metronome_row: Rect::NOTHING,
+            input_row: Rect::NOTHING,
+            click: Rect::NOTHING,
+            click_in_take: Rect::NOTHING,
             dest: Rect::NOTHING,
             default_tick: Rect::NOTHING,
             name: Rect::NOTHING,
             folder: Rect::NOTHING,
+            disk: Rect::NOTHING,
+            plugin: Rect::NOTHING,
             camera: Rect::NOTHING,
             audio: Rect::NOTHING,
-            preroll: Rect::NOTHING,
+            count_in: Rect::NOTHING,
+            tempo: Rect::NOTHING,
             export: Rect::NOTHING,
-            disk: Rect::NOTHING,
+            status: Rect::NOTHING,
+            clip: Rect::NOTHING,
+            rules: [Rect::NOTHING; 2],
         }
     }
 
@@ -285,47 +393,50 @@ impl Layout {
         l
     }
 
-    /// Idle: preview, then transport, then everything that decides where the
-    /// take goes. Left to right in that order deliberately — the device
-    /// pickers are NOT first, because after the first session they are the
-    /// controls nobody ever touches again.
+    /// The monitor's rectangle, which is the same one in both layouts.
+    fn monitor_of(body: Rect) -> Rect {
+        Rect::from_min_max(
+            Pos2::new(body.right() - body.width() * MONITOR_W, body.top()),
+            body.max,
+        )
+    }
+
+    /// Idle: preview, transport, destination, monitor.
+    ///
+    /// In that order deliberately. The device pickers are NOT first, because
+    /// after the first session they are the controls nobody ever touches again;
+    /// the faders are last because that is where they are during a take, and
+    /// they are the one group that may not move between the two layouts.
     fn fill_idle(&mut self, body: Rect, gap: f32) {
         // The preview wants to be landscape, so its width follows the band's
-        // own HEIGHT — never the camera's aspect, which is the whole point —
-        // and it never takes more than a little over 40% of the width, or the
-        // destination block stops holding a device name.
-        let pv_w = (body.height() * 1.85).clamp(body.width() * 0.18, body.width() * 0.42);
+        // own HEIGHT — never the camera's aspect, which is the whole point.
+        // It gives up about a fifth of what it used to claim: three faders and
+        // an instrument row moved in, and a framing view you look at twice a
+        // session may not crowd the controls you use every take.
+        let pv_w = (body.height() * 1.55).clamp(body.width() * 0.14, body.width() * 0.26);
         self.preview = Rect::from_min_max(body.min, Pos2::new(body.left() + pv_w, body.bottom()));
-        let rest = Rect::from_min_max(Pos2::new(self.preview.right() + gap, body.top()), body.max);
-        if !rest.is_positive() {
+        let monitor = Self::monitor_of(body);
+        self.fill_monitor(monitor, false);
+        self.rules[1] = rule_x(body, monitor.left() - gap * 0.5);
+
+        let middle = Rect::from_min_max(
+            Pos2::new(self.preview.right() + gap, body.top()),
+            Pos2::new(monitor.left() - gap, body.bottom()),
+        );
+        if !middle.is_positive() {
             return;
         }
-
-        let t = slice_h(rest, 0.0, 0.33);
-        let d = Rect::from_min_max(Pos2::new(t.right() + gap, rest.top()), rest.max);
-        self.fill_transport(t);
-        if !d.is_positive() {
-            return;
-        }
-
-        // Seven rows with real gaps between them. The gaps are not decoration:
-        // `Rect::contains` is inclusive at both edges, so two rows that merely
-        // touch share a line of pixels and the overlap test fails there.
-        let folder_row = slice_v(d, 0.00, 0.13);
-        self.dest = slice_h(folder_row, 0.00, 0.70);
-        self.default_tick = slice_h(folder_row, 0.74, 1.00);
-        self.name = slice_v(d, 0.17, 0.30);
-        self.folder = slice_v(d, 0.31, 0.42);
-        self.camera = slice_v(d, 0.45, 0.58);
-        self.audio = slice_v(d, 0.60, 0.73);
-        let export_row = slice_v(d, 0.76, 0.89);
-        self.preroll = slice_h(export_row, 0.00, 0.46);
-        self.export = slice_h(export_row, 0.52, 1.00);
-        self.disk = slice_v(d, 0.90, 1.00);
+        self.rules[0] = rule_x(body, middle.left() + middle.width() * 0.265);
+        self.fill_transport(slice_h(middle, 0.00, 0.25));
+        self.fill_destination(slice_h(middle, 0.28, 1.00));
     }
 
     /// The transport column: the round record button, a stop beside it, the
-    /// meter under both, and the clock with its own switch.
+    /// meter under both, and the clock under that.
+    ///
+    /// The clock now takes the whole width of the column. That is what deleting
+    /// the `CLOCK` toggle bought — the timecode used to share its row with a
+    /// small mystery box, and the box is what was making the number small.
     fn fill_transport(&mut self, t: Rect) {
         if !t.is_positive() {
             return;
@@ -338,45 +449,104 @@ impl Layout {
         self.stop =
             Rect::from_center_size(slice_h(top, 0.46, 0.80).center(), Vec2::splat(rec_d * 0.66));
         self.meter = slice_v(t, 0.56, 0.74);
-        let time = slice_v(t, 0.78, 1.0);
-        self.timecode = slice_h(time, 0.0, 0.62);
-        self.clock = slice_h(time, 0.66, 1.0);
+        self.timecode = slice_v(t, 0.78, 1.00);
+    }
+
+    /// The monitor column: three faders and the click.
+    ///
+    /// The same four rows in the same rectangle before and during a take —
+    /// see [`Layout::monitor_of`] — because this is the group that has to still
+    /// be there at 0:47, and a control you have to go and find again has not
+    /// really survived. The only thing that leaves is the "in take" tick, which
+    /// decides what goes in the FILE and is therefore a destination question
+    /// wearing a monitor's clothes.
+    fn fill_monitor(&mut self, m: Rect, rolling: bool) {
+        if !m.is_positive() {
+            return;
+        }
+        self.plugin_row = slice_v(m, 0.00, 0.21);
+        self.metronome_row = slice_v(m, 0.26, 0.47);
+        self.input_row = slice_v(m, 0.52, 0.73);
+        let switches = slice_v(m, 0.79, 1.00);
+        if rolling {
+            self.click = switches;
+        } else {
+            self.click = slice_h(switches, 0.00, 0.47);
+            self.click_in_take = slice_h(switches, 0.53, 1.00);
+        }
+    }
+
+    /// The destination column: eight small rows of things set once.
+    ///
+    /// Small on purpose. Every one of these is decided before the first take of
+    /// a session and then left alone, and the band only has 200 points; giving
+    /// the folder path the same weight as the record button is what made the
+    /// old one read as a wall.
+    fn fill_destination(&mut self, d: Rect) {
+        if !d.is_positive() {
+            return;
+        }
+        // Real gaps between the rows. They are not decoration: `Rect::contains`
+        // is inclusive at both edges, so two rows that merely touch share a
+        // line of pixels and the overlap test fails there.
+        let folder_row = slice_v(d, 0.00, 0.11);
+        self.dest = slice_h(folder_row, 0.00, 0.68);
+        self.default_tick = slice_h(folder_row, 0.72, 1.00);
+        self.name = slice_v(d, 0.13, 0.24);
+        // The two answers about where the take is going, side by side and in
+        // the faint ink: what it will be called, and whether it will fit.
+        let note = slice_v(d, 0.25, 0.33);
+        self.folder = slice_h(note, 0.00, 0.58);
+        self.disk = slice_h(note, 0.60, 1.00);
+        self.plugin = slice_v(d, 0.35, 0.46);
+        self.camera = slice_v(d, 0.48, 0.59);
+        self.audio = slice_v(d, 0.61, 0.72);
+        let take_row = slice_v(d, 0.74, 0.85);
+        self.count_in = slice_h(take_row, 0.00, 0.48);
+        self.tempo = slice_h(take_row, 0.52, 1.00);
+        self.export = slice_v(d, 0.88, 0.99);
     }
 
     /// Rolling: readable from the bench. The preview collapses to a strip that
     /// is enough to see somebody has walked in front of the camera and no more,
-    /// and the two things worth reading from two metres away take the rest.
+    /// the two things worth reading from two metres away take most of the rest,
+    /// and the monitor column stays exactly where it was.
     fn fill_rolling(&mut self, body: Rect, gap: f32, view: &RecorderView<'_>) {
-        let pv_w = (body.height() * 1.1).min(body.width() * 0.18);
+        let pv_w = (body.height() * 1.1).min(body.width() * 0.15);
         self.preview = Rect::from_min_max(body.min, Pos2::new(body.left() + pv_w, body.bottom()));
-        let rest = Rect::from_min_max(Pos2::new(self.preview.right() + gap, body.top()), body.max);
-        if !rest.is_positive() {
+        let monitor = Self::monitor_of(body);
+        self.fill_monitor(monitor, true);
+        self.rules[1] = rule_x(body, monitor.left() - gap * 0.5);
+
+        // Everything the destination column was using goes to the transport,
+        // which is why the clock is enormous here and merely legible at rest.
+        let t = Rect::from_min_max(
+            Pos2::new(self.preview.right() + gap, body.top()),
+            Pos2::new(monitor.left() - gap, body.bottom()),
+        );
+        if !t.is_positive() {
             return;
         }
-        self.meter = slice_v(rest, 0.74, 1.0);
-        let top = slice_v(rest, 0.0, 0.68);
+        self.meter = slice_v(t, 0.72, 1.00);
+        let top = slice_v(t, 0.0, 0.66);
 
-        // The dot stands exactly where the record button stood, so the band
+        // The dot stands roughly where the record button stood, so the band
         // does not reshuffle under the eye at the moment the take starts.
         // There is no record button while rolling — pressing it would mean
         // nothing, and a dead control is worse than no control.
-        let dot_d = (top.height() * 0.30).min(top.width() * 0.06);
-        self.dot = Rect::from_center_size(slice_h(top, 0.0, 0.10).center(), Vec2::splat(dot_d));
-        let stop_d = (top.height() * 0.62).min(top.width() * 0.12);
-        self.stop = Rect::from_center_size(slice_h(top, 0.12, 0.28).center(), Vec2::splat(stop_d));
-        self.clock = Rect::from_min_max(
-            Pos2::new(top.left() + top.width() * 0.90, top.top()),
-            Pos2::new(top.right(), top.top() + top.height() * 0.30),
-        );
+        let dot_d = (top.height() * 0.30).min(top.width() * 0.08);
+        self.dot = Rect::from_center_size(slice_h(top, 0.0, 0.12).center(), Vec2::splat(dot_d));
+        let stop_d = (top.height() * 0.62).min(top.width() * 0.14);
+        self.stop = Rect::from_center_size(slice_h(top, 0.14, 0.32).center(), Vec2::splat(stop_d));
 
-        // The one thing `hide_elapsed` suppresses is a CLOCK. A pre-roll
-        // countdown is the number the user is waiting for, and "FINISHING" is
-        // the reason not to close the lid yet; hiding either would be hiding
-        // the wrong thing under the name of a performance setting.
+        // The one thing `hide_elapsed` suppresses is a CLOCK. The count-in beat
+        // is the number the player is counting, and "FINISHING" is the reason
+        // not to close the lid yet; hiding either would be hiding the wrong
+        // thing under the name of a performance setting.
         self.timecode = if view.hide_elapsed && matches!(view.state, RecordState::Rolling) {
             Rect::NOTHING
         } else {
-            slice_h(top, 0.30, 0.88)
+            slice_h(top, 0.36, 1.00)
         };
     }
 
@@ -385,18 +555,26 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Hit); 10] {
+    fn targets(&self) -> [(Rect, Produces); 16] {
+        use Produces::{Along, Fixed};
+        let track = |row: Rect| fader_zones(row).1;
         [
-            (self.record, Hit::Record),
-            (self.stop, Hit::Stop),
-            (self.dest, Hit::ChooseFolder),
-            (self.default_tick, Hit::ToggleDefaultDir),
-            (self.name, Hit::NameField),
-            (self.camera, Hit::PickCamera),
-            (self.audio, Hit::PickAudio),
-            (self.preroll, Hit::CyclePreRoll),
-            (self.export, Hit::Export),
-            (self.clock, Hit::ToggleHideElapsed),
+            (self.record, Fixed(Hit::Record)),
+            (self.stop, Fixed(Hit::Stop)),
+            (track(self.plugin_row), Along(Hit::SetPluginGain)),
+            (track(self.metronome_row), Along(Hit::SetMetronomeGain)),
+            (track(self.input_row), Along(Hit::SetInputGain)),
+            (self.click, Fixed(Hit::ToggleMetronome)),
+            (self.click_in_take, Fixed(Hit::ToggleMetronomeInTake)),
+            (self.dest, Fixed(Hit::ChooseFolder)),
+            (self.default_tick, Fixed(Hit::ToggleDefaultDir)),
+            (self.name, Fixed(Hit::NameField)),
+            (self.plugin, Fixed(Hit::PickPlugin)),
+            (self.camera, Fixed(Hit::PickCamera)),
+            (self.audio, Fixed(Hit::PickAudio)),
+            (self.count_in, Fixed(Hit::CycleCountIn)),
+            (self.tempo, Along(tempo_at)),
+            (self.export, Fixed(Hit::Export)),
         ]
     }
 }
@@ -438,7 +616,12 @@ pub fn fit_preview(into: Rect, source_px: Vec2) -> Rect {
 
 /// What is under a click. The app turns one of these into a request and
 /// performs it after the frame; nothing here does anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `PartialEq` but **not** `Eq`, because four of the variants carry a float.
+/// Comparing two of those for equality is nearly always the wrong question
+/// anyway — "is this the same control I was already dragging?" is the right
+/// one, and that is [`Hit::is_same_control`].
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Hit {
     Record,
     Stop,
@@ -447,16 +630,39 @@ pub enum Hit {
     NameField,
     PickCamera,
     PickAudio,
-    CyclePreRoll,
+    /// Open the VST3 instrument picker.
+    PickPlugin,
+    /// Cycle 0 / 4 / 8 beats. See [`next_count_in`].
+    CycleCountIn,
     Export,
-    ToggleHideElapsed,
+    ToggleMetronome,
+    /// Whether the click is also recorded into the file.
+    ToggleMetronomeInTake,
+    /// A fader was pressed or dragged to this 0..=1 position along its travel.
+    ///
+    /// A POSITION and not a gain: `recorder::fader_to_gain` turns it into one,
+    /// and it lives there so that the fader's travel and the audio path's
+    /// scaling cannot disagree.
+    SetPluginGain(f32),
+    SetMetronomeGain(f32),
+    SetInputGain(f32),
+    /// Tempo dragged, already clamped to `MIN_BPM..=MAX_BPM`.
+    SetTempo(f64),
 }
 
 impl Hit {
-    /// Every variant, which is what the reachability test iterates. The
+    /// The value the four dragged variants carry in [`Hit::ALL`].
+    ///
+    /// Halfway along, which is a real point on every one of their travels and
+    /// not an end that might be special. Nothing compares against it: the
+    /// reachability test asks [`Hit::is_same_control`], because the whole point
+    /// of a dragged control is that the value depends on where you pressed.
+    const MIDWAY: f32 = 0.5;
+
+    /// Every control, which is what the reachability test iterates. The
     /// exhaustive match in [`Hit::label`] is what makes adding a variant
     /// without adding it here a compile error rather than an untested control.
-    pub const ALL: [Hit; 10] = [
+    pub const ALL: [Hit; 16] = [
         Hit::Record,
         Hit::Stop,
         Hit::ChooseFolder,
@@ -464,9 +670,15 @@ impl Hit {
         Hit::NameField,
         Hit::PickCamera,
         Hit::PickAudio,
-        Hit::CyclePreRoll,
+        Hit::PickPlugin,
+        Hit::CycleCountIn,
         Hit::Export,
-        Hit::ToggleHideElapsed,
+        Hit::ToggleMetronome,
+        Hit::ToggleMetronomeInTake,
+        Hit::SetPluginGain(Hit::MIDWAY),
+        Hit::SetMetronomeGain(Hit::MIDWAY),
+        Hit::SetInputGain(Hit::MIDWAY),
+        Hit::SetTempo((MIN_BPM + MAX_BPM) * 0.5),
     ];
 
     pub fn label(self) -> &'static str {
@@ -478,11 +690,89 @@ impl Hit {
             Hit::NameField => "Take name",
             Hit::PickCamera => "Camera",
             Hit::PickAudio => "Audio input",
-            Hit::CyclePreRoll => "Pre-roll",
+            Hit::PickPlugin => "Instrument",
+            Hit::CycleCountIn => "Count-in",
             Hit::Export => "Export",
-            Hit::ToggleHideElapsed => "Hide elapsed time",
+            Hit::ToggleMetronome => "Click",
+            Hit::ToggleMetronomeInTake => "Record the click into takes",
+            Hit::SetPluginGain(_) => "Instrument level",
+            Hit::SetMetronomeGain(_) => "Click level",
+            Hit::SetInputGain(_) => "Input level",
+            Hit::SetTempo(_) => "Tempo",
         }
     }
+
+    /// Whether two hits are the same CONTROL, ignoring any value one carries.
+    ///
+    /// `SetTempo(90.0)` and `SetTempo(140.0)` are one control being dragged,
+    /// which is the question a caller holding the mouse button down actually
+    /// has, and the question `==` cannot answer.
+    /// Whether this control is DRAGGED rather than clicked.
+    ///
+    /// Exactly the value-carrying variants: they are the ones whose value is a
+    /// function of where the pointer is, so they are the ones the app has to
+    /// keep following while the button is held. A button has nothing to follow.
+    pub fn is_draggable(&self) -> bool {
+        matches!(
+            self,
+            Hit::SetPluginGain(_)
+                | Hit::SetMetronomeGain(_)
+                | Hit::SetInputGain(_)
+                | Hit::SetTempo(_)
+        )
+    }
+
+    pub fn is_same_control(self, other: Hit) -> bool {
+        std::mem::discriminant(&self) == std::mem::discriminant(&other)
+    }
+}
+
+/// What a rectangle produces when it is pressed.
+///
+/// Two kinds, because four of the controls are DRAGGED: their answer depends on
+/// where along the rectangle the press landed. Making that a property of the
+/// region rather than of the caller is what keeps [`hit_test`] a pure function
+/// of geometry — the same point always produces the same hit, so the caller can
+/// simply ask again on every pointer move.
+#[derive(Debug, Clone, Copy)]
+enum Produces {
+    /// The same hit wherever inside it you press.
+    Fixed(Hit),
+    /// A hit carrying how far along the rect the press landed, 0..=1.
+    Along(fn(f32) -> Hit),
+}
+
+impl Produces {
+    fn hit(self, t: f32) -> Hit {
+        match self {
+            Produces::Fixed(h) => h,
+            Produces::Along(f) => f(t),
+        }
+    }
+}
+
+/// A tempo from a position along its control, clamped to what the SMF writer
+/// and every DAW's bar ruler will accept.
+///
+/// Linear across the whole legal range, and absolute rather than relative,
+/// because a relative drag needs to remember where the drag started and this
+/// function is not allowed to remember anything. The number is drawn beside the
+/// control for exactly that reason.
+fn tempo_at(t: f32) -> Hit {
+    Hit::SetTempo(MIN_BPM + f64::from(t.clamp(0.0, 1.0)) * (MAX_BPM - MIN_BPM))
+}
+
+/// How far along `r` the point `pos` fell, 0..=1 from its left edge to its
+/// right.
+///
+/// Clamped, so both ends of a fader's travel are reachable rather than being a
+/// value the last pixel rounds off the end of. `r.left()` is exactly 0.0,
+/// `r.right()` is exactly 1.0, and the middle is exactly 0.5.
+fn along(r: Rect, pos: Pos2) -> f32 {
+    if r.width() <= 0.0 {
+        return 0.0;
+    }
+    ((pos.x - r.left()) / r.width()).clamp(0.0, 1.0)
 }
 
 /// What is under `pos`, if anything.
@@ -490,12 +780,26 @@ impl Hit {
 /// The exact inverse of [`draw`], by construction rather than by discipline:
 /// both read the same [`Layout`].
 ///
-/// **While a take is live only [`Hit::Stop`] and [`Hit::ToggleHideElapsed`]
-/// survive.** Every destination control is gone, which is not a courtesy — the
-/// output folder, the take name and the devices are all decided at `T0` and a
-/// UI that lets you change them at 0:47 is a UI that promises something it
-/// cannot do. The clock switch survives because the moment a running timer
-/// becomes a distraction is the moment it is running.
+/// # Dragging
+///
+/// Four of the hits carry a value taken from where in their rectangle the press
+/// landed. **The caller is expected to call this again on every pointer move
+/// while the button is held**, and to keep hold of which control it grabbed —
+/// this function has no memory, so a pointer that wanders off the track returns
+/// whatever is under it now, or `None`. Comparing the new hit to the grabbed one
+/// with [`Hit::is_same_control`] is how the caller tells "still dragging the
+/// click fader" from "the pointer is over the record button".
+///
+/// # While a take is live
+///
+/// Only [`Hit::Stop`], the three faders and [`Hit::ToggleMetronome`] survive.
+/// Every destination control is gone, which is not a courtesy — the output
+/// folder, the take name and the devices are all decided at `T0` and a UI that
+/// lets you change them at 0:47 is a UI that promises something it cannot do.
+/// The monitor survives for the opposite reason: turning the click down halfway
+/// through a take is precisely when you need to, and the level you hear changes
+/// nothing about the file. The one monitor control that DOES change the file —
+/// whether the click is recorded into it — goes away with the destination.
 pub fn hit_test(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<Hit> {
     if !rect.contains(pos) {
         return None;
@@ -504,20 +808,20 @@ pub fn hit_test(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<Hit> {
         .targets()
         .into_iter()
         .find(|(r, _)| r.contains(pos))
-        .map(|(_, h)| h)
+        .map(|(r, k)| k.hit(along(r, pos)))
 }
 
-/// The next pre-roll in the cycle.
+/// The next count-in length in the cycle, in beats.
 ///
 /// Here rather than in the app so that the control's label and the effect of
 /// clicking it cannot disagree. An unknown value — a hand-edited settings file
 /// — lands on the first choice rather than sticking.
-pub fn next_preroll(current: u8) -> u8 {
-    let i = PREROLL_CHOICES
+pub fn next_count_in(current: u32) -> u32 {
+    let i = COUNT_IN_CHOICES
         .iter()
         .position(|&c| c == current)
         .map_or(0, |i| i + 1);
-    PREROLL_CHOICES[i % PREROLL_CHOICES.len()]
+    COUNT_IN_CHOICES[i % COUNT_IN_CHOICES.len()]
 }
 
 // ── drawing ────────────────────────────────────────────────────────────────
@@ -539,11 +843,17 @@ pub fn draw(painter: &Painter, rect: Rect, view: &RecorderView<'_>, s: &Settings
     let l = Layout::new(rect, view);
 
     draw_preview(painter, &l, view, &p);
-    draw_transport(painter, &l, view, &p);
+    draw_transport(painter, &l, &p);
     draw_meter(painter, l.meter, view.meters, &p);
     draw_readout(painter, &l, view, &p);
+    draw_monitor(painter, &l, view, &p);
     if !l.rolling {
         draw_destination(painter, &l, view, s, &p);
+    }
+    for r in l.rules {
+        if r.is_positive() {
+            painter.rect_filled(r, 0.0, p.line.gamma_multiply(0.55));
+        }
     }
     draw_status(painter, &l, view, &p);
 
@@ -571,16 +881,25 @@ fn control(painter: &Painter, r: Rect, p: &Palette) {
     painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
 }
 
+/// How far a labelled box's text stands in from its edges.
+///
+/// Bounded by the WIDTH as well as the height, which the first version was not:
+/// in a tall narrow box — a detached window's export button — a 30%-of-height
+/// inset ate the whole box and the label silently stopped being drawn.
+fn label_inset(r: Rect) -> f32 {
+    (r.height() * 0.30).min(r.width() * 0.06)
+}
+
 /// A labelled control: the caption in the faint ink, the value after it.
 ///
-/// One helper because six rows of the destination block are this shape, and six
+/// One helper because most of the destination column is this shape, and eight
 /// copies would drift apart the first time one of them was adjusted.
 fn labelled(painter: &Painter, r: Rect, cap: &str, value: &str, colour: Color32, p: &Palette) {
     control(painter, r, p);
     if !r.is_positive() {
         return;
     }
-    let inset = r.height() * 0.30;
+    let inset = label_inset(r);
     let inner = Rect::from_min_max(
         Pos2::new(r.left() + inset, r.top()),
         Pos2::new(r.right() - inset, r.bottom()),
@@ -661,7 +980,7 @@ fn draw_preview(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
     painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
 }
 
-fn draw_transport(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palette) {
+fn draw_transport(painter: &Painter, l: &Layout, p: &Palette) {
     if l.record.is_positive() {
         let c = l.record.center();
         let rad = l.record.width() * 0.5;
@@ -682,28 +1001,102 @@ fn draw_transport(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pa
             if l.rolling { p.ink } else { p.faint },
         );
     }
-    if l.clock.is_positive() {
-        control(painter, l.clock, p);
-        let size = fit_text(l.clock.shrink(2.0), "CLOCK", l.clock.height() * 0.5);
-        if size >= MIN_TEXT {
-            painter.text(
-                l.clock.center(),
-                Align2::CENTER_CENTER,
-                "CLOCK",
-                font(size),
-                if view.hide_elapsed { p.faint } else { p.ink },
-            );
-        }
-        if view.hide_elapsed {
-            painter.line_segment(
-                [
-                    Pos2::new(l.clock.left() + 2.0, l.clock.center().y),
-                    Pos2::new(l.clock.right() - 2.0, l.clock.center().y),
-                ],
-                Stroke::new(1.5_f32, p.faint),
-            );
-        }
+}
+
+// ── the monitor ────────────────────────────────────────────────────────────
+
+fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palette) {
+    for (row, cap, gain) in [
+        (l.plugin_row, "INSTRUMENT", view.gains.plugin),
+        (l.metronome_row, "CLICK", view.gains.metronome),
+        (l.input_row, "INPUT", view.gains.input),
+    ] {
+        draw_fader(painter, row, cap, gain, p);
     }
+    // Two questions that sound like one and are not: whether you HEAR the
+    // click, and whether it ends up in the file. The second is off by default
+    // because a click bleeding into a take is a ruined take.
+    draw_tick(painter, l.click, "Click", view.metronome_on, p);
+    draw_tick(painter, l.click_in_take, "In take", view.metronome_in_take, p);
+}
+
+/// One fader: a caption, a slotted track with a handle in it, and the level in
+/// dB. All three, because "clear volume knobs" was the brief and a bare strip
+/// of colour is none of them.
+///
+/// The dB reading is the part that is easy to leave out and the part that makes
+/// the control usable: a handle two thirds along means nothing on its own, and
+/// `-6.0 dB` means something to everyone who has ever used a mixer.
+fn draw_fader(painter: &Painter, row: Rect, cap: &str, gain: f32, p: &Palette) {
+    if !row.is_positive() {
+        return;
+    }
+    let (cap_r, track, val_r) = fader_zones(row);
+
+    let size = fit_text(cap_r, cap, cap_r.height() * FADER_TEXT);
+    if size >= MIN_TEXT {
+        painter.text(
+            Pos2::new(cap_r.left(), cap_r.center().y),
+            Align2::LEFT_CENTER,
+            cap,
+            font_light(size),
+            p.faint,
+        );
+    }
+
+    let reading = gain_text(gain);
+    let size = fit_text(val_r, &reading, val_r.height() * FADER_TEXT);
+    if size >= MIN_TEXT {
+        painter.text(
+            Pos2::new(val_r.right(), val_r.center().y),
+            Align2::RIGHT_CENTER,
+            &reading,
+            font(size),
+            // OFF is a state and not a level, and it is the one setting that
+            // will make somebody swear at a silent recording, so it does not
+            // get to look like a number.
+            if gain <= 0.0 { p.faint } else { p.ink },
+        );
+    }
+
+    if !track.is_positive() {
+        return;
+    }
+    painter.rect_filled(track, 2.0, p.well);
+    // The 0 dB mark, because unity is the one position everybody looks for and
+    // it is nowhere near the middle of a decibel scale.
+    let unity = track.left() + track.width() * gain_to_fader(1.0);
+    painter.line_segment(
+        [
+            Pos2::new(unity, track.top()),
+            Pos2::new(unity, track.bottom()),
+        ],
+        Stroke::new(1.0_f32, p.line),
+    );
+
+    let t = gain_to_fader(gain);
+    let x = track.left() + track.width() * t;
+    if t > 0.0 {
+        painter.rect_filled(
+            Rect::from_min_max(track.min, Pos2::new(x, track.bottom())),
+            2.0,
+            p.accent,
+        );
+    }
+    // The handle stays wholly inside the track at both ends rather than
+    // hanging half off it, so the ends of the travel look like ends.
+    let hw = (track.height() * 0.34).clamp(2.0, 7.0).min(track.width());
+    let lo = track.left() + hw * 0.5;
+    let hi = (track.right() - hw * 0.5).max(lo);
+    painter.rect_filled(
+        Rect::from_center_size(
+            Pos2::new(x.clamp(lo, hi), track.center().y),
+            Vec2::new(hw, track.height()),
+        ),
+        1.0,
+        p.ink,
+    );
+    painter.rect_stroke(track, 2.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
 }
 
 /// Where a linear level sits along the meter, 0..=1.
@@ -786,21 +1179,33 @@ fn draw_meter(painter: &Painter, r: Rect, m: Meters, p: &Palette) {
     }
 }
 
+/// What the big readout says.
+///
+/// Its own function so that the one thing about it that is easy to get wrong —
+/// what a count-in shows — can be asserted without a screen.
+///
+/// During a count-in it is the BEAT, because a count-in is a musical
+/// instruction and the number the player needs is the one the click is playing.
+/// A countdown in seconds against a click in beats is two clocks disagreeing in
+/// front of the person trying to come in on time.
+fn readout_text(state: RecordState, elapsed_s: f64) -> String {
+    match state {
+        RecordState::CountIn { beat, of } => format!("{beat} OF {of}"),
+        RecordState::Finishing => "FINISHING".to_owned(),
+        RecordState::Rolling | RecordState::Idle => timecode(elapsed_s),
+    }
+}
+
 fn draw_readout(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palette) {
     let r = l.timecode;
     if !r.is_positive() {
         return;
     }
-    let (text, colour) = match view.state {
-        // The countdown, very large, in place of the clock: it is the only
-        // number that matters while the user is walking back to the bench, and
-        // it is the reason they can look up from three metres away.
-        RecordState::PreRoll { remaining_s } => {
-            (format!("{}", remaining_s.max(0.0).ceil() as u32), p.rec)
-        }
-        RecordState::Finishing => ("FINISHING".to_owned(), p.ink),
-        RecordState::Rolling => (timecode(view.elapsed_s), p.ink),
-        RecordState::Idle => (timecode(view.elapsed_s), p.faint),
+    let text = readout_text(view.state, view.elapsed_s);
+    let colour = match view.state {
+        RecordState::CountIn { .. } => p.rec,
+        RecordState::Rolling | RecordState::Finishing => p.ink,
+        RecordState::Idle => p.faint,
     };
     let size = fit_text(r, &text, r.height() * (if l.rolling { 0.92 } else { 0.8 }));
     if size < MIN_TEXT {
@@ -814,20 +1219,34 @@ fn draw_readout(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
     painter.text(at, align, &text, font(size), colour);
 }
 
-/// A device row. `Missing` is neither `None` nor `Open` and must not read as
-/// either: it means the user already chose this device and it is not here right
-/// now, which is a thing to go and fix rather than a thing to go and set up.
-fn device_note(d: DeviceLabel<'_>) -> &'static str {
+// ── the destination ────────────────────────────────────────────────────────
+
+/// The suffix on a slot whose device is named but absent.
+///
+/// `Missing` is neither `None` nor `Open` and must not read as either: it means
+/// the user already chose this thing and it is not here right now, which is a
+/// thing to go and fix rather than a thing to go and set up. The wording is per
+/// slot because a camera is unplugged and a plugin fails to load, and telling a
+/// user their instrument is "not connected" sends them looking for a cable.
+fn device_note(d: DeviceLabel<'_>, missing: &'static str) -> &'static str {
     match d {
-        DeviceLabel::Missing(_) => "  (not connected)",
+        DeviceLabel::Missing(_) => missing,
         DeviceLabel::None | DeviceLabel::Open(_) => "",
+    }
+}
+
+fn device_ink(d: DeviceLabel<'_>, p: &Palette) -> Color32 {
+    match d {
+        DeviceLabel::None => p.faint,
+        DeviceLabel::Open(_) => p.ink,
+        DeviceLabel::Missing(_) => p.warn,
     }
 }
 
 /// What a take will actually produce, in four words.
 ///
-/// Drawn beside the Export button so the dialog is somewhere you go to CHANGE
-/// the answer rather than to find out what it is.
+/// Drawn as the Export button's own value so the dialog is somewhere you go to
+/// CHANGE the answer rather than to find out what it is.
 fn export_summary(spec: &ExportSpec) -> String {
     let mut parts: Vec<String> = Vec::new();
     if spec.audio {
@@ -849,6 +1268,28 @@ fn export_summary(spec: &ExportSpec) -> String {
     parts.join(" + ")
 }
 
+/// The count-in, in the fewest words that are still true.
+///
+/// Beats rather than bars, matching the menu: "8 beats" is what the click
+/// plays, and the app has no time signature to turn that into bars with.
+fn count_in_text(beats: u32) -> String {
+    if beats == 0 {
+        "off".to_owned()
+    } else {
+        format!("{beats} beats")
+    }
+}
+
+/// A tempo without a trailing `.0` on the whole numbers, which is nearly all of
+/// them, and without losing the half that 92.5 has.
+fn tempo_text(bpm: f64) -> String {
+    if (bpm - bpm.round()).abs() < 0.05 {
+        format!("{:.0}", bpm.round())
+    } else {
+        format!("{bpm:.1}")
+    }
+}
+
 fn draw_destination(
     painter: &Painter,
     l: &Layout,
@@ -864,7 +1305,7 @@ fn draw_destination(
         let size = fit_text(l.dest, "Choose...", l.dest.height() * 0.45);
         if size >= MIN_TEXT {
             painter.text(
-                Pos2::new(l.dest.right() - l.dest.height() * 0.3, l.dest.center().y),
+                Pos2::new(l.dest.right() - label_inset(l.dest), l.dest.center().y),
                 Align2::RIGHT_CENTER,
                 "Choose...",
                 font_light(size),
@@ -884,63 +1325,37 @@ fn draw_destination(
     // timestamp guarantees that. Type "nocturne" once, press record five
     // times, and get five adjacent folders with no overwrite dialog ever.
     let empty = view.take_name.is_empty();
+    let shown = if empty { "(optional)" } else { view.take_name };
     labelled(
         painter,
         l.name,
         "NAME",
-        if empty { "(optional)" } else { view.take_name },
+        shown,
         if empty { p.faint } else { p.ink },
         p,
     );
     if view.name_focused && l.name.is_positive() {
-        let size = (l.name.height() * 0.52).max(1.0);
-        let inset = l.name.height() * 0.30;
-        let x = l.name.left()
-            + inset
-            + size * ADV * (5.0 + view.take_name.chars().count() as f32 + 1.0);
-        painter.line_segment(
-            [
-                Pos2::new(x, l.name.center().y - size * 0.5),
-                Pos2::new(x, l.name.center().y + size * 0.5),
-            ],
-            Stroke::new(1.5_f32, p.ink),
+        // The caret goes after what has been TYPED, which is not what is drawn
+        // when the field is empty and showing its placeholder.
+        let inset = label_inset(l.name);
+        let inner = Rect::from_min_max(
+            Pos2::new(l.name.left() + inset, l.name.top()),
+            Pos2::new(l.name.right() - inset, l.name.bottom()),
         );
-    }
-    text_line(painter, l.folder, view.folder_preview, p.faint, false);
-
-    for (r, cap, dev) in [
-        (l.camera, "CAMERA", view.camera),
-        (l.audio, "AUDIO", view.audio),
-    ] {
-        let colour = match dev {
-            DeviceLabel::None => p.faint,
-            DeviceLabel::Open(_) => p.ink,
-            DeviceLabel::Missing(_) => p.warn,
-        };
-        let value = format!("{}{}", dev.text(), device_note(dev));
-        labelled(painter, r, cap, &value, colour, p);
-    }
-
-    let pre = if view.preroll_s == 0 {
-        "off".to_owned()
-    } else {
-        format!("{} s", view.preroll_s)
-    };
-    labelled(painter, l.preroll, "PRE-ROLL", &pre, p.ink, p);
-
-    control(painter, l.export, p);
-    if l.export.is_positive() {
-        let size = fit_text(l.export, "Export...", l.export.height() * 0.52);
-        if size >= MIN_TEXT {
-            painter.text(
-                l.export.center(),
-                Align2::CENTER_CENTER,
-                "Export...",
-                font(size),
-                p.ink,
+        let size = fit_text(inner, &format!("NAME {shown}"), inner.height() * 0.52);
+        if inner.is_positive() && size >= MIN_TEXT {
+            let typed = 5 + view.take_name.chars().count();
+            let x = inner.left() + size * ADV * typed as f32;
+            painter.line_segment(
+                [
+                    Pos2::new(x, l.name.center().y - size * 0.5),
+                    Pos2::new(x, l.name.center().y + size * 0.5),
+                ],
+                Stroke::new(1.5_f32, p.ink),
             );
         }
     }
+    text_line(painter, l.folder, view.folder_preview, p.faint, false);
 
     // Disk as a DURATION. "214 GB free" means nothing to a pianist and "~58
     // min" means everything, which is why the view carries minutes and not
@@ -949,28 +1364,77 @@ fn draw_destination(
         Some(m) => format!("{} left", disk_text(m)),
         None => "measuring free space".to_owned(),
     };
-    text_line(painter, l.disk, &disk, p.faint, false);
-    text_line(
+    text_line(painter, l.disk, &disk, p.faint, true);
+
+    for (r, cap, dev, missing) in [
+        (l.plugin, "INSTRUMENT", view.plugin, "  (did not load)"),
+        (l.camera, "CAMERA", view.camera, "  (not connected)"),
+        (l.audio, "AUDIO", view.audio, "  (not connected)"),
+    ] {
+        let value = format!("{}{}", dev.text(), device_note(dev, missing));
+        labelled(painter, r, cap, &value, device_ink(dev, p), p);
+    }
+
+    labelled(
         painter,
-        l.disk,
-        &export_summary(&s.record_export),
-        p.faint,
-        true,
+        l.count_in,
+        "COUNT-IN",
+        &count_in_text(view.count_in_beats),
+        p.ink,
+        p,
     );
+    draw_tempo(painter, l.tempo, view.tempo_bpm, p);
+    labelled(
+        painter,
+        l.export,
+        "EXPORT",
+        &export_summary(&s.record_export),
+        p.ink,
+        p,
+    );
+}
+
+/// The tempo box, with a hairline of travel along its bottom.
+///
+/// It is the only thing in this column that is dragged rather than clicked, and
+/// nothing else in the band is shaped like it, so it has to say so. The bar is
+/// where in `MIN_BPM..=MAX_BPM` the number sits — the same mapping [`tempo_at`]
+/// inverts, which is what makes the picture and the drag agree.
+fn draw_tempo(painter: &Painter, r: Rect, bpm: f64, p: &Palette) {
+    labelled(painter, r, "TEMPO", &tempo_text(bpm), p.ink, p);
+    if !r.is_positive() {
+        return;
+    }
+    let t = ((bpm - MIN_BPM) / (MAX_BPM - MIN_BPM)).clamp(0.0, 1.0) as f32;
+    let h = (r.height() * 0.14).max(1.0);
+    let bar = Rect::from_min_max(
+        Pos2::new(r.left(), r.bottom() - h),
+        Pos2::new(r.left() + r.width() * t, r.bottom()),
+    );
+    if bar.is_positive() {
+        painter.rect_filled(bar, 1.0, p.accent);
+    }
 }
 
 /// A tick box and its caption: two line segments rather than a glyph, because
 /// no bundled face is guaranteed to carry a check mark and a tofu box in a
 /// checkbox is indistinguishable from a ticked one.
+///
+/// The box is bounded by the WIDTH as well as the height. In a tall narrow slot
+/// — a detached window's click switch — a box sized off the height alone eats
+/// the whole control and the caption disappears.
 fn draw_tick(painter: &Painter, r: Rect, cap: &str, on: bool, p: &Palette) {
     control(painter, r, p);
     if !r.is_positive() {
         return;
     }
-    let inset = r.height() * 0.25;
-    let side = r.height() - inset * 2.0;
+    let inset = (r.height() * 0.25).min(r.width() * 0.08);
+    let side = (r.height() - inset * 2.0).min(r.width() * 0.30);
+    if side <= 0.0 {
+        return;
+    }
     let bx = Rect::from_min_size(
-        Pos2::new(r.left() + inset, r.top() + inset),
+        Pos2::new(r.left() + inset, r.center().y - side * 0.5),
         Vec2::splat(side),
     );
     painter.rect_stroke(bx, 1.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
@@ -1067,21 +1531,24 @@ pub fn draw_top_edge(painter: &Painter, rect: Rect, s: &Settings) {
 /// Not the band's proportions, for the same reason the neck's popout is not
 /// (D-UI-10): in its own window it should be legible rather than a slice of the
 /// main one. §5's reason for detaching at all is a big framing view on a second
-/// monitor, and the preview claims a little over 40% of the width, so this is
+/// monitor, and the preview claims about a quarter of the width, so this is
 /// about as small as the window gets while the destination column still holds a
 /// device name at a readable size.
 pub const DETACHED_DEFAULT: Vec2 = Vec2::new(720.0, 400.0);
 
 /// The smallest window the band still works in.
 ///
-/// The binding constraint is the destination column, not the preview: seven
-/// rows share the body's height and the column takes what is left after the
-/// preview and the transport. At 480x270 those rows are ~28pt and the column is
-/// ~170pt, which holds "CAMERA FaceTime HD" at about 8pt. Below that the band
-/// is a row of boxes with smudges in them, which reads as a rendering fault
-/// rather than as "too small" — the same failure `theory_panel::DETACHED_MIN`
-/// puts a floor under.
-pub const DETACHED_MIN: Vec2 = Vec2::new(480.0, 270.0);
+/// **Raised from 480x270 when the monitor column arrived.** The binding
+/// constraint is the same as it always was — the destination column, not the
+/// preview — but there is now a fourth group taking width from it and an
+/// instrument row taking height. At 640x340 the destination is ~190pt across
+/// with eight rows of ~32pt, which holds `EXPORT wav + midi` and
+/// `AUDIO Scarlett 2i2 USB` at about 10pt, and the fader captions and their dB
+/// readings clear `MIN_TEXT`. Below that the column is a stack of
+/// boxes with smudges in them, which reads as a rendering fault rather than as
+/// "too small" — the same failure `theory_panel::DETACHED_MIN` puts a floor
+/// under.
+pub const DETACHED_MIN: Vec2 = Vec2::new(640.0, 340.0);
 
 pub fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("ivory-recorder-window")
@@ -1108,6 +1575,9 @@ pub struct DetachedOutcome {
     pub context_menu_at: Option<Pos2>,
     /// A click landed on a control. Feed it to the same handler the band's
     /// clicks go to.
+    ///
+    /// Only the PRESS is reported here. A fader that is being dragged has to be
+    /// re-hit-tested by the app while the button is held — see [`hit_test`].
     pub hit: Option<Hit>,
 }
 
@@ -1184,9 +1654,9 @@ pub fn show_detached_window(
             outcome.inner_size = inner_rect.map(|r| r.size()).or(Some(rect.size()));
             outcome.outer_pos = outer_rect.map(|r| r.min);
 
-            // Ctrl-click IS the right-click on macOS, and this window has ten
-            // click targets. Without the guard, ctrl-clicking to open the menu
-            // over the transport starts a take at the same time.
+            // Ctrl-click IS the right-click on macOS, and this window has
+            // sixteen click targets. Without the guard, ctrl-clicking to open
+            // the menu over the transport starts a take at the same time.
             let ctrl_as_context = cfg!(target_os = "macos") && ctrl;
             let menu = secondary || (pressed && ctrl_as_context);
             if menu {
@@ -1226,7 +1696,7 @@ fn painter_border(painter: &Painter, rect: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recorder::Preview;
+    use crate::recorder::{fader_to_gain, Gains, Preview};
 
     fn band(w: f32) -> Rect {
         Rect::from_min_size(Pos2::new(0.0, 350.0), Vec2::new(w, band_height(w)))
@@ -1243,6 +1713,23 @@ mod tests {
             ..RecorderView::empty()
         }
     }
+
+    /// Every state a take passes through, which several tests have to sweep.
+    const STATES: [RecordState; 4] = [
+        RecordState::Idle,
+        RecordState::CountIn { beat: 3, of: 4 },
+        RecordState::Rolling,
+        RecordState::Finishing,
+    ];
+
+    /// The controls that stay reachable once a take is live.
+    const SURVIVORS: [Hit; 5] = [
+        Hit::Stop,
+        Hit::SetPluginGain(0.0),
+        Hit::SetMetronomeGain(0.0),
+        Hit::SetInputGain(0.0),
+        Hit::ToggleMetronome,
+    ];
 
     /// The whole reason `band_height` takes one argument. A camera that could
     /// change the band's height would resize the piano when somebody plugged in
@@ -1294,12 +1781,7 @@ mod tests {
         };
         for w in [400.0_f32, 1300.0] {
             let want = band_height(w);
-            for state in [
-                RecordState::Idle,
-                RecordState::PreRoll { remaining_s: 2.0 },
-                RecordState::Rolling,
-                RecordState::Finishing,
-            ] {
+            for state in STATES {
                 for preview in [None, Some(pv)] {
                     let v = RecorderView {
                         state,
@@ -1310,10 +1792,11 @@ mod tests {
                     // handed a rect the height already decided.
                     let l = Layout::new(band(w), &v);
                     assert_eq!(band_height(w), want, "{state:?} moved the band height");
-                    for (r, hit) in l.targets() {
+                    for (r, k) in l.targets() {
                         assert!(
                             !r.is_positive() || band(w).contains_rect(r),
-                            "{hit:?} escaped the band at {w}pt in {state:?}"
+                            "{} escaped the band at {w}pt in {state:?}",
+                            k.hit(0.0).label()
                         );
                     }
                 }
@@ -1387,15 +1870,13 @@ mod tests {
     /// other's clicks, and nothing about the picture says so.
     #[test]
     fn no_two_hit_regions_overlap() {
-        let states = [
-            RecordState::Idle,
-            RecordState::PreRoll { remaining_s: 3.0 },
-            RecordState::Rolling,
-            RecordState::Finishing,
-        ];
         for w in [500.0_f32, 900.0, 1300.0, 2600.0] {
-            for r in [band(w), Rect::from_min_size(Pos2::ZERO, DETACHED_DEFAULT)] {
-                for state in states {
+            for r in [
+                band(w),
+                Rect::from_min_size(Pos2::ZERO, DETACHED_DEFAULT),
+                Rect::from_min_size(Pos2::ZERO, DETACHED_MIN),
+            ] {
+                for state in STATES {
                     for hide in [false, true] {
                         let v = RecorderView {
                             state,
@@ -1407,9 +1888,9 @@ mod tests {
                             for j in (i + 1)..t.len() {
                                 assert!(
                                     !t[i].0.intersects(t[j].0),
-                                    "{:?} and {:?} overlap at {w}pt in {state:?}: {:?} {:?}",
-                                    t[i].1,
-                                    t[j].1,
+                                    "{} and {} overlap at {w}pt in {state:?}: {:?} {:?}",
+                                    t[i].1.hit(0.0).label(),
+                                    t[j].1.hit(0.0).label(),
                                     t[i].0,
                                     t[j].0
                                 );
@@ -1438,7 +1919,7 @@ mod tests {
                 let (rect, _) = l
                     .targets()
                     .into_iter()
-                    .find(|(_, h)| *h == want)
+                    .find(|(_, k)| k.hit(Hit::MIDWAY).is_same_control(want))
                     .expect("every variant is in `targets`");
                 assert!(
                     rect.is_positive(),
@@ -1446,10 +1927,10 @@ mod tests {
                     want.label(),
                     r.size()
                 );
-                assert_eq!(
-                    hit_test(r, &v, rect.center()),
-                    Some(want),
-                    "{} is not clickable at its own centre",
+                let got = hit_test(r, &v, rect.center());
+                assert!(
+                    got.is_some_and(|h| h.is_same_control(want)),
+                    "{} is not clickable at its own centre: got {got:?}",
                     want.label()
                 );
             }
@@ -1463,15 +1944,21 @@ mod tests {
     /// band rather than by asking the layout, because the question is what a
     /// user can hit and not what the struct says.
     ///
-    /// Stop, and the clock switch. Nothing else: the folder, the name and the
-    /// devices are all decided at `T0`, and offering them at 0:47 would be
-    /// promising something the recorder cannot do. Record is gone too — the
-    /// button is a red dot while rolling, and a dead control is worse than no
-    /// control.
+    /// Stop, the three faders and the click switch. Nothing else: the folder,
+    /// the name and the devices are all decided at `T0`, and offering them at
+    /// 0:47 would be promising something the recorder cannot do. Record is gone
+    /// too — the button is a red dot while rolling, and a dead control is worse
+    /// than no control.
+    ///
+    /// The monitor is the exception on purpose. Turning the click down halfway
+    /// through a take is exactly when you need to, and none of those three
+    /// faders can change what has already been written. The one that could —
+    /// "in take", which decides whether the click reaches the file — leaves
+    /// with the destination.
     #[test]
-    fn the_rolling_layout_offers_no_destination_hits() {
+    fn the_monitor_survives_a_take_and_the_destination_does_not() {
         for state in [
-            RecordState::PreRoll { remaining_s: 1.5 },
+            RecordState::CountIn { beat: 1, of: 8 },
             RecordState::Rolling,
             RecordState::Finishing,
         ] {
@@ -1482,17 +1969,18 @@ mod tests {
                     ..RecorderView::empty()
                 };
                 let r = band(1300.0);
-                let mut seen = Vec::new();
+                let mut seen: Vec<Hit> = Vec::new();
                 let mut y = r.top();
                 while y <= r.bottom() {
                     let mut x = r.left();
                     while x <= r.right() {
                         if let Some(h) = hit_test(r, &v, Pos2::new(x, y)) {
                             assert!(
-                                matches!(h, Hit::Stop | Hit::ToggleHideElapsed),
-                                "{h:?} is reachable at ({x}, {y}) during {state:?}"
+                                SURVIVORS.iter().any(|s| s.is_same_control(h)),
+                                "{} is reachable at ({x}, {y}) during {state:?}",
+                                h.label()
                             );
-                            if !seen.contains(&h) {
+                            if !seen.iter().any(|s| s.is_same_control(h)) {
                                 seen.push(h);
                             }
                         }
@@ -1500,20 +1988,158 @@ mod tests {
                     }
                     y += 2.0;
                 }
-                seen.sort_by_key(|h| format!("{h:?}"));
-                assert_eq!(
-                    seen,
-                    vec![Hit::Stop, Hit::ToggleHideElapsed],
-                    "the two survivors are not both reachable during {state:?}"
-                );
+                for want in SURVIVORS {
+                    assert!(
+                        seen.iter().any(|s| s.is_same_control(want)),
+                        "{} is unreachable during {state:?}",
+                        want.label()
+                    );
+                }
+                assert_eq!(seen.len(), SURVIVORS.len());
             }
         }
     }
 
+    /// A control that survives a take and then moves is only half a survivor.
+    ///
+    /// Everything else in the band jumps when a take starts — that is what the
+    /// two layouts are for — so the one group you might reach for at 0:47 has
+    /// to be exactly where it was at 0:00, to the point, and not merely still
+    /// present somewhere.
+    #[test]
+    fn the_monitor_is_the_same_rectangle_before_and_during_a_take() {
+        for r in [
+            band(500.0),
+            band(1300.0),
+            band(2600.0),
+            Rect::from_min_size(Pos2::new(40.0, 90.0), DETACHED_DEFAULT),
+            Rect::from_min_size(Pos2::ZERO, DETACHED_MIN),
+        ] {
+            let at_rest = Layout::new(r, &idle());
+            let live = Layout::new(r, &rolling());
+            assert_eq!(at_rest.plugin_row, live.plugin_row, "instrument moved");
+            assert_eq!(at_rest.metronome_row, live.metronome_row, "click moved");
+            assert_eq!(at_rest.input_row, live.input_row, "input moved");
+            // The switch keeps its left edge and its height. It is the one row
+            // that changes shape, because the tick beside it — which decides
+            // what goes in the FILE — leaves with the destination.
+            assert_eq!(at_rest.click.min, live.click.min, "the click switch moved");
+            assert_eq!(at_rest.click.height(), live.click.height());
+            assert!(live.click.width() > at_rest.click.width());
+            // And the divider that marks the group off does not move either.
+            assert_eq!(at_rest.rules[1], live.rules[1]);
+        }
+    }
+
+    /// A fader whose ends cannot be reached is a fader that cannot be turned
+    /// off and cannot be turned up, which is both ends of the only two things
+    /// anybody does with one.
+    #[test]
+    fn a_faders_whole_travel_is_reachable_from_end_to_end() {
+        fn position(h: Option<Hit>) -> f32 {
+            match h {
+                Some(
+                    Hit::SetPluginGain(t) | Hit::SetMetronomeGain(t) | Hit::SetInputGain(t),
+                ) => t,
+                other => panic!("that was not a fader: {other:?}"),
+            }
+        }
+        for r in [
+            band(1300.0),
+            band(700.0),
+            Rect::from_min_size(Pos2::ZERO, DETACHED_MIN),
+        ] {
+            // Live as well as idle: the faders are the group that survives.
+            for v in [idle(), rolling()] {
+                let l = Layout::new(r, &v);
+                for (row, want) in [
+                    (l.plugin_row, Hit::SetPluginGain(0.0)),
+                    (l.metronome_row, Hit::SetMetronomeGain(0.0)),
+                    (l.input_row, Hit::SetInputGain(0.0)),
+                ] {
+                    let (_, track, _) = fader_zones(row);
+                    assert!(track.is_positive(), "{} has no track", want.label());
+                    let at = |x: f32| hit_test(r, &v, Pos2::new(x, track.center().y));
+                    assert!(
+                        at(track.center().x).is_some_and(|h| h.is_same_control(want)),
+                        "{} is not the control under its own track",
+                        want.label()
+                    );
+                    assert_eq!(position(at(track.left())), 0.0, "{}", want.label());
+                    assert_eq!(position(at(track.right())), 1.0, "{}", want.label());
+                    let mid = position(at(track.center().x));
+                    assert!((mid - 0.5).abs() < 1e-3, "{} centred at {mid}", want.label());
+                    // And the ends mean what the audio path will read them as.
+                    assert_eq!(fader_to_gain(position(at(track.left()))), 0.0);
+                    assert!(fader_to_gain(position(at(track.right()))) > 1.0);
+                }
+            }
+        }
+    }
+
+    /// The tempo is dragged along its box, and a drag that could reach 0.001
+    /// BPM would draw a DAW a bar ruler several centuries long.
+    #[test]
+    fn the_tempo_drag_covers_the_legal_range_and_no_more() {
+        let r = band(1300.0);
+        let v = idle();
+        let l = Layout::new(r, &v);
+        let at = |x: f32| match hit_test(r, &v, Pos2::new(x, l.tempo.center().y)) {
+            Some(Hit::SetTempo(b)) => b,
+            other => panic!("that was not the tempo: {other:?}"),
+        };
+        assert!((at(l.tempo.left()) - MIN_BPM).abs() < 1e-9);
+        assert!((at(l.tempo.right()) - MAX_BPM).abs() < 1e-9);
+        let mid = at(l.tempo.center().x);
+        assert!(
+            (mid - (MIN_BPM + MAX_BPM) * 0.5).abs() < 1.0,
+            "the middle of the box is {mid} BPM"
+        );
+        // Monotonic across the whole box, or a rightward drag could slow down.
+        let mut last = f64::MIN;
+        for i in 0..=50 {
+            let bpm = at(l.tempo.left() + l.tempo.width() * i as f32 / 50.0);
+            assert!(bpm >= last, "the tempo went backwards at {i}");
+            assert!((MIN_BPM..=MAX_BPM).contains(&bpm), "{bpm} is out of range");
+            last = bpm;
+        }
+    }
+
+    /// The clock the setting hides is a CLOCK. The count-in beat is the number
+    /// the player is counting on, and a performance setting that swallowed it
+    /// would be hiding the wrong thing under the right name.
+    #[test]
+    fn the_count_in_readout_shows_the_beat_and_hide_elapsed_leaves_it_alone() {
+        assert_eq!(
+            readout_text(RecordState::CountIn { beat: 3, of: 4 }, 0.0),
+            "3 OF 4"
+        );
+        assert_eq!(
+            readout_text(RecordState::CountIn { beat: 7, of: 8 }, 91.0),
+            "7 OF 8",
+            "the elapsed clock does not leak into the count"
+        );
+        assert_eq!(readout_text(RecordState::Finishing, 12.0), "FINISHING");
+        assert_eq!(readout_text(RecordState::Rolling, 252.0), "4:12");
+
+        let r = band(1300.0);
+        for hide in [false, true] {
+            let v = RecorderView {
+                state: RecordState::CountIn { beat: 1, of: 4 },
+                hide_elapsed: hide,
+                ..RecorderView::empty()
+            };
+            assert!(
+                Layout::new(r, &v).timecode.is_positive(),
+                "the beat vanished with hide_elapsed = {hide}"
+            );
+        }
+    }
+
     /// The setting no competitor offers: after a blinking light, a running
-    /// timer is the most-cited performance distraction. What it hides is a
-    /// CLOCK, though — not the pre-roll countdown the user is waiting for, and
-    /// not the notice that files are still being written.
+    /// timer is the most-cited performance distraction. It is reached from the
+    /// menu now — there is no `CLOCK` box in the band, because the owner could
+    /// not tell what one was for — but the readout still obeys it.
     #[test]
     fn the_clock_is_not_drawn_while_rolling_when_it_is_hidden() {
         let r = band(1300.0);
@@ -1533,8 +2159,8 @@ mod tests {
             "the clock is still on screen during a take"
         );
         assert!(
-            hidden(RecordState::PreRoll { remaining_s: 2.0 }).is_positive(),
-            "the countdown is the number the user is waiting for"
+            hidden(RecordState::CountIn { beat: 2, of: 4 }).is_positive(),
+            "the count-in is the number the user is waiting for"
         );
         assert!(
             hidden(RecordState::Finishing).is_positive(),
@@ -1563,7 +2189,7 @@ mod tests {
             live.height() > at_rest.height() * 2.0,
             "the rolling timecode is not bigger: {live:?} vs {at_rest:?}"
         );
-        // The record button and the meter are still there either way.
+        // The meter, the stop button and the faders are still there either way.
         for state in [RecordState::Idle, RecordState::Rolling] {
             let l = Layout::new(
                 r,
@@ -1574,9 +2200,10 @@ mod tests {
                 },
             );
             assert!(l.meter.is_positive(), "the meter went away in {state:?}");
+            assert!(l.stop.is_positive(), "the transport went away in {state:?}");
             assert!(
-                l.stop.is_positive() && l.clock.is_positive(),
-                "the transport went away in {state:?}"
+                l.plugin_row.is_positive() && l.click.is_positive(),
+                "the monitor went away in {state:?}"
             );
         }
     }
@@ -1598,6 +2225,12 @@ mod tests {
             live.meter.height() > at_rest.meter.height(),
             "the meter did not grow for the rolling layout"
         );
+        // And the tick that decides what goes in the FILE leaves with the rest
+        // of the destination, while the switch that decides what you HEAR does
+        // not.
+        assert!(at_rest.click_in_take.is_positive());
+        assert!(!live.click_in_take.is_positive());
+        assert!(live.click.is_positive());
     }
 
     /// Linear amplitude on a linear bar is why naive meters look broken. Half
@@ -1622,31 +2255,82 @@ mod tests {
         assert!(meter_x(CLIP_ZONE) > 0.85, "the red zone is not at the top");
     }
 
+    /// A fader with no number beside it is a strip of colour, which is what the
+    /// owner was complaining about. The number has to actually FIT, and the
+    /// widest thing it can say is eight characters wide.
     #[test]
-    fn the_preroll_control_cycles_through_every_choice_and_comes_back() {
-        let mut seen = Vec::new();
-        let mut v = PREROLL_CHOICES[0];
-        for _ in 0..PREROLL_CHOICES.len() {
-            seen.push(v);
-            v = next_preroll(v);
+    fn a_gain_reading_fits_the_box_reserved_for_it_at_the_smallest_band() {
+        let widest = (0..=100)
+            .map(|i| gain_text(fader_to_gain(i as f32 / 100.0)))
+            .max_by_key(|t| t.chars().count())
+            .expect("the sweep is not empty");
+        assert_eq!(widest.chars().count(), 8, "{widest} is a new worst case");
+
+        for r in [
+            band(500.0),
+            band(900.0),
+            band(1300.0),
+            Rect::from_min_size(Pos2::ZERO, DETACHED_MIN),
+        ] {
+            for v in [idle(), rolling()] {
+                let l = Layout::new(r, &v);
+                for row in [l.plugin_row, l.metronome_row, l.input_row] {
+                    let (cap, _, val) = fader_zones(row);
+                    let size = fit_text(val, &widest, val.height() * FADER_TEXT);
+                    assert!(
+                        size >= MIN_TEXT,
+                        "'{widest}' draws at {size}pt in {r:?}, which is a smudge"
+                    );
+                    let cap_size = fit_text(cap, "INSTRUMENT", cap.height() * FADER_TEXT);
+                    assert!(cap_size >= MIN_TEXT, "the caption draws at {cap_size}pt");
+                }
+            }
         }
-        assert_eq!(seen, PREROLL_CHOICES.to_vec());
-        assert_eq!(v, PREROLL_CHOICES[0], "the cycle does not come back round");
+    }
+
+    #[test]
+    fn the_count_in_control_cycles_through_every_choice_and_comes_back() {
+        let mut seen = Vec::new();
+        let mut v = COUNT_IN_CHOICES[0];
+        for _ in 0..COUNT_IN_CHOICES.len() {
+            seen.push(v);
+            v = next_count_in(v);
+        }
+        assert_eq!(seen, COUNT_IN_CHOICES.to_vec());
+        assert_eq!(v, COUNT_IN_CHOICES[0], "the cycle does not come back round");
         // A value a hand-edited settings file could hold lands somewhere real
         // rather than sticking.
-        assert_eq!(next_preroll(97), PREROLL_CHOICES[0]);
+        assert_eq!(next_count_in(97), COUNT_IN_CHOICES[0]);
+        // And the label says beats, because that is what the click plays.
+        assert_eq!(count_in_text(0), "off");
+        assert_eq!(count_in_text(8), "8 beats");
+    }
+
+    #[test]
+    fn a_tempo_reads_as_a_round_number_unless_it_is_not_one() {
+        assert_eq!(tempo_text(120.0), "120");
+        assert_eq!(tempo_text(92.5), "92.5");
+        assert_eq!(tempo_text(60.0), "60");
     }
 
     /// A chosen device that is not plugged in is neither "None" nor working,
     /// and it must not read as either: one is a thing to set up and the other
-    /// is a thing to go and fix.
+    /// is a thing to go and fix. An instrument that would not load is a third
+    /// thing again, and "not connected" would send the user looking for a
+    /// cable.
     #[test]
     fn a_missing_device_reads_differently_from_an_open_one() {
-        assert_eq!(device_note(DeviceLabel::Open("FaceTime HD")), "");
-        assert_eq!(device_note(DeviceLabel::None), "");
-        assert!(device_note(DeviceLabel::Missing("Scarlett")).contains("not connected"));
+        assert_eq!(device_note(DeviceLabel::Open("FaceTime HD"), "  (gone)"), "");
+        assert_eq!(device_note(DeviceLabel::None, "  (gone)"), "");
+        assert!(device_note(DeviceLabel::Missing("Scarlett"), "  (not connected)")
+            .contains("not connected"));
+        assert!(device_note(DeviceLabel::Missing("Pianoteq"), "  (did not load)")
+            .contains("did not load"));
         let s = Settings::default();
         let p = palette(&s);
+        assert_eq!(device_ink(DeviceLabel::Missing("x"), &p), p.warn);
+        assert_eq!(device_ink(DeviceLabel::Open("x"), &p), p.ink);
+        assert_eq!(device_ink(DeviceLabel::None, &p), p.faint);
         assert_ne!(p.warn, p.ink, "a missing device is drawn in the same ink");
         assert_ne!(p.warn, p.faint);
     }
@@ -1693,19 +2377,13 @@ mod tests {
             texture: egui::TextureId::User(7),
             size: Vec2::new(640.0, 480.0),
         };
-        let states = [
-            RecordState::Idle,
-            RecordState::PreRoll { remaining_s: 2.4 },
-            RecordState::Rolling,
-            RecordState::Finishing,
-        ];
         for dark in [false, true] {
             let s = Settings {
                 dark_mode: dark,
                 ..Settings::default()
             };
             for w in [0.0_f32, 60.0, 400.0, 1300.0, 2600.0] {
-                for state in states {
+                for state in STATES {
                     for preview in [None, Some(pv)] {
                         let v = RecorderView {
                             state,
@@ -1724,6 +2402,18 @@ mod tests {
                             take_name: "nocturne",
                             name_focused: true,
                             folder_preview: "nocturne-2026-08-16-141203",
+                            plugin: DeviceLabel::Missing("Pianoteq 8"),
+                            // Every fader at a different, awkward place:
+                            // silence, past unity, and the click's default.
+                            gains: Gains {
+                                plugin: 3.98,
+                                metronome: 0.0,
+                                input: 0.5,
+                            },
+                            metronome_on: true,
+                            metronome_in_take: dark,
+                            tempo_bpm: 92.5,
+                            count_in_beats: 8,
                             camera: DeviceLabel::Missing("FaceTime HD Camera"),
                             audio: DeviceLabel::Open("Scarlett 2i2 USB"),
                             preview,
@@ -1731,7 +2421,6 @@ mod tests {
                             hide_elapsed: dark,
                             message: Some("recorded 4:12 to nocturne-2026-08-16-141203"),
                             clip_warning: true,
-                            ..RecorderView::empty()
                         };
                         let r = band(w);
                         let _ = ctx.run(Default::default(), |ctx| {

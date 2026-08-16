@@ -7,6 +7,8 @@
 //! plugin, a layer in the canvas. `show_dialog_viewport` is the funnel that
 //! makes that the same code, and nothing here may open a window by itself.
 
+use std::path::{Path, PathBuf};
+
 use crate::fonts;
 use crate::menu::ColorTarget;
 // `Layout` is taken by egui's own, and the recorder's is the composite's
@@ -46,6 +48,31 @@ pub enum Dialog {
         selected: Option<usize>,
         /// The uid currently open.
         current: Option<String>,
+    },
+    /// Choose the VST3 instrument Tangent plays through.
+    ///
+    /// **The list is a directory listing and nothing more** — see the "plugin
+    /// picker" section comment for why this dialog opens no modules, and
+    /// [`Dialog::plugin_picker`] for how the caller builds it.
+    PluginPicker {
+        /// One row per installed VST3 bundle, already sorted for humans.
+        plugins: Vec<PluginEntry>,
+        /// An index into `plugins`, NEVER into the filtered list. The two are
+        /// only ever reconciled in [`plugin_choice`], which is the one place a
+        /// selection becomes a value.
+        selected: Option<usize>,
+        /// The bundle path currently loaded, if any.
+        current: Option<String>,
+        /// Free-text filter. There are 112 VST3s on the owner's machine and
+        /// scrolling a list that long to find "Pianoteq" is the difference
+        /// between a usable picker and a bad one, so this is the primary
+        /// interaction rather than a nicety.
+        filter: String,
+        /// Take keyboard focus on the first frame, like the other text fields
+        /// do. It is also what scrolls the loaded plugin into view once, which
+        /// is the only thing that makes marking it worth anything ninety rows
+        /// down.
+        focus: bool,
     },
     NoMidiInput,
     MidiError {
@@ -224,6 +251,22 @@ pub enum DialogAction {
     ChooseDevice {
         kind: DeviceKind,
         uid: Option<String>,
+    },
+    /// Load a VST3 instrument, or unload the one that is loaded.
+    ///
+    /// The value is the BUNDLE PATH and not a name, because the path is the
+    /// identity and the settings key: two vendors ship a "Piano", and a plugin
+    /// renamed between versions would come back from the settings file as
+    /// nothing at all.
+    ///
+    /// `None` is the picker's None row: unload, and play nothing.
+    ///
+    /// **This is the one action in the file that runs somebody else's code
+    /// inside Tangent.** It is why a Full build carries
+    /// `com.apple.security.cs.disable-library-validation`, and why the dialog
+    /// says so before the button is clicked rather than after.
+    LoadPlugin {
+        path: Option<String>,
     },
     SetExport(ExportSpec),
     /// As above, and write it to the settings file so every later take starts
@@ -1056,6 +1099,304 @@ impl DeviceKind {
     }
 }
 
+// ── the plugin picker ───────────────────────────────────────────────────────
+//
+// There are 112 VST3 bundles installed on the owner's machine, and the one
+// decision this dialog makes is that it will not open a single one of them.
+//
+// A picker showing each plugin's REAL name has to ask each plugin, and asking
+// means `Module::open` — which on macOS runs the bundle's `bundleEntry`, where
+// plugins locate sample libraries, read preset folders and spawn threads (see
+// the header of `ivory-host/src/scan.rs`). A hundred of those in a row is
+// seconds of a frozen window, and it is precisely where a broken plugin takes
+// the process down: before the user has chosen anything at all, from a dialog
+// they opened to look. So the rows come from `ivory_host::discover()`, which is
+// a `read_dir` and nothing more — paths and file names.
+//
+// What that costs is honest and small: the vendor column is usually empty, and
+// the dialog says why rather than leaving it looking like missing data. One
+// module is opened, at the moment one is loaded.
+//
+// Nothing here takes a rescan, a refresh or a "read them all properly" flag. An
+// API that invited scanning would eventually be taken up.
+
+/// The picker as a window. As wide as the Export dialog so the two notes at the
+/// bottom wrap the same way, and tall enough that a filtered list is worth
+/// looking at.
+const PLUGIN_DIALOG_W: f32 = 560.0;
+const PLUGIN_DIALOG_H: f32 = 460.0;
+/// The `Frame` margin on every side; see `TUNING_MARGIN` for why it is named.
+const PLUGIN_MARGIN: i8 = 12;
+/// Point size of the two notes under the list.
+const PLUGIN_NOTE_PT: f32 = 9.0;
+/// Height reserved for those notes, whether or not the list is empty.
+///
+/// Reserved rather than measured, for the reason spelled out on
+/// `TUNING_FOOTER_H`: a band that changed size would walk the button row under
+/// the cursor, and a band reserved too small pushes Load off the bottom edge
+/// where only Esc can reach it. The test
+/// `the_notes_under_the_list_fit_the_space_reserved_for_them` measures the real
+/// strings against this rather than trusting the arithmetic.
+const PLUGIN_FOOTER_H: f32 = 60.0;
+
+/// What the None row says. Not just "None": what choosing it DOES is the part
+/// worth spelling out, exactly as on [`DeviceKind::none_row`].
+const PLUGIN_NONE_ROW: &str = "None  —  no instrument; unloads the one that is loaded";
+
+/// Said under the list, every time, in full-strength text rather than the faint
+/// grey the other note gets.
+///
+/// A plugin is not a document Tangent reads: it is code, in this process, with
+/// this process's file access and this process's crash. Somebody deserves to
+/// know that before they click Load rather than after their first bad plugin,
+/// and the sentence is short enough that they will actually read it.
+const PLUGIN_TRUST_NOTE: &str =
+    "A plugin is somebody else's code, running inside Tangent. It shares this process, so one that \
+     crashes takes Tangent with it — which is also why this build ships with macOS library \
+     validation disabled. Load ones you trust.";
+
+/// Said under that: why the vendor column is mostly blank.
+///
+/// Without it an empty vendor reads as a bug. With it, it reads as the
+/// deliberate choice described in this section's header.
+const PLUGIN_SCAN_NOTE: &str =
+    "Names come from the files on disk. Tangent opens a plugin, and asks it what it really is, only \
+     when it loads it — asking all of them would mean starting all of them.";
+
+/// One installed VST3, as a directory listing knows it.
+///
+/// Public because the fields are the whole contract with the app: the caller
+/// builds these from `ivory_host::discover()`, and a caller that already knows
+/// a vendor (because it has loaded that bundle before) may fill it in. What it
+/// must never do is go and find out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginEntry {
+    /// Absolute path to the `.vst3` bundle. This is the identity and the
+    /// settings key — a display name is not unique and changes with the
+    /// vendor's whims.
+    pub path: String,
+    /// What to show: the bundle's file stem, cleaned up.
+    pub name: String,
+    /// Vendor, when known. Usually empty, and that is not a gap to be filled:
+    /// filling it requires OPENING the module. See the section header.
+    pub vendor: String,
+}
+
+impl PluginEntry {
+    /// Read a row off a bundle path, opening nothing.
+    ///
+    /// The stem, because a `.vst3` is a DIRECTORY and its name is the only
+    /// thing on disk that reads like a product ("Pianoteq 8.vst3"). A bundle
+    /// whose path has no stem at all — a trailing `..`, a caller's mistake —
+    /// falls back to the whole path rather than an unclickable-looking blank
+    /// row.
+    pub fn from_bundle(path: &Path) -> PluginEntry {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let full = path.to_string_lossy().into_owned();
+        PluginEntry {
+            name: stem.unwrap_or_else(|| full.clone()),
+            path: full,
+            vendor: String::new(),
+        }
+    }
+}
+
+/// Whether a row survives the filter box.
+///
+/// Case-insensitive, and on the vendor as well as the name, because "Arturia"
+/// is how you look for the eleven of them at once and "arturia" is how it gets
+/// typed. An empty filter matches everything, so the list needs no special case
+/// for the state it opens in.
+fn plugin_matches(entry: &PluginEntry, filter: &str) -> bool {
+    let needle = filter.trim().to_lowercase();
+    needle.is_empty()
+        || entry.name.to_lowercase().contains(&needle)
+        || entry.vendor.to_lowercase().contains(&needle)
+}
+
+/// The rows the filter leaves on screen, as indices into `plugins`.
+///
+/// Indices and not references, because `selected` is an index and the two have
+/// to be comparable. Both the list and [`plugin_choice`] are built from this
+/// one function, so what is on screen and what OK commits cannot disagree —
+/// which is the whole of the index-into-a-filtered-list bug.
+fn visible_plugins(plugins: &[PluginEntry], filter: &str) -> Vec<usize> {
+    plugins
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| plugin_matches(p, filter))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// What Load would do, when it would do anything.
+#[derive(Debug, PartialEq, Eq)]
+enum PluginChoice<'a> {
+    Load(&'a PluginEntry),
+    /// The None row: unload whatever is loaded and play nothing.
+    Unload,
+}
+
+impl PluginChoice<'_> {
+    /// The action, built from the entry — so the PATH travels and the name
+    /// stays on screen where it belongs.
+    fn action(&self) -> DialogAction {
+        DialogAction::LoadPlugin {
+            path: match self {
+                PluginChoice::Load(e) => Some(e.path.clone()),
+                PluginChoice::Unload => None,
+            },
+        }
+    }
+}
+
+/// What the picker is currently offering to do, or nothing.
+///
+/// **The single gate**, exactly as `confirm` is for the tuning editor and
+/// `export_ready` is for Export: the Load button is enabled on `is_some()` and
+/// the action is built from the same value, so "you cannot load a row you
+/// cannot see" is one function rather than two conditions that drift apart.
+///
+/// Three rules, in this order:
+///
+/// 1. The highlighted entry, **if the filter still shows it**. Select Pianoteq,
+///    then type "serum", and Pianoteq is not what the user is looking at any
+///    more; committing it would be the classic filtered-list bug wearing a
+///    different hat.
+/// 2. Otherwise, the only entry the filter left — the reason typing four
+///    letters and pressing Enter works, which with 112 plugins is how the
+///    dialog is actually used. It needs a NON-EMPTY filter: on a machine with
+///    exactly one plugin installed, an empty filter also leaves exactly one
+///    entry, and that rule would make the None row unreachable.
+/// 3. Otherwise the None row (`selected` is nothing), and only when there is
+///    something to unload. Unloading nothing is not an action, which is what
+///    greys Load out on a picker opened with no instrument running.
+fn plugin_choice<'a>(
+    plugins: &'a [PluginEntry],
+    selected: Option<usize>,
+    current: Option<&str>,
+    filter: &str,
+) -> Option<PluginChoice<'a>> {
+    let visible = visible_plugins(plugins, filter);
+    if let Some(i) = selected {
+        if visible.contains(&i) {
+            // Resolved through `get` rather than indexed. The list is rebuilt
+            // from disk every time the dialog opens, and a stale index must
+            // select nothing rather than panic.
+            return plugins.get(i).map(PluginChoice::Load);
+        }
+    }
+    if !filter.trim().is_empty() {
+        if let [only] = visible[..] {
+            return plugins.get(only).map(PluginChoice::Load);
+        }
+    }
+    if selected.is_none() && current.is_some() {
+        return Some(PluginChoice::Unload);
+    }
+    None
+}
+
+/// One row's text: a mark for the plugin that is loaded, the name, and the
+/// vendor when there is one.
+///
+/// The mark LEADS. It trails on [`Dialog::DevicePicker`], where there are four
+/// devices and you can see them all; ninety rows down a list of 112 a trailing
+/// bullet is invisible, and the dialog's font is monospace, so a one-character
+/// gutter lines every row up into a column you can run an eye down.
+fn plugin_row(entry: &PluginEntry, current: Option<&str>) -> String {
+    let mark = if current == Some(entry.path.as_str()) {
+        '\u{2022}'
+    } else {
+        ' '
+    };
+    if entry.vendor.trim().is_empty() {
+        format!("{mark} {}", entry.name)
+    } else {
+        format!("{mark} {}   ({})", entry.name, entry.vendor)
+    }
+}
+
+/// Where VST3s live on this platform, said out loud when none were found.
+///
+/// An empty box teaches nothing, and an empty list has an ordinary cause on
+/// every platform: the installer offered AU or VST2 and the user took it. So
+/// the dialog names the directories it looked in.
+///
+/// `cfg!` and not a probe, exactly as [`encoder_note`] does it: this asks about
+/// the TARGET, which is the machine the dialog will be read on, so a Windows
+/// build cross-compiled on this Mac still names the Windows folder.
+fn vst3_locations() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "No VST3 instruments found. macOS keeps them in ~/Library/Audio/Plug-Ins/VST3 for one user \
+         and /Library/Audio/Plug-Ins/VST3 for everybody. An installer that offered you AU or VST2 \
+         and took the default put nothing in either."
+    } else if cfg!(target_os = "windows") {
+        "No VST3 instruments found. Windows keeps them in %COMMONPROGRAMFILES%\\VST3 — usually \
+         C:\\Program Files\\Common Files\\VST3. An installer that offered you VST2 and took the \
+         default put nothing there."
+    } else {
+        "No VST3 instruments found. Linux keeps them in ~/.vst3 for one user and /usr/lib/vst3 for \
+         everybody."
+    }
+}
+
+impl Dialog {
+    /// Open the picker on the bundles the caller found.
+    ///
+    /// `bundles` is `ivory_host::discover()`'s output verbatim — a directory
+    /// listing, which is the whole point (see the section header above). This
+    /// crate cannot depend on `ivory-host` and does not want to: paths in,
+    /// a path out.
+    ///
+    /// The app opens it like this:
+    ///
+    /// ```ignore
+    /// self.dialog = Some(Dialog::plugin_picker(
+    ///     &ivory_host::discover(),
+    ///     self.settings.plugin_path.clone(),   // what is loaded now, or None
+    /// ));
+    /// ```
+    ///
+    /// and drains `DialogAction::LoadPlugin { path }`, where `None` means
+    /// unload.
+    ///
+    /// Two things happen on the way in. The rows are sorted the way a person
+    /// reads a list rather than the way `discover` returns them — it sorts
+    /// `PathBuf`s, so the system folder lands before the user's and "Zebra"
+    /// before "arturia", which in a list of 112 is indistinguishable from
+    /// unsorted. And the loaded plugin is preselected, so the dialog opens on
+    /// the answer to "what am I playing through", not on row one.
+    pub fn plugin_picker(bundles: &[PathBuf], current: Option<String>) -> Dialog {
+        let mut plugins: Vec<PluginEntry> = bundles
+            .iter()
+            .map(|p| PluginEntry::from_bundle(p))
+            .collect();
+        plugins.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                // Two bundles can share a name — the user's copy and the system
+                // one — and a comparator that called them equal would order
+                // them differently on different runs.
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        let selected = current
+            .as_deref()
+            .and_then(|c| plugins.iter().position(|p| p.path == c));
+        Dialog::PluginPicker {
+            plugins,
+            selected,
+            current,
+            filter: String::new(),
+            focus: true,
+        }
+    }
+}
+
 /// Stable surface identity: a viewport id on the desktop, an `Area` id in a
 /// plugin. `dialog: Option<Dialog>` means there is never more than one open, so
 /// one id serves them all and the window keeps its place between dialogs.
@@ -1337,6 +1678,217 @@ pub fn show(
                                 }
                                 if ui.button("Cancel").clicked() {
                                     result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
+        Dialog::PluginPicker {
+            plugins,
+            selected,
+            current,
+            filter,
+            focus,
+        } => {
+            // Themed, unlike the two pickers above it. Those are stock because
+            // Qt showed the MIDI dialogs that way (spec §7.1) and the recorder's
+            // device picker is their twin; this one has a live text field and
+            // two paragraphs of the app's own voice in it, and reads as part of
+            // Tangent rather than as a system sheet.
+            let t = theme(dark_mode);
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Load Instrument",
+                Vec2::new(PLUGIN_DIALOG_W, PLUGIN_DIALOG_H),
+                Vec2::new(460.0, 300.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    // The filter field paints its interior on `extreme_bg_color`
+                    // — stock near-black otherwise, a hole punched through a
+                    // themed dialog. Same trap as the tuning editor.
+                    ui.visuals_mut().extreme_bg_color = t.bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    let faint = t.text.gamma_multiply(0.72);
+                    // Taken before the field consumes it: the same first frame
+                    // that focuses the filter scrolls the loaded plugin into
+                    // view, which is what makes marking it worth anything when
+                    // it is ninety rows down.
+                    let first_frame = *focus;
+                    // Read here, not from `ctx`: on the desktop this dialog is
+                    // its own viewport with its own input, and the parent
+                    // context never sees the key at all. A singleline `TextEdit`
+                    // surrenders focus on Enter but does not consume the event
+                    // (`filtered_events` copies), so one read serves the field
+                    // and the list both.
+                    //
+                    // Never on the opening frame. Inline there is one context
+                    // and one event queue, so the keystroke that opened the
+                    // picker is still in it — and the dialog would confirm
+                    // itself before it was ever seen.
+                    let enter = !first_frame && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let mut confirm_now = false;
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(PLUGIN_MARGIN))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Filter:").font(bold(11.0)).color(t.text));
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(filter)
+                                        .font(bold(12.0))
+                                        .text_color(t.text)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                if *focus {
+                                    *focus = false;
+                                    focus_and_select_all(ui, &resp, filter);
+                                }
+                            });
+
+                            let visible = visible_plugins(plugins, filter);
+                            if plugins.is_empty() {
+                                // Not an empty box with a greyed button: an
+                                // empty list cannot be told apart from a picker
+                                // that failed, and the ordinary cause is an
+                                // installer that offered AU or VST2 and was
+                                // taken up on it.
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(vst3_locations())
+                                        .font(bold(11.0))
+                                        .color(t.text),
+                                );
+                                ui.add_space(4.0);
+                            } else {
+                                ui.label(
+                                    RichText::new(if filter.trim().is_empty() {
+                                        format!("{} installed", plugins.len())
+                                    } else {
+                                        format!("{} of {}", visible.len(), plugins.len())
+                                    })
+                                    .font(bold(PLUGIN_NOTE_PT))
+                                    .color(faint),
+                                );
+                                ui.add_space(2.0);
+                            }
+                            // The two notes, the button row, and the space
+                            // between them. See `PLUGIN_FOOTER_H` for why the
+                            // band is a reservation and not a measurement.
+                            let bottom_h = PLUGIN_FOOTER_H + 34.0 + 8.0;
+                            let list_h = (ui.available_height() - bottom_h).max(40.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(list_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    // The None row first, always present, never
+                                    // filtered, and there even when nothing is
+                                    // installed: it is not an entry, and
+                                    // unloading has to stay reachable from a
+                                    // picker whose plugin folder has moved since
+                                    // the plugin was loaded.
+                                    if ui
+                                        .selectable_label(
+                                            selected.is_none(),
+                                            RichText::new(format!("  {PLUGIN_NONE_ROW}"))
+                                                .font(bold(12.0))
+                                                .color(t.text),
+                                        )
+                                        .clicked()
+                                    {
+                                        *selected = None;
+                                    }
+                                    for &i in &visible {
+                                        let Some(entry) = plugins.get(i) else {
+                                            continue;
+                                        };
+                                        let resp = ui.selectable_label(
+                                            *selected == Some(i),
+                                            RichText::new(plugin_row(entry, current.as_deref()))
+                                                .font(bold(12.0))
+                                                .color(t.text),
+                                        );
+                                        // `i`, the index into `plugins` — never
+                                        // the position in `visible`, which
+                                        // changes under the user with every
+                                        // keystroke.
+                                        if resp.clicked() {
+                                            *selected = Some(i);
+                                        }
+                                        if resp.double_clicked() {
+                                            *selected = Some(i);
+                                            confirm_now = true;
+                                        }
+                                        if first_frame && *selected == Some(i) {
+                                            // The mark is worth nothing ninety
+                                            // rows down a list nobody has
+                                            // scrolled.
+                                            resp.scroll_to_me(Some(Align::Center));
+                                        }
+                                    }
+                                    if visible.is_empty() && !plugins.is_empty() {
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            RichText::new(
+                                                "Nothing matches that. Clear the filter to see \
+                                                 them all.",
+                                            )
+                                            .font(bold(11.0))
+                                            .color(t.text),
+                                        );
+                                    }
+                                });
+
+                            // ── what this costs you ─────────────────────────
+                            //
+                            // Full strength for the warning and faint for the
+                            // explanation, because one of them is a thing the
+                            // user has to decide about and the other is a thing
+                            // they were about to wonder.
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(PLUGIN_TRUST_NOTE)
+                                    .font(bold(PLUGIN_NOTE_PT))
+                                    .color(t.text),
+                            );
+                            ui.label(
+                                RichText::new(PLUGIN_SCAN_NOTE)
+                                    .font(bold(PLUGIN_NOTE_PT))
+                                    .color(faint),
+                            );
+
+                            // Computed AFTER the list, so it answers this
+                            // frame's click rather than the one before it.
+                            let choice =
+                                plugin_choice(plugins, *selected, current.as_deref(), filter);
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let load = ui.add_enabled(
+                                    choice.is_some(),
+                                    Button::new(RichText::new("Load").color(t.text)),
+                                );
+                                let cancel =
+                                    ui.add(Button::new(RichText::new("Cancel").color(t.text)));
+                                // Cancel is asked FIRST, and that is not tidiness:
+                                // egui activates a focused button with Enter, so
+                                // a user who tabbed to Cancel and pressed it
+                                // would otherwise trip the global Enter below and
+                                // load a plugin by pressing the button that says
+                                // don't.
+                                if cancel.clicked() {
+                                    result.close = true;
+                                } else if load.clicked() || confirm_now || enter {
+                                    // Enter, a double-click and the button all
+                                    // take the value the gate offered, which is
+                                    // the point of there being one gate: they
+                                    // cannot come to mean different things.
+                                    // Escape is the funnel's job.
+                                    if let Some(c) = &choice {
+                                        action = Some(c.action());
+                                        result.close = true;
+                                    }
                                 }
                             });
                         });
@@ -3665,5 +4217,442 @@ mod tests {
             ),
             _ => panic!("the dialog closed itself, or changed into another one"),
         }
+    }
+
+    // ── the plugin picker ───────────────────────────────────────────────────
+
+    fn entry(path: &str, name: &str, vendor: &str) -> PluginEntry {
+        PluginEntry {
+            path: path.to_owned(),
+            name: name.to_owned(),
+            vendor: vendor.to_owned(),
+        }
+    }
+
+    /// A believable shelf. Two vendors are known because the app has loaded
+    /// those bundles before; the other two are blank, which is the ordinary
+    /// case and the whole point of the picker not scanning.
+    fn installed() -> Vec<PluginEntry> {
+        vec![
+            entry(
+                "/Library/Audio/Plug-Ins/VST3/Analog Lab V.vst3",
+                "Analog Lab V",
+                "Arturia",
+            ),
+            entry(
+                "/Users/x/Library/Audio/Plug-Ins/VST3/Pianoteq 8.vst3",
+                "Pianoteq 8",
+                "Modartt",
+            ),
+            entry("/Library/Audio/Plug-Ins/VST3/Serum2.vst3", "Serum2", ""),
+            entry("/Library/Audio/Plug-Ins/VST3/Vital.vst3", "Vital", ""),
+        ]
+    }
+
+    /// Every string a frame actually painted.
+    ///
+    /// "The dialog says where VST3s live" is a claim about what is on screen and
+    /// there is no other way to reach it: the help is a label, not a value. So
+    /// the frame's shapes are walked and their galleys read.
+    fn painted_text(output: &egui::FullOutput) -> String {
+        fn walk(shape: &egui::epaint::Shape, out: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for c in &output.shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    /// The picker drawn inline, the way a plugin editor draws it: what ended up
+    /// on the screen, and anything it asked the app to do.
+    ///
+    /// Three frames, not one. An `egui::Area` whose size is not known yet runs a
+    /// SIZING PASS — it lays the whole dialog out and paints none of it
+    /// (`Area::content_ui` builds that `Ui` with `.invisible()`), and areas
+    /// fade in over the frames after. A test that ran one frame and read the
+    /// shapes would find a blank screen and conclude the dialog draws nothing,
+    /// which is the wrong answer to the right question.
+    fn run_picker(dialog: &mut Option<Dialog>) -> (String, Option<DialogAction>) {
+        let ctx = egui::Context::default();
+        // The themed dialogs name Courier Prime explicitly and epaint PANICS on
+        // a font family that is not bound.
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let placement = Placement {
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::PLUGIN,
+        };
+        let mut action = None;
+        let mut painted = String::new();
+        for _ in 0..3 {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 520.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    if let Some(a) = show(ctx, dialog, true, placement) {
+                        action = Some(a);
+                    }
+                },
+            );
+            painted = painted_text(&out);
+        }
+        (painted, action)
+    }
+
+    /// With 112 plugins installed the filter is the dialog, so it has to find
+    /// things the way somebody actually types: any case, and by the maker as
+    /// well as the product — "arturia" is how you ask for the eleven of them at
+    /// once, and the vendor is not in the name.
+    #[test]
+    fn the_filter_matches_a_name_or_a_vendor_in_any_case_and_an_empty_one_shows_everything() {
+        let plugins = installed();
+        let names = |f: &str| {
+            visible_plugins(&plugins, f)
+                .into_iter()
+                .map(|i| plugins[i].name.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(names(""), ["Analog Lab V", "Pianoteq 8", "Serum2", "Vital"]);
+        assert_eq!(names("   "), names(""), "whitespace is not a filter");
+        assert_eq!(names("piano"), ["Pianoteq 8"]);
+        assert_eq!(names("PIANO"), ["Pianoteq 8"], "the caps lock case");
+        assert_eq!(names(" piano "), ["Pianoteq 8"], "a pasted name has spaces");
+        assert_eq!(names("arturia"), ["Analog Lab V"], "not matched on vendor");
+        assert_eq!(names("MODARTT"), ["Pianoteq 8"]);
+        // A blank vendor must not turn into a wildcard. `contains("")` is true
+        // of every string, so the empty needle is ruled out first and the two
+        // vendorless rows answer for their names alone.
+        assert_eq!(names("ital"), ["Vital"]);
+        assert!(names("zzz").is_empty());
+    }
+
+    /// The bug this dialog is most likely to grow: a row is highlighted, the
+    /// user types, the list becomes a different list, and OK commits either the
+    /// row that scrolled out of sight or whatever now sits at that position.
+    /// The committed value is an ENTRY, resolved against what is on screen.
+    #[test]
+    fn filtering_after_a_selection_never_commits_a_row_the_user_can_no_longer_see() {
+        let plugins = installed();
+        // Vital is highlighted; "an" leaves Analog Lab V and Pianoteq 8, and
+        // Vital is not among them.
+        let stale = plugin_choice(&plugins, Some(3), None, "an");
+        assert_eq!(
+            stale, None,
+            "Load stayed live over a selection the filter had hidden: {stale:?}"
+        );
+        // And in particular it is not the filtered list's row 3, nor its row 0
+        // — the two shapes the index bug takes.
+        assert_ne!(stale, Some(PluginChoice::Load(&plugins[0])));
+
+        // Narrowed to one, the user types four letters and presses Enter. That
+        // is how a list of 112 is used, so the single match wins over a stale
+        // highlight rather than greying the button out.
+        assert_eq!(
+            plugin_choice(&plugins, Some(3), None, "piano"),
+            Some(PluginChoice::Load(&plugins[1]))
+        );
+        // A selection the filter still SHOWS is untouched by any of this.
+        assert_eq!(
+            plugin_choice(&plugins, Some(3), None, "ital"),
+            Some(PluginChoice::Load(&plugins[3]))
+        );
+        // The list is rebuilt from disk on every open, so an index left over
+        // from a bundle that has since been deleted selects nothing rather than
+        // panicking.
+        assert_eq!(plugin_choice(&plugins, Some(99), None, ""), None);
+    }
+
+    /// The None row is a real choice — it is how you get the sound back off a
+    /// plugin without quitting — so it carries a value of its own rather than
+    /// being "cancel with extra steps".
+    #[test]
+    fn the_none_row_unloads_the_instrument_that_is_loaded() {
+        let plugins = installed();
+        let loaded = plugins[1].path.clone();
+        let choice = plugin_choice(&plugins, None, Some(&loaded), "")
+            .expect("the None row is a choice, not an absence of one");
+        assert_eq!(choice, PluginChoice::Unload);
+        match choice.action() {
+            DialogAction::LoadPlugin { path } => {
+                assert_eq!(path, None, "the None row loaded something");
+            }
+            _ => panic!("the None row produced some other action"),
+        }
+        // Nothing loaded, nothing typed, nothing highlighted: Load is greyed,
+        // because unloading nothing is not an action.
+        assert_eq!(plugin_choice(&plugins, None, None, ""), None);
+        // One plugin installed and an empty filter also leaves "exactly one
+        // match" — and if that rule fired here, the None row could never be
+        // reached on a machine with a single instrument.
+        let one = vec![plugins[1].clone()];
+        assert_eq!(
+            plugin_choice(&one, None, Some(&loaded), ""),
+            Some(PluginChoice::Unload)
+        );
+    }
+
+    /// An empty list has an ordinary cause — the installer offered AU or VST2
+    /// and the user took the default — and an empty box cannot be told apart
+    /// from a picker that failed. So the dialog names the folders it looked in,
+    /// and this reads what actually reached the screen.
+    #[test]
+    fn an_empty_plugin_list_says_where_vst3s_live_instead_of_showing_an_empty_box() {
+        // The directories are the platform's, decided by the TARGET, so a
+        // cross-built Windows binary still names the Windows folder.
+        #[cfg(target_os = "macos")]
+        assert!(
+            vst3_locations().contains("~/Library/Audio/Plug-Ins/VST3")
+                && vst3_locations().contains(" /Library/Audio/Plug-Ins/VST3"),
+            "{}",
+            vst3_locations()
+        );
+        #[cfg(target_os = "windows")]
+        assert!(
+            vst3_locations().contains("%COMMONPROGRAMFILES%\\VST3"),
+            "{}",
+            vst3_locations()
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            vst3_locations().contains("~/.vst3") && vst3_locations().contains("/usr/lib/vst3"),
+            "{}",
+            vst3_locations()
+        );
+
+        let mut dialog = Some(Dialog::plugin_picker(&[], None));
+        let (painted, action) = run_picker(&mut dialog);
+        assert!(action.is_none(), "an empty picker loaded something");
+        assert!(
+            painted.contains(vst3_locations()),
+            "the help never reached the screen: {painted}"
+        );
+        // The warning is not conditional on there being a list. It is the same
+        // dialog and it will be read again the moment a plugin is installed.
+        assert!(painted.contains(PLUGIN_TRUST_NOTE), "{painted}");
+        // And the None row survives an empty folder, because the plugin that is
+        // loaded may be the one whose folder has moved — unloading it is the
+        // one thing this picker can still do.
+        assert!(painted.contains(PLUGIN_NONE_ROW), "{painted}");
+        assert!(dialog.is_some(), "the picker closed itself");
+    }
+
+    /// Opening on row one, with nothing marked, makes the user answer "what am
+    /// I playing through" by reading 112 rows. The loaded bundle is preselected
+    /// and marked, and — because it may be ninety rows down — the mark is only
+    /// worth anything if the list opens on it, which is what the `focus` flag
+    /// also does. This runs the frame inline, the way a plugin editor draws it.
+    #[test]
+    fn the_loaded_plugin_opens_preselected_and_marked() {
+        let bundles: Vec<PathBuf> = [
+            "/Library/Audio/Plug-Ins/VST3/Vital.vst3",
+            // Lower case on purpose: `discover` sorts paths, so a byte sort
+            // would file this after "Vital" and a user would call the list
+            // unsorted.
+            "/Library/Audio/Plug-Ins/VST3/analog lab v.vst3",
+            "/Users/x/Library/Audio/Plug-Ins/VST3/Pianoteq 8.vst3",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let loaded = "/Users/x/Library/Audio/Plug-Ins/VST3/Pianoteq 8.vst3".to_owned();
+
+        let opened = Dialog::plugin_picker(&bundles, Some(loaded.clone()));
+        match &opened {
+            Dialog::PluginPicker {
+                plugins,
+                selected,
+                current,
+                filter,
+                focus,
+            } => {
+                assert_eq!(
+                    plugins.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+                    ["analog lab v", "Pianoteq 8", "Vital"],
+                    "sorted the way a byte comparison sorts, not the way a person reads"
+                );
+                // The name is the stem: nobody wants to read ".vst3" 112 times.
+                assert!(plugins.iter().all(|p| !p.name.contains(".vst3")));
+                // Nothing was opened, so nothing knows a vendor. This is the
+                // assertion that fails the day the picker starts scanning.
+                assert!(plugins.iter().all(|p| p.vendor.is_empty()));
+                assert_eq!(*selected, Some(1), "it did not open on what is loaded");
+                assert_eq!(current.as_deref(), Some(loaded.as_str()));
+                assert!(filter.is_empty() && *focus);
+                assert!(
+                    plugin_row(&plugins[1], Some(&loaded)).starts_with('\u{2022}'),
+                    "the loaded plugin is not marked"
+                );
+                assert!(
+                    plugin_row(&plugins[0], Some(&loaded)).starts_with(' '),
+                    "a plugin that is not loaded was marked as if it were"
+                );
+                // A blank vendor leaves no empty brackets behind; a known one
+                // is shown, which is the only reason the field exists.
+                assert_eq!(plugin_row(&plugins[2], None), "  Vital");
+                assert_eq!(
+                    plugin_row(&entry("/x/A.vst3", "A", "Arturia"), None),
+                    "  A   (Arturia)"
+                );
+            }
+            _ => panic!("plugin_picker built some other dialog"),
+        }
+
+        let mut dialog = Some(opened);
+        let (painted, action) = run_picker(&mut dialog);
+        assert!(action.is_none(), "the picker loaded a plugin unasked");
+        assert!(
+            painted.contains("\u{2022} Pianoteq 8"),
+            "the mark never reached the screen: {painted}"
+        );
+        assert!(
+            painted.contains(PLUGIN_NONE_ROW) && painted.contains(PLUGIN_SCAN_NOTE),
+            "{painted}"
+        );
+    }
+
+    /// Typing four letters and pressing Enter is how a list of 112 is used, so
+    /// the key has to go all the way through the funnel and come out as the
+    /// action. What it must NOT do is answer the keystroke that opened the
+    /// dialog: inline there is one context and one event queue, and a picker
+    /// that confirmed itself before it was read would be a dialog nobody could
+    /// see.
+    #[test]
+    fn enter_loads_the_highlighted_plugin_but_never_on_the_frame_that_opened_the_dialog() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let placement = Placement {
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::PLUGIN,
+        };
+        let held_enter = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 520.0))),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+
+        let loaded = "/Users/x/Library/Audio/Plug-Ins/VST3/Pianoteq 8.vst3".to_owned();
+        let mut dialog = Some(Dialog::plugin_picker(
+            &[
+                PathBuf::from("/Library/Audio/Plug-Ins/VST3/Vital.vst3"),
+                PathBuf::from(&loaded),
+            ],
+            Some(loaded.clone()),
+        ));
+
+        let mut action = None;
+        let _ = ctx.run(held_enter(), |ctx| {
+            action = show(ctx, &mut dialog, true, placement);
+        });
+        assert!(
+            action.is_none() && dialog.is_some(),
+            "the picker answered the keystroke that opened it"
+        );
+
+        let _ = ctx.run(held_enter(), |ctx| {
+            action = show(ctx, &mut dialog, true, placement);
+        });
+        match action {
+            Some(DialogAction::LoadPlugin { path }) => {
+                assert_eq!(path.as_deref(), Some(loaded.as_str()), "it loaded another");
+            }
+            _ => panic!("Enter did not load the highlighted plugin"),
+        }
+        assert!(dialog.is_none(), "it loaded a plugin and stayed open");
+    }
+
+    /// The name is what is on screen and the path is what is stored. Two
+    /// vendors ship a "Piano", plugins are renamed between versions, and a
+    /// settings file holding a display name comes back as nothing at all.
+    #[test]
+    fn confirming_commits_the_bundle_path_and_never_the_display_name() {
+        let plugins = installed();
+        let choice =
+            plugin_choice(&plugins, Some(1), None, "").expect("a highlighted row is a choice");
+        assert_eq!(choice, PluginChoice::Load(&plugins[1]));
+        match choice.action() {
+            DialogAction::LoadPlugin { path } => {
+                assert_eq!(path.as_deref(), Some(plugins[1].path.as_str()));
+                assert_ne!(path.as_deref(), Some(plugins[1].name.as_str()));
+                assert!(
+                    path.as_deref().is_some_and(|p| p.ends_with(".vst3")),
+                    "what travelled was not a bundle path: {path:?}"
+                );
+            }
+            _ => panic!("Load produced some other action"),
+        }
+    }
+
+    /// The two notes get a fixed band so the buttons do not walk under the
+    /// cursor as the list is filtered. That only works if what they say fits —
+    /// and "it comes to about four lines" is exactly the reasoning that once
+    /// pushed a dialog's OK button off its own bottom edge.
+    #[test]
+    fn the_notes_under_the_list_fit_the_space_reserved_for_them() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+
+        // Exactly the width the labels are given: the dialog's, less the
+        // `Frame` margin on each side.
+        let content_w = PLUGIN_DIALOG_W - 2.0 * f32::from(PLUGIN_MARGIN);
+        let mut total = 0.0_f32;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(PLUGIN_DIALOG_W, PLUGIN_DIALOG_H),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                crate::shell::viewport_ui(ctx, |ui| {
+                    let height = |m: &str| {
+                        ui.painter()
+                            .layout(
+                                m.to_owned(),
+                                FontId::new(PLUGIN_NOTE_PT, fonts::courier_bold()),
+                                Color32::WHITE,
+                                content_w,
+                            )
+                            .size()
+                            .y
+                    };
+                    // Both are painted, every frame, one under the other.
+                    total = height(PLUGIN_TRUST_NOTE)
+                        + height(PLUGIN_SCAN_NOTE)
+                        + ui.spacing().item_spacing.y;
+                });
+            },
+        );
+        assert!(
+            total <= PLUGIN_FOOTER_H,
+            "{PLUGIN_FOOTER_H}pt is reserved for the notes and they need {total}pt, \
+             which would push Load off the bottom edge"
+        );
     }
 }

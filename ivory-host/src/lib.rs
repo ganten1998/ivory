@@ -17,6 +17,6 @@ pub mod instance;
 pub mod ready;
 pub mod scan;
 
-pub use instance::{Bus, Instance, Note, Setup};
+pub use instance::{Bus, Control, Instance, Note, Rendered, Setup};
 pub use ready::{Policy, Readiness, State as ReadyState};
 pub use scan::{discover, ClassInfo, Module};

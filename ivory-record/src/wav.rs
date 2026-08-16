@@ -121,6 +121,9 @@ pub const DEFAULT_PATCH_SECONDS: f64 = 2.0;
 
 const WAVE_FORMAT_PCM: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+/// Read but never written: see trap 5 in [`read_pcm`] for why a reader has to
+/// know this tag, and the `Int24` doc above for why a writer should not use it.
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
 /// The RIFF size field is always at offset 4. It is the one offset in the file
 /// that never depends on what was written.
@@ -136,6 +139,12 @@ pub enum SampleFormat {
     /// older tools choke on and plain tag-1 24-bit is what Sound Devices, Zoom,
     /// REAPER and Pro Tools all produce and consume.
     Int24,
+    /// 32-bit integer. Nothing here writes it by choice — an `f32` source has
+    /// 24 bits of mantissa, so a 32-bit integer take carries not one bit more
+    /// information than [`SampleFormat::Int24`] and costs a third more disk.
+    /// It exists because [`read_pcm`] meets files in this format and the
+    /// reader's vocabulary and the writer's must be the same one.
+    Int32,
     /// 32-bit IEEE float. Needs a `fact` chunk and a `cbSize` in `fmt ` — see
     /// trap 11.
     Float32,
@@ -146,7 +155,7 @@ impl SampleFormat {
         match self {
             SampleFormat::Int16 => 16,
             SampleFormat::Int24 => 24,
-            SampleFormat::Float32 => 32,
+            SampleFormat::Int32 | SampleFormat::Float32 => 32,
         }
     }
 
@@ -543,6 +552,13 @@ impl WavWriter {
                     self.scratch.push((v >> 16) as u8);
                 }
             }
+            SampleFormat::Int32 => {
+                for &s in samples {
+                    let (v, clipped) = quantise(s, 32);
+                    self.clipped += u64::from(clipped);
+                    self.scratch.extend_from_slice(&v.to_le_bytes());
+                }
+            }
             SampleFormat::Float32 => {
                 for &s in samples {
                     // Trap 8: counted, never clamped. Trap 9: a non-finite
@@ -710,6 +726,184 @@ impl Drop for WavWriter {
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Reading
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Decode a whole PCM or float WAV held in memory.
+///
+/// The counterpart to [`WavWriter`], and deliberately the smaller half: this
+/// exists so the app can `include_bytes!` a fixed asset — the metronome click —
+/// and get samples out of it without a decoder dependency. It reads a file that
+/// is already in memory and returns every sample interleaved as `f32`, which is
+/// what everything downstream of here speaks.
+///
+/// # The traps, each with a test below
+///
+/// 1. **A WAV is a chunk LIST and `fmt ` is not guaranteed to be first.** The
+///    metronome asset this was written for opens `RIFF/WAVE` and then a
+///    **`JUNK` chunk of 28 bytes** before `fmt ` — a padding chunk written by
+///    Pro Tools and by half the hardware recorders on the market, so that a
+///    later `ds64` can be dropped in without moving the audio. A reader that
+///    assumes "header, then `fmt `, then `data`" reads the JUNK payload as a
+///    format block: zeroes, which is a zero channel count and a zero sample
+///    rate, and every division after that is by zero. So the chunk list is
+///    walked, by id, to the end.
+/// 2. **An odd-length chunk carries a pad byte that is not in its size.** Miss
+///    it and every following chunk id is read one byte early, which is the
+///    same failure as trap 1 but harder to see.
+/// 3. **A chunk size may be a lie.** Files truncated by a crashed recorder
+///    routinely claim a `data` size larger than the bytes that follow, and a
+///    streaming writer legitimately writes `0xFFFFFFFF`. Every read is bounded
+///    by the slice, never by the declared size, and a short `data` yields the
+///    audio that is really there rather than an error.
+/// 4. **24-bit is three bytes and must be sign-extended by hand.** Assembling
+///    them into an `i32` and forgetting the shift makes every negative sample a
+///    very large positive one: full-scale noise on the bottom half of the wave.
+/// 5. **`WAVE_FORMAT_EXTENSIBLE` (0xFFFE) hides the real format in a GUID.**
+///    Anything above 16 bits from a modern DAW is likely to be tagged this way;
+///    reading tag 0xFFFE as "unknown" rejects perfectly ordinary files. The
+///    first two bytes of the subformat GUID are the tag it stands for.
+/// 6. **8-bit WAV is UNSIGNED**, with 0x80 as zero, and it is the one common
+///    format whose silence is not a run of zero bytes. Rather than carry a
+///    format the writer cannot write, it is refused by name — a clear error
+///    beats a plausible one that plays as a square wave.
+///
+/// The returned [`WavSpec`] describes the FILE, not the returned samples: its
+/// `format` is what was on disk even though what comes back is always `f32`.
+pub fn read_pcm(bytes: &[u8]) -> Result<(WavSpec, Vec<f32>), String> {
+    if bytes.len() < 12 {
+        return Err(format!("not a WAV: {} bytes is shorter than a RIFF header", bytes.len()));
+    }
+    if &bytes[0..4] != b"RIFF" {
+        // RF64 is the >4 GiB variant and is a different container with a `ds64`
+        // chunk; naming it is more useful than "bad magic".
+        let what = if &bytes[0..4] == b"RF64" { "an RF64 file, not a RIFF WAV" } else { "not a RIFF file" };
+        return Err(format!("{what} (magic {:?})", String::from_utf8_lossy(&bytes[0..4])));
+    }
+    if &bytes[8..12] != b"WAVE" {
+        return Err(format!(
+            "RIFF form is {:?}, not WAVE",
+            String::from_utf8_lossy(&bytes[8..12])
+        ));
+    }
+
+    let mut fmt: Option<&[u8]> = None;
+    let mut data: Option<&[u8]> = None;
+    let mut at = 12usize;
+    // Trap 1: walk the list. `at + 8` rather than `at < len` so a trailing
+    // fragment too short to hold a chunk header ends the walk instead of
+    // indexing past it.
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let declared = u32::from_le_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]]) as usize;
+        let body = at + 8;
+        // Trap 3: the slice is the authority, not the size field.
+        let end = body.saturating_add(declared).min(bytes.len());
+        match id {
+            b"fmt " => fmt = Some(&bytes[body..end]),
+            b"data" => data = Some(&bytes[body..end]),
+            _ => {}
+        }
+        // Trap 2: the pad byte is not counted in the chunk's size. Checked,
+        // because a `0xFFFFFFFF` size from a streaming writer would otherwise
+        // wrap the cursor back to the start of the file and loop forever.
+        match body.checked_add(declared).and_then(|n| n.checked_add(declared & 1)) {
+            Some(next) => at = next,
+            None => break,
+        }
+    }
+
+    let fmt = fmt.ok_or_else(|| "no fmt chunk".to_string())?;
+    if fmt.len() < 16 {
+        return Err(format!("fmt chunk is {} bytes, and the minimum is 16", fmt.len()));
+    }
+    let mut tag = u16::from_le_bytes([fmt[0], fmt[1]]);
+    let channels = u16::from_le_bytes([fmt[2], fmt[3]]);
+    let sample_rate = u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]);
+    let bits = u16::from_le_bytes([fmt[14], fmt[15]]);
+
+    // Trap 5. The extension is `cbSize`(2) + validBits(2) + channelMask(4) +
+    // a 16-byte GUID whose first two bytes are the tag it stands for.
+    if tag == WAVE_FORMAT_EXTENSIBLE {
+        if fmt.len() < 26 {
+            return Err("fmt says WAVE_FORMAT_EXTENSIBLE but carries no subformat GUID".to_string());
+        }
+        tag = u16::from_le_bytes([fmt[24], fmt[25]]);
+    }
+
+    if channels == 0 {
+        return Err("fmt declares zero channels".to_string());
+    }
+    if sample_rate == 0 {
+        return Err("fmt declares a zero sample rate".to_string());
+    }
+
+    let format = match (tag, bits) {
+        (WAVE_FORMAT_PCM, 16) => SampleFormat::Int16,
+        (WAVE_FORMAT_PCM, 24) => SampleFormat::Int24,
+        (WAVE_FORMAT_PCM, 32) => SampleFormat::Int32,
+        (WAVE_FORMAT_IEEE_FLOAT, 32) => SampleFormat::Float32,
+        // Trap 6.
+        (WAVE_FORMAT_PCM, 8) => {
+            return Err("8-bit WAV is unsigned and is not supported; convert it to 16-bit".to_string())
+        }
+        (WAVE_FORMAT_IEEE_FLOAT, 64) => {
+            return Err("64-bit float WAV is not supported; convert it to 32-bit float".to_string())
+        }
+        (WAVE_FORMAT_PCM, other) => return Err(format!("{other}-bit PCM is not supported")),
+        (other, bits) => return Err(format!("format tag {other} at {bits} bits is not supported")),
+    };
+
+    let spec = WavSpec {
+        sample_rate,
+        channels,
+        format,
+    };
+    let Some(data) = data else {
+        return Err("no data chunk".to_string());
+    };
+
+    let stride = format.bytes_per_sample() as usize;
+    // Trap 3 again, and trap 12's reading half: a `data` chunk that ends
+    // mid-frame yields whole frames and drops the fragment. Keeping it would
+    // rotate the channels of everything that came before it relative to
+    // whatever is appended next.
+    let frames = data.len() / (stride * channels as usize);
+    let samples = frames * channels as usize;
+    let mut out = Vec::with_capacity(samples);
+    for i in 0..samples {
+        let s = &data[i * stride..i * stride + stride];
+        out.push(match format {
+            SampleFormat::Int16 => {
+                i32::from(i16::from_le_bytes([s[0], s[1]])) as f32 / full_scale(16)
+            }
+            // Trap 4: build the three bytes into the TOP of an i32 and shift
+            // back down arithmetically. `(s[2] as i32) << 16` alone leaves
+            // every negative sample as a large positive one.
+            SampleFormat::Int24 => {
+                let raw = (i32::from(s[0]) << 8) | (i32::from(s[1]) << 16) | (i32::from(s[2]) << 24);
+                (raw >> 8) as f32 / full_scale(24)
+            }
+            SampleFormat::Int32 => {
+                i32::from_le_bytes([s[0], s[1], s[2], s[3]]) as f32 / full_scale(32)
+            }
+            SampleFormat::Float32 => f32::from_le_bytes([s[0], s[1], s[2], s[3]]),
+        });
+    }
+    Ok((spec, out))
+}
+
+/// `2^(bits-1)`: the scale [`quantise`] multiplies by and [`read_pcm`] divides
+/// by.
+///
+/// One function rather than two constants on purpose. If the reader and the
+/// writer ever disagreed about full scale, a file would come back a fraction of
+/// a dB from where it went in and nothing would say so.
+fn full_scale(bits: u32) -> f32 {
+    (1u32 << (bits - 1)) as f32
+}
+
 /// One float sample to an integer of `bits` bits, and whether it was at or past
 /// full scale.
 ///
@@ -723,7 +917,11 @@ fn quantise(x: f32, bits: u32) -> (i32, bool) {
     if !x.is_finite() {
         return (0, true);
     }
-    let scale = (1u32 << (bits - 1)) as f32;
+    let scale = full_scale(bits);
+    // At 32 bits `scale - 1.0` is `scale` again — an f32 has 24 bits of
+    // mantissa and cannot represent 2^31 - 1 — so the clamp does not bound the
+    // cast on its own. The `as` cast saturates at `i32::MAX`, which is the same
+    // answer, and that is why this is safe rather than lucky.
     let max = scale - 1.0;
     let min = -scale;
     ((x * scale).round().clamp(min, max) as i32, is_at_full_scale(x))
@@ -1305,4 +1503,218 @@ mod tests {
     #[test]
     #[ignore = "requires an audio input device and a signed bundle"]
     fn a_real_capture_lands_in_a_file_a_daw_will_open() {}
+
+    // ── reading ────────────────────────────────────────────────────────────
+
+    /// Build a WAV by hand, optionally with a `JUNK` chunk in front of `fmt `.
+    ///
+    /// Hand-rolled rather than round-tripped through [`WavWriter`], because the
+    /// whole point of these tests is files this crate did NOT write.
+    fn build_wav(tag: u16, bits: u16, channels: u16, rate: u32, body: &[u8], junk: bool) -> Vec<u8> {
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&tag.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        let block_align = channels * bits / 8;
+        fmt.extend_from_slice(&(rate * u32::from(block_align)).to_le_bytes());
+        fmt.extend_from_slice(&block_align.to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&0u32.to_le_bytes()); // patched below
+        out.extend_from_slice(b"WAVE");
+        if junk {
+            out.extend_from_slice(b"JUNK");
+            out.extend_from_slice(&28u32.to_le_bytes());
+            out.extend_from_slice(&[0u8; 28]);
+        }
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        out.extend_from_slice(&fmt);
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(body);
+        let riff = (out.len() - 8) as u32;
+        out[4..8].copy_from_slice(&riff.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn a_junk_chunk_before_fmt_does_not_become_the_format_block() {
+        // This is the shape of `assets/click.wav` and of anything Pro Tools
+        // ever wrote. A reader that assumes fmt-then-data reads 28 zero bytes
+        // as the format and then divides by a zero channel count.
+        let body: Vec<u8> = (0..8u8).flat_map(|i| [i, 0]).collect();
+        let bytes = build_wav(WAVE_FORMAT_PCM, 16, 1, 48_000, &body, true);
+        let (spec, samples) = read_pcm(&bytes).expect("a JUNK chunk is not an error");
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 48_000);
+        assert_eq!(spec.format, SampleFormat::Int16);
+        assert_eq!(samples.len(), 8);
+    }
+
+    #[test]
+    fn an_odd_length_chunk_is_followed_by_a_pad_byte_that_is_not_in_its_size() {
+        // A 3-byte JUNK chunk. Skip the pad and every id afterwards is read one
+        // byte early, so `fmt ` is never found.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"JUNK");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0]); // three bytes plus the pad
+        let tail = build_wav(WAVE_FORMAT_PCM, 16, 2, 44_100, &[0, 0, 0, 0], false);
+        bytes.extend_from_slice(&tail[12..]);
+        let riff = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&riff.to_le_bytes());
+
+        let (spec, samples) = read_pcm(&bytes).expect("the pad byte must be skipped");
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.sample_rate, 44_100);
+        assert_eq!(samples.len(), 2);
+    }
+
+    #[test]
+    fn twenty_four_bit_samples_are_sign_extended_rather_than_read_as_large_positives() {
+        // -1, -8388608 (full-scale negative) and +8388607, little end first.
+        let body = [0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x80, 0xFF, 0xFF, 0x7F];
+        let bytes = build_wav(WAVE_FORMAT_PCM, 24, 1, 48_000, &body, false);
+        let (spec, s) = read_pcm(&bytes).unwrap();
+        assert_eq!(spec.format, SampleFormat::Int24);
+        assert!(s[0] < 0.0, "-1 read as {} — the shift is missing", s[0]);
+        assert!((s[1] + 1.0).abs() < 1e-6, "full-scale negative read as {}", s[1]);
+        assert!((s[2] - 1.0).abs() < 1e-4, "full-scale positive read as {}", s[2]);
+    }
+
+    #[test]
+    fn every_supported_word_size_lands_at_the_same_amplitude() {
+        // Half scale in each format. They must agree, or a click read from a
+        // 16-bit file is 48 dB quieter than the same click read from 24-bit.
+        let i16b = build_wav(WAVE_FORMAT_PCM, 16, 1, 48_000, &16_384i16.to_le_bytes(), false);
+        let i24b = build_wav(WAVE_FORMAT_PCM, 24, 1, 48_000, &[0x00, 0x00, 0x40], false);
+        let i32b = build_wav(WAVE_FORMAT_PCM, 32, 1, 48_000, &1_073_741_824i32.to_le_bytes(), false);
+        let f32b = build_wav(WAVE_FORMAT_IEEE_FLOAT, 32, 1, 48_000, &0.5f32.to_le_bytes(), false);
+        for bytes in [i16b, i24b, i32b, f32b] {
+            let (spec, s) = read_pcm(&bytes).unwrap();
+            assert!(
+                (s[0] - 0.5).abs() < 1e-4,
+                "{:?} read half scale as {}",
+                spec.format,
+                s[0]
+            );
+        }
+    }
+
+    #[test]
+    fn an_extensible_format_tag_is_followed_into_its_subformat_guid() {
+        // Anything above 16 bits out of a modern DAW is likely to be tagged
+        // 0xFFFE, and rejecting that rejects ordinary files.
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&WAVE_FORMAT_EXTENSIBLE.to_le_bytes());
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&48_000u32.to_le_bytes());
+        fmt.extend_from_slice(&144_000u32.to_le_bytes());
+        fmt.extend_from_slice(&3u16.to_le_bytes());
+        fmt.extend_from_slice(&24u16.to_le_bytes());
+        fmt.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        fmt.extend_from_slice(&24u16.to_le_bytes()); // valid bits
+        fmt.extend_from_slice(&4u32.to_le_bytes()); // channel mask
+        fmt.extend_from_slice(&WAVE_FORMAT_PCM.to_le_bytes()); // the GUID's head
+        fmt.extend_from_slice(&[0u8; 14]);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&fmt);
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&[0x00, 0x00, 0x40]);
+        let riff = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&riff.to_le_bytes());
+
+        let (spec, s) = read_pcm(&bytes).unwrap();
+        assert_eq!(spec.format, SampleFormat::Int24);
+        assert!((s[0] - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_data_chunk_that_claims_more_than_it_holds_yields_what_is_really_there() {
+        // A recorder killed mid-take leaves exactly this, and so does a
+        // streaming writer that never patched its header.
+        let mut bytes = build_wav(WAVE_FORMAT_PCM, 16, 2, 48_000, &[0u8; 8], false);
+        let n = bytes.len();
+        bytes[n - 12..n - 8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let (_, s) = read_pcm(&bytes).expect("a truncated take is readable, not an error");
+        assert_eq!(s.len(), 4, "read past the end of the buffer");
+    }
+
+    #[test]
+    fn a_data_chunk_ending_mid_frame_drops_the_fragment_rather_than_swapping_the_channels() {
+        // Three samples in a stereo file. Keeping the odd one puts the right
+        // channel on the left meter for everything appended afterwards.
+        let bytes = build_wav(WAVE_FORMAT_PCM, 16, 2, 48_000, &[1, 0, 2, 0, 3, 0], false);
+        let (_, s) = read_pcm(&bytes).unwrap();
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_wav_is_refused_by_name_rather_than_indexed_into() {
+        assert!(read_pcm(&[]).is_err());
+        assert!(read_pcm(b"RIF").is_err());
+        assert!(read_pcm(&[0u8; 64]).unwrap_err().contains("not a RIFF"));
+        let mut rf64 = vec![0u8; 64];
+        rf64[0..4].copy_from_slice(b"RF64");
+        assert!(read_pcm(&rf64).unwrap_err().contains("RF64"));
+        let mut avi = vec![0u8; 64];
+        avi[0..4].copy_from_slice(b"RIFF");
+        avi[8..12].copy_from_slice(b"AVI ");
+        assert!(read_pcm(&avi).unwrap_err().contains("not WAVE"));
+        // Eight-bit is unsigned, so silence is 0x80 and reading it as signed is
+        // a full-scale DC offset. Refused by name.
+        let eight = build_wav(WAVE_FORMAT_PCM, 8, 1, 48_000, &[0x80, 0x80], false);
+        assert!(read_pcm(&eight).unwrap_err().contains("unsigned"));
+    }
+
+    #[test]
+    fn a_chunk_size_that_would_wrap_the_cursor_ends_the_walk_instead_of_looping() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"JUNK");
+        bytes.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 16]);
+        // No fmt is reachable past a chunk that claims the rest of the address
+        // space, and the loop must terminate rather than hang the app.
+        assert!(read_pcm(&bytes).is_err());
+    }
+
+    #[test]
+    fn the_metronome_asset_decodes_to_half_a_second_of_mono_forty_eight_kilohertz_audio() {
+        // The real file, compiled in. Its measured shape (RECORDER-PLAN §4a's
+        // monitor path): mono, 48 kHz, 24-bit, 0.53 s, with a JUNK chunk in
+        // front of `fmt `. If someone replaces the asset with a stereo or
+        // 44.1 kHz file this test says so before the metronome does.
+        let (spec, samples) = read_pcm(include_bytes!("../../assets/click.wav"))
+            .expect("assets/click.wav must decode");
+        assert_eq!(spec.channels, 1, "the click is mixed into every output channel");
+        assert_eq!(spec.sample_rate, 48_000);
+        assert_eq!(spec.format, SampleFormat::Int24);
+        let seconds = samples.len() as f32 / spec.sample_rate as f32;
+        assert!(
+            (0.4..0.7).contains(&seconds),
+            "the click is {seconds:.3} s, which is not a click"
+        );
+        let peak = samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+        assert!(peak > 0.1, "the click decoded to near-silence (peak {peak})");
+        assert!(
+            samples.iter().all(|s| s.is_finite()),
+            "a non-finite sample in the click would poison every block it is mixed into"
+        );
+    }
 }
