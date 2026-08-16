@@ -34,7 +34,7 @@
 //! unmapped from under them. `Module` therefore does the pairing itself and
 //! deliberately leaks on the failure path.
 
-use std::ffi::{c_void, CStr, OsStr};
+use std::ffi::{c_void, CString, OsStr};
 use std::path::{Path, PathBuf};
 
 use vst3::Steinberg::{IPluginFactory, IPluginFactoryTrait, PClassInfo, PFactoryInfo};
@@ -298,7 +298,7 @@ struct Library {
 
 impl Library {
     fn open(binary: &Path, #[allow(unused)] bundle_path: &Path) -> Result<Self, String> {
-        let c_path = std::ffi::CString::new(binary.as_os_str().as_encoded_bytes())
+        let c_path = CString::new(binary.as_os_str().as_encoded_bytes())
             .map_err(|_| "path contains a NUL".to_string())?;
 
         // SAFETY: `c_path` is a valid NUL-terminated path. RTLD_LOCAL keeps the
@@ -306,19 +306,7 @@ impl Library {
         // plugins built against different versions of the same framework are
         // loaded at once — the classic cause of "loading plugin B breaks plugin
         // A" in every host that gets this wrong.
-        let handle = unsafe { libc_dlopen(c_path.as_ptr(), RTLD_NOW | RTLD_LOCAL) };
-        if handle.is_null() {
-            // SAFETY: dlerror is valid immediately after a failed dlopen.
-            let err = unsafe {
-                let e = libc_dlerror();
-                if e.is_null() {
-                    "unknown error".to_string()
-                } else {
-                    CStr::from_ptr(e).to_string_lossy().into_owned()
-                }
-            };
-            return Err(format!("dlopen failed: {err}"));
-        }
+        let handle = load(&c_path, binary)?;
 
         let mut lib = Self {
             handle,
@@ -375,7 +363,7 @@ impl Library {
             size_of::<*mut c_void>(),
             "T must be pointer-sized"
         );
-        let sym = unsafe { libc_dlsym(self.handle, name.as_ptr().cast()) };
+        let sym = unsafe { find_symbol(self.handle, name.as_ptr().cast()) };
         if sym.is_null() {
             return None;
         }
@@ -400,21 +388,116 @@ impl Drop for Library {
     }
 }
 
-// Minimal dlfcn bindings. `libloading` would do this too, but it is a
-// dependency for three symbols and it does not know about CFBundle.
-const RTLD_NOW: i32 = 2;
-#[cfg(target_os = "macos")]
-const RTLD_LOCAL: i32 = 4;
-#[cfg(not(target_os = "macos"))]
-const RTLD_LOCAL: i32 = 0;
+// ── Loading a shared library, per platform ──────────────────────────────────
+//
+// Split because `dlopen` does not exist on Windows, and `cargo check` will not
+// tell you: a check never links, so this compiled cleanly for the Windows
+// target for as long as it existed and failed only at `cargo xwin build` with
+// three undefined symbols. That is the argument for building the release
+// artifact rather than trusting a check, and it is why `build-cross.sh` has
+// both.
 
-extern "C" {
-    #[link_name = "dlopen"]
-    fn libc_dlopen(path: *const i8, flags: i32) -> *mut c_void;
-    #[link_name = "dlsym"]
-    fn libc_dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
-    #[link_name = "dlerror"]
-    fn libc_dlerror() -> *const i8;
+/// Open the module. The handle is opaque and only [`find_symbol`] reads it.
+#[cfg(not(windows))]
+fn load(c_path: &CString, _binary: &Path) -> Result<*mut c_void, String> {
+    // Imported here rather than at the top of the file: the Windows loader
+    // below has no use for it, and an unconditional import is a warning there.
+    use std::ffi::CStr;
+
+    // Minimal dlfcn bindings. `libloading` would do this too, but it is a
+    // dependency for three symbols and it does not know about CFBundle.
+    const RTLD_NOW: i32 = 2;
+    #[cfg(target_os = "macos")]
+    const RTLD_LOCAL: i32 = 4;
+    #[cfg(not(target_os = "macos"))]
+    const RTLD_LOCAL: i32 = 0;
+
+    extern "C" {
+        #[link_name = "dlopen"]
+        fn libc_dlopen(path: *const i8, flags: i32) -> *mut c_void;
+        #[link_name = "dlerror"]
+        fn libc_dlerror() -> *const i8;
+    }
+
+    // SAFETY: `c_path` is a NUL-terminated path that outlives the call.
+    let handle = unsafe { libc_dlopen(c_path.as_ptr(), RTLD_NOW | RTLD_LOCAL) };
+    if handle.is_null() {
+        // SAFETY: dlerror is valid immediately after a failed dlopen.
+        let err = unsafe {
+            let e = libc_dlerror();
+            if e.is_null() {
+                "unknown error".to_string()
+            } else {
+                CStr::from_ptr(e).to_string_lossy().into_owned()
+            }
+        };
+        return Err(format!("dlopen failed: {err}"));
+    }
+    Ok(handle)
+}
+
+/// `LoadLibraryW`, and the path has to be UTF-16.
+///
+/// The `W` form rather than `A`: plugin directories live under the user's
+/// profile, and a user whose name is not representable in the system code page
+/// cannot load a plugin at all through the ANSI entry point.
+#[cfg(windows)]
+fn load(_c_path: &CString, binary: &Path) -> Result<*mut c_void, String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    extern "system" {
+        fn LoadLibraryW(path: *const u16) -> *mut c_void;
+        fn GetLastError() -> u32;
+    }
+
+    let mut wide: Vec<u16> = binary.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err("path contains a NUL".to_string());
+    }
+    wide.push(0);
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+    if handle.is_null() {
+        // SAFETY: no FFI call happens between the failure and this read.
+        let code = unsafe { GetLastError() };
+        // 126 is ERROR_MOD_NOT_FOUND, which on a plugin almost always means a
+        // DEPENDENCY is missing rather than the plugin itself — the message
+        // says so because "module not found" pointing at a file that plainly
+        // exists is the most confusing error in Windows plugin hosting.
+        let hint = if code == 126 {
+            " (the plugin or one of its dependent DLLs could not be found)"
+        } else {
+            ""
+        };
+        return Err(format!("LoadLibrary failed: error {code}{hint}"));
+    }
+    Ok(handle)
+}
+
+/// Look up an exported symbol. `null` when it is absent.
+///
+/// # Safety
+/// `handle` must be a live handle from [`load`] and `name` a NUL-terminated
+/// symbol name.
+#[cfg(not(windows))]
+unsafe fn find_symbol(handle: *mut c_void, name: *const i8) -> *mut c_void {
+    extern "C" {
+        #[link_name = "dlsym"]
+        fn libc_dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
+    }
+    // SAFETY: the caller's contract is this function's.
+    unsafe { libc_dlsym(handle, name) }
+}
+
+/// # Safety
+/// As above.
+#[cfg(windows)]
+unsafe fn find_symbol(handle: *mut c_void, name: *const i8) -> *mut c_void {
+    extern "system" {
+        fn GetProcAddress(module: *mut c_void, name: *const i8) -> *mut c_void;
+    }
+    // SAFETY: the caller's contract is this function's.
+    unsafe { GetProcAddress(handle, name) }
 }
 
 #[cfg(target_os = "macos")]
