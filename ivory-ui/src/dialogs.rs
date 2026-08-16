@@ -1,19 +1,50 @@
 //! Dialogs (spec §7): MIDI picker (default styling), About (themed, D-UI-6),
-//! color modals (egui picker, themed, D-UI-7), MIDI info/error boxes.
+//! color modals (egui picker, themed, D-UI-7), MIDI info/error boxes, the
+//! custom tuning editor for the guitar view (D-UI-15), and the recorder's
+//! Export dialog (RECORDER-PLAN §5).
 //! Each dialog is its own decorated immediate viewport, like Qt's top-level
-//! dialogs (the fixed-size main window is too small to host them).
+//! dialogs (the fixed-size main window is too small to host them) — or, in a
+//! plugin, a layer in the canvas. `show_dialog_viewport` is the funnel that
+//! makes that the same code, and nothing here may open a window by itself.
 
 use crate::fonts;
 use crate::menu::ColorTarget;
+// `Layout` is taken by egui's own, and the recorder's is the composite's
+// camera-over-display arrangement. Aliased rather than qualified at every use,
+// because `unused_qualifications` is a workspace lint and the two would
+// otherwise have to be spelled out in full on alternate lines.
+use crate::recorder::{
+    DisplayShows, ExportSpec, Layout as VideoLayout, Resolution, VideoMode, FPS_CHOICES, MAX_BPM,
+    MIN_BPM,
+};
 use egui::{
     Align, Button, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Stroke, Vec2,
 };
+use ivory_core::fretboard::{self, Tuning, TuningError, MAX_STRINGS};
+use ivory_core::patterns::{NOTE_NAMES, NOTE_NAMES_FLAT};
 use ivory_core::OverrideInfo;
 
 pub enum Dialog {
     MidiPicker {
         ports: Vec<String>,
         selected: Option<usize>,
+        current: Option<String>,
+    },
+    /// Choose a camera or an audio input for the recorder.
+    ///
+    /// One dialog for both, because the app does exactly the same thing with
+    /// each — the same reason `ports::CaptureDevices` is one trait. Separate
+    /// from [`Dialog::MidiPicker`] despite looking identical, because the
+    /// values are different: a MIDI port is chosen and reported by NAME, and a
+    /// capture device by stable UID. Merging them would mean the merged dialog
+    /// carried both and each caller ignored one.
+    DevicePicker {
+        kind: DeviceKind,
+        devices: Vec<crate::ports::DeviceInfo>,
+        /// `None` is the "None" row, which is a real choice: closing the camera
+        /// is how you record audio-only without unplugging anything.
+        selected: Option<usize>,
+        /// The uid currently open.
         current: Option<String>,
     },
     NoMidiInput,
@@ -78,6 +109,59 @@ pub enum Dialog {
         title: &'static str,
         message: String,
     },
+    /// Build a tuning by hand (the "Custom..." entry under Tuning).
+    ///
+    /// Opened with [`Dialog::custom_tuning`], which seeds it from whatever
+    /// tuning is live — almost every custom tuning is "standard but…", and
+    /// starting from an empty grid would make the common case the slow one.
+    CustomTuning {
+        /// The tuning's name. Free text, and the one field the user must
+        /// actually think about: see [`Problem::NameClash`] for what happens
+        /// when it collides with a preset.
+        name: String,
+        /// One row per string, index 0 the LOWEST — the same order as
+        /// `Tuning::open`, so no reversal happens anywhere except in the
+        /// drawing loop, which paints them highest-first the way tab and every
+        /// chord chart do.
+        strings: Vec<TuningString>,
+        /// Sharps or flats, mirrored from `Settings::prefer_flats` when the
+        /// dialog is opened. Held here rather than read from settings because
+        /// this crate's dialogs are handed their state, and because a tuning
+        /// spelled Eb2 in the editor and D#2 on the piano is the one thing a
+        /// note-name field must never do.
+        prefer_flats: bool,
+        /// Focus and select the name on the first frame, as the other dialogs
+        /// with a prefilled field do.
+        focus: bool,
+    },
+    /// What one take writes (RECORDER-PLAN §5).
+    ///
+    /// Opened with [`Dialog::export`], which is also where the one rule that
+    /// carries real information is applied — see [`Rederivable`].
+    Export {
+        /// The spec being edited.
+        ///
+        /// **`tempo_bpm` in here is the value the dialog OPENED with, not the
+        /// live one.** `tempo_text` is what the user is looking at and
+        /// [`export_ready`] is the single place the two are reconciled; a
+        /// keystroke never writes this field, which is what stops "9" on the
+        /// way to "92" from being stored as 20.
+        spec: ExportSpec,
+        /// Tempo as text, because a partially-typed number is not a number.
+        /// "9" on the way to "92" must not be clamped to 20 under the user's
+        /// cursor.
+        tempo_text: String,
+        /// "Use these settings for every take" — the same one-click
+        /// persistence affordance as the output folder's "Default" tick, and
+        /// it writes to the same place.
+        remember: bool,
+        /// Opened from the result strip after a take rather than before one.
+        /// Camera controls are greyed and the reason is stated.
+        post_take: bool,
+        /// What the finished take actually captured, when `post_take`. Used to
+        /// decide which controls can still do anything.
+        had_camera: bool,
+    },
 }
 
 /// Snapshot of learned-re-ranker state for display.
@@ -118,6 +202,858 @@ pub enum DialogAction {
     },
     /// D-UI-9: discard all learned weights.
     ForgetLearning,
+    /// Adopt a tuning the user built by hand.
+    ///
+    /// It is already valid: the only path to this action is through
+    /// [`confirm`], which builds it with `Tuning::custom`, so the solver's
+    /// monotone invariant holds and the app does not have to check again.
+    ///
+    /// **It cannot be stored the way a preset is.** `Settings` keeps
+    /// `fretboard_tuning` as a NAME, and `Settings::fretboard_spec` resolves
+    /// that name through `Tuning::by_name`, which knows only the preset table:
+    /// a custom tuning saved as a bare name comes back as Standard on the next
+    /// launch, silently. The pitches have to be persisted next to the name.
+    SetCustomTuning(Tuning),
+    /// Use this spec for the rest of this session, without persisting it.
+    ///
+    /// Already valid: the only path to either of these is [`export_ready`], so
+    /// `problem()` is None and the tempo mark is inside `MIN_BPM..=MAX_BPM`.
+    /// The app does not have to check again.
+    /// A capture device was chosen. `None` means the None row: close whatever
+    /// is open and select nothing.
+    ChooseDevice {
+        kind: DeviceKind,
+        uid: Option<String>,
+    },
+    SetExport(ExportSpec),
+    /// As above, and write it to the settings file so every later take starts
+    /// from it. This is the "Use these settings for every take" tick, and it
+    /// goes to the same place the output folder's "Default" tick does.
+    SetExportAndRemember(ExportSpec),
+}
+
+// ── the custom tuning editor ────────────────────────────────────────────────
+//
+// A tuning is six-to-twelve numbers, so the temptation is a row of numeric
+// fields and a Save button. Two things make it more than that.
+//
+// The first is that a guitarist thinks in note names. "The low string is E2"
+// is a sentence; "the low string is 40" is a lookup. Both are offered on every
+// row and they stay in step, and the SPELLING comes from `ivory_core::patterns`
+// rather than a table written here, so the editor cannot start calling a note
+// Eb while the piano above it calls the same note D#.
+//
+// The second is that one of the rules being enforced is load-bearing rather
+// than cosmetic. `Tuning::custom` refuses a tuning whose strings do not ascend,
+// because the voicing solver's search IS the assumption that they do; a tuning
+// that dips does not produce a wrong shape, it produces a search that quietly
+// stops covering real candidates. An editor that answered that with "invalid"
+// would be hiding the only interesting thing it knows, so every refusal here is
+// reported as a reason.
+
+/// The editor as a window. Wide enough that "Remove low string" and "Strings:"
+/// share a line, tall enough that a six-string tuning needs no scrolling.
+const TUNING_DIALOG_W: f32 = 480.0;
+const TUNING_DIALOG_H: f32 = 500.0;
+/// The `Frame` margin on every side. Named rather than inline because the width
+/// the message wraps into is the dialog's less two of these, and the test that
+/// proves the message fits has to measure at exactly that width.
+const TUNING_MARGIN: i8 = 12;
+/// Point size of the message under the string list.
+const TUNING_FOOTER_PT: f32 = 10.0;
+/// Height reserved for that message, whether or not there is one.
+///
+/// Reserved rather than measured per frame, and deliberately generous. A footer
+/// that grew as you typed would walk the button row up and down under the
+/// cursor; a footer reserved too SMALL pushes the confirm button off the bottom
+/// edge, which is the bug the D-UI-9 result box already had once and which only
+/// Esc could get you out of. `the_longest_refusal_fits_the_space_reserved_for_it`
+/// measures the real messages against this rather than trusting the arithmetic.
+const TUNING_FOOTER_H: f32 = 58.0;
+
+/// One editable string in the tuning editor.
+///
+/// The two fields are the same value in two notations, and the invariant is
+/// that `text` is what the user last committed to: it is what [`confirm`] reads
+/// and it is what is on screen. `pitch` is the last value `text` successfully
+/// parsed to, which is what the number spinner drags, and the two can only
+/// disagree while a half-typed name (`"E"`, `"A#"`) sits in the field. Editing
+/// either one writes the other, which is the whole reason both can be offered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TuningString {
+    /// A note name (`E2`, `A#3`, `Db4`) or a bare MIDI number.
+    pub text: String,
+    /// The MIDI pitch of the open string.
+    pub pitch: u8,
+}
+
+impl TuningString {
+    /// A row showing `pitch`, spelled under the caller's accidental
+    /// preference.
+    pub fn new(pitch: u8, prefer_flats: bool) -> Self {
+        Self {
+            text: pitch_name(pitch, prefer_flats),
+            pitch,
+        }
+    }
+}
+
+/// A new low string is tuned a fourth below the one above it.
+///
+/// Not a guess: every extended-range instrument in `TUNINGS` grows downward in
+/// fourths. 7-String is Standard with a low B at 35 (a fourth under the low E
+/// at 40), 8-String is that with a low F# at 30, Bass (5) is Bass (4) with a
+/// low B at 23 under its low E at 28. The test
+/// `adding_a_string_grows_the_low_end_like_a_seven_string` asserts the result
+/// is those presets note for note.
+const ADDED_STRING_DROP: u8 = 5;
+
+/// What a first string is tuned to when there is none to reason from.
+///
+/// Unreachable through the menu — the editor is always seeded from a live
+/// tuning — but `strings` is a `Vec` and a caller may hand over an empty one.
+/// A low E is the string every guitarist would expect to appear.
+const DEFAULT_OPEN_PITCH: u8 = 40;
+
+impl Dialog {
+    /// Open the tuning editor on a copy of `from`.
+    ///
+    /// The name is prefilled with something that is NOT the preset's own name,
+    /// because saving a custom tuning called "Standard" is the trap described
+    /// on [`DialogAction::SetCustomTuning`] — the app would resolve that name
+    /// back to the preset and the user's pitches would be gone. Editing a
+    /// tuning that is already custom keeps its name, which is what "edit"
+    /// means.
+    pub fn custom_tuning(from: &Tuning, prefer_flats: bool) -> Dialog {
+        Dialog::CustomTuning {
+            name: if from.is_preset() {
+                format!("{} (custom)", from.name)
+            } else {
+                from.name.to_string()
+            },
+            strings: rows_for(&from.open, prefer_flats),
+            prefer_flats,
+            focus: true,
+        }
+    }
+}
+
+/// Spell a MIDI pitch the way the rest of the app spells it, with an octave.
+///
+/// The pitch-class table is `ivory_core::patterns`, the same one the chord
+/// strip, the teach layer and the theory panel render from — a second table
+/// here would be a second spelling convention, and the day it disagreed the
+/// fretboard would name a string Eb2 while the piano lit D#.
+///
+/// The octave is scientific pitch notation, MIDI 60 = C4, which is what makes
+/// `TUNINGS`'s Standard read back as the E2 A2 D3 G3 B3 E4 written on every
+/// guitar chart (asserted in the tests, because an off-by-one octave here would
+/// be invisible until a guitarist read it).
+pub fn pitch_name(pitch: u8, prefer_flats: bool) -> String {
+    let names = if prefer_flats {
+        NOTE_NAMES_FLAT
+    } else {
+        NOTE_NAMES
+    };
+    format!("{}{}", names[(pitch % 12) as usize], pitch as i32 / 12 - 1)
+}
+
+/// Read a pitch the way a guitarist writes one.
+///
+/// `Err` carries the hint shown under the field: a parser that can only say
+/// "no" makes the user guess which of six things was wrong, and the six things
+/// are cheap to tell apart here and impossible to tell apart later.
+///
+/// Deliberately more forgiving than [`pitch_name`] is expressive. Sharps and
+/// flats are both accepted whichever the app prefers, case does not matter, and
+/// a bare MIDI number is taken as one — nobody typing a tuning off a forum post
+/// should have to notice which notation it was written in. One thing it does
+/// NOT do is spell by convention across an octave boundary: `Cb2` is read as
+/// "the pitch class of Cb, in octave 2" rather than as B1. No instrument is
+/// tuned to Cb, and the flat table has no Cb in it at all, so inventing a rule
+/// for it here would only create a spelling the rest of the app cannot produce.
+pub fn parse_pitch(text: &str) -> Result<u8, &'static str> {
+    let s = text.trim();
+    if s.is_empty() {
+        return Err("Type a note name like E2, or a MIDI number.");
+    }
+    // A bare number is a MIDI note number. Unambiguous, because no note name is
+    // all digits.
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        return match s.parse::<u32>() {
+            Ok(n) if n <= 127 => Ok(n as u8),
+            _ => Err("A MIDI note number runs from 0 to 127."),
+        };
+    }
+    // Uppercase the LETTER, one character, not the string. `parse_root` matches
+    // 'A'..'G' in upper case only, so "e2" would be thrown out — but
+    // `to_uppercase()` on the whole thing turns "Bb2" into "BB2", which parses
+    // as a B with no accidental and then chokes on the octave. That is the
+    // entire reason this is done by index.
+    let head: String = s
+        .char_indices()
+        .map(|(i, c)| if i == 0 { c.to_ascii_uppercase() } else { c })
+        .collect();
+    // The letter and accidental come from the teach layer's own parser, so this
+    // field accepts exactly the note names "Teach Chord Name" accepts.
+    let Some((pc, rest)) = ivory_core::overrides::parse_root(&head) else {
+        return Err("A pitch starts with a note letter A to G, like E2.");
+    };
+    if rest.is_empty() {
+        return Err("A pitch needs an octave: E2, not E.");
+    }
+    if matches!(rest.as_bytes().first(), Some(b'#' | b'b')) {
+        return Err("One accidental only: E#2 or Eb2.");
+    }
+    let Ok(octave) = rest.parse::<i32>() else {
+        return Err("The octave has to be a number: E2, or E-1 at the very bottom.");
+    };
+    // The inverse of `pitch_name`'s octave, and tested as a round trip in both
+    // directions over the whole MIDI range.
+    let midi = (octave + 1) * 12 + pc as i32;
+    if !(0..=127).contains(&midi) {
+        return Err("That pitch is outside MIDI's 0 to 127.");
+    }
+    Ok(midi as u8)
+}
+
+/// The highest pitch core will accept as an open string.
+///
+/// ASKED, not copied. The ceiling is `MAX_OPEN_PITCH`, a private constant in
+/// `fretboard.rs` that exists because a 24-fret neck adds two octaves and there
+/// has to be MIDI left above the nut for them. A second copy of that number
+/// here would be a number that stops agreeing the day the fret count changes,
+/// and it would stop agreeing silently — the spinner would offer a pitch the
+/// validator refuses. Probing costs 128 calls, once, behind a `OnceLock`.
+fn highest_open_pitch() -> u8 {
+    static CEILING: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *CEILING.get_or_init(|| {
+        (0..=127u8)
+            .rev()
+            .find(|p| Tuning::custom("probe", vec![*p]).is_ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Add a string BELOW the lowest one, tuned a fourth down.
+///
+/// Which end grows is the difference between "add a string" doing the obvious
+/// thing and the annoying one: a 7-string guitar is a 6-string with a low B
+/// added *below*, not a seventh string stapled above the top E. See
+/// [`ADDED_STRING_DROP`] for the evidence that this is the instruments' rule
+/// and not a preference.
+fn add_low_string(strings: &mut Vec<TuningString>, prefer_flats: bool) {
+    if strings.len() >= MAX_STRINGS {
+        // `Tuning::custom` would refuse it, and the solver's leaf count is why
+        // the cap exists at all. The button is disabled here too; this is the
+        // guard that makes the function safe to call anyway.
+        return;
+    }
+    let pitch = strings
+        .first()
+        // Saturating, so the new string can never be tuned ABOVE the one it is
+        // added under — that would be the monotone break the solver cannot
+        // survive, introduced by the button meant to be safe.
+        .map_or(DEFAULT_OPEN_PITCH, |low| {
+            low.pitch.saturating_sub(ADDED_STRING_DROP)
+        });
+    strings.insert(0, TuningString::new(pitch, prefer_flats));
+}
+
+/// Take the lowest string away again: the exact inverse of [`add_low_string`].
+///
+/// It has to be the same end. Press Add then Remove and you must get back what
+/// you had, and the presets shed from that end too — Bass (5) without its low B
+/// is Bass (4), note for note, and 8-String without its low F# is 7-String.
+fn remove_low_string(strings: &mut Vec<TuningString>) {
+    // One string is a legal tuning (a diddley bow, or a work in progress);
+    // none is not, and `Tuning::custom` refuses it.
+    if strings.len() > 1 {
+        strings.remove(0);
+    }
+}
+
+/// A whole set of rows for a tuning's open strings, spelled and in order.
+fn rows_for(open: &[u8], prefer_flats: bool) -> Vec<TuningString> {
+    open.iter()
+        .map(|&p| TuningString::new(p, prefer_flats))
+        .collect()
+}
+
+/// Why the editor will not build a tuning yet, in a form that can be said out
+/// loud.
+///
+/// `Debug` for the tests' sake: a failing assertion has to be able to print the
+/// refusal it did not expect.
+#[derive(Debug)]
+enum Problem {
+    /// A row's text is not a pitch. Carries the string's number counted 1-based
+    /// from the LOW end — the numbering `TuningError` itself uses, so a message
+    /// from here and a message from core point at the same row.
+    Unreadable {
+        string: usize,
+        text: String,
+        hint: &'static str,
+    },
+    /// The name is a preset's, with different pitches behind it.
+    NameClash { preset: String },
+    /// `Tuning::custom` refused it.
+    Refused(TuningError),
+}
+
+impl Problem {
+    /// One sentence of what is wrong, then why it matters.
+    ///
+    /// `NotAscending` and `PitchRange` are re-worded rather than deferred to
+    /// `TuningError`'s own `Display`, for one reason each: core quotes raw MIDI
+    /// numbers ("string 3 is 45"), which is the wrong language to answer
+    /// somebody who is looking at a field that says A2 — and `NotAscending` is
+    /// the one refusal whose reason is worth more than the fact. `StringCount`
+    /// and `EmptyName` already say the whole thing and mention no pitches, so
+    /// they are passed through as core writes them.
+    fn message(&self, prefer_flats: bool) -> String {
+        match self {
+            Problem::Unreadable { string, text, hint } => {
+                format!("String {string}: \"{text}\" is not a pitch. {hint}")
+            }
+            Problem::NameClash { preset } => format!(
+                "\"{preset}\" is already a preset. Tangent saves a tuning by name and looks \
+                 that name back up in the preset table when it starts, so this one would \
+                 return as the preset and your pitches would be gone. Give it a name of its \
+                 own."
+            ),
+            Problem::Refused(TuningError::NotAscending {
+                string,
+                previous,
+                found,
+            }) => format!(
+                "String {} ({}) sounds below string {} ({}). Strings must run low to high, \
+                 and that is not tidiness: the voicing solver searches by assuming each \
+                 string is higher than the last, so a tuning that dips makes it stop finding \
+                 shapes your instrument can really play.",
+                string + 1,
+                pitch_name(*found, prefer_flats),
+                string,
+                pitch_name(*previous, prefer_flats),
+            ),
+            Problem::Refused(TuningError::PitchRange(p)) => format!(
+                "{} is too high for an open string: a 24-fret neck reaches two octaves above \
+                 it and there has to be MIDI left for them. {} is as high as an open string \
+                 goes.",
+                pitch_name(*p, prefer_flats),
+                pitch_name(highest_open_pitch(), prefer_flats),
+            ),
+            Problem::Refused(e) => e.to_string(),
+        }
+    }
+}
+
+/// Build the tuning the editor is currently describing, or say why not.
+///
+/// **The single gate.** The confirm button is enabled on `is_ok()` and the
+/// action is built from the `Ok` value, so "you cannot confirm an invalid
+/// tuning" is one function rather than two conditions that can drift apart.
+///
+/// It reads `text`, never `pitch`: the field is what the user is looking at,
+/// and a tuning built from a number they can no longer see would be a tuning
+/// they did not ask for.
+fn confirm(name: &str, strings: &[TuningString]) -> Result<Tuning, Problem> {
+    let mut open = Vec::with_capacity(strings.len());
+    for (i, row) in strings.iter().enumerate() {
+        match parse_pitch(&row.text) {
+            Ok(p) => open.push(p),
+            Err(hint) => {
+                return Err(Problem::Unreadable {
+                    string: i + 1,
+                    text: row.text.clone(),
+                    hint,
+                })
+            }
+        }
+    }
+    // Checked here rather than in core, because it is not a fact about tunings:
+    // it is a fact about how THIS app stores one. See
+    // `DialogAction::SetCustomTuning`. Identical pitches under a preset's name
+    // are harmless — that is simply the preset — so only a real collision is
+    // refused.
+    if let Some(preset) = Tuning::by_name(name.trim()) {
+        if preset.open.as_ref() != open.as_slice() {
+            return Err(Problem::NameClash {
+                preset: preset.name.to_string(),
+            });
+        }
+    }
+    Tuning::custom(name, open).map_err(Problem::Refused)
+}
+
+// ── the export dialog ───────────────────────────────────────────────────────
+//
+// The owner asked for "a dialog menu with a selector that can include: Camera +
+// Synced sound + Tangent's Display all in one video ALONG with midi in the
+// export", with the other combinations available too. So it is a real selector
+// over a real spec (`recorder::ExportSpec`), and every rule about what is a
+// legal spec lives THERE and is already tested. This file renders it and
+// refuses to commit an invalid one; it does not get a second opinion about
+// what "valid" means.
+//
+// It is reached from two places and they mean different things. From the
+// Recorder band before a take, it chooses what that take will produce. From the
+// result strip after a take, it re-runs the subset that is genuinely
+// re-derivable — and that subset is much smaller than it looks, which is what
+// `Rederivable` is for.
+
+/// Whether the video encoder exists yet.
+///
+/// **It does not** (plan steps 6-7; today only the WAV and the SMF are
+/// written). The whole video section is still drawn, because the layout is the
+/// specified design and it has to be right — but every video mode other than
+/// `None` is greyed and the dialog says so in plain words, because a dialog
+/// that silently promises an `.mp4` nobody will ever find is worse than a
+/// dialog that admits what it can do.
+///
+/// **Flip this to `true` when the encoder lands** and the section comes alive:
+/// it is the only edit, which is the point of it being a constant rather than
+/// eleven scattered conditions that can be half-remembered.
+pub const VIDEO_EXPORT_READY: bool = false;
+
+/// The dialog as a window. Wide enough for the left column and the longest
+/// radio label on one line, tall enough that the §5 mock needs no scrolling
+/// before a take. After one it does, because the reason the camera controls are
+/// dead is worth several lines and the body scrolls rather than the buttons
+/// moving.
+const EXPORT_DIALOG_W: f32 = 560.0;
+const EXPORT_DIALOG_H: f32 = 620.0;
+/// The `Frame` margin on every side; see `TUNING_MARGIN` for why it is named.
+const EXPORT_MARGIN: i8 = 12;
+/// The left column. Every control in the dialog starts at the same x whichever
+/// section it is in, which is what makes the §5 mock read as one form rather
+/// than four stacked ones.
+const EXPORT_LABEL_W: f32 = 148.0;
+/// How far a sub-section's label ("Layout", "Display shows") sits in from a
+/// section's ("Video"). The mock's indentation, in points.
+const EXPORT_SUB_INDENT: f32 = 12.0;
+/// Point size of the footer — the estimate and the refusal.
+const EXPORT_FOOTER_PT: f32 = 10.0;
+/// Height reserved for that footer, whether or not there is a refusal in it.
+///
+/// Reserved rather than measured, for the reason spelled out on
+/// `TUNING_FOOTER_H`: a band that grows as you click walks the button row up
+/// and down under the cursor, and a band reserved too small pushes Export off
+/// the bottom edge where only Esc can reach it.
+/// `the_longest_export_refusal_fits_the_space_reserved_for_it` measures the
+/// real messages against this rather than trusting the arithmetic.
+const EXPORT_FOOTER_H: f32 = 46.0;
+
+/// What a take can still be turned into after it has been recorded.
+///
+/// **This is the one rule in the dialog that carries real information.** Camera
+/// frames are composited and encoded *while the take runs* — §0 rules out
+/// keeping them (one 20-minute 1080p30 take is 112 GB as raw NV12) and there is
+/// no decoder anywhere in this design, so nothing can read the finished file
+/// back. Therefore:
+///
+/// | after Stop | re-derivable? | why |
+/// |---|---|---|
+/// | the SMF tempo mark | yes | rewriting the tempo meta is a file edit |
+/// | a display-only video, any panel selection | yes | replay the recorded `.mid` offline through the compositor; the four `draw` functions are pure painters with no time dependence |
+/// | anything containing the camera | **no** | those frames were composited and encoded live |
+///
+/// It is a value rather than a handful of `if post_take &&` scattered through
+/// the rendering code because getting it wrong offers the user an option that
+/// cannot work, which is worse than not offering it at all — and because a rule
+/// with one home can be tested, which is what
+/// `a_take_recorded_without_a_camera_can_never_gain_one` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rederivable {
+    /// The camera tick, the video modes that imply a camera, and "Match
+    /// camera" — the resolution of a camera that is no longer running.
+    pub camera: bool,
+    /// The composite layout. Fixed after a take even when the take HAD a
+    /// camera: those frames were composited in that arrangement already, so
+    /// "Camera full frame" can never become "Side by side".
+    pub layout: bool,
+    /// The display layer and which panels are in it. Always true: this is the
+    /// half that genuinely survives, because it is repainted from the MIDI.
+    pub display: bool,
+    /// The SMF tempo mark. Always true: it is a file edit.
+    pub tempo: bool,
+    /// Why something is greyed, in words the dialog prints verbatim. `None`
+    /// before a take, when nothing is greyed and there is nothing to explain.
+    pub why: Option<&'static str>,
+}
+
+impl Rederivable {
+    /// Before a take, nothing has happened yet, so nothing is fixed.
+    pub const EVERYTHING: Rederivable = Rederivable {
+        camera: true,
+        layout: true,
+        display: true,
+        tempo: true,
+        why: None,
+    };
+
+    /// Bring a spec down to what this take can actually still produce.
+    ///
+    /// Applied once, when the dialog opens, so it can never OPEN showing a
+    /// camera video it cannot make — the seed comes from the settings file or
+    /// from the last take, and neither of them knows what this take caught.
+    /// After that the user's own ticks stand: a spec they break themselves is
+    /// refused with a reason, not silently re-ticked.
+    pub fn clamp(self, mut spec: ExportSpec) -> ExportSpec {
+        if !self.camera {
+            spec.composite.camera = false;
+            if spec.video.wants_video() {
+                // With the camera layer gone, every multi-file mode collapses
+                // to the one video that is still re-derivable: the display,
+                // replayed offline from the recorded `.mid`. And if the
+                // display is not in it either, there is no video left to make
+                // at all — offering an empty composite would be offering the
+                // option that cannot work.
+                spec.video = if spec.composite.display && spec.composite.shows.any() {
+                    VideoMode::Composite
+                } else {
+                    VideoMode::None
+                };
+            }
+        }
+        spec
+    }
+}
+
+/// The rule, in one place. See [`Rederivable`].
+pub fn rederivable(post_take: bool, had_camera: bool) -> Rederivable {
+    if !post_take {
+        return Rederivable::EVERYTHING;
+    }
+    Rederivable {
+        // False either way, and the reason differs: a take with no camera has
+        // no frames to composite, and a take WITH one has frames that were
+        // already composited and encoded. Neither can be re-made.
+        camera: false,
+        layout: false,
+        display: true,
+        tempo: true,
+        why: Some(if had_camera {
+            "This take's camera was composited and encoded as it ran, in the layout chosen \
+             then, and the frames were never kept — Tangent has no decoder to read them back. \
+             So the camera and the layout are settled now. The tempo mark, and a display-only \
+             video in any panel selection, can still be re-made from the recorded MIDI."
+        } else {
+            "This take was recorded without the camera, and it can never gain one: camera \
+             frames are composited and encoded while the take runs and nothing keeps them. \
+             The tempo mark, and a display-only video in any panel selection, can still be \
+             re-made from the recorded MIDI."
+        }),
+    }
+}
+
+/// Seed "Display shows" from the panels the user actually has on screen.
+///
+/// The video's panel selection then **overrides the live settings, for the
+/// video only** — that is the whole reason `DisplayShows` exists as its own set
+/// of flags rather than the dialog reading `Settings` at render time. Recording
+/// a clean piano-and-chord video while keeping the fretboard on screen for your
+/// own use is the case it is for, and because the compositor drives the same
+/// `draw` functions with its own `Settings` copy, it costs a struct field
+/// rather than a code path.
+pub fn shows_from_settings(s: &crate::settings::Settings) -> DisplayShows {
+    DisplayShows {
+        // No flags to read: the piano and the chord readout are never off.
+        // They are the app.
+        piano: true,
+        chord: true,
+        fretboard: s.show_fretboard,
+        // One tick for three flags, because the theory band is one panel on
+        // screen however many diagrams are inside it. Seeding from
+        // `theory_circle` alone would silently drop somebody who has only the
+        // Tonnetz showing — hence `Views::any`, which is the same question the
+        // band itself asks.
+        theory: s.theory_views().any(),
+    }
+}
+
+/// Read a tempo mark the way somebody types one.
+///
+/// Refuses out of range rather than clamping, and that is the point:
+/// `MIN_BPM..=MAX_BPM` exists because a DAW will happily import 0.001 BPM and
+/// draw a bar ruler several centuries long, and a field that quietly turned a
+/// typed 400 into 300 would be a field the user did not notice lying to them.
+fn parse_bpm(text: &str) -> Result<f64, String> {
+    let s = text.trim();
+    if s.is_empty() {
+        return Err("The tempo mark is a number of beats per minute, like 120.".to_owned());
+    }
+    let Ok(v) = s.parse::<f64>() else {
+        return Err(format!("\"{s}\" is not a tempo. Type a number, like 120."));
+    };
+    if !v.is_finite() || !(MIN_BPM..=MAX_BPM).contains(&v) {
+        return Err(format!(
+            "A tempo mark runs from {MIN_BPM:.0} to {MAX_BPM:.0} BPM. It does not move a single \
+             note — it decides where a DAW's bar lines land."
+        ));
+    }
+    Ok(v)
+}
+
+/// A tempo for the field: `120`, not `120.0`, and `92.5` when it really is.
+fn bpm_text(bpm: f64) -> String {
+    if bpm.fract() == 0.0 {
+        format!("{bpm:.0}")
+    } else {
+        format!("{bpm}")
+    }
+}
+
+/// Build the spec the dialog is currently describing, or say why not.
+///
+/// **The single gate**, exactly as `confirm` is for the tuning editor: the
+/// Export button is enabled on `is_ok()` and the action carries the `Ok` value,
+/// so "you cannot export an invalid spec" is one function rather than two
+/// conditions that drift apart.
+///
+/// The tempo comes from the TEXT, never from `spec.tempo_bpm`, because the text
+/// is what the user is looking at. `problem()` is asked of the spec that would
+/// actually be written, and its own words are used verbatim — a second wording
+/// here would be a second answer to the same question.
+fn export_ready(spec: &ExportSpec, tempo_text: &str) -> Result<ExportSpec, String> {
+    // A tempo mark is written into the SMF and nowhere else, so with no MIDI
+    // there is nothing to validate. Checking anyway would grey Export out over
+    // a stale value in a field that is itself greyed, which is a dead end with
+    // no way for the user to see what it wants.
+    let tempo_bpm = if spec.midi {
+        parse_bpm(tempo_text)?
+    } else {
+        spec.tempo_bpm
+    };
+    let out = ExportSpec { tempo_bpm, ..*spec };
+    match out.problem() {
+        Some(p) => Err(p.message().to_owned()),
+        None => Ok(out),
+    }
+}
+
+/// Which action a commit is. One function, so the tick and the consequence
+/// cannot drift apart.
+fn export_action(spec: ExportSpec, remember: bool) -> DialogAction {
+    if remember {
+        DialogAction::SetExportAndRemember(spec)
+    } else {
+        DialogAction::SetExport(spec)
+    }
+}
+
+/// The footer's first line: what this take costs, in disk and in CPU.
+///
+/// A rate and an encoder count rather than a byte total, because the two
+/// questions somebody actually has are "will this fill my disk" and "will this
+/// stutter while I play". `megabytes_per_minute` and `encoder_count` are the
+/// recorder's own arithmetic; nothing is recomputed here.
+fn estimate_line(spec: &ExportSpec) -> String {
+    let mb = spec.megabytes_per_minute();
+    let encoders = match spec.encoder_count() {
+        0 => "no video encoder".to_owned(),
+        1 => "1 video encoder".to_owned(),
+        n => format!("{n} video encoders"),
+    };
+    format!(
+        "~{mb:.0} MB a minute, about {:.1} GB an hour, {encoders}.",
+        mb * 60.0 / 1000.0
+    )
+}
+
+/// What those encoders cost on the machine this is running on.
+///
+/// Three simultaneous 1080p30 encodes is nothing for VideoToolbox and Media
+/// Foundation and is genuinely expensive for a software encoder, and somebody
+/// about to run three of them deserves to know which one they have *before*
+/// they find out during a take.
+///
+/// `cfg!` and not a probe: this asks about the TARGET, which is where the
+/// dialog will be read, so a Windows build cross-compiled on this Mac still
+/// says Media Foundation.
+fn encoder_note() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Video encoding here runs on VideoToolbox, so three 1080p30 streams cost the CPU almost \
+         nothing."
+    } else if cfg!(target_os = "windows") {
+        "Video encoding here runs on Media Foundation, so three 1080p30 streams cost the CPU \
+         almost nothing."
+    } else {
+        "Video encoding here is a software encoder: every stream is real CPU, and three 1080p30 \
+         streams will be felt while you play."
+    }
+}
+
+/// Said out loud under the video modes while [`VIDEO_EXPORT_READY`] is false.
+const VIDEO_PENDING_NOTE: &str =
+    "Video export is not written yet — it arrives with the encoder. This take will write the \
+     audio and the MIDI. The controls below are the finished design and are greyed until then.";
+
+/// The dialog's left column: a label of a fixed width.
+///
+/// The space is ALLOCATED and the text painted into it, rather than laid out
+/// from the label's own size, because egui advances a sub-layout by what the
+/// child actually used — so "Video" would pull its row's controls left and the
+/// straight column the mock draws would bend.
+fn export_label(ui: &mut egui::Ui, t: &DialogTheme, text: &str, sub: bool) {
+    let h = ui.spacing().interact_size.y;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(EXPORT_LABEL_W, h), egui::Sense::hover());
+    if text.is_empty() {
+        return;
+    }
+    let indent = if sub { EXPORT_SUB_INDENT } else { 0.0 };
+    ui.painter().text(
+        rect.left_center() + Vec2::new(indent, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text,
+        FontId::new(if sub { 10.0 } else { 11.0 }, fonts::courier_bold()),
+        if sub {
+            t.text.gamma_multiply(0.72)
+        } else {
+            t.text
+        },
+    );
+}
+
+/// One themed checkbox that may be greyed.
+///
+/// `add_enabled` fades the whole widget through the painter, which is what
+/// makes a disabled control LOOK disabled rather than merely ignore the click —
+/// and a control that ignores clicks silently is how a user concludes the app
+/// is broken.
+fn export_check(ui: &mut egui::Ui, t: &DialogTheme, enabled: bool, on: &mut bool, label: &str) {
+    let text = RichText::new(label)
+        .font(FontId::new(11.0, fonts::courier_bold()))
+        .color(t.text);
+    ui.add_enabled(enabled, egui::Checkbox::new(on, text));
+}
+
+/// One themed radio button that may be greyed. Sets `current` when chosen.
+fn export_radio<T: PartialEq>(
+    ui: &mut egui::Ui,
+    t: &DialogTheme,
+    enabled: bool,
+    current: &mut T,
+    value: T,
+    label: &str,
+) {
+    let text = RichText::new(label)
+        .font(FontId::new(11.0, fonts::courier_bold()))
+        .color(t.text);
+    if ui
+        .add_enabled(enabled, egui::RadioButton::new(*current == value, text))
+        .clicked()
+    {
+        *current = value;
+    }
+}
+
+/// A wrapped explanatory paragraph, full width. Full width and not in the label
+/// column, because a horizontal layout has infinite width and a long line in
+/// one would run off the edge of the dialog instead of wrapping.
+fn export_para(ui: &mut egui::Ui, t: &DialogTheme, text: &str) {
+    ui.add_space(3.0);
+    ui.label(
+        RichText::new(text)
+            .font(FontId::new(9.0, fonts::courier_bold()))
+            .color(t.text.gamma_multiply(0.72)),
+    );
+    ui.add_space(3.0);
+}
+
+impl Dialog {
+    /// Open the Export dialog on `spec`.
+    ///
+    /// `post_take` is the difference between the dialog's two entry points and
+    /// they mean different things: from the Recorder band's `Export...` button
+    /// it chooses what the NEXT take produces, and from the result strip after
+    /// a take it re-runs what is genuinely re-derivable from the one just
+    /// finished. `had_camera` is what that finished take actually caught.
+    ///
+    /// The spec is [`Rederivable::clamp`]ed on the way in, so a dialog opened
+    /// after a take can never OPEN promising a camera video that cannot exist —
+    /// the seed comes from the settings file or the last take, and neither of
+    /// them knows what this take caught.
+    ///
+    /// The app opens it like this:
+    ///
+    /// ```ignore
+    /// let mut spec = /* the remembered ExportSpec, or ExportSpec::default() */;
+    /// spec.composite.shows = dialogs::shows_from_settings(&self.settings);
+    /// self.dialog = Some(Dialog::export(spec, false, false));   // before a take
+    /// self.dialog = Some(Dialog::export(spec, true, take.had_camera)); // after one
+    /// ```
+    ///
+    /// and drains `DialogAction::SetExport` / `SetExportAndRemember`, the
+    /// second of which also writes the spec to settings.
+    pub fn export(spec: ExportSpec, post_take: bool, had_camera: bool) -> Dialog {
+        let mut spec = rederivable(post_take, had_camera).clamp(spec);
+        if !VIDEO_EXPORT_READY {
+            // Honesty, in the same edit as the greying: while there is no
+            // encoder, a remembered `video` from the settings file would
+            // otherwise be committed as a promise of a file that will never
+            // appear. Delete these three lines when the constant flips.
+            spec.video = VideoMode::None;
+        }
+        Dialog::Export {
+            tempo_text: bpm_text(spec.tempo_bpm),
+            spec,
+            remember: false,
+            post_take,
+            had_camera,
+        }
+    }
+}
+
+/// Which kind of device a [`Dialog::DevicePicker`] is choosing.
+///
+/// Carries its own copy through the action so the app does not have to remember
+/// which picker it opened — the answer arrives saying what question it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Camera,
+    AudioInput,
+}
+
+impl DeviceKind {
+    pub fn title(self) -> &'static str {
+        match self {
+            DeviceKind::Camera => "Select Camera",
+            DeviceKind::AudioInput => "Select Audio Input",
+        }
+    }
+
+    fn prompt(self) -> &'static str {
+        match self {
+            DeviceKind::Camera => "Camera to record and preview:",
+            DeviceKind::AudioInput => "Audio input to record:",
+        }
+    }
+
+    /// What the None row says. Not just "None": what choosing it DOES is the
+    /// part worth spelling out, because a recorder with no camera is a normal
+    /// thing to want and a recorder with no audio input is usually a mistake.
+    fn none_row(self) -> &'static str {
+        match self {
+            DeviceKind::Camera => "None  —  record without video",
+            DeviceKind::AudioInput => "None  —  record MIDI only",
+        }
+    }
+
+    fn nothing_found(self) -> &'static str {
+        match self {
+            DeviceKind::Camera => {
+                "No cameras found. If one is connected, Tangent may not have \
+                 been granted camera access yet — check System Settings > \
+                 Privacy & Security."
+            }
+            DeviceKind::AudioInput => {
+                "No audio inputs found. If an interface is connected, Tangent \
+                 may not have been granted microphone access yet — check \
+                 System Settings > Privacy & Security."
+            }
+        }
+    }
 }
 
 /// Stable surface identity: a viewport id on the desktop, an `Area` id in a
@@ -315,6 +1251,99 @@ pub fn show(
     let mut action = None;
 
     let result = match dialog {
+        Dialog::DevicePicker {
+            kind,
+            devices,
+            selected,
+            current,
+        } => {
+            let kind = *kind;
+            let stock = stock_style(ctx);
+            show_dialog_viewport(
+                ctx,
+                placement,
+                kind.title(),
+                Vec2::new(420.0, 320.0),
+                Vec2::new(360.0, 200.0),
+                |ui, result| {
+                    *ui.style_mut() = stock.clone();
+                    let bg = ui.style().visuals.window_fill;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.label(kind.prompt());
+                            if devices.is_empty() {
+                                // Not an empty list with an OK button. On macOS
+                                // an empty world is what a missing entitlement
+                                // looks like, and on every platform it is what
+                                // an unplugged interface looks like — either
+                                // way a silent empty box teaches nothing.
+                                ui.add_space(8.0);
+                                ui.label(kind.nothing_found());
+                            }
+                            ui.add_space(4.0);
+                            let bottom_h = 34.0;
+                            let list_h = (ui.available_height() - bottom_h).max(40.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(list_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    // The None row first, and always present.
+                                    if ui
+                                        .selectable_label(selected.is_none(), kind.none_row())
+                                        .clicked()
+                                    {
+                                        *selected = None;
+                                    }
+                                    for (i, d) in devices.iter().enumerate() {
+                                        // The default is MARKED, not
+                                        // preselected: "System Default" has to
+                                        // stay a visible choice, or somebody
+                                        // with two interfaces cannot tell which
+                                        // one they are about to get.
+                                        let label = if d.default {
+                                            format!("{}   (system default)", d.name)
+                                        } else {
+                                            d.name.clone()
+                                        };
+                                        let live = current.as_deref() == Some(d.uid.as_str());
+                                        let label = if live {
+                                            format!("{label}  \u{2022}")
+                                        } else {
+                                            label
+                                        };
+                                        if ui.selectable_label(*selected == Some(i), label).clicked()
+                                        {
+                                            *selected = Some(i);
+                                        }
+                                    }
+                                });
+                            ui.add_space(6.0);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("OK").clicked() {
+                                    // An out-of-range index cannot happen from
+                                    // the UI, but the list is rebuilt from live
+                                    // hardware every time this opens — so it is
+                                    // resolved through `get` rather than
+                                    // indexed, and a device unplugged while the
+                                    // dialog was open selects nothing instead
+                                    // of panicking.
+                                    let uid = selected
+                                        .and_then(|i| devices.get(i))
+                                        .map(|d| d.uid.clone());
+                                    action = Some(DialogAction::ChooseDevice { kind, uid });
+                                    result.close = true;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
         Dialog::MidiPicker {
             ports,
             selected,
@@ -1099,6 +2128,632 @@ pub fn show(
             }
             r
         }
+
+        Dialog::CustomTuning {
+            name,
+            strings,
+            prefer_flats,
+            focus,
+        } => {
+            let t = theme(dark_mode);
+            let flats = *prefer_flats;
+            // Asked once, outside the loop: see `highest_open_pitch`. The
+            // spinner is clamped to it, so the one refusal a user could hit by
+            // dragging is not reachable by dragging at all.
+            let ceiling = highest_open_pitch();
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Custom Tuning",
+                Vec2::new(TUNING_DIALOG_W, TUNING_DIALOG_H),
+                Vec2::new(440.0, 320.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    // Text fields and number spinners paint their interiors on
+                    // `extreme_bg_color`, which is stock near-black otherwise:
+                    // a row of holes punched through a themed dialog.
+                    ui.visuals_mut().extreme_bg_color = t.bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    let faint = t.text.gamma_multiply(0.72);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(TUNING_MARGIN))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Name:").font(bold(11.0)).color(t.text));
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(name)
+                                        .font(bold(12.0))
+                                        .text_color(t.text)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                if *focus {
+                                    *focus = false;
+                                    focus_and_select_all(ui, &resp, name);
+                                }
+                            });
+
+                            // ── start from a preset ─────────────────────────
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("Start from:").font(bold(10.0)).color(faint),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                for preset in fretboard::TUNINGS {
+                                    // Marked while the rows still hold exactly
+                                    // this preset's pitches, so "standard
+                                    // but…" stops claiming to be standard the
+                                    // moment it stops being standard.
+                                    let untouched = strings.len() == preset.open.len()
+                                        && strings
+                                            .iter()
+                                            .zip(preset.open.iter())
+                                            .all(|(row, p)| row.pitch == *p);
+                                    if ui
+                                        .selectable_label(
+                                            untouched,
+                                            RichText::new(preset.name.as_ref())
+                                                .font(bold(10.0))
+                                                .color(t.text),
+                                        )
+                                        .clicked()
+                                    {
+                                        // Pitches ONLY. The name belongs to
+                                        // the user: it is typed once while the
+                                        // presets are clicked several times
+                                        // trying them on, so overwriting it
+                                        // would throw away typing that cannot
+                                        // be got back.
+                                        *strings = rows_for(&preset.open, flats);
+                                    }
+                                }
+                            });
+
+                            // ── how many strings ────────────────────────────
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("Strings: {}", strings.len()))
+                                        .font(bold(11.0))
+                                        .color(t.text),
+                                );
+                                ui.add_space(6.0);
+                                // Buttons rather than a count field, and the
+                                // word "low" in both labels, because the count
+                                // alone cannot say WHICH end changes — and
+                                // which end changes is the whole difference
+                                // between the obvious behaviour and the
+                                // annoying one (see `add_low_string`).
+                                if ui
+                                    .add_enabled(
+                                        strings.len() < MAX_STRINGS,
+                                        Button::new(
+                                            RichText::new("Add low string").color(t.text),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    add_low_string(strings, flats);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        strings.len() > 1,
+                                        Button::new(
+                                            RichText::new("Remove low string").color(t.text),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    remove_low_string(strings);
+                                }
+                            });
+
+                            // ── the strings themselves ──────────────────────
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(
+                                    "Highest string at the top. They are numbered from the \
+                                     LOWEST, the way the message below counts them.",
+                                )
+                                .font(bold(9.0))
+                                .color(faint),
+                            );
+                            // The interval up from the string below. A player
+                            // reads a tuning by its gaps — standard is
+                            // 5 5 5 4 5 — and a NEGATIVE one is the monotone
+                            // break made visible before Create is even
+                            // reached. Snapshotted before the rows are drawn
+                            // because a row cannot see its neighbour through
+                            // an `iter_mut`; one frame of lag on a decoration.
+                            let gaps: Vec<Option<i16>> = strings
+                                .iter()
+                                .enumerate()
+                                .map(|(i, row)| {
+                                    i.checked_sub(1).map(|below| {
+                                        row.pitch as i16 - strings[below].pitch as i16
+                                    })
+                                })
+                                .collect();
+                            // The message band, the button row, and the space
+                            // between them. See `TUNING_FOOTER_H` for why the
+                            // band is a reservation rather than a measurement.
+                            let bottom_h = TUNING_FOOTER_H + 34.0 + 8.0;
+                            let list_h = (ui.available_height() - bottom_h).max(40.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(list_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    // Drawn highest-first, which is how tab and
+                                    // every chord chart are read, while the
+                                    // numbering still counts from the lowest
+                                    // string so it agrees with `TuningError`.
+                                    for (i, row) in strings.iter_mut().enumerate().rev() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(format!("{:>2}", i + 1))
+                                                    .font(bold(11.0))
+                                                    .color(faint),
+                                            );
+                                            let typed = ui.add(
+                                                egui::TextEdit::singleline(&mut row.text)
+                                                    .font(bold(12.0))
+                                                    .text_color(t.text)
+                                                    .desired_width(58.0),
+                                            );
+                                            if typed.changed() {
+                                                // A row whose text does not
+                                                // parse keeps the last pitch
+                                                // that did, so the spinner
+                                                // never shows a number nobody
+                                                // chose while a name is
+                                                // half-typed.
+                                                if let Ok(p) = parse_pitch(&row.text) {
+                                                    row.pitch = p;
+                                                }
+                                            }
+                                            let dragged = ui.add(
+                                                egui::DragValue::new(&mut row.pitch)
+                                                    .range(0..=ceiling),
+                                            );
+                                            if dragged.changed() {
+                                                // `confirm` reads the FIELD, so
+                                                // a spinner that moved the
+                                                // number without rewriting the
+                                                // text would build a tuning out
+                                                // of a value the user can no
+                                                // longer see.
+                                                row.text = pitch_name(row.pitch, flats);
+                                            }
+                                            if let Some(Some(gap)) = gaps.get(i) {
+                                                ui.label(
+                                                    RichText::new(format!("{gap:+}"))
+                                                        .font(bold(10.0))
+                                                        // Full strength when it
+                                                        // descends: the theme
+                                                        // has no error colour,
+                                                        // and weight is the one
+                                                        // emphasis that works
+                                                        // in both themes.
+                                                        .color(if *gap < 0 {
+                                                            t.text
+                                                        } else {
+                                                            faint
+                                                        }),
+                                                );
+                                            }
+                                        });
+                                    }
+                                });
+
+                            // ── what is wrong, or what will be made ─────────
+                            //
+                            // Computed AFTER the rows are drawn, so the message
+                            // answers this frame's keystroke rather than the
+                            // one before it, and always occupies the same band
+                            // whether it is a complaint or a confirmation.
+                            let ready = confirm(name, strings);
+                            let footer = match &ready {
+                                Ok(built) => format!(
+                                    "{} strings: {}",
+                                    built.strings(),
+                                    built
+                                        .open
+                                        .iter()
+                                        .map(|&p| pitch_name(p, flats))
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                ),
+                                Err(problem) => problem.message(flats),
+                            };
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(footer)
+                                    .font(bold(TUNING_FOOTER_PT))
+                                    .color(if ready.is_ok() { faint } else { t.text }),
+                            );
+
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add_enabled(
+                                        ready.is_ok(),
+                                        Button::new(RichText::new("Use Tuning").color(t.text)),
+                                    )
+                                    .clicked()
+                                {
+                                    // Closes only by producing a tuning. A
+                                    // disabled button cannot be clicked, so
+                                    // this is belt and braces — but the belt is
+                                    // that there is exactly one place a
+                                    // `Tuning` is built, and it is the same
+                                    // value that enabled the button.
+                                    if let Ok(built) = &ready {
+                                        action = Some(DialogAction::SetCustomTuning(
+                                            built.clone(),
+                                        ));
+                                        result.close = true;
+                                    }
+                                }
+                                if ui
+                                    .add(Button::new(RichText::new("Cancel").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
+        Dialog::Export {
+            spec,
+            tempo_text,
+            remember,
+            post_take,
+            had_camera,
+        } => {
+            let t = theme(dark_mode);
+            let post_take = *post_take;
+            // Asked once, outside the drawing, because every greyed control in
+            // the dialog is greyed by this one value. See `Rederivable`.
+            let can = rederivable(post_take, *had_camera);
+            show_dialog_viewport(
+                ctx,
+                placement,
+                // The two entry points mean different things and the title bar
+                // is the cheapest place to say which one this is.
+                if post_take {
+                    "Export This Take"
+                } else {
+                    "Export"
+                },
+                Vec2::new(EXPORT_DIALOG_W, EXPORT_DIALOG_H),
+                Vec2::new(470.0, 340.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    // The tempo field paints its interior on `extreme_bg_color`
+                    // — stock near-black otherwise, a hole punched through a
+                    // themed dialog. Same trap as the tuning editor.
+                    ui.visuals_mut().extreme_bg_color = t.bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    let faint = t.text.gamma_multiply(0.72);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(EXPORT_MARGIN))
+                        .show(ui, |ui| {
+                            // The footer band and the button row are reserved
+                            // first; everything else scrolls. Inline in a
+                            // plugin the canvas can be shorter than the
+                            // dialog, and Export has to stay reachable there
+                            // too — that is the whole reason the funnel exists.
+                            let bottom_h = EXPORT_FOOTER_H + 34.0 + 8.0;
+                            let body_h = (ui.available_height() - bottom_h).max(60.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(body_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    // ── always written ──────────────────────
+                                    //
+                                    // No filenames here, unlike the §5 mock:
+                                    // the take's name is built by
+                                    // `ivory_record::take` and this crate is
+                                    // never handed it (see `recorder.rs` on why
+                                    // the band is given strings rather than
+                                    // computing them). What each file IS is the
+                                    // part the dialog can say truthfully.
+                                    ui.horizontal(|ui| {
+                                        export_label(ui, &t, "Always written", false);
+                                        export_check(ui, &t, true, &mut spec.audio, "Audio");
+                                        ui.label(
+                                            RichText::new("48 kHz 24-bit stereo .wav")
+                                                .font(bold(9.0))
+                                                .color(faint),
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        export_label(ui, &t, "", false);
+                                        export_check(ui, &t, true, &mut spec.midi, "MIDI");
+                                        ui.label(
+                                            RichText::new("SMF 1, 960 ppq, tick 0 at take start")
+                                                .font(bold(9.0))
+                                                .color(faint),
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        export_label(ui, &t, "", false);
+                                        // Live after a take: rewriting the
+                                        // tempo meta is a file edit, which is
+                                        // the one thing on this dialog that is
+                                        // re-derivable without question. Dead
+                                        // with no MIDI, because there would be
+                                        // no file to write it into.
+                                        let tempo_on = can.tempo && spec.midi;
+                                        ui.label(
+                                            RichText::new("Tempo mark")
+                                                .font(bold(11.0))
+                                                .color(t.text),
+                                        );
+                                        ui.add_enabled(
+                                            tempo_on,
+                                            egui::TextEdit::singleline(tempo_text)
+                                                .font(bold(12.0))
+                                                .text_color(t.text)
+                                                .desired_width(52.0),
+                                        );
+                                        ui.label(
+                                            RichText::new("BPM").font(bold(11.0)).color(t.text),
+                                        );
+                                    });
+
+                                    // ── video ───────────────────────────────
+                                    ui.add_space(6.0);
+                                    for (i, m) in VideoMode::ALL.into_iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            export_label(
+                                                ui,
+                                                &t,
+                                                if i == 0 { "Video" } else { "" },
+                                                false,
+                                            );
+                                            export_radio(
+                                                ui,
+                                                &t,
+                                                m == VideoMode::None || VIDEO_EXPORT_READY,
+                                                &mut spec.video,
+                                                m,
+                                                m.label(),
+                                            );
+                                        });
+                                    }
+                                    if !VIDEO_EXPORT_READY {
+                                        export_para(ui, &t, VIDEO_PENDING_NOTE);
+                                    }
+
+                                    // ── what is in the composite ────────────
+                                    //
+                                    // The camera and display ticks are read by
+                                    // the per-source modes too (they are what
+                                    // `encoder_count` counts), so they follow
+                                    // "is there a video at all" rather than
+                                    // "is there a composite". The layout is the
+                                    // only control that is about the composite
+                                    // specifically.
+                                    let video_on = spec.video.wants_video();
+                                    let composite_on = spec.video.has_composite();
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        export_label(ui, &t, "Composite contains", true);
+                                        export_check(
+                                            ui,
+                                            &t,
+                                            video_on && can.camera,
+                                            &mut spec.composite.camera,
+                                            "Camera",
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        export_label(ui, &t, "", true);
+                                        export_check(
+                                            ui,
+                                            &t,
+                                            video_on,
+                                            &mut spec.composite.display,
+                                            "Tangent's display",
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        export_label(ui, &t, "", true);
+                                        export_check(
+                                            ui,
+                                            &t,
+                                            video_on,
+                                            &mut spec.composite.audio,
+                                            "Performance audio",
+                                        );
+                                    });
+                                    for (i, l) in VideoLayout::ALL.into_iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            export_label(
+                                                ui,
+                                                &t,
+                                                if i == 0 { "Layout" } else { "" },
+                                                true,
+                                            );
+                                            export_radio(
+                                                ui,
+                                                &t,
+                                                composite_on && can.layout,
+                                                &mut spec.composite.layout,
+                                                l,
+                                                l.label(),
+                                            );
+                                        });
+                                    }
+                                    // Said here rather than at the bottom,
+                                    // because it is the answer to "why can I
+                                    // not click these".
+                                    if let Some(why) = can.why {
+                                        export_para(ui, &t, why);
+                                    }
+
+                                    // ── which panels the display draws ──────
+                                    //
+                                    // The app's own panel names, not a second
+                                    // vocabulary invented for the video. These
+                                    // override the live settings FOR THE VIDEO
+                                    // ONLY — recording a clean piano-and-chord
+                                    // video while keeping the fretboard on
+                                    // screen for your own use is the case this
+                                    // exists for. `shows_from_settings` seeds
+                                    // them.
+                                    let shows_on =
+                                        video_on && spec.composite.display && can.display;
+                                    ui.horizontal(|ui| {
+                                        export_label(ui, &t, "Display shows", true);
+                                        export_check(
+                                            ui,
+                                            &t,
+                                            shows_on,
+                                            &mut spec.composite.shows.piano,
+                                            "Piano",
+                                        );
+                                        export_check(
+                                            ui,
+                                            &t,
+                                            shows_on,
+                                            &mut spec.composite.shows.chord,
+                                            "Chord name",
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        export_label(ui, &t, "", true);
+                                        export_check(
+                                            ui,
+                                            &t,
+                                            shows_on,
+                                            &mut spec.composite.shows.fretboard,
+                                            "Fretboard",
+                                        );
+                                        export_check(
+                                            ui,
+                                            &t,
+                                            shows_on,
+                                            &mut spec.composite.shows.theory,
+                                            "Theory",
+                                        );
+                                    });
+
+                                    // ── frame size and rate ─────────────────
+                                    ui.add_space(6.0);
+                                    for (i, chunk) in Resolution::ALL.chunks(2).enumerate() {
+                                        ui.horizontal(|ui| {
+                                            export_label(
+                                                ui,
+                                                &t,
+                                                if i == 0 { "Resolution" } else { "" },
+                                                true,
+                                            );
+                                            for &r in chunk {
+                                                // "Match camera" after a take
+                                                // would be matching a camera
+                                                // that is not running and whose
+                                                // frames were never kept.
+                                                let on = video_on
+                                                    && (r != Resolution::MatchCamera || can.camera);
+                                                export_radio(
+                                                    ui,
+                                                    &t,
+                                                    on,
+                                                    &mut spec.resolution,
+                                                    r,
+                                                    r.label(),
+                                                );
+                                            }
+                                        });
+                                    }
+                                    ui.horizontal(|ui| {
+                                        export_label(ui, &t, "Frame rate", true);
+                                        for f in FPS_CHOICES {
+                                            export_radio(
+                                                ui,
+                                                &t,
+                                                video_on,
+                                                &mut spec.fps,
+                                                f,
+                                                &format!("{f} fps"),
+                                            );
+                                        }
+                                    });
+                                    export_para(ui, &t, encoder_note());
+                                });
+
+                            // ── what it costs, or what is wrong ─────────────
+                            //
+                            // Computed AFTER the body, so the footer answers
+                            // this frame's click rather than the one before it,
+                            // and occupying the same band either way so the
+                            // buttons do not walk under the cursor.
+                            let built = export_ready(spec, tempo_text);
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(estimate_line(spec))
+                                    .font(bold(EXPORT_FOOTER_PT))
+                                    .color(faint),
+                            );
+                            if let Err(why) = &built {
+                                ui.label(
+                                    RichText::new(why.as_str())
+                                        .font(bold(EXPORT_FOOTER_PT))
+                                        .color(t.text),
+                                );
+                            }
+
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.horizontal(|ui| {
+                                let mut keep = *remember;
+                                if ui
+                                    .checkbox(
+                                        &mut keep,
+                                        RichText::new("Use these settings for every take")
+                                            .font(bold(11.0))
+                                            .color(t.text),
+                                    )
+                                    .changed()
+                                {
+                                    *remember = keep;
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            built.is_ok(),
+                                            Button::new(RichText::new("Export").color(t.text)),
+                                        )
+                                        .clicked()
+                                    {
+                                        // Closes only by producing a spec, and
+                                        // it is the same value that enabled the
+                                        // button — `export_ready` is the one
+                                        // gate, so nothing invalid can reach
+                                        // the app even if the button were
+                                        // somehow clicked while greyed.
+                                        if let Ok(s) = &built {
+                                            action = Some(export_action(*s, *remember));
+                                            result.close = true;
+                                        }
+                                    }
+                                    if ui
+                                        .add(Button::new(RichText::new("Cancel").color(t.text)))
+                                        .clicked()
+                                    {
+                                        result.close = true;
+                                    }
+                                });
+                            });
+                        });
+                },
+            )
+        }
     };
 
     if result.close {
@@ -1163,5 +2818,852 @@ mod tests {
         assert!(p.x >= 0.0 && p.y >= 0.0, "pushed off the top-left: {p:?}");
         assert!(p.x + size.x <= 2560.0 + 0.5, "hangs off the right: {p:?}");
         assert!(p.y + size.y <= 1440.0 + 0.5, "hangs off the bottom: {p:?}");
+    }
+
+    // ── the custom tuning editor ────────────────────────────────────────────
+
+    /// Rows built from what somebody would actually type.
+    fn rows(texts: &[&str]) -> Vec<TuningString> {
+        texts
+            .iter()
+            .map(|s| TuningString {
+                text: (*s).to_owned(),
+                pitch: parse_pitch(s).unwrap_or(0),
+            })
+            .collect()
+    }
+
+    fn pitches(rows: &[TuningString]) -> Vec<u8> {
+        rows.iter().map(|r| r.pitch).collect()
+    }
+
+    fn preset(name: &str) -> Vec<u8> {
+        Tuning::by_name(name)
+            .unwrap_or_else(|| panic!("{name} is not in TUNINGS any more"))
+            .open
+            .to_vec()
+    }
+
+    /// A note name has to survive the trip out to the field and back, in the
+    /// spelling the app prefers — otherwise the editor would rewrite a string
+    /// the user typed into a different one the moment they touched the spinner.
+    #[test]
+    fn note_names_and_midi_numbers_round_trip_in_the_spelling_the_app_prefers() {
+        for prefer_flats in [true, false] {
+            for pitch in 0..=127u8 {
+                let name = pitch_name(pitch, prefer_flats);
+                assert_eq!(
+                    parse_pitch(&name),
+                    Ok(pitch),
+                    "{name} did not come back as {pitch}"
+                );
+            }
+        }
+        // The app prefers flats (`ChordDetector::new`, `Settings::default`),
+        // and a string has to be spelled the way the piano above it spells the
+        // same note. This is the assertion that would fail if the editor grew
+        // its own note table.
+        assert_eq!(pitch_name(61, true), "Db4");
+        assert_eq!(pitch_name(61, false), "C#4");
+        // Both spellings are READ whichever is preferred, and case is not a
+        // spelling: nobody copying a tuning off a forum post holds shift for it.
+        for text in ["Db4", "C#4", "db4", "c#4", " Db4 ", "61"] {
+            assert_eq!(parse_pitch(text), Ok(61), "{text:?} was not read as Db4");
+        }
+        // Standard must read back as the E A D G B E written on every guitar
+        // chart, in the octaves a guitarist would write. An off-by-one octave
+        // is invisible until somebody who plays reads it.
+        let standard: Vec<String> = Tuning::standard()
+            .open
+            .iter()
+            .map(|&p| pitch_name(p, true))
+            .collect();
+        assert_eq!(standard, ["E2", "A2", "D3", "G3", "B3", "E4"]);
+        // Both ends of MIDI, where the octave arithmetic goes negative.
+        assert_eq!(pitch_name(0, true), "C-1");
+        assert_eq!(parse_pitch("C-1"), Ok(0));
+        assert_eq!(parse_pitch("G9"), Ok(127));
+
+        // A parser that can only say "no" makes the user guess which of six
+        // things was wrong, so each refusal names its own.
+        for (bad, must_mention) in [
+            ("", "note name"),
+            ("   ", "note name"),
+            ("H2", "A to G"),
+            ("E", "octave"),
+            ("E#b2", "accidental"),
+            ("Ex", "octave"),
+            ("C-3", "MIDI"),
+            ("300", "0 to 127"),
+        ] {
+            let hint = parse_pitch(bad).expect_err(&format!("{bad:?} was read as a pitch"));
+            assert!(
+                hint.contains(must_mention),
+                "{bad:?} was refused with {hint:?}, which never mentions {must_mention:?}"
+            );
+        }
+    }
+
+    /// Every way a tuning can be refused has to arrive as a REASON. The one
+    /// that matters is `NotAscending`: it is not a style rule, it is the
+    /// voicing solver's search invariant, and "invalid" would be hiding the
+    /// only interesting thing the editor knows.
+    #[test]
+    fn every_reason_a_tuning_can_be_refused_reaches_the_user_as_a_reason() {
+        // Listed one by one on purpose: a variant added to `TuningError` later
+        // must be given words here too.
+        for e in [
+            TuningError::StringCount(0),
+            TuningError::StringCount(MAX_STRINGS + 1),
+            TuningError::NotAscending {
+                string: 2,
+                previous: 50,
+                found: 45,
+            },
+            TuningError::PitchRange(120),
+            TuningError::EmptyName,
+        ] {
+            let msg = Problem::Refused(e.clone()).message(true);
+            assert!(msg.len() > 20, "{e:?} was answered with {msg:?}");
+            assert!(
+                !msg.to_lowercase().contains("invalid"),
+                "{e:?} was answered with \"invalid\", which is not a reason: {msg:?}"
+            );
+        }
+
+        let ascending = Problem::Refused(TuningError::NotAscending {
+            string: 2,
+            previous: 50,
+            found: 45,
+        })
+        .message(true);
+        // Note names, not MIDI numbers: the user is looking at a field that
+        // says A2. This is the whole reason core's `Display` is not reused for
+        // this variant.
+        assert!(
+            ascending.contains("A2") && ascending.contains("D3"),
+            "not in the notation the fields use: {ascending}"
+        );
+        assert!(
+            !ascending.contains("45") && !ascending.contains("50"),
+            "raw MIDI numbers leaked into a note-name editor: {ascending}"
+        );
+        // 1-based from the LOW end, the way `TuningError` counts, so the
+        // message and the row numbers on screen point at the same string.
+        assert!(
+            ascending.contains("String 3") && ascending.contains("string 2"),
+            "the wrong string is accused: {ascending}"
+        );
+        assert!(
+            ascending.contains("solver") && ascending.contains("shapes"),
+            "the reason is missing, so this reads as a taste rule: {ascending}"
+        );
+
+        let too_high = Problem::Refused(TuningError::PitchRange(120)).message(true);
+        assert!(too_high.contains("C9"), "which pitch? {too_high}");
+        assert!(
+            too_high.contains(&pitch_name(highest_open_pitch(), true)),
+            "refused without saying what would be accepted: {too_high}"
+        );
+
+        let unreadable = Problem::Unreadable {
+            string: 3,
+            text: "Q9".to_owned(),
+            hint: parse_pitch("Q9").expect_err("Q is not a note"),
+        }
+        .message(true);
+        assert!(
+            unreadable.contains("String 3") && unreadable.contains("Q9"),
+            "{unreadable}"
+        );
+
+        let clash = Problem::NameClash {
+            preset: "Standard".to_owned(),
+        }
+        .message(true);
+        assert!(clash.contains("Standard"), "{clash}");
+        assert!(
+            clash.contains("name"),
+            "the fix is to rename it, and the message has to say so: {clash}"
+        );
+    }
+
+    /// A seventh string is a low B added BELOW the low E, not a string stapled
+    /// above the top one, and the shipped presets settle it rather than taste:
+    /// this asserts the result is `TUNINGS`'s own 7- and 8-string tunings, note
+    /// for note.
+    #[test]
+    fn adding_a_string_grows_the_low_end_like_a_seven_string() {
+        let mut r: Vec<TuningString> = Tuning::standard()
+            .open
+            .iter()
+            .map(|&p| TuningString::new(p, true))
+            .collect();
+
+        add_low_string(&mut r, true);
+        assert_eq!(
+            pitches(&r),
+            preset("7-String"),
+            "the added string is not the low B a 7-string guitar actually has"
+        );
+        // And it arrives spelled, not as an empty box waiting to be filled in.
+        assert_eq!(r[0].text, "B1");
+        add_low_string(&mut r, true);
+        assert_eq!(pitches(&r), preset("8-String"));
+
+        remove_low_string(&mut r);
+        remove_low_string(&mut r);
+        assert_eq!(
+            pitches(&r),
+            preset("Standard"),
+            "Add then Remove has to be a round trip, which it only is if both \
+             touch the same end"
+        );
+
+        // The presets shed from that end too, which is the other half of the
+        // argument for it.
+        let mut bass: Vec<TuningString> = preset("Bass (5)")
+            .iter()
+            .map(|&p| TuningString::new(p, true))
+            .collect();
+        remove_low_string(&mut bass);
+        assert_eq!(pitches(&bass), preset("Bass (4)"));
+
+        // The bounds hold even when a caller ignores the disabled buttons, and
+        // nothing added below can ever sound ABOVE what it was added under —
+        // an "add a string" button that broke the solver's invariant would be
+        // the worst possible source of it.
+        let mut wide = r.clone();
+        for _ in 0..20 {
+            add_low_string(&mut wide, true);
+        }
+        assert_eq!(wide.len(), MAX_STRINGS);
+        for pair in wide.windows(2) {
+            assert!(
+                pair[0].pitch <= pair[1].pitch,
+                "adding strings broke the ascending order: {:?}",
+                pitches(&wide)
+            );
+        }
+        let mut one = vec![TuningString::new(40, true)];
+        remove_low_string(&mut one);
+        assert_eq!(one.len(), 1, "a tuning with no strings is not a tuning");
+    }
+
+    /// Confirm is one function, and it is the same value that greys the button
+    /// out and that builds the `Tuning` — so nothing invalid can reach the app
+    /// even if the button were somehow clicked.
+    #[test]
+    fn confirm_refuses_everything_the_solver_could_not_survive() {
+        let good = confirm("My Tuning", &rows(&["E2", "A2", "D3", "G3", "B3", "E4"]))
+            .expect("standard tuning under a new name is the plainest custom tuning there is");
+        assert_eq!(good.name, "My Tuning");
+        assert_eq!(good.open.as_ref(), Tuning::standard().open.as_ref());
+        // Whitespace is the user's, not the tuning's.
+        assert_eq!(
+            confirm("  Padded  ", &rows(&["E2"]))
+                .expect("a padded name is a name")
+                .name,
+            "Padded"
+        );
+        // A copy of a preset under its own name IS that preset, so it is
+        // harmless and must not be refused.
+        assert!(
+            confirm("Standard", &rows(&["E2", "A2", "D3", "G3", "B3", "E4"])).is_ok(),
+            "an unedited copy of a preset was refused"
+        );
+
+        let many: Vec<&str> = vec!["E2"; MAX_STRINGS + 1];
+        for (why, name, texts) in [
+            ("a half-typed pitch", "My Tuning", vec!["E2", "A2", "D3", "E"]),
+            ("a name that is only whitespace", "   ", vec!["E2", "A2"]),
+            (
+                "a preset's name over different pitches",
+                "Drop D",
+                vec!["E2", "A2"],
+            ),
+            (
+                "a preset's name in lower case, since lookup ignores it",
+                "drop d",
+                vec!["E2", "A2"],
+            ),
+            ("strings that do not ascend", "My Tuning", vec!["E2", "D2"]),
+            (
+                "an open string with no room to fret above it",
+                "My Tuning",
+                vec!["C9"],
+            ),
+            ("no strings at all", "My Tuning", vec![]),
+            ("more strings than the solver will enumerate", "My Tuning", many),
+        ] {
+            let problem = confirm(name, &rows(&texts))
+                .err()
+                .unwrap_or_else(|| panic!("{why} was accepted"));
+            let msg = problem.message(true);
+            assert!(msg.len() > 20, "{why} was refused with {msg:?}");
+            assert!(
+                !msg.to_lowercase().contains("invalid"),
+                "{why}: \"invalid\" is not a reason: {msg}"
+            );
+        }
+    }
+
+    /// The message under the strings gets a fixed band of the dialog so that
+    /// the buttons do not walk up and down under the cursor as you type. That
+    /// only works if the LONGEST thing it can say fits inside the band — and
+    /// "it should come to about four lines" is exactly the reasoning that once
+    /// pushed the D-UI-9 result box's OK button off its bottom edge. So this
+    /// measures every message the editor can produce, in the face it uses, at
+    /// the size it uses, wrapped to the width it has.
+    #[test]
+    fn the_longest_refusal_fits_the_space_reserved_for_it() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+
+        let mut messages = vec![
+            Problem::NameClash {
+                preset: "Half Step Down".to_owned(),
+            }
+            .message(true),
+            Problem::Unreadable {
+                string: 12,
+                text: "not a note at all".to_owned(),
+                hint: parse_pitch("Q").expect_err("Q is not a note"),
+            }
+            .message(true),
+        ];
+        for e in [
+            TuningError::StringCount(MAX_STRINGS + 1),
+            TuningError::NotAscending {
+                string: 11,
+                previous: 103,
+                found: 0,
+            },
+            TuningError::PitchRange(127),
+            TuningError::EmptyName,
+        ] {
+            messages.push(Problem::Refused(e).message(true));
+        }
+        // The band holds the confirmation as well as the complaints, and the
+        // longest of those is a full twelve strings spelled out.
+        let widest = Tuning::custom("wide", (0..MAX_STRINGS as u8).map(|i| i * 8).collect())
+            .expect("twelve ascending strings inside the range is a legal tuning");
+        messages.push(format!(
+            "{} strings: {}",
+            widest.strings(),
+            widest
+                .open
+                .iter()
+                .map(|&p| pitch_name(p, false))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+
+        // Exactly the width the label is given: the dialog's, less the
+        // `Frame` margin on each side.
+        let content_w = TUNING_DIALOG_W - 2.0 * f32::from(TUNING_MARGIN);
+        let mut worst = (0.0_f32, String::new());
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(TUNING_DIALOG_W, TUNING_DIALOG_H),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                crate::shell::viewport_ui(ctx, |ui| {
+                    for m in &messages {
+                        let galley = ui.painter().layout(
+                            m.clone(),
+                            FontId::new(TUNING_FOOTER_PT, fonts::courier_bold()),
+                            Color32::WHITE,
+                            content_w,
+                        );
+                        if galley.size().y > worst.0 {
+                            worst = (galley.size().y, m.clone());
+                        }
+                    }
+                });
+            },
+        );
+        assert!(
+            worst.0 <= TUNING_FOOTER_H,
+            "{TUNING_FOOTER_H}pt is reserved for the message and the longest one \
+             needs {}pt, which would push the buttons off the bottom edge: {:?}",
+            worst.0,
+            worst.1
+        );
+    }
+
+    /// The editor has to draw where there is no window manager at all: in a
+    /// plugin it is an `Area` in the DAW's canvas, and `show` is the only
+    /// funnel that knows the difference. This runs a whole frame of it inline —
+    /// text fields, a wrapped row of preset buttons, a scroll area and twelve
+    /// spinners sharing one `Area` id — and asserts the editor does nothing on
+    /// its own until it is confirmed.
+    #[test]
+    fn the_editor_draws_inline_in_a_plugin_and_says_nothing_until_it_is_confirmed() {
+        let ctx = egui::Context::default();
+        // The dialogs name Courier Prime explicitly and epaint PANICS on a
+        // font family that is not bound, so the fonts have to be installed
+        // exactly as the app installs them.
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+
+        let mut dialog = Some(Dialog::custom_tuning(&Tuning::standard(), true));
+        let placement = Placement {
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::PLUGIN,
+        };
+        let mut action = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 400.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                action = show(ctx, &mut dialog, true, placement);
+            },
+        );
+        assert!(action.is_none(), "the editor acted without being asked to");
+
+        match dialog {
+            Some(Dialog::CustomTuning { name, strings, .. }) => {
+                assert_eq!(strings.len(), 6, "it did not open on the live tuning");
+                // Opened on a name the app will NOT resolve back to the preset,
+                // which is the trap `DialogAction::SetCustomTuning` describes.
+                assert_ne!(name, "Standard");
+                assert!(
+                    confirm(&name, &strings).is_ok(),
+                    "the editor opened on a tuning it would refuse to accept: {}",
+                    confirm(&name, &strings)
+                        .err()
+                        .map(|p| p.message(true))
+                        .unwrap_or_default()
+                );
+            }
+            _ => panic!("the editor closed itself, or changed into another dialog"),
+        }
+    }
+
+    // ── the export dialog ───────────────────────────────────────────────────
+
+    use crate::recorder::{Composite, SpecProblem};
+
+    /// The four specs the validator has an opinion about, plus the one it does
+    /// not. Built by hand rather than through `Dialog::export`, which clamps.
+    fn export_specs() -> [ExportSpec; 4] {
+        [
+            ExportSpec::default(),
+            ExportSpec {
+                audio: false,
+                midi: false,
+                ..Default::default()
+            },
+            ExportSpec {
+                video: VideoMode::Composite,
+                composite: Composite {
+                    camera: false,
+                    display: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ExportSpec {
+                video: VideoMode::Composite,
+                composite: Composite {
+                    camera: false,
+                    display: true,
+                    shows: DisplayShows {
+                        piano: false,
+                        chord: false,
+                        fretboard: false,
+                        theory: false,
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// One function greys the button and builds the value, so the two cannot
+    /// drift apart — and the words shown are the recorder's own, because a
+    /// second wording here would be a second answer to the same question.
+    #[test]
+    fn the_export_button_is_greyed_exactly_when_the_spec_has_a_problem() {
+        for s in export_specs() {
+            let built = export_ready(&s, "120");
+            assert_eq!(
+                built.is_err(),
+                s.problem().is_some(),
+                "the button and the validator disagree about {s:?}"
+            );
+            match (s.problem(), built) {
+                (Some(p), Err(msg)) => assert_eq!(msg, p.message(), "invented its own words"),
+                (None, Ok(out)) => assert_eq!(out, s, "an accepted spec was altered on the way"),
+                (p, b) => panic!("{p:?} against {b:?}"),
+            }
+        }
+        // Audio and MIDI default ON and cannot both be off: the owner's brief
+        // is that a take produces the audio, the MIDI and the video, and a
+        // directory with none of the first two is not a take. Refused, rather
+        // than an empty folder appearing on the user's disk.
+        let none = ExportSpec {
+            audio: false,
+            midi: false,
+            ..Default::default()
+        };
+        assert!(ExportSpec::default().audio && ExportSpec::default().midi);
+        assert_eq!(
+            export_ready(&none, "120").unwrap_err(),
+            SpecProblem::NothingToWrite.message()
+        );
+    }
+
+    /// A finished take can never gain the camera. Those frames are composited
+    /// and encoded as the take runs and nothing keeps them (§0: raw retention
+    /// is 112 GB per take), and there is no decoder anywhere in this design to
+    /// read the finished file back. Offering the tick anyway would be offering
+    /// an option that cannot work, which is worse than not offering it.
+    #[test]
+    fn a_take_recorded_without_a_camera_can_never_gain_one() {
+        let can = rederivable(true, false);
+        assert!(!can.camera, "the camera controls were left live");
+        assert!(!can.layout, "a layout for a camera layer that cannot exist");
+        assert!(
+            can.tempo && can.display,
+            "the two things that ARE re-derivable were greyed with them"
+        );
+        let why = can.why.expect("greyed with no reason given");
+        assert!(
+            why.to_lowercase().contains("camera"),
+            "the reason never mentions the camera: {why}"
+        );
+
+        // And the seed is clamped, so the dialog cannot even OPEN promising a
+        // camera video: the spec comes from the settings file or the last take
+        // and neither of them knows what this take caught.
+        let clamped = can.clamp(ExportSpec {
+            video: VideoMode::Both,
+            ..Default::default()
+        });
+        assert!(!clamped.composite.camera);
+        assert_eq!(
+            clamped.video,
+            VideoMode::Composite,
+            "a display-only video IS re-derivable — replayed from the recorded .mid"
+        );
+        assert!(clamped.is_valid());
+
+        // With the display out of it too there is no video left to make, and
+        // an empty composite is not a video.
+        let nothing_left = can.clamp(ExportSpec {
+            video: VideoMode::Composite,
+            composite: Composite {
+                camera: true,
+                display: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(nothing_left.video, VideoMode::None);
+        assert!(
+            nothing_left.is_valid(),
+            "clamping produced a spec the dialog would then refuse: {nothing_left:?}"
+        );
+    }
+
+    /// The camera half is settled even when there WAS a camera: those frames
+    /// were composited in that arrangement as the take ran, so "Camera full
+    /// frame, display overlaid" can never become "Side by side".
+    #[test]
+    fn a_finished_take_cannot_be_given_a_different_layout_even_when_it_had_a_camera() {
+        let can = rederivable(true, true);
+        assert!(!can.layout, "the layout was left live after the take");
+        assert!(!can.camera);
+        assert!(can.tempo && can.display);
+        let why = can.why.expect("greyed with no reason given");
+        assert!(
+            why.to_lowercase().contains("layout"),
+            "the layout is greyed and nothing says why: {why}"
+        );
+        // A take that HAD a camera and one that did not are greyed for
+        // different reasons, and they are worth saying differently.
+        assert_ne!(can.why, rederivable(true, false).why);
+
+        // Before a take nothing has happened yet, so nothing is fixed and
+        // there is nothing to explain.
+        let before = rederivable(false, false);
+        assert_eq!(before, Rederivable::EVERYTHING);
+        assert!(before.why.is_none());
+        let untouched = ExportSpec {
+            video: VideoMode::Both,
+            ..Default::default()
+        };
+        assert_eq!(before.clamp(untouched), untouched);
+    }
+
+    /// The field holds TEXT for exactly this reason: a partially-typed number
+    /// is not a number, and "9" on the way to "92" must not be rounded up to
+    /// `MIN_BPM` under the cursor. And a tempo that is finished and out of
+    /// range is REFUSED, not quietly clamped — a field that turned a typed 400
+    /// into 300 would be a field lying to somebody who was not watching.
+    #[test]
+    fn a_half_typed_tempo_never_reaches_the_spec_and_an_impossible_one_is_refused_not_clamped() {
+        let spec = ExportSpec {
+            tempo_bpm: 120.0,
+            ..Default::default()
+        };
+        for half in ["9", "", " ", "-", "1.", "9e"] {
+            assert!(
+                export_ready(&spec, half).is_err(),
+                "{half:?} was accepted as a tempo"
+            );
+            assert_eq!(spec.tempo_bpm, 120.0, "{half:?} reached the stored spec");
+        }
+        for bad in ["19", "19.9", "301", "0", "-40", "1e9", "NaN", "inf"] {
+            let e = export_ready(&spec, bad).expect_err("{bad:?} was accepted");
+            assert!(e.len() > 20, "{bad:?} was refused with {e:?}");
+        }
+        // In range is taken exactly, at both ends and with a fraction.
+        for (text, want) in [
+            ("120", 120.0),
+            ("92.5", 92.5),
+            (" 88 ", 88.0),
+            ("20", MIN_BPM),
+            ("300", MAX_BPM),
+        ] {
+            assert_eq!(
+                export_ready(&spec, text).expect("a legal tempo").tempo_bpm,
+                want,
+                "{text:?}"
+            );
+        }
+        // With no MIDI there is no file to write a tempo mark into, so a stale
+        // value in a greyed field must not be able to grey Export out as well
+        // — that is a dead end with nothing on screen the user can fix.
+        let no_midi = ExportSpec {
+            midi: false,
+            ..spec
+        };
+        assert_eq!(
+            export_ready(&no_midi, "not a tempo at all")
+                .expect("a greyed field refused an export it has no say in")
+                .tempo_bpm,
+            120.0
+        );
+    }
+
+    /// Open it, change nothing, commit: the spec has to come back exactly as it
+    /// went in. The seeded text is the only copy of the tempo while the dialog
+    /// is open, so a constructor that seeded it badly would silently rewrite
+    /// the value on the way out.
+    #[test]
+    fn the_export_dialog_opens_on_the_spec_it_was_given_and_commits_it_unchanged() {
+        let spec = ExportSpec {
+            tempo_bpm: 92.5,
+            ..Default::default()
+        };
+        match Dialog::export(spec, false, true) {
+            Dialog::Export {
+                spec: seeded,
+                tempo_text,
+                remember,
+                post_take,
+                had_camera,
+            } => {
+                assert_eq!(seeded, spec, "the spec was altered on the way in");
+                assert_eq!(tempo_text, "92.5");
+                assert!(!remember, "it must not persist without being asked to");
+                assert!(!post_take && had_camera);
+                assert_eq!(
+                    export_ready(&seeded, &tempo_text).expect("opened on a spec it refuses"),
+                    spec,
+                    "a round trip through the field changed the tempo"
+                );
+            }
+            _ => panic!("Dialog::export built some other dialog"),
+        }
+        // A whole number reads as a whole number: a field opening on "120.0"
+        // is one every user retypes.
+        match Dialog::export(ExportSpec::default(), false, false) {
+            Dialog::Export { tempo_text, .. } => assert_eq!(tempo_text, "120"),
+            _ => panic!("Dialog::export built some other dialog"),
+        }
+    }
+
+    /// The tick is the whole difference between "this take" and "every take",
+    /// so it decides the action rather than being reported alongside it.
+    #[test]
+    fn the_remember_tick_is_what_chooses_the_action_that_persists() {
+        let spec = ExportSpec {
+            fps: 60,
+            ..Default::default()
+        };
+        match export_action(spec, false) {
+            DialogAction::SetExport(s) => assert_eq!(s, spec),
+            _ => panic!("an unticked box persisted the spec anyway"),
+        }
+        match export_action(spec, true) {
+            DialogAction::SetExportAndRemember(s) => assert_eq!(s, spec),
+            _ => panic!("the tick did not reach the action"),
+        }
+    }
+
+    /// The video panels seed from what is on screen, and the theory band is
+    /// one panel however many diagrams are inside it.
+    #[test]
+    fn the_video_panel_ticks_seed_from_the_panels_that_are_on_screen() {
+        let mut s = crate::settings::Settings::default();
+        let shows = shows_from_settings(&s);
+        assert!(shows.piano && shows.chord, "the panels that are never off");
+        assert!(!shows.fretboard && !shows.theory);
+        s.show_fretboard = true;
+        // Only the Tonnetz. Seeding from `theory_circle` alone would drop this
+        // user's band out of their video without saying anything.
+        s.theory_tonnetz = true;
+        let shows = shows_from_settings(&s);
+        assert!(shows.fretboard && shows.theory);
+    }
+
+    /// Disk AND CPU, because "will it fill my disk" and "will it stutter while
+    /// I play" are two questions and a byte count answers only one of them.
+    #[test]
+    fn the_estimate_names_a_rate_and_an_encoder_count() {
+        let quiet = estimate_line(&ExportSpec::default());
+        assert!(quiet.contains("MB a minute"), "{quiet}");
+        assert!(
+            quiet.contains("no video encoder"),
+            "audio and MIDI run no encoder at all: {quiet}"
+        );
+        let busy = estimate_line(&ExportSpec {
+            video: VideoMode::Both,
+            ..Default::default()
+        });
+        assert!(busy.contains("3 video encoders"), "{busy}");
+        assert!(
+            encoder_note().contains("1080p30"),
+            "the note never says what a stream costs: {}",
+            encoder_note()
+        );
+    }
+
+    /// The footer gets a fixed band so the buttons do not walk up and down
+    /// under the cursor as you click. That only works if the longest thing it
+    /// can say fits — and "it should come to about two lines" is exactly the
+    /// reasoning that once pushed a dialog's OK button off its own bottom edge.
+    #[test]
+    fn the_longest_export_refusal_fits_the_space_reserved_for_it() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+
+        // Every refusal the footer can hold, plus the fattest estimate line —
+        // the two are painted together, so it is their SUM that has to fit.
+        let mut refusals: Vec<String> = export_specs()
+            .into_iter()
+            .filter_map(|s| export_ready(&s, "120").err())
+            .collect();
+        for bad in ["", "not a tempo at all, not even close", "400"] {
+            refusals.push(
+                export_ready(&ExportSpec::default(), bad).expect_err("a bad tempo was accepted"),
+            );
+        }
+        let estimate = estimate_line(&ExportSpec {
+            video: VideoMode::Both,
+            ..Default::default()
+        });
+
+        // Exactly the width the labels are given: the dialog's, less the
+        // `Frame` margin on each side.
+        let content_w = EXPORT_DIALOG_W - 2.0 * f32::from(EXPORT_MARGIN);
+        let mut worst = (0.0_f32, String::new());
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(EXPORT_DIALOG_W, EXPORT_DIALOG_H),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                crate::shell::viewport_ui(ctx, |ui| {
+                    let height = |m: &str| {
+                        ui.painter()
+                            .layout(
+                                m.to_owned(),
+                                FontId::new(EXPORT_FOOTER_PT, fonts::courier_bold()),
+                                Color32::WHITE,
+                                content_w,
+                            )
+                            .size()
+                            .y
+                    };
+                    let base = height(&estimate);
+                    for m in &refusals {
+                        let total = base + height(m) + ui.spacing().item_spacing.y;
+                        if total > worst.0 {
+                            worst = (total, m.clone());
+                        }
+                    }
+                });
+            },
+        );
+        assert!(
+            worst.0 <= EXPORT_FOOTER_H,
+            "{EXPORT_FOOTER_H}pt is reserved for the footer and the estimate plus the \
+             longest refusal needs {}pt, which would push Export off the bottom edge: {:?}",
+            worst.0,
+            worst.1
+        );
+    }
+
+    /// Like the tuning editor, this dialog has to draw where there is no window
+    /// manager at all — in a plugin it is an `Area` in the DAW's canvas, and
+    /// `show` is the only funnel that knows the difference. This runs a whole
+    /// frame of it inline (a text field, four radio groups, eleven checkboxes
+    /// and a scroll area sharing one `Area` id) and asserts it does nothing on
+    /// its own until it is confirmed.
+    #[test]
+    fn the_export_dialog_draws_inline_in_a_plugin_and_says_nothing_until_it_is_confirmed() {
+        let ctx = egui::Context::default();
+        // The dialogs name Courier Prime explicitly and epaint PANICS on a
+        // font family that is not bound.
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+
+        // The post-take case, which is the one with greyed controls in it.
+        let mut dialog = Some(Dialog::export(ExportSpec::default(), true, false));
+        let placement = Placement {
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::PLUGIN,
+        };
+        let mut action = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 420.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                action = show(ctx, &mut dialog, true, placement);
+            },
+        );
+        assert!(action.is_none(), "the dialog exported without being asked");
+
+        match dialog {
+            Some(Dialog::Export {
+                spec, tempo_text, ..
+            }) => assert!(
+                export_ready(&spec, &tempo_text).is_ok(),
+                "it opened on a spec it would refuse to export: {:?}",
+                export_ready(&spec, &tempo_text).err()
+            ),
+            _ => panic!("the dialog closed itself, or changed into another one"),
+        }
     }
 }

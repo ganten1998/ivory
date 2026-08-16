@@ -35,7 +35,53 @@ pub enum KeyAction {
     ManageTaughtChords,
     ToggleChordLearning,
     ToggleNotePreference,
+    /// §5: start or stop a take.
+    ///
+    /// The first binding here that is not always live — see [`Gates`].
+    ToggleRecording,
     CloseHelp,
+}
+
+/// What the app is currently OFFERING a key.
+///
+/// A struct passed into `pressed` and `draw_help` rather than an `if` around
+/// the call in `app.rs`, and that is the whole point of it. This module's one
+/// rule is that the bindings and the card come from a single table; filtering
+/// at the call site puts the binding on one side of a condition and its
+/// description on the other, and the two drift apart the first time somebody
+/// edits one of them. Going through here, a key that cannot fire is also a key
+/// the card does not mention, by construction.
+///
+/// `Default` is "nothing extra is open", which is the conservative direction: a
+/// gate that nobody remembered to wire up costs a shortcut rather than firing
+/// one nobody asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Gates {
+    /// The Recorder band is showing.
+    ///
+    /// Space toggles recording, and it is gated on the band being OPEN rather
+    /// than on the host merely being able to record: a user who has never
+    /// opened the recorder must not start a take by pressing the widest key on
+    /// the keyboard while reaching for something else. Opening the band is the
+    /// consent, and it is one right-click away.
+    ///
+    /// Note for whoever wires this up: the band owns a take-name text field. A
+    /// space typed into it must not also hit the transport, so `app.rs` has to
+    /// keep `pressed` away from a frame where a text field holds keyboard
+    /// focus — the same reasoning that already keeps it away from dialogs and
+    /// the open menu.
+    pub recorder_shown: bool,
+}
+
+/// Whether a binding is live right now.
+///
+/// The single gate. `pressed` and `draw_help` both come through here, so the
+/// card cannot advertise a dead key and a live key cannot go unlisted.
+fn available(action: KeyAction, gates: Gates) -> bool {
+    match action {
+        KeyAction::ToggleRecording => gates.recorder_shown,
+        _ => true,
+    }
 }
 
 /// (key, label, what it does, whether it appears on the card).
@@ -66,6 +112,16 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     (Key::M, "M", KeyAction::ManageTaughtChords, true),
     (Key::L, "L", KeyAction::ToggleChordLearning, true),
     (Key::P, "P", KeyAction::ToggleNotePreference, true),
+    // §5: one button, not arm-then-record, and Space because that is what every
+    // transport in every DAW the user already owns is bound to.
+    //
+    // LAST of the listed rows on purpose. It is the only gated one, so it is
+    // the only one that can appear and disappear; at the end of the table it
+    // takes the end of the card with it, instead of reflowing every row below
+    // it each time the band opens. It is also the first listed key that is not
+    // a single letter, which is why the key column is measured now rather than
+    // assumed — see `key_col_w`.
+    (Key::Space, "Space", KeyAction::ToggleRecording, true),
     // Escape only closes the card; it is not worth a row of its own.
     (Key::Escape, "Esc", KeyAction::CloseHelp, false),
 ];
@@ -90,8 +146,22 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ManageTaughtChords => "chords you have taught",
         KeyAction::ToggleChordLearning => "chord learning",
         KeyAction::ToggleNotePreference => "sharps or flats",
+        KeyAction::ToggleRecording => "start or stop recording",
         KeyAction::CloseHelp => "close this card",
     }
+}
+
+/// The rows the card shows, in table order.
+///
+/// Shared with `pressed` through `available`, which is what makes "listed but
+/// dead" and "live but unlisted" the same impossible thing rather than two
+/// separate bugs to remember.
+fn card_rows(gates: Gates) -> Vec<(&'static str, &'static str)> {
+    BINDINGS
+        .iter()
+        .filter(|&&(_, _, a, shown)| shown && available(a, gates))
+        .map(|&(_, label, action, _)| (label, describe(action)))
+        .collect()
 }
 
 /// Which action a frame's keypresses ask for, if any.
@@ -99,14 +169,19 @@ fn describe(a: KeyAction) -> &'static str {
 /// Returns at most one, because two shortcuts firing on one frame is never
 /// what anybody meant. Modifiers are REQUIRED to be absent: Cmd-R and Ctrl-R
 /// belong to the OS and the browser habit, and swallowing them would be rude.
-pub fn pressed(ctx: &egui::Context) -> Option<KeyAction> {
+///
+/// `gates` says which bindings are live; it is a parameter rather than a filter
+/// in `app.rs` so the card cannot disagree with the keyboard. See [`Gates`].
+pub fn pressed(ctx: &egui::Context, gates: Gates) -> Option<KeyAction> {
     ctx.input(|i| {
         if i.modifiers.any() {
             return None;
         }
         BINDINGS
             .iter()
-            .filter(|(_, _, a, _)| !matches!(a, KeyAction::ToggleHelp | KeyAction::CloseHelp))
+            .filter(|&&(_, _, a, _)| {
+                !matches!(a, KeyAction::ToggleHelp | KeyAction::CloseHelp) && available(a, gates)
+            })
             .find(|(key, ..)| i.key_pressed(*key))
             .map(|&(_, _, action, _)| action)
     })
@@ -161,7 +236,22 @@ pub fn help_progress(ctx: &egui::Context, allowed: bool) -> f32 {
 /// shortcuts in one column do not fit at any legible size while two columns fit
 /// comfortably. Using the shape of the window beats shrinking the type until
 /// nobody can read it.
-fn layout(rect: Rect, rows: usize, widest: usize) -> (Rect, f32, usize) {
+/// Width of the key column, which is no longer a constant.
+///
+/// It was a flat `size * 3.2` while every listed key was one character wide.
+/// Space is the first that is not: "Space" set in Courier at ~0.62 em per glyph
+/// is 3.1 em, so it would have run into its own description with a fifth of a
+/// character to spare — which on screen reads as a rendering fault rather than
+/// a layout one. Measured from the widest label instead, with the old value
+/// kept as a floor so a card of single letters is pixel-identical to before.
+///
+/// One function, called by both `layout` and `draw_help`, because a card sized
+/// on one number and painted with another is the bug this replaces.
+fn key_col_w(size: f32, widest_key: usize) -> f32 {
+    (size * 3.2).max(size * (widest_key as f32 * 0.62 + 1.0))
+}
+
+fn layout(rect: Rect, rows: usize, widest: usize, widest_key: usize) -> (Rect, f32, usize) {
     let rows = rows.max(1);
     for cols in 1..=3usize {
         let per_col = rows.div_ceil(cols);
@@ -170,7 +260,7 @@ fn layout(rect: Rect, rows: usize, widest: usize) -> (Rect, f32, usize) {
 
         let row_h = size * 1.75;
         let pad = size * 1.4;
-        let col_w = size * 3.2 + widest as f32 * size * 0.62;
+        let col_w = key_col_w(size, widest_key) + widest as f32 * size * 0.62;
         let w = col_w * cols as f32 + pad * 2.0 + pad * (cols - 1) as f32;
         let h = per_col as f32 * row_h + pad * 2.4;
 
@@ -194,14 +284,17 @@ fn layout(rect: Rect, rows: usize, widest: usize) -> (Rect, f32, usize) {
 /// Centred, sized to its own content, and painted directly rather than through
 /// a `Window` so it cannot be dragged off, cannot be resized into nothing, and
 /// looks identical in a plugin editor where there is no window manager at all.
-pub fn draw_help(painter: &Painter, rect: Rect, dark: bool, t: f32) {
-    let rows: Vec<(&str, &str)> = BINDINGS
-        .iter()
-        .filter(|(.., shown)| *shown)
-        .map(|&(_, label, action, _)| (label, describe(action)))
-        .collect();
+///
+/// `gates` reaches the card for one reason only: a shortcut the app would
+/// ignore must not be advertised. It goes through the same `available` the
+/// keyboard does, so the card and the binding cannot disagree about Space.
+pub fn draw_help(painter: &Painter, rect: Rect, dark: bool, t: f32, gates: Gates) {
+    let rows = card_rows(gates);
     let widest = rows.iter().map(|(_, d)| d.len()).max().unwrap_or(20);
-    let (resting, size, cols) = layout(rect, rows.len(), widest);
+    // Counted in `chars`, not bytes: the labels are ASCII today and a "⌫" one
+    // day would otherwise be measured as three characters wide.
+    let widest_key = rows.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(1);
+    let (resting, size, cols) = layout(rect, rows.len(), widest, widest_key);
     // Slide down from above the top edge. At t = 0 the card sits entirely off
     // the top, so the first frame of the animation is genuinely invisible
     // rather than a flash of a half-drawn card.
@@ -211,7 +304,7 @@ pub fn draw_help(painter: &Painter, rect: Rect, dark: bool, t: f32) {
 
     let row_h = size * 1.75;
     let pad = size * 1.4;
-    let key_w = size * 3.2;
+    let key_w = key_col_w(size, widest_key);
     let per_col = rows.len().div_ceil(cols);
     let col_w = (card_rect.width() - pad * 2.0) / cols as f32;
     let font = FontId::new(size, crate::fonts::courier());
@@ -284,6 +377,16 @@ mod tests {
             .filter(|(.., s)| *s)
             .map(|&(_, _, a, _)| a)
             .collect();
+        // A gated binding must be a LISTED one, or the gate hides a shortcut
+        // the card was never going to mention in the first place.
+        for &(_, label, action, is_shown) in BINDINGS {
+            if !available(action, Gates { recorder_shown: true }) {
+                panic!("{label} is dead even with every gate open");
+            }
+            if !available(action, Gates::default()) {
+                assert!(is_shown, "{label} is gated but never listed");
+            }
+        }
         for &(_, label, action, is_shown) in BINDINGS {
             if !is_shown && action != KeyAction::CloseHelp {
                 assert!(shown.contains(&action), "{label} is bound but never listed");
@@ -312,25 +415,122 @@ mod tests {
                 modifiers: mods,
             });
             let mut got = Some(KeyAction::ClearNotes);
-            let _ = ctx.run(input, |ctx| got = pressed(ctx));
+            // Every gate open, so this is testing the modifier and nothing else.
+            let _ = ctx.run(input, |ctx| {
+                got = pressed(ctx, Gates { recorder_shown: true });
+            });
             assert_eq!(got, None, "R fired with {mods:?} held");
         }
     }
 
-    #[test]
-    fn a_bare_key_does_fire() {
+    /// Press one key, with the gates in a given state, and see what comes back.
+    fn press(key: Key, gates: Gates) -> Option<KeyAction> {
         let ctx = egui::Context::default();
         let mut input = egui::RawInput::default();
         input.events.push(egui::Event::Key {
-            key: Key::K,
+            key,
             physical_key: None,
             pressed: true,
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
         let mut got = None;
-        let _ = ctx.run(input, |ctx| got = pressed(ctx));
-        assert_eq!(got, Some(KeyAction::ToggleKeytoggle));
+        let _ = ctx.run(input, |ctx| got = pressed(ctx, gates));
+        got
+    }
+
+    #[test]
+    fn a_bare_key_does_fire() {
+        assert_eq!(
+            press(Key::K, Gates::default()),
+            Some(KeyAction::ToggleKeytoggle)
+        );
+    }
+
+    /// §5: a user who has never opened the Recorder must not start a take by
+    /// pressing the widest key on the keyboard.
+    ///
+    /// Space is the one binding that is not always live, and it is gated on the
+    /// BAND being open rather than on the host being able to capture: opening
+    /// the band is the consent, and it is one right-click away. Ungated, the
+    /// first thing a stray thumb does in a piano app is begin recording the
+    /// room.
+    #[test]
+    fn space_does_nothing_until_the_recorder_band_is_open() {
+        assert_eq!(
+            press(Key::Space, Gates::default()),
+            None,
+            "Space started a take on a recorder the user has never opened"
+        );
+        assert_eq!(
+            press(Key::Space, Gates { recorder_shown: true }),
+            Some(KeyAction::ToggleRecording)
+        );
+        // The gate is Space's alone: nothing else changes with it.
+        for (key, want) in [
+            (Key::K, KeyAction::ToggleKeytoggle),
+            (Key::G, KeyAction::ToggleFretboard),
+        ] {
+            for gates in [Gates::default(), Gates { recorder_shown: true }] {
+                assert_eq!(press(key, gates), Some(want), "{key:?} under {gates:?}");
+            }
+        }
+    }
+
+    /// The card is built through the same gate the keyboard is, so it cannot
+    /// advertise a key that would do nothing. "Listed but dead" and "live but
+    /// unlisted" are the same bug told two ways, and one `available` kills both.
+    #[test]
+    fn the_card_does_not_list_space_while_the_recorder_is_hidden() {
+        let hidden = card_rows(Gates::default());
+        assert!(
+            !hidden.iter().any(|(label, _)| *label == "Space"),
+            "the card offers a shortcut the app would ignore"
+        );
+        let shown = card_rows(Gates { recorder_shown: true });
+        assert_eq!(
+            shown.len(),
+            hidden.len() + 1,
+            "opening the band added something other than Space"
+        );
+        assert_eq!(
+            shown.last().map(|(l, d)| (*l, *d)),
+            Some(("Space", describe(KeyAction::ToggleRecording))),
+            "Space is last, so appearing does not reflow every row above it"
+        );
+        // And every listed row is a live binding, in both states.
+        for gates in [Gates::default(), Gates { recorder_shown: true }] {
+            for (label, _) in card_rows(gates) {
+                let (_, _, action, _) = BINDINGS
+                    .iter()
+                    .find(|(_, l, ..)| *l == label)
+                    .unwrap_or_else(|| panic!("{label} is on the card but not in the table"));
+                assert!(available(*action, gates), "{label} is listed but dead");
+            }
+        }
+    }
+
+    /// Space is the first listed key that is not one character wide, and the
+    /// key column used to be a constant three-and-a-bit characters. Set in
+    /// Courier that leaves "Space" a fifth of a glyph clear of its own
+    /// description, which reads on screen as a broken renderer.
+    #[test]
+    fn the_key_column_is_wide_enough_for_the_longest_label_it_shows() {
+        let size = 14.0_f32;
+        // ~0.62 em per glyph is what the card's own column maths assumes.
+        let glyph = size * 0.62;
+        for label in card_rows(Gates { recorder_shown: true })
+            .iter()
+            .map(|(l, _)| *l)
+        {
+            let text = label.chars().count() as f32 * glyph;
+            assert!(
+                key_col_w(size, label.chars().count()) >= text + glyph * 0.8,
+                "{label} has no gap before its description"
+            );
+        }
+        // A card of single letters is unchanged: the old constant is the floor.
+        assert_eq!(key_col_w(size, 1), size * 3.2);
     }
 
     /// The card must fit inside the window it is drawn over, at every size the
@@ -342,12 +542,15 @@ mod tests {
     /// screenshot.
     #[test]
     fn the_card_fits_the_window_at_every_size_and_row_count() {
-        let shown = BINDINGS.iter().filter(|(.., s)| *s).count();
+        // The real maximum, taken through the gate rather than off the table:
+        // the card is longest with every binding live.
+        let shown = card_rows(Gates { recorder_shown: true }).len();
         for w in [650.0_f32, 975.0, 1300.0, 1950.0, 2600.0] {
             for h in [w / 8.667, w / 8.667 + 50.0, w / 8.667 + 182.0, 90.0] {
                 let rect = Rect::from_min_size(Pos2::new(7.0, 11.0), Vec2::new(w, h));
                 for rows in [1, shown, shown + 4, 20] {
-                    let (card, size, cols) = layout(rect, rows, 46);
+                    // 5 is "Space", the widest key label the card carries.
+                    let (card, size, cols) = layout(rect, rows, 46, 5);
                     // ALWAYS: nothing is ever painted outside the app.
                     assert!(size >= 8.0, "text shrank below legible at {w}x{h}");
                     assert!(
@@ -381,13 +584,17 @@ mod tests {
             let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w / 8.667 + 50.0));
             let _ = ctx.run(Default::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    for t in [0.0, 0.01, 0.5, 0.999, 1.0] {
-                        draw_help(ui.painter(), rect, false, t);
-                        draw_help(ui.painter(), rect, true, t);
+                    // Both gate states: they are two different row counts, and
+                    // the shorter one is the card most users will ever see.
+                    for gates in [Gates::default(), Gates { recorder_shown: true }] {
+                        for t in [0.0, 0.01, 0.5, 0.999, 1.0] {
+                            draw_help(ui.painter(), rect, false, t, gates);
+                            draw_help(ui.painter(), rect, true, t, gates);
+                        }
+                        // Out of range must not escape the window either.
+                        draw_help(ui.painter(), rect, false, -1.0, gates);
+                        draw_help(ui.painter(), rect, true, 2.0, gates);
                     }
-                    // Out of range must not escape the window either.
-                    draw_help(ui.painter(), rect, false, -1.0);
-                    draw_help(ui.painter(), rect, true, 2.0);
                 });
             });
         }

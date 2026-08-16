@@ -3,7 +3,14 @@
 #![windows_subsystem = "windows"]
 
 mod desktop;
+#[cfg(feature = "recorder")]
+mod devices;
 mod midi;
+/// The recording session. Absent from a Minimal build, where `ivory-record` is
+/// not linked at all — the exclusion the compiler enforces rather than a flag
+/// anyone can flip (docs/RECORDER-PLAN.md §12a).
+#[cfg(feature = "recorder")]
+mod record;
 
 use ivory_ui::settings::Settings;
 
@@ -45,6 +52,26 @@ fn parse_cli() -> CliArgs {
         match arg.as_str() {
             "-l" | "--list" => {
                 midi::print_port_list();
+                std::process::exit(0);
+            }
+            // Undocumented on purpose (absent from --help): a developer probe
+            // for the recorder's raw MIDI tap, which the GUI cannot show yet.
+            // It is how the timestamp, the channel, the continuous pedal sweep
+            // and the release velocity get checked against a REAL keyboard,
+            // which no unit test can do. See docs/RECORDER-PLAN.md step 1.
+            #[cfg(feature = "recorder")]
+            "--dump-midi" => {
+                midi::dump_raw(args.next());
+                std::process::exit(0);
+            }
+            // The other half of the same idea, for audio: record one take from
+            // the default input with no GUI and report what landed on disk.
+            // The only way to exercise the whole capture chain against real
+            // hardware, and the way a missing microphone entitlement shows up
+            // as an empty device list rather than as a mystery months later.
+            #[cfg(feature = "recorder")]
+            "--record-test" => {
+                record::record_test(args.next());
                 std::process::exit(0);
             }
             "-h" | "--help" => print_usage_and_exit(0),

@@ -116,6 +116,19 @@ pub struct Settings {
     /// back to Standard at the point of use rather than being rewritten, so a
     /// settings file shared with a later build keeps its tuning.
     pub fretboard_tuning: String,
+    /// A user-built tuning, as `name` and comma-separated open MIDI pitches.
+    ///
+    /// Two keys rather than one, and BOTH absent unless a custom tuning has
+    /// actually been made. `fretboard_tuning` selects it by holding
+    /// [`CUSTOM_TUNING`]; the pitches live here so that switching to a preset
+    /// and back does not lose the tuning the user spent time entering.
+    ///
+    /// Stored as text rather than an array because the whole settings file is
+    /// hand-serialised scalars (see `load_from`/`save_to`), and a nested array
+    /// would be the only one — a shape a future reader of that code would have
+    /// to special-case for no gain.
+    pub fretboard_custom_name: Option<String>,
+    pub fretboard_custom_open: Option<String>,
     /// Capo fret. 0 is none. Clamped at use, never on load.
     pub fretboard_capo: i64,
     /// Fingerboard wood: "rosewood" (default), "maple", "ebony". Stored
@@ -127,12 +140,26 @@ pub struct Settings {
     pub capo_style: String,
     /// D-UI-16: the guitar view is in its own window.
     pub fretboard_detached: bool,
+    /// The theory band is popped into its own window.
+    ///
+    /// The third detachable surface, after the chord strip and the fretboard,
+    /// and it follows their rules exactly — including that `Caps::detachable`
+    /// forces it off at construction, so a plugin seeded from a desktop
+    /// settings file cannot start with a band it has no window to put.
+    pub theory_detached: bool,
     /// Remembered popout geometry. Absent until the window has been placed,
     /// exactly like the detached chord window's (D-UI-11).
     pub fretboard_win_w: Option<i64>,
     pub fretboard_win_h: Option<i64>,
     pub fretboard_win_x: Option<i64>,
     pub fretboard_win_y: Option<i64>,
+    /// The theory window's remembered geometry. Same shape and same rule as the
+    /// fretboard's: absent until the window has actually been placed, so a
+    /// tiling WM's idea of the size is never mistaken for the user's (D-UI-11).
+    pub theory_win_w: Option<i64>,
+    pub theory_win_h: Option<i64>,
+    pub theory_win_x: Option<i64>,
+    pub theory_win_y: Option<i64>,
     /// D-UI-17: which theory diagrams are showing. Three independent flags,
     /// because any combination is allowed and an enum would need a variant per
     /// combination to say so. All off by default, and deliberately so: the
@@ -151,6 +178,61 @@ pub struct Settings {
     /// what you put there, by clicking the piano, the neck or the diagrams
     /// themselves, and stays put until you change it.
     pub theory_follow_midi: bool,
+    /// The Recorder band is showing.
+    ///
+    /// Off by default and deliberately NOT part of `first_launch()`, for the
+    /// same reason `show_fretboard` is off for existing users: the band is 200
+    /// points tall, and a window that grows on its own is the geometry surprise
+    /// this app has already been bitten by twice. Someone who wants to record
+    /// turns it on once; someone who wants a chord display never sees it.
+    pub show_recorder: bool,
+    /// The Recorder band is in its own window — the fourth detachable surface,
+    /// and the one with the best reason to be on a second monitor: a big
+    /// framing view of the camera while the piano stays where it was.
+    pub recorder_detached: bool,
+    pub recorder_win_w: Option<i64>,
+    pub recorder_win_h: Option<i64>,
+    pub recorder_win_x: Option<i64>,
+    pub recorder_win_y: Option<i64>,
+    /// Where takes are written. Absent means the platform's videos folder with
+    /// a `Tangent` subfolder — resolved at the point of use by [`record_root`],
+    /// never stored as a resolved string, so moving a home directory does not
+    /// strand it.
+    ///
+    /// [`record_root`]: Settings::record_root
+    pub record_dir: Option<String>,
+    /// The "set as default" tick next to the folder. False means the folder was
+    /// chosen for this session and the picker will open there next time without
+    /// the choice being permanent.
+    pub record_dir_is_default: bool,
+    /// The take name, kept across takes.
+    ///
+    /// It persists because the timestamp already guarantees uniqueness, so the
+    /// typed name never has to be unique — type "nocturne" once, press record
+    /// five times, get five adjacent folders and no overwrite dialog ever.
+    pub record_take_name: Option<String>,
+    /// The camera's stable UID, not its name. Two identical webcams share a
+    /// name, and a name changes with the OS language.
+    pub record_camera_uid: Option<String>,
+    /// The audio input's stable UID. Same reasoning.
+    pub record_audio_device: Option<String>,
+    /// `input`, `plugin` or `both`. Stored verbatim; an unknown value resolves
+    /// to `input` at the point of use, like `font_choice`.
+    pub record_audio_source: String,
+    /// Pre-roll countdown in seconds. Clamped to
+    /// [`recorder::PREROLL_CHOICES`](crate::recorder::PREROLL_CHOICES) on read.
+    pub record_preroll_s: i64,
+    /// Hide the running clock while recording. §5: after a blinking light, a
+    /// running timer is the most-cited performance distraction, and no
+    /// competitor offers the checkbox.
+    pub record_hide_elapsed: bool,
+    /// The Export dialog's whole state, when "use these settings for every
+    /// take" is ticked.
+    ///
+    /// One nested object rather than eleven flat keys — see
+    /// `ExportSpec::to_value` for why. A default spec is still written, so the
+    /// file always shows what a take will produce.
+    pub record_export: crate::recorder::ExportSpec,
     /// Unknown keys from the file, preserved verbatim on save (file order).
     pub extra: Map<String, Value>,
 }
@@ -194,12 +276,15 @@ impl Default for Settings {
             teach_apply_all_keys: true,
             show_fretboard: false,
             fretboard_tuning: "Standard".to_owned(),
+            fretboard_custom_name: None,
+            fretboard_custom_open: None,
             fretboard_capo: 0,
             fretboard_wood: crate::fretboard_panel::Wood::default().key().to_owned(),
             capo_style: crate::fretboard_panel::CapoStyle::default()
                 .key()
                 .to_owned(),
             fretboard_detached: false,
+            theory_detached: false,
             theory_circle: false,
             theory_tonnetz: false,
             theory_triangles: false,
@@ -208,6 +293,25 @@ impl Default for Settings {
             fretboard_win_h: None,
             fretboard_win_x: None,
             fretboard_win_y: None,
+            theory_win_w: None,
+            theory_win_h: None,
+            theory_win_x: None,
+            theory_win_y: None,
+            show_recorder: false,
+            recorder_detached: false,
+            recorder_win_w: None,
+            recorder_win_h: None,
+            recorder_win_x: None,
+            recorder_win_y: None,
+            record_dir: None,
+            record_dir_is_default: false,
+            record_take_name: None,
+            record_camera_uid: None,
+            record_audio_device: None,
+            record_audio_source: "input".to_owned(),
+            record_preroll_s: 3,
+            record_hide_elapsed: false,
+            record_export: crate::recorder::ExportSpec::default(),
             extra: Map::new(),
         }
     }
@@ -424,6 +528,12 @@ impl Settings {
                 s.capo_style = t.to_owned();
             }
         }
+        if let Some(Value::String(v)) = map.remove("fretboard_custom_name") {
+            s.fretboard_custom_name = Some(v);
+        }
+        if let Some(Value::String(v)) = map.remove("fretboard_custom_open") {
+            s.fretboard_custom_open = Some(v);
+        }
         if let Some(v) = map.remove("fretboard_tuning") {
             if let Some(t) = v.as_str() {
                 s.fretboard_tuning = t.to_owned();
@@ -440,10 +550,57 @@ impl Settings {
             }
         }
         take_bool(&mut map, "fretboard_detached", &mut s.fretboard_detached);
+        take_bool(&mut map, "theory_detached", &mut s.theory_detached);
         take_opt_i64(&mut map, "fretboard_win_w", &mut s.fretboard_win_w);
         take_opt_i64(&mut map, "fretboard_win_h", &mut s.fretboard_win_h);
         take_opt_i64(&mut map, "fretboard_win_x", &mut s.fretboard_win_x);
         take_opt_i64(&mut map, "fretboard_win_y", &mut s.fretboard_win_y);
+        take_opt_i64(&mut map, "theory_win_w", &mut s.theory_win_w);
+        take_opt_i64(&mut map, "theory_win_h", &mut s.theory_win_h);
+        take_opt_i64(&mut map, "theory_win_x", &mut s.theory_win_x);
+        take_opt_i64(&mut map, "theory_win_y", &mut s.theory_win_y);
+
+        // ── the recorder ────────────────────────────────────────────────────
+        take_bool(&mut map, "show_recorder", &mut s.show_recorder);
+        take_bool(&mut map, "recorder_detached", &mut s.recorder_detached);
+        take_opt_i64(&mut map, "recorder_win_w", &mut s.recorder_win_w);
+        take_opt_i64(&mut map, "recorder_win_h", &mut s.recorder_win_h);
+        take_opt_i64(&mut map, "recorder_win_x", &mut s.recorder_win_x);
+        take_opt_i64(&mut map, "recorder_win_y", &mut s.recorder_win_y);
+        let take_opt_str = |map: &mut Map<String, Value>, key: &str, dst: &mut Option<String>| {
+            if let Some(Value::String(v)) = map.remove(key) {
+                // An empty string is not a path, a uid or a name. Written by
+                // hand or by an earlier build clearing a field, it would
+                // otherwise be "chosen" and resolve to the process's working
+                // directory the first time a take was written.
+                if !v.trim().is_empty() {
+                    *dst = Some(v);
+                }
+            }
+        };
+        take_opt_str(&mut map, "record_dir", &mut s.record_dir);
+        take_bool(
+            &mut map,
+            "record_dir_is_default",
+            &mut s.record_dir_is_default,
+        );
+        take_opt_str(&mut map, "record_take_name", &mut s.record_take_name);
+        take_opt_str(&mut map, "record_camera_uid", &mut s.record_camera_uid);
+        take_opt_str(&mut map, "record_audio_device", &mut s.record_audio_device);
+        if let Some(v) = map.remove("record_audio_source") {
+            if let Some(t) = v.as_str() {
+                s.record_audio_source = t.to_owned();
+            }
+        }
+        if let Some(v) = map.remove("record_preroll_s") {
+            if let Some(n) = v.as_i64() {
+                s.record_preroll_s = n;
+            }
+        }
+        take_bool(&mut map, "record_hide_elapsed", &mut s.record_hide_elapsed);
+        if let Some(v) = map.remove("record_export") {
+            s.record_export = crate::recorder::ExportSpec::from_value(&v);
+        }
 
         s.extra = map; // whatever is left, preserved in file order
         s
@@ -524,6 +681,10 @@ impl Settings {
         put_opt("fretboard_win_h", self.fretboard_win_h);
         put_opt("fretboard_win_x", self.fretboard_win_x);
         put_opt("fretboard_win_y", self.fretboard_win_y);
+        put_opt("theory_win_w", self.theory_win_w);
+        put_opt("theory_win_h", self.theory_win_h);
+        put_opt("theory_win_x", self.theory_win_x);
+        put_opt("theory_win_y", self.theory_win_y);
         map.insert(
             "teach_apply_all_keys".into(),
             Value::Bool(self.teach_apply_all_keys),
@@ -548,6 +709,15 @@ impl Settings {
             "fretboard_capo".into(),
             Value::Number(self.fretboard_capo.into()),
         );
+        // Additive and ABSENT when unset, like `custom_font_path`. A key that is
+        // written as `null` is a key an older build has to know to ignore; a key
+        // that is not there at all is one it never sees.
+        if let Some(n) = &self.fretboard_custom_name {
+            map.insert("fretboard_custom_name".into(), Value::String(n.clone()));
+        }
+        if let Some(o) = &self.fretboard_custom_open {
+            map.insert("fretboard_custom_open".into(), Value::String(o.clone()));
+        }
         map.insert(
             "fretboard_wood".into(),
             Value::String(self.fretboard_wood.clone()),
@@ -556,6 +726,60 @@ impl Settings {
             "fretboard_detached".into(),
             Value::Bool(self.fretboard_detached),
         );
+        map.insert(
+            "theory_detached".into(),
+            Value::Bool(self.theory_detached),
+        );
+        // ── the recorder ────────────────────────────────────────────────────
+        map.insert("show_recorder".into(), Value::Bool(self.show_recorder));
+        map.insert(
+            "recorder_detached".into(),
+            Value::Bool(self.recorder_detached),
+        );
+        // Written out longhand rather than through `put_opt` above: that
+        // closure holds a mutable borrow of `map`, and reusing it here — after
+        // the plain `map.insert` calls in between — extends the borrow across
+        // them and does not compile.
+        for (key, value) in [
+            ("recorder_win_w", self.recorder_win_w),
+            ("recorder_win_h", self.recorder_win_h),
+            ("recorder_win_x", self.recorder_win_x),
+            ("recorder_win_y", self.recorder_win_y),
+        ] {
+            if let Some(n) = value {
+                map.insert(key.into(), Value::Number(n.into()));
+            }
+        }
+        // Absent when unset, like `custom_font_path` — an absent output folder
+        // means "the platform's default", which is a live decision made at the
+        // point of use, not a string to be frozen into the file.
+        for (key, value) in [
+            ("record_dir", &self.record_dir),
+            ("record_take_name", &self.record_take_name),
+            ("record_camera_uid", &self.record_camera_uid),
+            ("record_audio_device", &self.record_audio_device),
+        ] {
+            if let Some(v) = value {
+                map.insert(key.into(), Value::String(v.clone()));
+            }
+        }
+        map.insert(
+            "record_dir_is_default".into(),
+            Value::Bool(self.record_dir_is_default),
+        );
+        map.insert(
+            "record_audio_source".into(),
+            Value::String(self.record_audio_source.clone()),
+        );
+        map.insert(
+            "record_preroll_s".into(),
+            Value::Number(self.record_preroll_s.into()),
+        );
+        map.insert(
+            "record_hide_elapsed".into(),
+            Value::Bool(self.record_hide_elapsed),
+        );
+        map.insert("record_export".into(), self.record_export.to_value());
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -657,11 +881,78 @@ impl Settings {
         }
     }
 
+    pub fn theory_win_size(&self) -> egui::Vec2 {
+        match (self.theory_win_w, self.theory_win_h) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => egui::Vec2::new(w as f32, h as f32),
+            _ => crate::theory_panel::DETACHED_DEFAULT,
+        }
+    }
+
+    pub fn theory_win_pos(&self) -> Option<egui::Pos2> {
+        match (self.theory_win_x, self.theory_win_y) {
+            (Some(x), Some(y)) => Some(egui::Pos2::new(x as f32, y as f32)),
+            _ => None,
+        }
+    }
+
     pub fn fretboard_win_pos(&self) -> Option<egui::Pos2> {
         match (self.fretboard_win_x, self.fretboard_win_y) {
             (Some(x), Some(y)) => Some(egui::Pos2::new(x as f32, y as f32)),
             _ => None,
         }
+    }
+
+    pub fn recorder_win_size(&self) -> egui::Vec2 {
+        match (self.recorder_win_w, self.recorder_win_h) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => egui::Vec2::new(w as f32, h as f32),
+            _ => crate::recorder_panel::DETACHED_DEFAULT,
+        }
+    }
+
+    pub fn recorder_win_pos(&self) -> Option<egui::Pos2> {
+        match (self.recorder_win_x, self.recorder_win_y) {
+            (Some(x), Some(y)) => Some(egui::Pos2::new(x as f32, y as f32)),
+            _ => None,
+        }
+    }
+
+    /// Where takes go.
+    ///
+    /// Resolved here rather than stored, so an absent `record_dir` follows the
+    /// machine rather than whatever the machine looked like when the file was
+    /// written. `dirs::video_dir()` is the right call on all three platforms —
+    /// it reads `FOLDERID_Videos` on Windows and `$XDG_VIDEOS_DIR` on Linux
+    /// rather than assuming an English folder name, which is the bug in every
+    /// hardcoded `~/Videos`.
+    ///
+    /// **Never the Desktop and never the bundle directory.** The fallback when
+    /// the platform has no videos folder at all is the home directory, because
+    /// a take written next to the executable is one nobody finds again and one
+    /// that fails outright inside a signed `.app`.
+    pub fn record_root(&self) -> PathBuf {
+        if let Some(d) = &self.record_dir {
+            let p = PathBuf::from(d);
+            if !p.as_os_str().is_empty() {
+                return p;
+            }
+        }
+        let base = dirs::video_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        base.join("Tangent")
+    }
+
+    /// Pre-roll, clamped to what the UI can actually offer.
+    ///
+    /// Sanitised at the point of use, like the tuning and the capo: a file from
+    /// a later build with a 10-second pre-roll keeps its 10 in the file and
+    /// counts down from the nearest thing this build has.
+    pub fn preroll_seconds(&self) -> u8 {
+        let want = self.record_preroll_s.clamp(0, 255) as u8;
+        crate::recorder::PREROLL_CHOICES
+            .into_iter()
+            .min_by_key(|c| c.abs_diff(want))
+            .unwrap_or(3)
     }
 
     /// The board the fretboard view draws, from whatever is in the file.
@@ -697,9 +988,46 @@ impl Settings {
         }
     }
 
+    /// The value `fretboard_tuning` holds when the custom tuning is selected.
+    ///
+    /// A sentinel rather than a separate boolean, so there is exactly one field
+    /// answering "which tuning is in use" and no way for two of them to
+    /// disagree. It cannot collide with a preset: `Tuning::by_name` is checked
+    /// first and no preset is called this.
+    pub const CUSTOM_TUNING: &str = "Custom";
+
+    /// The user's custom tuning, if one has been built and is still valid.
+    ///
+    /// Re-validated on every read rather than trusted. The file is editable by
+    /// hand and is shared with older and newer builds, and an invalid tuning —
+    /// one whose strings do not ascend — would break the voicing solver's
+    /// monotone search invariant rather than merely looking wrong.
+    pub fn custom_tuning(&self) -> Option<ivory_core::fretboard::Tuning> {
+        use ivory_core::fretboard::Tuning;
+        let name = self.fretboard_custom_name.as_ref()?;
+        let open = self.fretboard_custom_open.as_ref()?;
+        let pitches: Option<Vec<u8>> = open
+            .split(',')
+            .map(|p| p.trim().parse::<u8>().ok())
+            .collect();
+        Tuning::custom(name.clone(), pitches?).ok()
+    }
+
     pub fn fretboard_spec(&self) -> ivory_core::fretboard::FretboardSpec {
         use ivory_core::fretboard::{FretboardSpec, Tuning};
-        let tuning = Tuning::by_name(&self.fretboard_tuning).unwrap_or_else(Tuning::standard);
+        // A preset wins on name; then the custom tuning; then Standard. The
+        // fallback is deliberate and silent: a settings file naming a tuning
+        // this build does not have (an older build, or a hand edit) opens on
+        // Standard rather than refusing to start, and the stored name is left
+        // alone so a newer build still finds it.
+        let tuning = Tuning::by_name(&self.fretboard_tuning)
+            .cloned()
+            .or_else(|| {
+                (self.fretboard_tuning == Self::CUSTOM_TUNING)
+                    .then(|| self.custom_tuning())
+                    .flatten()
+            })
+            .unwrap_or_else(Tuning::standard);
         let frets = FretboardSpec::default().frets;
         FretboardSpec {
             tuning,
@@ -736,6 +1064,68 @@ mod tests {
     /// A first launch shows the whole app; a corrupt file does not get
     /// rearranged behind the user's back. Both matter, and they are one line
     /// apart in `load()`.
+    /// A custom tuning survives a save/load round trip and is usable.
+    #[test]
+    fn a_custom_tuning_round_trips_through_the_settings_file() {
+        let mut s = Settings::default();
+        s.fretboard_tuning = Settings::CUSTOM_TUNING.to_owned();
+        s.fretboard_custom_name = Some("Nashville".to_owned());
+        s.fretboard_custom_open = Some("40,45,50,55,59,64".to_owned());
+
+        let json = s.to_json();
+        let back = Settings::from_json(&json);
+        assert_eq!(back.fretboard_custom_name.as_deref(), Some("Nashville"));
+        let spec = back.fretboard_spec();
+        assert_eq!(spec.tuning.name, "Nashville");
+        assert_eq!(spec.tuning.strings(), 6);
+    }
+
+    /// The two keys are absent, not null, when no custom tuning exists — the
+    /// same rule `custom_font_path` follows, so an older build never meets them.
+    #[test]
+    fn an_unused_custom_tuning_writes_no_keys_at_all() {
+        let json = Settings::default().to_json();
+        assert!(!json.contains("fretboard_custom_name"), "{json}");
+        assert!(!json.contains("fretboard_custom_open"), "{json}");
+    }
+
+    /// A hand-edited or corrupt custom tuning falls back rather than reaching
+    /// the solver. Descending strings would break its monotone search
+    /// invariant, which is a silent wrong answer rather than a crash.
+    #[test]
+    fn an_invalid_custom_tuning_falls_back_to_standard() {
+        for bad in [
+            "64,59,55,50,45,40",  // descending: violates the solver's invariant
+            "40,45,notanumber",   // unparseable
+            "",                   // empty
+            "40,45,50,55,59,64,64,64,64,64,64,64,64", // 13 strings, over MAX
+        ] {
+            let mut s = Settings::default();
+            s.fretboard_tuning = Settings::CUSTOM_TUNING.to_owned();
+            s.fretboard_custom_name = Some("Broken".to_owned());
+            s.fretboard_custom_open = Some(bad.to_owned());
+            assert!(s.custom_tuning().is_none(), "{bad:?} should be refused");
+            assert_eq!(
+                s.fretboard_spec().tuning.name,
+                "Standard",
+                "{bad:?} should fall back rather than reach the solver"
+            );
+        }
+    }
+
+    /// Selecting a preset does not discard the custom tuning, so switching away
+    /// and back does not lose work.
+    #[test]
+    fn choosing_a_preset_keeps_the_custom_tuning_on_disk() {
+        let mut s = Settings::default();
+        s.fretboard_custom_name = Some("Mine".to_owned());
+        s.fretboard_custom_open = Some("38,45,50,55,59,64".to_owned());
+        s.fretboard_tuning = "DADGAD".to_owned();
+        let back = Settings::from_json(&s.to_json());
+        assert_eq!(back.fretboard_spec().tuning.name, "DADGAD");
+        assert!(back.custom_tuning().is_some(), "the custom tuning was lost");
+    }
+
     #[test]
     fn a_first_launch_shows_everything_and_a_broken_file_does_not() {
         let first = Settings::first_launch();
@@ -920,7 +1310,7 @@ mod tests {
     fn the_shipped_tunings_all_survive_a_round_trip() {
         for t in ivory_core::fretboard::TUNINGS {
             let mut s = Settings::default();
-            s.fretboard_tuning = t.name.to_owned();
+            s.fretboard_tuning = t.name.to_string();
             s.fretboard_capo = 5;
             let back = Settings::from_map(s.to_map());
             assert_eq!(back.fretboard_spec().tuning.name, t.name);

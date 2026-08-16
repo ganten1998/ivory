@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Hardened-runtime entitlements for Tangent.app. See build/macos/README.md
+      for why each key is here and what breaks without it.
+
+      FORMAT WARNING, learned the hard way: AMFI parses this file with its own
+      strict XML reader, not CFPreferences. The DOCTYPE line above is REQUIRED
+      and comments must live INSIDE the dict — a comment between the <?xml?>
+      declaration and <plist> makes codesign fail with "Failed to parse
+      entitlements: AMFIUnserializeXML: syntax error", which names a line number
+      but not the actual rule. Verified by bisection, not guessed.
+    -->
+
+    <!--
+      CAPTURE. Apple uses the same key names for App Sandbox and Hardened
+      Runtime, so these are correct for a non-sandboxed notarized app too. Both
+      are in the Developer-ID-allowed set: no provisioning profile, no App ID
+      registration, no entitlement request, and the notary service accepts them.
+
+      These gate the DEVICE. NSCameraUsageDescription and
+      NSMicrophoneUsageDescription in Info.plist gate the PROMPT. Both are
+      required and they fail DIFFERENTLY: a missing entitlement is a silent
+      refusal with no Privacy row ever appearing, while a missing usage string
+      terminates the process.
+    -->
+    <key>com.apple.security.device.camera</key>
+    <true/>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!--
+      PLUGIN HOSTING. Library validation restricts loading to code signed by the
+      same Team ID or by Apple, which every third-party VST3 fails by
+      definition — dlopen returns "different Team IDs". This is the entitlement
+      Apple provides for hosts, and it is why they warn against enabling it
+      unless you genuinely load third-party plug-ins. Tangent genuinely does.
+    -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!--
+      Disabling library validation is NOT sufficient alone, and the failure is
+      easy to misdiagnose because the plugin loads successfully and then dies
+      inside its own allocator. Verified by experiment (arm64, Darwin 25.6),
+      hardened host dlopen'ing a foreign-signed dylib:
+
+        runtime, no entitlements             -> dlopen fails, "different Team IDs"
+        runtime + disable-library-validation -> loads, then MAP_JIT fails, EINVAL
+        runtime + both of the above          -> works
+
+      Almost every serious instrument JITs its DSP graph, so this is the normal
+      case. Signing the PLUGIN with allow-jit does nothing: a dylib carries no
+      entitlements of its own and an in-process plugin runs under the host's.
+    -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+</dict>
+</plist>

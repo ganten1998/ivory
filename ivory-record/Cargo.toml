@@ -1,0 +1,121 @@
+[package]
+# The recorder: clock, capture, encode, mux, and the files a take produces.
+#
+# WHAT IS NOT HERE IS AS DELIBERATE AS IN `ivory-ui`, but the rule is the
+# opposite one. `ivory-ui` exists so that platform things are UNREACHABLE from
+# shared GUI code. This crate exists so that platform things have somewhere to
+# live that is NOT the GUI: cpal, a camera, an encoder and a file writer all
+# belong to a desktop and none of them belong in a VST3 editor.
+#
+# So: `ivory` depends on this crate; `ivory-ui` and `ivory-core` must NEVER.
+# `scripts/check-firewall.sh` asserts that, and see docs/RECORDER-PLAN.md §10
+# item 5 for why that assertion needs `--target all` to mean anything.
+#
+# No egui here either. The recorder produces bytes; drawing them is `ivory-ui`'s
+# job and compositing them is `ivory`'s (RECORDER-PLAN §6).
+name = "ivory-record"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# `default-features = false, features = ["std"]` turns OFF `parallel`, which is
+# the only thing that would pull `rayon`. With it off midly has ZERO transitive
+# dependencies: one line in Cargo.lock, one Unlicense entry in
+# THIRD-PARTY-LICENSES. `parallel` only accelerates PARSING, which a recorder
+# never does.
+midly = { version = "0.5", default-features = false, features = ["std"] }
+
+# Audio I/O. Apache-2.0. `default = []` upstream, so the ASIO feature stays OFF
+# and the Windows backend is WASAPI — which matters because ASIO went the
+# OPPOSITE way from VST3 and is now GPLv3-or-proprietary.
+cpal = "0.16"
+
+# Lock-free SPSC ring, MIT OR Apache-2.0. The audio callback must never
+# allocate, never lock and never touch a file; this is how samples leave it.
+rtrb = "0.3"
+
+# ── the camera, macOS only ──────────────────────────────────────────────────
+#
+# TARGET-GATED, NOT HOST-GATED, and the distinction is the release. Windows
+# builds go through `cargo xwin` FROM a Mac and Linux is cross-compiled too, so
+# anything written as a plain `[dependencies]` entry — or gated on a *host*
+# condition — would be pulled into the Windows link and fail there. The gate is
+# on `target_os`, and `scripts/check-firewall.sh --target all` is where that
+# stays true. Verify by hand with:
+#
+#   cargo tree -p ivory-record --target x86_64-pc-windows-msvc | grep -i objc
+#
+# Zlib OR Apache-2.0 OR MIT, all four. `default-features = false` matters more
+# than usual here: objc2-av-foundation's default feature set is EVERY class in
+# AVFoundation (~500 modules, a multi-minute build). The list below is the
+# capture pipeline and nothing else.
+#
+# These are not new to the dependency graph: cpal 0.16 already links
+# objc2 0.6, objc2-core-audio, objc2-core-audio-types and objc2-core-foundation
+# for its CoreAudio backend, so the camera adds four crates to a tree that was
+# already objc2-shaped rather than introducing a second FFI style.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSError",
+    "NSObject",
+    "NSProcessInfo",
+    "NSString",
+    "NSValue",
+] }
+# No `block2`: the only AVFoundation entry point that needs it is
+# `requestAccessForMediaType:completionHandler:`, and we deliberately do not
+# call it. AVFoundation raises the TCC prompt by itself when an
+# AVCaptureDeviceInput is created, so the prompt happens at Open Camera — the
+# one moment where the user has just asked for a camera and the dialog is not a
+# non-sequitur. See `permission_status` in `camera.rs`.
+objc2-av-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "AVCaptureDevice",
+    "AVCaptureInput",
+    "AVCaptureOutput",
+    "AVCaptureOutputBase",
+    "AVCaptureSession",
+    "AVCaptureVideoDataOutput",
+    "AVMediaFormat",
+    "dispatch2",
+    "objc2-core-media",
+] }
+objc2-core-media = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    # Without this, `CMSampleBuffer::image_buffer()` does not exist — the
+    # accessor is feature-gated on the CoreVideo dep, and its absence reads as
+    # "no method named image_buffer" rather than as a missing feature.
+    "objc2-core-video",
+    "CMBase",
+    "CMFormatDescription",
+    "CMSampleBuffer",
+    "CMTime",
+] }
+objc2-core-video = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "CVBase",
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVReturn",
+] }
+# The delegate must be handed a SERIAL queue or AVFoundation makes no ordering
+# promise about frames (`setSampleBufferDelegate:queue:` documents exactly
+# that). `DispatchQueue::new(label, None)` is serial — a null attr is the
+# serial attr.
+dispatch2 = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+] }
+
+[lints]
+workspace = true

@@ -2,12 +2,20 @@
 //!
 //! Qt shows menus as their own top-level popup windows; the fixed 200px-tall
 //! main window cannot host a ~460px menu, so the menu is rendered in its own
-//! borderless immediate viewport at the global cursor position. The Size
-//! submenu is a second sibling viewport to its right (Qt-like placement).
+//! borderless immediate viewport at the global cursor position. An open
+//! submenu is a second sibling viewport to its right (Qt-like placement) —
+//! one viewport, reused, because only one submenu is ever open.
 //!
 //! Chrome parity (spec §6.1): bold Courier Prime, per-mode colors, item
 //! padding 4px 20px, no rounding, 1px separators, toggle items rename
 //! themselves (no checkmarks anywhere).
+//!
+//! The rows are grouped into CATEGORIES: the top level names a subject
+//! (Window, Colors, Keyboard, Chords, Theory, Fretboard) and the hover carries
+//! the verbs. It was twenty-six near-flat rows, which is a list to read rather
+//! than a menu to aim at. **Two levels, and only two** — see `Entry::Submenu`
+//! and `build_entries`, which is written around that limit rather than against
+//! it.
 
 use crate::fonts;
 use crate::fretboard_panel;
@@ -26,7 +34,9 @@ pub enum ColorTarget {
     ChordText,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// `Clone` but not `Copy`: `SetTuning` carries an owned name, because a custom
+/// tuning's name is user input.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum MenuAction {
     SetSizePercent(i64),
     ToggleBorderless,
@@ -53,7 +63,17 @@ pub enum MenuAction {
     /// D-UI-15: the guitar view.
     ToggleFretboard,
     /// Name from `fretboard::TUNINGS`.
-    SetTuning(&'static str),
+    /// `String`, not `&'static str`: a custom tuning's name is user input and
+    /// has no static lifetime.
+    SetTuning(String),
+    /// Open the custom-tuning editor.
+    ///
+    /// A dialog, not a window, which is why it survives in a plugin for the
+    /// same reason "Teach Chord Name..." does: it needs no second OS window, no
+    /// device and no size of its own. It is offered only while the fretboard is
+    /// showing — an editor for something the user cannot see is a control with
+    /// no visible effect.
+    EditCustomTuning,
     SetCapo(u8),
     /// Fingerboard wood key (see `fretboard_panel::Wood`).
     SetWood(&'static str),
@@ -65,12 +85,56 @@ pub enum MenuAction {
     /// D-UI-16: pop the guitar view into its own window, and put it back.
     DetachFretboard,
     AttachFretboard,
+    /// D-UI-17: pop the theory band into its own window, and put it back.
+    ///
+    /// The third detachable surface, and it follows the other two exactly so
+    /// there is one set of habits rather than three — including that
+    /// `Caps::detachable` gates it, because a plugin has no window to pop it
+    /// into.
+    DetachTheory,
+    AttachTheory,
+    /// §5: show and hide the Recorder band.
+    ///
+    /// This row is the ONLY way the feature is reachable. `show_recorder`
+    /// defaults to false and is deliberately kept out of `first_launch()`, and
+    /// this menu is the entire chrome — there is no menu bar and no preferences
+    /// dialog — so an earlier draft of the recorder shipped completely
+    /// invisible. Every row below exists because of that.
+    ///
+    /// Hiding also CLOSES the detached window rather than orphaning it, which
+    /// is what `ToggleFretboard` already means; the app does the closing, so
+    /// the contract lives in the action name.
+    ToggleRecorder,
+    /// §5: pop the Recorder band into its own window, and put it back.
+    ///
+    /// The fourth detachable surface and the one with the best reason to be on
+    /// a second monitor — a big framing view of the camera while the piano
+    /// stays where it was. Gated on `caps.detachable` like the other three.
+    DetachRecorder,
+    AttachRecorder,
+    /// §5: open the Export dialog and its composition selector.
+    ///
+    /// A dialog rather than a window, so on its own it would survive a plugin
+    /// for the same reason "Teach Chord Name..." does. It does not, because it
+    /// configures a take that a plugin may not capture or write in the first
+    /// place — the whole category goes, not this row.
+    ShowExportDialog,
+    /// §5: pre-roll countdown in seconds; one of `recorder::PREROLL_CHOICES`.
+    SetPreRoll(u8),
+    /// §5: hide the running clock while recording.
+    ///
+    /// After a blinking light, a running timer is the most-cited performance
+    /// distraction in the piano forums, and no competitor offers the switch.
+    ToggleHideElapsed,
     ShowAbout,
     ResetSettings,
 }
 
 /// Everything the menu needs to know to render its labels.
-#[derive(Clone, Copy)]
+/// `Clone` but no longer `Copy`: `tuning` is a `String` since custom tunings
+/// exist. Every call site takes it by value already, so the only cost is one
+/// explicit `.clone()` where a view is reused.
+#[derive(Clone)]
 pub struct MenuView {
     pub dark_mode: bool,
     pub borderless: bool,
@@ -92,7 +156,12 @@ pub struct MenuView {
     /// D-UI-15: the guitar view is showing. Its Tuning and Capo submenus are
     /// hidden while it is off, rather than offered and inert.
     pub fretboard_on: bool,
-    pub tuning: &'static str,
+    /// The tuning currently in use, by name.
+    ///
+    /// `String` rather than `&'static str` since custom tunings exist: a
+    /// user-entered name has no static lifetime, and the alternative — leaking
+    /// it to fake one — would leak a little more on every edit.
+    pub tuning: String,
     pub capo: u8,
     pub wood: &'static str,
     /// D-UI-16: the guitar view is in its own window.
@@ -101,6 +170,30 @@ pub struct MenuView {
     pub theory: crate::theory_panel::Views,
     /// D-UI-17: whether the theory band follows live playing.
     pub theory_follows_midi: bool,
+    /// D-UI-17: the theory band is in its own window.
+    ///
+    /// Needed for the same reason `fretboard_detached` is: the Detach row
+    /// renames itself to Attach, and there are no checkmarks in this menu, so
+    /// the label IS the state readout. Without this the row could only ever say
+    /// one of the two things, and half of it would be a lie.
+    pub theory_detached: bool,
+    /// §5: the Recorder band is showing.
+    ///
+    /// Named to match `fretboard_on` rather than the `show_recorder` setting it
+    /// comes from: the two rows behave identically, and this is the label's
+    /// input, not the file's key.
+    pub recorder_on: bool,
+    /// §5: the Recorder band is in its own window.
+    ///
+    /// Needed for the same reason `theory_detached` is: the Detach row renames
+    /// itself to Attach, so the label IS the state readout.
+    pub recorder_detached: bool,
+    /// §5: the live pre-roll, in seconds. Comes from
+    /// `Settings::preroll_seconds()`, which has already clamped a stray value
+    /// from a later build's file to something this menu can mark.
+    pub preroll_s: u8,
+    /// §5: the running clock is hidden while recording.
+    pub hide_elapsed: bool,
     /// What the host allows. Rows whose action needs a window, a device list,
     /// or control of its own size are not shown where they cannot work — an
     /// inert row is worse than an absent one, because the user cannot tell
@@ -165,6 +258,42 @@ fn measured_height(entries: &[Entry], row_h: f32) -> f32 {
         .sum()
 }
 
+/// Pull an open submenu back onto the monitor.
+///
+/// Slide up rather than off the bottom, and flip to the menu's LEFT rather than
+/// off the right edge, which is what a native menu does. `menu_left` is the
+/// parent menu's left edge, so the flipped submenu lands against it.
+///
+/// A function rather than four lines inside `show` because the test used to
+/// re-implement it, and a re-implemented clamp passes while the real one is
+/// wrong. Grouping the menu into categories made that a much bigger risk:
+/// Chords, Theory, Fretboard, Wood, Tuning and Capo all open from rows below
+/// the halfway mark, so nearly every hover in the menu now depends on this.
+fn clamp_submenu(pos: Pos2, size: Vec2, menu_left: f32, mon: Vec2) -> Pos2 {
+    let mut p = pos;
+    if p.y + size.y > mon.y {
+        p.y = (mon.y - size.y).max(0.0);
+    }
+    if p.x + size.x > mon.x {
+        p.x = (menu_left - size.x).max(0.0);
+    }
+    p
+}
+
+/// One row inside a submenu.
+///
+/// A `(String, MenuAction)` pair until the menu was grouped into categories.
+/// It carries `enabled` for the same reason the top-level `Item` does: "Teach
+/// Chord Name..." and "Correct Chord Name..." act on the voicing you are
+/// holding and grey out without one, and grouping moved them a level down. A
+/// submenu item that could not be greyed would have silently re-enabled them,
+/// and the teach dialog would open with nothing to teach.
+struct SubItem {
+    label: String,
+    action: MenuAction,
+    enabled: bool,
+}
+
 enum Entry {
     Separator,
     Item {
@@ -176,10 +305,43 @@ enum Entry {
     /// be exactly one of these (Size), hard-coded from the entry list all the
     /// way down to the viewport; the guitar view needs two more, so the whole
     /// path is now driven by the list.
+    ///
+    /// **Items, not entries: this is the last level.** A submenu holds rows and
+    /// nothing else, and `show` draws exactly one sibling popup, so there is no
+    /// third level to nest into. Every category below is designed around that.
     Submenu {
         label: String,
-        items: Vec<(String, MenuAction)>,
+        items: Vec<SubItem>,
     },
+}
+
+/// Push a category, as a hover when there is something worth hovering for.
+///
+/// The shape follows the content, which is what keeps `Caps` honest: under
+/// `Caps::PLUGIN` the Window category loses Borderless, Keyboard loses its
+/// device row and Fretboard loses Detach, so a category can arrive here with
+/// one item or none. An empty hover is a dead end the user cannot tell from a
+/// bug, and a one-item hover charges a hover to reach a single row. So nothing
+/// vanishes, one item is drawn as an ordinary row, and two or more open.
+///
+/// It also gives the fretboard block its shape for free: with the guitar view
+/// off there is only "Show Fretboard" to say, so the category IS that row.
+fn push_category(entries: &mut Vec<Entry>, label: &str, mut items: Vec<SubItem>) {
+    match items.len() {
+        0 => {}
+        1 => {
+            let only = items.remove(0);
+            entries.push(Entry::Item {
+                label: only.label,
+                action: only.action,
+                enabled: only.enabled,
+            });
+        }
+        _ => entries.push(Entry::Submenu {
+            label: label.to_owned(),
+            items,
+        }),
+    }
 }
 
 /// Where an open submenu goes and how big it is. Measured at open time with
@@ -222,36 +384,55 @@ pub struct MenuState {
 const MENU_ID: &str = "ivory-menu";
 const SUBMENU_ID: &str = "ivory-menu-sub";
 
+/// The menu, as categories.
+///
+/// It was twenty-six rows deep and almost entirely flat, which is a list to
+/// read rather than a menu to aim at. Everything that belongs together is now
+/// one hover: the top level names the SUBJECT, the hover carries the verbs.
+///
+/// Two rules shape what follows, and both are the type's, not a preference:
+/// a submenu holds items and not more submenus (`Entry::Submenu`), and a
+/// category with nothing in it must not draw as an empty hover
+/// (`push_category`). Where those two collide with the tidy grouping, the
+/// comment at the collision says which one won.
 fn build_entries(view: MenuView) -> Vec<Entry> {
     let item = |label: &str, action: MenuAction| Entry::Item {
         label: label.to_owned(),
         action,
         enabled: true,
     };
-    let submenu = |label: &str, items: Vec<(String, MenuAction)>| Entry::Submenu {
+    let row = |label: &str, action: MenuAction| SubItem {
         label: label.to_owned(),
-        items,
+        action,
+        enabled: true,
     };
     let mut e = Vec::new();
-    // 1. Size. Offered wherever a size can be CHOSEN, which includes a plugin:
-    //    it cannot set its own window, but it can ask, and VST3 has a path for
-    //    exactly that. Leaving it out was the difference between an editor you
-    //    can read and one you cannot.
+
+    // ── Window ─────────────────────────────────────────────────────────────
+    // Size was a submenu of its own, and it CANNOT become a child of Window:
+    // `Entry::Submenu` holds items, not submenus, and `show` draws exactly one
+    // sibling popup — there is no third level, and inventing one would rewrite
+    // the placement, clamping and hover-tracking path all at once. So the
+    // percents are Window's own items. Same seven choices, same actions, still
+    // one hover from the top, and Borderless joins them because it is the only
+    // other thing there is to say about the window.
+    let mut window: Vec<SubItem> = Vec::new();
     if view.caps.size_presets {
-        e.push(submenu(
-            "Size",
-            SIZE_PERCENTS
-                .iter()
-                .map(|&p| (format!("{p}%"), MenuAction::SetSizePercent(p)))
-                .collect(),
-        ));
-        e.push(Entry::Separator);
+        // Offered wherever a size can be CHOSEN, which includes a plugin: it
+        // cannot set its own window, but it can ask, and VST3 has a path for
+        // exactly that. Leaving it out was the difference between an editor you
+        // can read and one you cannot.
+        window.extend(SIZE_PERCENTS.iter().map(|&p| SubItem {
+            label: format!("{p}%"),
+            action: MenuAction::SetSizePercent(p),
+            enabled: true,
+        }));
     }
-    // 2. Borderless is a different question with a different answer: window
-    //    chrome belongs to whoever owns the window, and in a plugin that is
-    //    the host. Label shows what you would switch TO.
+    // Borderless is a different question with a different answer: window
+    // chrome belongs to whoever owns the window, and in a plugin that is the
+    // host. Label shows what you would switch TO.
     if view.caps.window_sizing {
-        e.push(item(
+        window.push(row(
             if view.borderless {
                 "Bordered"
             } else {
@@ -259,35 +440,18 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
             },
             MenuAction::ToggleBorderless,
         ));
-        e.push(Entry::Separator);
     }
-    // A plugin is handed its notes by the host and has no device to choose.
-    if view.caps.midi_ports {
-        e.push(item("Select MIDI Input...", MenuAction::SelectMidiInput));
-        e.push(Entry::Separator);
-    }
-    e.push(item(
-        "Set White Key Color...",
-        MenuAction::PickColor(ColorTarget::WhiteIdle),
-    ));
-    e.push(item(
-        "Set Black Key Color...",
-        MenuAction::PickColor(ColorTarget::BlackIdle),
-    ));
-    e.push(Entry::Separator);
-    e.push(item(
-        "Set Active Key Color...",
-        MenuAction::PickColor(ColorTarget::Active),
-    ));
-    e.push(item(
-        "Set Sustain Color...",
-        MenuAction::PickColor(ColorTarget::Sustain),
-    ));
-    e.push(item(
-        "Set Chord Color...",
-        MenuAction::PickColor(ColorTarget::ChordText),
-    ));
-    e.push(Entry::Separator);
+    push_category(&mut e, "Window", window);
+
+    // Dark Mode is deliberately NOT filed under a category, and it is the one
+    // row that isn't.
+    //
+    // It is the most-flipped item in the menu, so a hover to reach it is a toll
+    // paid all day; and it is the row `app.rs`'s plugin test clicks BY LABEL
+    // through `rows_for_test` to prove menu rows are alive at all in an editor,
+    // which only works while it is a top-level item. Moving it into a hover
+    // means updating that test in the same change, or the only end-to-end proof
+    // that the plugin menu works at all goes red.
     e.push(item(
         if view.dark_mode {
             "Light Mode"
@@ -297,31 +461,52 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         MenuAction::ToggleDarkMode,
     ));
     // Only offered when a second typeface is actually installed, matching how
-    // Detach appears conditionally rather than showing a dead row.
+    // Detach appears conditionally rather than showing a dead row. One row, so
+    // no category: a "Text" hover holding a single typeface name would cost a
+    // hover and save nothing.
     if let Some(next) = view.next_font {
         e.push(item(next, MenuAction::CycleFont));
     }
+
+    // ── Colors ─────────────────────────────────────────────────────────────
+    // Five flat rows and a separator, now one hover. Spelled the American way
+    // because every label inside it already is ("Set White Key Color...") and a
+    // "Colours" hover full of "Color..." items reads like a bug.
+    push_category(
+        &mut e,
+        "Colors",
+        vec![
+            row(
+                "Set White Key Color...",
+                MenuAction::PickColor(ColorTarget::WhiteIdle),
+            ),
+            row(
+                "Set Black Key Color...",
+                MenuAction::PickColor(ColorTarget::BlackIdle),
+            ),
+            row(
+                "Set Active Key Color...",
+                MenuAction::PickColor(ColorTarget::Active),
+            ),
+            row(
+                "Set Sustain Color...",
+                MenuAction::PickColor(ColorTarget::Sustain),
+            ),
+            row(
+                "Set Chord Color...",
+                MenuAction::PickColor(ColorTarget::ChordText),
+            ),
+        ],
+    );
     e.push(Entry::Separator);
-    e.push(item(
-        if view.supporter {
-            "Supporter Key..."
-        } else {
-            "Support Tangent..."
-        },
-        MenuAction::ShowSupporterKey,
-    ));
-    if view.supporter {
-        e.push(item(
-            if view.heart_on {
-                "Hide Heart"
-            } else {
-                "Show Heart"
-            },
-            MenuAction::ToggleHeart,
-        ));
+
+    // ── Keyboard ───────────────────────────────────────────────────────────
+    let mut keyboard = Vec::new();
+    // A plugin is handed its notes by the host and has no device to choose.
+    if view.caps.midi_ports {
+        keyboard.push(row("Select MIDI Input...", MenuAction::SelectMidiInput));
     }
-    e.push(Entry::Separator);
-    e.push(item(
+    keyboard.push(row(
         if view.keytoggle {
             "Disable Keytoggle"
         } else {
@@ -329,9 +514,10 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         },
         MenuAction::ToggleKeytoggle,
     ));
-    // Chord-detection block (the detector is always available in the Rust build).
-    e.push(Entry::Separator);
-    e.push(item(
+    // Note spelling sits with the keys rather than with the chords. It respells
+    // every name in the app, not just chord names, and the keyboard is where
+    // the user meets it first.
+    keyboard.push(row(
         if view.prefer_flats {
             "Use Sharps (A#)"
         } else {
@@ -339,11 +525,16 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         },
         MenuAction::ToggleNotePreference,
     ));
-    e.push(Entry::Separator);
+    push_category(&mut e, "Keyboard", keyboard);
+
+    // ── Chords ─────────────────────────────────────────────────────────────
+    // The detector, its window, and everything that teaches it — six rows and
+    // three separators' worth of top level, all of it about one subject.
+    let mut chords = Vec::new();
     if view.detached && view.caps.detachable {
-        e.push(item("Attach Chord Window", MenuAction::AttachChordWindow));
+        chords.push(row("Attach Chord Window", MenuAction::AttachChordWindow));
     } else {
-        e.push(item(
+        chords.push(row(
             if view.detection_enabled {
                 "Disable Chord Detection"
             } else {
@@ -352,30 +543,23 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
             MenuAction::ToggleChordDetection,
         ));
         if view.detection_enabled && view.caps.detachable {
-            e.push(item("Detach Chord Window", MenuAction::DetachChordWindow));
+            chords.push(row("Detach Chord Window", MenuAction::DetachChordWindow));
         }
     }
-    // D-UI-5: teach items, inside the detection block, right after the
-    // Detach/Attach entry, preceded by their own separator. "Teach Chord
-    // Name..." is greyed only when no notes are held; "Manage Taught
-    // Chords..." is always available.
-    e.push(Entry::Separator);
-    e.push(Entry::Item {
+    // D-UI-5: "Teach Chord Name..." is greyed only when no notes are held;
+    // "Manage Taught Chords..." is always available.
+    chords.push(SubItem {
         label: "Teach Chord Name...".to_owned(),
         action: MenuAction::TeachChordName,
         enabled: view.notes_held,
     });
-    e.push(Entry::Item {
-        label: "Manage Taught Chords...".to_owned(),
-        action: MenuAction::ManageTaughtChords,
-        enabled: true,
-    });
-    // D-UI-9: the learned re-ranker. "Correct Chord Name..." needs a voicing to
-    // act on; the toggle renames itself like every other toggle here (Qt parity
-    // — no checkmarks anywhere). Forgetting what was learned lives in "Manage
-    // Taught Chords...", one step away from the button that trains.
-    e.push(Entry::Separator);
-    e.push(Entry::Item {
+    chords.push(row(
+        "Manage Taught Chords...",
+        MenuAction::ManageTaughtChords,
+    ));
+    // D-UI-9: the learned re-ranker. Forgetting what was learned lives in
+    // "Manage Taught Chords...", one step away from the button that trains.
+    chords.push(SubItem {
         label: "Correct Chord Name...".to_owned(),
         action: MenuAction::CorrectChordName,
         // Needs both a voicing AND a visible reading: with detection off,
@@ -383,7 +567,9 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         // "Now reads: (none)" and the result would land somewhere invisible.
         enabled: view.notes_held && view.detection_enabled,
     });
-    e.push(item(
+    // The toggle renames itself like every other toggle here (Qt parity — no
+    // checkmarks anywhere).
+    chords.push(row(
         if view.learning_on {
             "Disable Chord Learning"
         } else {
@@ -391,56 +577,72 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         },
         MenuAction::ToggleChordLearning,
     ));
-    // D-UI-17: the theory band. A submenu rather than three top-level rows,
-    // because the menu is already long and these three belong together — and
-    // each row renames itself the way every other toggle here does, so the
-    // submenu says what is showing without a checkmark column.
-    e.push(Entry::Separator);
-    e.push(submenu(
-        "Theory",
-        crate::theory_panel::View::ALL
-            .iter()
-            .map(|v| {
-                (
-                    if v.is_on(view.theory) {
-                        format!("Hide {}", v.label())
-                    } else {
-                        format!("Show {}", v.label())
-                    },
-                    MenuAction::ToggleTheoryView(*v),
-                )
-            })
-            // Whether the band tracks your playing sits with the diagrams
-            // rather than in the keytoggle block, because it is a property of
-            // this display and of nothing else.
-            .chain(std::iter::once((
-                if view.theory_follows_midi {
-                    "Stop Following MIDI".to_owned()
-                } else {
-                    "Follow MIDI".to_owned()
-                },
-                MenuAction::ToggleTheoryFollowsMidi,
-            )))
-            .collect(),
+    push_category(&mut e, "Chords", chords);
+
+    // ── Theory ─────────────────────────────────────────────────────────────
+    // D-UI-17: the theory band. Each row renames itself the way every other
+    // toggle here does, so the hover says what is showing without a checkmark
+    // column.
+    let mut theory: Vec<SubItem> = crate::theory_panel::View::ALL
+        .iter()
+        .map(|v| SubItem {
+            label: if v.is_on(view.theory) {
+                format!("Hide {}", v.label())
+            } else {
+                format!("Show {}", v.label())
+            },
+            action: MenuAction::ToggleTheoryView(*v),
+            enabled: true,
+        })
+        .collect();
+    // Whether the band tracks your playing sits with the diagrams rather than
+    // in the keyboard block, because it is a property of this display and of
+    // nothing else.
+    theory.push(row(
+        if view.theory_follows_midi {
+            "Stop Following MIDI"
+        } else {
+            "Follow MIDI"
+        },
+        MenuAction::ToggleTheoryFollowsMidi,
     ));
-    // D-UI-15: the guitar view. Its own block, because it is a second
-    // instrument rather than another chord-display option, and its two
-    // submenus only exist while it is on: a Tuning row on a hidden fretboard
-    // is a control for something the user cannot see.
-    e.push(Entry::Separator);
-    e.push(item(
+    // D-UI-17: the third detachable surface. Last in the hover, not second like
+    // the fretboard's, because the diagram toggles above it are what the band
+    // IS — where it lives is the afterthought.
+    if view.caps.detachable {
+        theory.push(row(
+            if view.theory_detached {
+                "Attach Theory"
+            } else {
+                "Detach Theory"
+            },
+            if view.theory_detached {
+                MenuAction::AttachTheory
+            } else {
+                MenuAction::DetachTheory
+            },
+        ));
+    }
+    push_category(&mut e, "Theory", theory);
+
+    // ── Fretboard ──────────────────────────────────────────────────────────
+    // D-UI-15: the guitar view. Its own subject, because it is a second
+    // instrument rather than another chord-display option. While it is off the
+    // category collapses to the one row there is to show — a Custom Tuning
+    // item on a hidden fretboard is a control for something you cannot see.
+    let mut fretboard = vec![row(
         if view.fretboard_on {
             "Hide Fretboard"
         } else {
             "Show Fretboard"
         },
         MenuAction::ToggleFretboard,
-    ));
+    )];
     if view.fretboard_on {
         // Mirrors the chord window's Detach/Attach exactly, so there is one
         // set of habits rather than two.
         if view.caps.detachable {
-            e.push(item(
+            fretboard.push(row(
                 if view.fretboard_detached {
                     "Attach Fretboard"
                 } else {
@@ -453,42 +655,56 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 },
             ));
         }
-        e.push(submenu(
+        fretboard.push(row("Custom Tuning...", MenuAction::EditCustomTuning));
+    }
+    push_category(&mut e, "Fretboard", fretboard);
+    if view.fretboard_on {
+        // Wood, Tuning and Capo stay TOP-LEVEL hovers, immediately under the
+        // Fretboard row and inside the same separator block so they still read
+        // as its business.
+        //
+        // They are lists of choices — three woods, every shipped tuning, ten
+        // frets — so each is already a submenu, and a submenu cannot hold
+        // another one (see `Entry::Submenu`). The alternatives were both worse
+        // than a sibling: flattening ~20 choices into the Fretboard hover, or
+        // inventing a third menu level for three rows. Siblings it is.
+        push_category(
+            &mut e,
             "Wood",
             fretboard_panel::Wood::ALL
                 .iter()
-                .map(|w| {
-                    (
-                        if w.key() == view.wood {
-                            format!("{}  \u{2022}", w.label())
-                        } else {
-                            w.label().to_owned()
-                        },
-                        MenuAction::SetWood(w.key()),
-                    )
+                .map(|w| SubItem {
+                    label: if w.key() == view.wood {
+                        format!("{}  \u{2022}", w.label())
+                    } else {
+                        w.label().to_owned()
+                    },
+                    action: MenuAction::SetWood(w.key()),
+                    enabled: true,
                 })
                 .collect(),
-        ));
-        e.push(submenu(
+        );
+        push_category(
+            &mut e,
             "Tuning",
             fretboard::TUNINGS
                 .iter()
-                .map(|t| {
-                    (
-                        // The current one is marked rather than hidden: a
-                        // submenu that never says what is selected makes you
-                        // close it again to find out.
-                        if t.name == view.tuning {
-                            format!("{}  \u{2022}", t.name)
-                        } else {
-                            t.name.to_owned()
-                        },
-                        MenuAction::SetTuning(t.name),
-                    )
+                .map(|t| SubItem {
+                    // The current one is marked rather than hidden: a submenu
+                    // that never says what is selected makes you close it again
+                    // to find out.
+                    label: if t.name == view.tuning {
+                        format!("{}  \u{2022}", t.name)
+                    } else {
+                        t.name.to_string()
+                    },
+                    action: MenuAction::SetTuning(t.name.to_string()),
+                    enabled: true,
                 })
                 .collect(),
-        ));
-        e.push(submenu(
+        );
+        push_category(
+            &mut e,
             "Capo",
             (0..=CAPO_MAX)
                 .map(|f| {
@@ -497,16 +713,148 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                     } else {
                         format!("Fret {f}")
                     };
-                    (
-                        if f == view.capo {
+                    SubItem {
+                        label: if f == view.capo {
                             format!("{label}  \u{2022}")
                         } else {
                             label
                         },
-                        MenuAction::SetCapo(f),
-                    )
+                        action: MenuAction::SetCapo(f),
+                        enabled: true,
+                    }
                 })
                 .collect(),
+        );
+    }
+
+    // ── Recorder ───────────────────────────────────────────────────────────
+    // §5. LAST of the subjects, after the whole display block, and the position
+    // is the argument rather than an accident.
+    //
+    // Window, Keyboard, Chords, Theory and Fretboard are all answers to "what
+    // is on screen" — asked and re-asked all day, which is why they are near
+    // the top. The recorder is a MODE the user enters: it opens a camera,
+    // claims 200 points of the window and ends in files on disk. You go to it
+    // deliberately, once, and then you are in it; putting it among the display
+    // toggles would make it one more thing to scan past every time somebody
+    // wants dark mode. The plan's own control-order thinking is the same shape:
+    // the things you touch constantly come first, and the things you set up
+    // once come after.
+    //
+    // It also physically cannot go between Fretboard and Wood/Tuning/Capo,
+    // which are siblings that have to stay adjacent to the row they belong to.
+    //
+    // The whole category is gated on `caps.capture_devices` rather than row by
+    // row: a plugin has no business opening a camera behind the DAW's back, and
+    // a Minimal build has not linked the code to. Absent, not
+    // offered-and-greyed — an inert row is worse than a missing one, because
+    // the user cannot tell it from a bug.
+    if view.caps.capture_devices {
+        // Renames itself rather than carrying a checkmark, per the chrome rule
+        // at the top of this file. (Wood/Tuning/Capo use a `•` marker instead,
+        // and that is not an exception to it: those are lists of CHOICES, where
+        // the question is which one, not whether.)
+        let mut recorder = vec![row(
+            if view.recorder_on {
+                // "Hide" closes the detached window rather than orphaning it,
+                // exactly as "Hide Fretboard" does. The app does the closing;
+                // what matters here is that both states are one action, so
+                // there is never a hidden band with a live window beside it.
+                "Hide Recorder"
+            } else {
+                "Show Recorder"
+            },
+            MenuAction::ToggleRecorder,
+        )];
+        if view.recorder_on {
+            // Detach needs `caps.detachable` ON TOP of `capture_devices`: a
+            // host may be able to open a camera and still have no second window
+            // to put the framing view in. Same gate the fretboard and theory
+            // detach rows use, so there is one set of habits rather than four.
+            if view.caps.detachable {
+                recorder.push(row(
+                    if view.recorder_detached {
+                        "Attach Recorder"
+                    } else {
+                        "Detach Recorder"
+                    },
+                    if view.recorder_detached {
+                        MenuAction::AttachRecorder
+                    } else {
+                        MenuAction::DetachRecorder
+                    },
+                ));
+            }
+            recorder.push(row("Export...", MenuAction::ShowExportDialog));
+            recorder.push(row(
+                if view.hide_elapsed {
+                    "Show Elapsed Time"
+                } else {
+                    "Hide Elapsed Time"
+                },
+                MenuAction::ToggleHideElapsed,
+            ));
+        }
+        push_category(&mut e, "Recorder", recorder);
+        if view.recorder_on {
+            // A SIBLING hover, for exactly the reason Wood/Tuning/Capo are:
+            // pre-roll is a list of choices, so it is already a submenu, and a
+            // submenu cannot hold another one (see `Entry::Submenu`). Offered
+            // only while the band is showing — a countdown length for a
+            // recorder you cannot see is a control with no visible effect.
+            push_category(
+                &mut e,
+                "Pre-roll",
+                crate::recorder::PREROLL_CHOICES
+                    .into_iter()
+                    .map(|s| {
+                        let label = if s == 0 {
+                            "No countdown".to_owned()
+                        } else {
+                            format!("{s} seconds")
+                        };
+                        SubItem {
+                            // Marked rather than hidden, like Tuning and Capo: a
+                            // submenu that never says what is selected makes you
+                            // close it again to find out.
+                            label: if s == view.preroll_s {
+                                format!("{label}  \u{2022}")
+                            } else {
+                                label
+                            },
+                            action: MenuAction::SetPreRoll(s),
+                            enabled: true,
+                        }
+                    })
+                    .collect(),
+            );
+        }
+    }
+
+    // ── The rows that are not a category ───────────────────────────────────
+    // Three one-shot actions and the supporter pair. None of them groups with
+    // anything: burying "About" under a "Help" hover would be a hover invented
+    // to hold one row.
+    e.push(Entry::Separator);
+    e.push(item(
+        if view.supporter {
+            "Supporter Key..."
+        } else {
+            "Support Tangent..."
+        },
+        MenuAction::ShowSupporterKey,
+    ));
+    if view.supporter {
+        // Stays beside the supporter row rather than under Colors: it is a
+        // visibility toggle for a decoration, not a colour, and it only exists
+        // for the person the row above it is addressed to.
+        e.push(item(
+            if view.heart_on {
+                "Hide Heart"
+            } else {
+                "Show Heart"
+            },
+            MenuAction::ToggleHeart,
         ));
     }
     e.push(Entry::Separator);
@@ -524,7 +872,7 @@ impl MenuState {
         global_pos: Pos2,
         monitor_size: Option<Vec2>,
     ) -> Self {
-        let entries = build_entries(view);
+        let entries = build_entries(view.clone());
         let font = FontId::new(MENU_FONT_SIZE, fonts::courier_bold());
 
         let measure = |ctx: &egui::Context, text: &str| -> Vec2 {
@@ -601,7 +949,7 @@ impl MenuState {
                 Entry::Submenu { items, .. } => {
                     let w = items
                         .iter()
-                        .fold(0.0_f32, |acc, (l, _)| acc.max(measure(ctx, l).x));
+                        .fold(0.0_f32, |acc, it| acc.max(measure(ctx, &it.label).x));
                     subs.push(SubGeom {
                         row_top: height,
                         size: Vec2::new((w + 2.0 * PAD_X).ceil(), items.len() as f32 * row_h),
@@ -844,7 +1192,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
                             hover_close_submenu = true;
                         }
                         if r.clicked() {
-                            action = Some(*a);
+                            action = Some(a.clone());
                             *want_close = true;
                         }
                     }
@@ -901,14 +1249,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
             _ => Pos2::new(state.pos.x + state.size.x, state.pos.y + row_top),
         };
         if let Some(mon) = state.monitor {
-            // Slide up rather than off the bottom, and flip to the menu's LEFT
-            // rather than off the right edge, which is what a native menu does.
-            if sub_pos.y + sub_size.y > mon.y {
-                sub_pos.y = (mon.y - sub_size.y).max(0.0);
-            }
-            if sub_pos.x + sub_size.x > mon.x {
-                sub_pos.x = (state.pos.x - sub_size.x).max(0.0);
-            }
+            sub_pos = clamp_submenu(sub_pos, sub_size, state.pos.x, mon);
         }
 
         let sub_spec = crate::shell::SurfaceSpec {
@@ -935,9 +1276,12 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
                 })
                 .nth(sub_i);
             ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
-                for (label, a) in items.into_iter().flatten() {
-                    if menu_button(ui, label, true, row_h).clicked() {
-                        action = Some(*a);
+                for it in items.into_iter().flatten() {
+                    // `it.enabled`, not `true`: "Teach Chord Name..." lives in
+                    // a submenu now, and hard-coding this is how a dialog opens
+                    // on a voicing that is not being held.
+                    if menu_button(ui, &it.label, it.enabled, row_h).clicked() {
+                        action = Some(it.action.clone());
                         *want_close = true;
                     }
                 }
@@ -994,13 +1338,68 @@ mod tests {
             supporter: false,
             heart_on: true,
             fretboard_on: false,
-            tuning: "Standard",
+            tuning: "Standard".to_string(),
             capo: 0,
             wood: "rosewood",
             fretboard_detached: false,
             theory: crate::theory_panel::Views::default(),
             theory_follows_midi: false,
+            theory_detached: false,
+            // Off, like the setting it mirrors: the band is 200 points tall and
+            // a window that grows on its own is the geometry surprise this app
+            // has already been bitten by twice.
+            recorder_on: false,
+            recorder_detached: false,
+            preroll_s: 3,
+            hide_elapsed: false,
             caps: Caps::DESKTOP,
+        }
+    }
+
+    /// Everything on at once, for the tests that need the biggest menu there
+    /// is. A helper rather than four copies of the same literal, because the
+    /// copies drifted the moment the recorder arrived and the "fullest" menu
+    /// silently stopped being the fullest one.
+    fn fullest() -> MenuView {
+        MenuView {
+            fretboard_on: true,
+            recorder_on: true,
+            supporter: true,
+            next_font: Some("Terminess"),
+            ..view()
+        }
+    }
+
+    #[test]
+    #[ignore = "structure dump, not an assertion"]
+    fn dump_menu_structure() {
+        // `fullest()`, not `view()`: a dump that leaves out the fretboard and
+        // recorder blocks is a dump of two thirds of the menu, which is not
+        // what anyone runs this for.
+        for e in build_entries(fullest()) {
+            match e {
+                Entry::Submenu { label, items } => {
+                    println!("[{label}]");
+                    for it in items {
+                        // Greyed items are marked: the whole point of `SubItem`
+                        // carrying `enabled` is that a hover can hold one.
+                        println!(
+                            "    {}{}",
+                            it.label,
+                            if it.enabled { "" } else { "  (greyed)" }
+                        );
+                    }
+                }
+                other => println!("{}", label_of(&other)),
+            }
+        }
+    }
+
+    fn label_of(e: &Entry) -> String {
+        match e {
+            Entry::Item { label, .. } => label.clone(),
+            Entry::Separator => "-----".into(),
+            Entry::Submenu { label, .. } => format!("[{label}]"),
         }
     }
 
@@ -1011,8 +1410,8 @@ mod tests {
             .filter_map(|e| match e {
                 Entry::Submenu { label, items } => Some((
                     label,
-                    items.iter().map(|(l, _)| l.clone()).collect(),
-                    items.into_iter().map(|(_, a)| a).collect(),
+                    items.iter().map(|it| it.label.clone()).collect(),
+                    items.into_iter().map(|it| it.action).collect(),
                 )),
                 _ => None,
             })
@@ -1022,12 +1421,18 @@ mod tests {
     /// One submenu by name. Positional indexing broke every time a submenu
     /// was added above another, which is a test failing for the wrong reason.
     fn sub(v: MenuView, name: &str) -> (String, Vec<String>, Vec<MenuAction>) {
-        submenus(v)
+        submenus(v.clone())
             .into_iter()
             .find(|(n, ..)| n == name)
             .unwrap_or_else(|| panic!("no {name} submenu"))
     }
 
+    /// The hover labels, in menu order — what the top level READS as.
+    fn category_names(v: MenuView) -> Vec<String> {
+        submenus(v).into_iter().map(|(n, ..)| n).collect()
+    }
+
+    /// TOP-LEVEL clickable rows only.
     fn rows(v: MenuView) -> Vec<(String, MenuAction, bool)> {
         build_entries(v)
             .into_iter()
@@ -1042,8 +1447,35 @@ mod tests {
             .collect()
     }
 
+    /// Every clickable row in the whole menu: the top level and the inside of
+    /// every hover, in the order the user meets them.
+    ///
+    /// Most of what these tests assert is "this row exists, with this label,
+    /// greyed exactly when it cannot act". Grouping the menu into categories
+    /// moved a dozen rows one level down without changing any of that, so the
+    /// tests ask the whole menu rather than the top level of it. The plugin
+    /// test in particular MUST use this: a row that needs a window is just as
+    /// dead one level down.
+    fn all_rows(v: MenuView) -> Vec<(String, MenuAction, bool)> {
+        build_entries(v)
+            .into_iter()
+            .flat_map(|e| match e {
+                Entry::Item {
+                    label,
+                    action,
+                    enabled,
+                } => vec![(label, action, enabled)],
+                Entry::Submenu { items, .. } => items
+                    .into_iter()
+                    .map(|it| (it.label, it.action, it.enabled))
+                    .collect(),
+                Entry::Separator => Vec::new(),
+            })
+            .collect()
+    }
+
     fn find(v: MenuView, action: MenuAction) -> Option<(String, bool)> {
-        rows(v)
+        all_rows(v)
             .into_iter()
             .find(|(_, a, _)| *a == action)
             .map(|(l, _, e)| (l, e))
@@ -1051,25 +1483,32 @@ mod tests {
 
     /// D-UI-9: correcting acts on the held voicing AND needs a visible reading,
     /// so it greys out with no notes down or with detection off.
+    ///
+    /// Unchanged in intent by the regrouping; it now proves it about a row
+    /// inside the Chords hover, which is the reason `SubItem` has an `enabled`
+    /// field at all.
     #[test]
     fn correct_item_needs_notes_and_detection() {
         let mut v = view();
         let label = "Correct Chord Name...".to_owned();
         assert_eq!(
-            find(v, MenuAction::CorrectChordName),
+            find(v.clone(), MenuAction::CorrectChordName),
             Some((label.clone(), false))
         );
         v.notes_held = true;
         assert_eq!(
-            find(v, MenuAction::CorrectChordName),
+            find(v.clone(), MenuAction::CorrectChordName),
             Some((label.clone(), true))
         );
         // Detection off nulls current_chord — nothing to correct against.
         v.detection_enabled = false;
-        assert_eq!(find(v, MenuAction::CorrectChordName), Some((label, false)));
+        assert_eq!(
+            find(v.clone(), MenuAction::CorrectChordName),
+            Some((label, false))
+        );
         // Teaching still works with detection off: it pins a name outright.
         assert_eq!(
-            find(v, MenuAction::TeachChordName).map(|(_, e)| e),
+            find(v.clone(), MenuAction::TeachChordName).map(|(_, e)| e),
             Some(true)
         );
     }
@@ -1079,61 +1518,104 @@ mod tests {
     fn learning_toggle_renames_itself() {
         let mut v = view();
         assert_eq!(
-            find(v, MenuAction::ToggleChordLearning),
+            find(v.clone(), MenuAction::ToggleChordLearning),
             Some(("Enable Chord Learning".to_owned(), true))
         );
         v.learning_on = true;
         assert_eq!(
-            find(v, MenuAction::ToggleChordLearning),
+            find(v.clone(), MenuAction::ToggleChordLearning),
             Some(("Disable Chord Learning".to_owned(), true))
         );
     }
 
-    /// The Size submenu is the one that existed before submenus were plural.
-    /// It must come out of the generalised path byte-for-byte the same.
+    /// The size choices are the ones that existed before submenus were plural,
+    /// and they must come out of the generalised path unchanged.
+    ///
+    /// Same intent as when this test was called `size_is_still_the_first_
+    /// submenu...`, asserted against the new shape: "Size" could not become a
+    /// child of "Window" (a submenu holds items, not submenus), so the percents
+    /// ARE Window's items. Still the first hover, still seven, still 100% third.
     #[test]
-    fn size_is_still_the_first_submenu_and_still_lists_the_same_percents() {
+    fn the_size_percents_are_still_the_first_hover_and_still_read_the_same() {
         let subs = submenus(view());
-        assert_eq!(subs[0].0, "Size");
+        assert_eq!(subs[0].0, "Window");
         assert_eq!(
-            subs[0].1,
-            vec!["50%", "75%", "100%", "125%", "150%", "175%", "200%"]
+            subs[0].1[..7],
+            ["50%", "75%", "100%", "125%", "150%", "175%", "200%"]
         );
         assert_eq!(subs[0].2[2], MenuAction::SetSizePercent(100));
+        // Borderless joined them rather than sitting loose at the top level.
+        assert_eq!(subs[0].1[7], "Borderless");
+    }
+
+    /// Dark Mode is the one row that is deliberately NOT in a category.
+    ///
+    /// `app.rs`'s plugin test finds it by label through `rows_for_test` and
+    /// clicks it to prove menu rows are alive at all in an editor — and
+    /// `rows_for_test` returns top-level items only. Filing it under a hover
+    /// breaks that test in another file, which is the sort of failure nobody
+    /// reads the second time. It is also the most-flipped row in the menu, so
+    /// the hover would be a toll paid all day.
+    #[test]
+    fn dark_mode_stays_a_top_level_row_because_another_file_clicks_it_by_label() {
+        for caps in [Caps::DESKTOP, Caps::PLUGIN] {
+            let v = MenuView {
+                caps,
+                next_font: Some("Terminess"),
+                ..view()
+            };
+            assert!(
+                rows(v)
+                    .iter()
+                    .any(|(l, a, _)| l == "Dark Mode" && *a == MenuAction::ToggleDarkMode),
+                "no top-level Dark Mode row under {caps:?}"
+            );
+        }
     }
 
     /// D-UI-15: the guitar view renames itself like every other toggle here,
-    /// and its two submenus exist only while it is on. A Tuning row on a
+    /// and its choice lists exist only while it is on. A Tuning row on a
     /// hidden fretboard is a control for something you cannot see.
     #[test]
     fn the_fretboard_toggle_brings_its_submenus_with_it() {
         let mut v = view();
         assert_eq!(
-            find(v, MenuAction::ToggleFretboard),
+            find(v.clone(), MenuAction::ToggleFretboard),
             Some(("Show Fretboard".to_owned(), true))
         );
+        // With the view off there is exactly one thing to say about it, so the
+        // Fretboard category is that row rather than a hover onto one item.
         assert_eq!(
-            submenus(v)
-                .iter()
-                .map(|(n, ..)| n.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Size", "Theory"],
-            "only Size and Theory while the fretboard is off"
+            category_names(v.clone()),
+            vec!["Window", "Colors", "Keyboard", "Chords", "Theory"],
+            "no fretboard hovers while the fretboard is off"
         );
+        assert!(rows(v.clone()).iter().any(|(l, ..)| l == "Show Fretboard"));
 
         v.fretboard_on = true;
         assert_eq!(
-            find(v, MenuAction::ToggleFretboard),
+            find(v.clone(), MenuAction::ToggleFretboard),
             Some(("Hide Fretboard".to_owned(), true))
         );
-        let subs = submenus(v);
         // Asserted as the whole list, in order: an inserted submenu that
         // silently shifts Wood/Tuning/Capo is exactly what this catches.
+        // Wood, Tuning and Capo are SIBLINGS of Fretboard rather than children
+        // of it because a submenu cannot hold a submenu — see `build_entries`.
         assert_eq!(
-            subs.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>(),
-            vec!["Size", "Theory", "Wood", "Tuning", "Capo"]
+            category_names(v.clone()),
+            vec![
+                "Window",
+                "Colors",
+                "Keyboard",
+                "Chords",
+                "Theory",
+                "Fretboard",
+                "Wood",
+                "Tuning",
+                "Capo"
+            ]
         );
-        let wood = sub(v, "Wood");
+        let wood = sub(v.clone(), "Wood");
         assert_eq!(wood.1.len(), 3, "three woods");
         assert!(
             wood.1[0].starts_with("Rosewood"),
@@ -1143,12 +1625,12 @@ mod tests {
         assert_eq!(wood.2[0], MenuAction::SetWood("rosewood"));
         // Detach mirrors the chord window's toggle, renaming itself.
         assert_eq!(
-            find(v, MenuAction::DetachFretboard).map(|(l, _)| l),
+            find(v.clone(), MenuAction::DetachFretboard).map(|(l, _)| l),
             Some("Detach Fretboard".to_owned())
         );
         let d = MenuView {
             fretboard_detached: true,
-            ..v
+            ..v.clone()
         };
         assert_eq!(
             find(d, MenuAction::AttachFretboard).map(|(l, _)| l),
@@ -1157,7 +1639,7 @@ mod tests {
         // Every shipped tuning is offered, and the live one is marked rather
         // than hidden: a submenu that never says what is selected makes you
         // close it again to find out.
-        let tuning = sub(v, "Tuning");
+        let tuning = sub(v.clone(), "Tuning");
         assert_eq!(tuning.1.len(), fretboard::TUNINGS.len());
         assert!(tuning.1[0].starts_with("Standard"));
         assert!(
@@ -1165,14 +1647,14 @@ mod tests {
             "the current tuning is marked"
         );
         assert!(!tuning.1[1].ends_with('\u{2022}'));
-        assert_eq!(tuning.2[0], MenuAction::SetTuning("Standard"));
+        assert_eq!(tuning.2[0], MenuAction::SetTuning("Standard".to_string()));
         assert!(
             tuning.2.iter().all(|a| matches!(a, MenuAction::SetTuning(n)
                 if fretboard::Tuning::by_name(n).is_some())),
             "every offered tuning must resolve"
         );
 
-        let capo = sub(v, "Capo");
+        let capo = sub(v.clone(), "Capo");
         assert_eq!(capo.1[0], "No Capo  \u{2022}");
         assert_eq!(capo.1[1], "Fret 1");
         assert_eq!(capo.2[0], MenuAction::SetCapo(0));
@@ -1183,11 +1665,11 @@ mod tests {
     fn the_marked_row_follows_the_settings() {
         let v = MenuView {
             fretboard_on: true,
-            tuning: "DADGAD",
+            tuning: "DADGAD".to_string(),
             capo: 3,
             ..view()
         };
-        let tuning = sub(v, "Tuning");
+        let tuning = sub(v.clone(), "Tuning");
         let marked: Vec<&String> = tuning
             .1
             .iter()
@@ -1195,64 +1677,211 @@ mod tests {
             .collect();
         assert_eq!(marked.len(), 1);
         assert!(marked[0].starts_with("DADGAD"));
-        assert_eq!(sub(v, "Capo").1[3], "Fret 3  \u{2022}");
+        assert_eq!(sub(v.clone(), "Capo").1[3], "Fret 3  \u{2022}");
     }
 
-    /// A submenu low in a long menu must slide up rather than run off the
-    /// bottom of the screen. Size never needed this — it is the first row and
-    /// seven rows tall — but Capo is ten rows and sits near the end.
+    /// A submenu low in the menu must slide up rather than run off the bottom
+    /// of the screen, and flip left rather than off the right edge.
+    ///
+    /// Same intent as before, but asserted about EVERY hover and against the
+    /// real `clamp_submenu` rather than a copy of it — the copy could pass
+    /// while `show` was wrong. It matters more now: grouping the menu into
+    /// categories means most hovers open from rows below the halfway mark,
+    /// where only Capo used to be.
     #[test]
-    fn a_submenu_near_the_bottom_is_pulled_back_onto_the_screen() {
-        // The clamp, in the same form `show` applies it.
-        let clamp = |pos: Pos2, size: Vec2, menu_x: f32, mon: Vec2| {
-            let mut p = pos;
-            if p.y + size.y > mon.y {
-                p.y = (mon.y - size.y).max(0.0);
-            }
-            if p.x + size.x > mon.x {
-                p.x = (menu_x - size.x).max(0.0);
-            }
-            p
-        };
+    fn every_submenu_is_pulled_back_onto_the_screen_near_a_corner() {
         let mon = Vec2::new(1440.0, 900.0);
-        let size = Vec2::new(120.0, 260.0); // ten rows of Capo
-                                            // Opened near the bottom: pulled up so the last row is reachable.
-        let p = clamp(Pos2::new(1000.0, 820.0), size, 900.0, mon);
-        assert!(p.y + size.y <= mon.y, "bottom row is off-screen at {p:?}");
-        // Opened near the right edge: flipped to the menu's other side.
-        let p = clamp(Pos2::new(1380.0, 100.0), size, 1260.0, mon);
-        assert!(p.x + size.x <= mon.x, "right edge is off-screen at {p:?}");
-        assert!(p.x < 1380.0, "it should flip left, not just shrink back");
+        let row_h = 21.0; // a typical measured row; the clamp is height-blind
+        let width = 260.0;
+        // The fullest menu there is: fretboard on, so Wood/Tuning/Capo exist,
+        // and recorder on, so Pre-roll does — the newest hover and the lowest,
+        // which makes it the one most likely to run off the bottom.
+        let v = fullest();
+        for (name, items, _) in submenus(v.clone()) {
+            let size = Vec2::new(width, items.len() as f32 * row_h);
+            // Opened from the bottom-right, the corner where a menu that was
+            // right-clicked low on a small screen puts its rows.
+            let p = clamp_submenu(Pos2::new(1380.0, 860.0), size, 1120.0, mon);
+            assert!(
+                p.y >= 0.0 && p.y + size.y <= mon.y,
+                "[{name}] runs off the bottom at {p:?}"
+            );
+            assert!(
+                p.x >= 0.0 && p.x + size.x <= mon.x,
+                "[{name}] runs off the right at {p:?}"
+            );
+            assert!(
+                p.x < 1380.0,
+                "[{name}] should flip to the menu's left, not just shrink back"
+            );
+        }
         // Comfortably inside: untouched.
         let inside = Pos2::new(300.0, 200.0);
-        assert_eq!(clamp(inside, size, 200.0, mon), inside);
+        assert_eq!(
+            clamp_submenu(inside, Vec2::new(120.0, 260.0), 200.0, mon),
+            inside
+        );
     }
 
-    /// The desktop menu must be BYTE-IDENTICAL under `Caps::DESKTOP`. This
-    /// refactor is only safe if the shipping app cannot tell it happened.
+    /// A category must be worth the hover it costs.
+    ///
+    /// `Caps` can hollow one out — Window loses Borderless in a plugin,
+    /// Keyboard loses its device row, Fretboard loses Detach — and an empty
+    /// hover is a dead end the user cannot tell from a bug, while a one-item
+    /// hover charges a hover for a single row.
+    #[test]
+    fn no_category_opens_onto_nothing_or_onto_a_single_row() {
+        for caps in [Caps::DESKTOP, Caps::PLUGIN, Caps::MINIMAL] {
+            for on in [false, true] {
+                let v = MenuView {
+                    caps,
+                    fretboard_on: on,
+                    detached: on,
+                    fretboard_detached: on,
+                    theory_detached: on,
+                    // Both states matter under both `Caps`: a Recorder hover
+                    // holding only "Detach Recorder" is exactly what a
+                    // `capture_devices`-true / `detachable`-false host would
+                    // produce if the show/hide row were ever gated too.
+                    recorder_on: on,
+                    recorder_detached: on,
+                    supporter: on,
+                    next_font: on.then_some("Terminess"),
+                    ..view()
+                };
+                for (name, items, _) in submenus(v) {
+                    assert!(
+                        items.len() >= 2,
+                        "[{name}] is a hover over {} row(s) under {caps:?}",
+                        items.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The point of the whole exercise: a top level of subjects, not a
+    /// screenful of verbs. It was twenty-six near-flat rows, which is a list
+    /// you read rather than a menu you aim at.
+    #[test]
+    fn the_top_level_is_a_short_list_of_subjects() {
+        let count = |v: MenuView| {
+            build_entries(v)
+                .iter()
+                .filter(|e| !matches!(e, Entry::Separator))
+                .count()
+        };
+        // Was 16. The recorder costs two, and both are structural rather than
+        // sprawl: one subject (Recorder) plus one choice-list sibling
+        // (Pre-roll), which is the exact shape the fretboard already has and
+        // the only shape `Entry::Submenu` allows. Raise this only for a reason
+        // that can be written down in the same breath.
+        assert!(
+            count(fullest()) <= 18,
+            "the fullest menu is back to {} top-level rows",
+            count(fullest())
+        );
+        assert!(
+            count(view()) <= 11,
+            "the everyday menu is {} top-level rows",
+            count(view())
+        );
+    }
+
+    /// D-UI-17: the theory band is the third detachable surface and its row
+    /// renames itself like the other two. It is absent where there is no window
+    /// to put it in, which is the same rule the other two follow.
+    #[test]
+    fn the_theory_detach_row_renames_itself_and_is_absent_without_a_window() {
+        assert_eq!(
+            find(view(), MenuAction::DetachTheory).map(|(l, _)| l),
+            Some("Detach Theory".to_owned())
+        );
+        let d = MenuView {
+            theory_detached: true,
+            ..view()
+        };
+        assert_eq!(
+            find(d.clone(), MenuAction::AttachTheory).map(|(l, _)| l),
+            Some("Attach Theory".to_owned())
+        );
+        assert_eq!(
+            find(d, MenuAction::DetachTheory),
+            None,
+            "one row with two names, never both at once"
+        );
+        let p = MenuView {
+            caps: Caps::PLUGIN,
+            ..view()
+        };
+        assert_eq!(find(p.clone(), MenuAction::DetachTheory), None);
+        assert_eq!(
+            sub(p, "Theory").1.len(),
+            crate::theory_panel::View::ALL.len() + 1,
+            "the diagrams and Follow MIDI, and nothing that needs a window"
+        );
+    }
+
+    /// The custom-tuning editor is a fretboard control, so it appears with the
+    /// fretboard and not before. It is a dialog rather than a window, so unlike
+    /// Detach it survives a plugin — the same reasoning that keeps "Teach Chord
+    /// Name..." there.
+    #[test]
+    fn custom_tuning_is_offered_only_while_the_fretboard_is_showing() {
+        assert_eq!(
+            find(view(), MenuAction::EditCustomTuning),
+            None,
+            "an editor for a view the user cannot see"
+        );
+        let on = MenuView {
+            fretboard_on: true,
+            ..view()
+        };
+        assert_eq!(
+            find(on.clone(), MenuAction::EditCustomTuning),
+            Some(("Custom Tuning...".to_owned(), true))
+        );
+        let plugin = MenuView {
+            caps: Caps::PLUGIN,
+            ..on.clone()
+        };
+        assert!(find(plugin, MenuAction::EditCustomTuning).is_some());
+        // It sits in the Fretboard hover, NOT in Tuning, where every item must
+        // resolve to a shipped tuning.
+        assert!(sub(on.clone(), "Fretboard")
+            .2
+            .contains(&MenuAction::EditCustomTuning));
+        assert!(sub(on, "Tuning")
+            .2
+            .iter()
+            .all(|a| matches!(a, MenuAction::SetTuning(_))));
+    }
+
+    /// The desktop menu must still offer everything it offered under
+    /// `Caps::DESKTOP`. Regrouping is only safe if nothing WENT AWAY; where a
+    /// row lives is what changed, so this asks the whole menu rather than the
+    /// top level of it.
     #[test]
     fn desktop_caps_change_nothing() {
         let mut v = view();
         v.fretboard_on = true;
         v.detection_enabled = true;
-        let with = rows(v);
-        // The same view, built the way it was before Caps existed, is what
-        // `Caps::DESKTOP` has to reproduce: every row present.
-        assert!(with
-            .iter()
-            .any(|(_, a, _)| *a == MenuAction::ToggleBorderless));
-        assert!(with
-            .iter()
-            .any(|(_, a, _)| *a == MenuAction::SelectMidiInput));
-        assert!(with
-            .iter()
-            .any(|(_, a, _)| *a == MenuAction::DetachChordWindow));
-        assert!(with
-            .iter()
-            .any(|(_, a, _)| *a == MenuAction::DetachFretboard));
-        assert_eq!(submenus(v)[0].0, "Size");
+        let with = all_rows(v.clone());
+        for want in [
+            MenuAction::ToggleBorderless,
+            MenuAction::SelectMidiInput,
+            MenuAction::DetachChordWindow,
+            MenuAction::DetachFretboard,
+            MenuAction::DetachTheory,
+        ] {
+            assert!(
+                with.iter().any(|(_, a, _)| *a == want),
+                "{want:?} went missing on the desktop"
+            );
+        }
+        assert_eq!(submenus(v.clone())[0].0, "Window");
         assert_eq!(
-            with.last().map(|(_, a, _)| *a),
+            rows(v.clone()).last().map(|(_, a, _)| a.clone()),
             Some(MenuAction::ResetSettings)
         );
     }
@@ -1268,17 +1897,50 @@ mod tests {
             detection_enabled: true,
             detached: true,
             fretboard_detached: true,
+            theory_detached: true,
+            // Turned ON deliberately. The settings file is shared with the
+            // standalone, so a plugin WILL be handed `show_recorder: true` by
+            // somebody's config; the category has to be absent because of
+            // `caps`, not because the flag happened to be false.
+            recorder_on: true,
+            recorder_detached: true,
             ..view()
         };
-        let forbidden = [
+        // Detach/Attach Theory joins the list for exactly the reason the other
+        // two detach pairs are on it: it needs a second OS window, and a plugin
+        // editor is handed one window by the host and gets no more.
+        //
+        // `EditCustomTuning` is deliberately NOT here. It raises a dialog, and
+        // dialogs are drawn in the canvas when `caps.child_windows` is false —
+        // the same road "Teach Chord Name..." takes, which this test asserts
+        // survives a few lines down.
+        //
+        // EVERY recorder action is here, including the two that raise no window
+        // and open no device by themselves (`ShowExportDialog`, `SetPreRoll`,
+        // `ToggleHideElapsed`). They are forbidden by what they are ABOUT: each
+        // one configures a capture a plugin may not perform, so a row offering
+        // it is a promise the editor cannot keep. Listing only the obvious
+        // three is precisely how a plugin row for a camera slips through.
+        let mut forbidden = vec![
             MenuAction::SelectMidiInput,
             MenuAction::ToggleBorderless,
             MenuAction::DetachChordWindow,
             MenuAction::AttachChordWindow,
             MenuAction::DetachFretboard,
             MenuAction::AttachFretboard,
+            MenuAction::DetachTheory,
+            MenuAction::AttachTheory,
+            MenuAction::ToggleRecorder,
+            MenuAction::DetachRecorder,
+            MenuAction::AttachRecorder,
+            MenuAction::ShowExportDialog,
+            MenuAction::ToggleHideElapsed,
         ];
-        for (label, action, _) in rows(v) {
+        // Built from the table rather than spelled out, so a fourth pre-roll
+        // choice cannot be added to `PREROLL_CHOICES` and quietly arrive in a
+        // plugin unlisted here.
+        forbidden.extend(crate::recorder::PREROLL_CHOICES.map(MenuAction::SetPreRoll));
+        for (label, action, _) in all_rows(v.clone()) {
             assert!(
                 !forbidden.contains(&action),
                 "{label} needs something a plugin editor does not have"
@@ -1291,24 +1953,27 @@ mod tests {
         // make it. Borderless is the row that genuinely cannot survive: window
         // chrome belongs to whoever owns the window.
         assert!(
-            submenus(v).iter().any(|(name, ..)| name == "Size"),
-            "a plugin with no Size submenu has no way to be made readable"
+            all_rows(v.clone())
+                .iter()
+                .any(|(_, a, _)| *a == MenuAction::SetSizePercent(100)),
+            "a plugin with no size choices has no way to be made readable"
         );
         assert!(
-            !rows(v)
+            !all_rows(v.clone())
                 .iter()
                 .any(|(_, a, _)| *a == MenuAction::ToggleBorderless),
             "window chrome is the host's in a plugin"
         );
         // And what SHOULD survive still does: the whole point is a plugin that
         // can still teach a chord, change tuning and pick a colour.
-        let kept = rows(v);
+        let kept = all_rows(v.clone());
         for want in [
             MenuAction::ToggleDarkMode,
             MenuAction::ToggleKeytoggle,
             MenuAction::TeachChordName,
             MenuAction::ManageTaughtChords,
             MenuAction::ToggleFretboard,
+            MenuAction::EditCustomTuning,
             MenuAction::ShowAbout,
         ] {
             assert!(
@@ -1316,14 +1981,21 @@ mod tests {
                 "{want:?} went missing"
             );
         }
-        // Theory, Wood, Tuning and Capo are pure state and must all remain:
-        // none of them needs a window, a device or a size of its own.
+        // Every category is still there, and still in the same order: none of
+        // them is emptied out by `Caps::PLUGIN`.
         assert_eq!(
-            submenus(v)
-                .iter()
-                .map(|(n, ..)| n.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Size", "Theory", "Wood", "Tuning", "Capo"]
+            category_names(v.clone()),
+            vec![
+                "Window",
+                "Colors",
+                "Keyboard",
+                "Chords",
+                "Theory",
+                "Fretboard",
+                "Wood",
+                "Tuning",
+                "Capo"
+            ]
         );
     }
 
@@ -1336,12 +2008,15 @@ mod tests {
         use crate::theory_panel::{View, Views};
         let mut v = view();
         assert_eq!(
-            sub(v, "Theory").1,
+            sub(v.clone(), "Theory").1,
             vec![
                 "Show Circle of Fifths",
                 "Show Tonnetz",
                 "Show Harmonic Triangles",
                 "Follow MIDI",
+                // Where the band LIVES comes last: the toggles above it are
+                // what the band is.
+                "Detach Theory",
             ]
         );
         let mut want: Vec<MenuAction> = View::ALL
@@ -1349,7 +2024,8 @@ mod tests {
             .map(|x| MenuAction::ToggleTheoryView(*x))
             .collect();
         want.push(MenuAction::ToggleTheoryFollowsMidi);
-        assert_eq!(sub(v, "Theory").2, want);
+        want.push(MenuAction::DetachTheory);
+        assert_eq!(sub(v.clone(), "Theory").2, want);
 
         // The follow row renames itself like every other toggle here, and it
         // is OFF by default: the band is something to look at while playing,
@@ -1360,8 +2036,8 @@ mod tests {
             ..view()
         };
         assert_eq!(
-            sub(following, "Theory").1.last().map(String::as_str),
-            Some("Stop Following MIDI")
+            sub(following, "Theory").1[View::ALL.len()],
+            "Stop Following MIDI"
         );
 
         v.theory = Views {
@@ -1370,7 +2046,7 @@ mod tests {
             triangles: true,
         };
         assert_eq!(
-            sub(v, "Theory").1[..3],
+            sub(v.clone(), "Theory").1[..3],
             [
                 "Hide Circle of Fifths",
                 "Show Tonnetz",
@@ -1382,17 +2058,240 @@ mod tests {
 
     /// The learning block sits with the teach block, after it, and the menu
     /// still ends with About / Reset.
+    ///
+    /// Same intent, new shape: those four rows are inside the Chords hover
+    /// now, so the order is asserted there instead of across the top level.
     #[test]
     fn learning_block_sits_after_the_teach_block() {
-        let r = rows(view());
-        let pos = |a: MenuAction| r.iter().position(|(_, x, _)| *x == a).unwrap();
+        let chords = sub(view(), "Chords").2;
+        let pos = |a: MenuAction| {
+            chords
+                .iter()
+                .position(|x| *x == a)
+                .unwrap_or_else(|| panic!("{a:?} is not in the Chords hover"))
+        };
+        assert!(
+            pos(MenuAction::ToggleChordDetection) < pos(MenuAction::TeachChordName),
+            "the detector's own switch comes before the things that train it"
+        );
         assert!(pos(MenuAction::TeachChordName) < pos(MenuAction::ManageTaughtChords));
         assert!(pos(MenuAction::ManageTaughtChords) < pos(MenuAction::CorrectChordName));
         assert!(pos(MenuAction::CorrectChordName) < pos(MenuAction::ToggleChordLearning));
-        assert!(pos(MenuAction::ToggleChordLearning) < pos(MenuAction::ShowAbout));
+
+        let top = rows(view());
         assert_eq!(
-            r.last().map(|(_, a, _)| *a),
+            top.last().map(|(_, a, _)| a.clone()),
             Some(MenuAction::ResetSettings)
+        );
+        assert_eq!(
+            top.iter().position(|(_, a, _)| *a == MenuAction::ShowAbout),
+            Some(top.len() - 2),
+            "About and Reset are the last two rows"
+        );
+    }
+
+    /// §5: this row is the entire affordance. `show_recorder` is off by default
+    /// and out of `first_launch()`, this menu is the whole chrome, and an
+    /// earlier draft of the recorder shipped with no way to switch it on at
+    /// all. So: it exists, it renames itself rather than growing a checkmark,
+    /// and the band's other controls arrive with it.
+    #[test]
+    fn the_recorder_row_renames_itself_and_brings_its_controls_with_it() {
+        let mut v = view();
+        assert_eq!(
+            find(v.clone(), MenuAction::ToggleRecorder),
+            Some(("Show Recorder".to_owned(), true))
+        );
+        // Off, the category IS that one row — the same collapse the fretboard
+        // gets, and for the same reason: there is one thing to say.
+        assert!(!category_names(v.clone()).iter().any(|n| n == "Recorder"));
+        assert!(rows(v.clone()).iter().any(|(l, ..)| l == "Show Recorder"));
+        for absent in [
+            MenuAction::ShowExportDialog,
+            MenuAction::ToggleHideElapsed,
+            MenuAction::DetachRecorder,
+        ] {
+            assert_eq!(
+                find(v.clone(), absent.clone()),
+                None,
+                "{absent:?} is a control for a band the user cannot see"
+            );
+        }
+        assert!(!category_names(v.clone()).iter().any(|n| n == "Pre-roll"));
+
+        v.recorder_on = true;
+        assert_eq!(
+            find(v.clone(), MenuAction::ToggleRecorder),
+            Some(("Hide Recorder".to_owned(), true)),
+            "the label is the state readout; there are no checkmarks here"
+        );
+        // Detach mirrors the other three detachable surfaces, renaming itself.
+        assert_eq!(
+            find(v.clone(), MenuAction::DetachRecorder).map(|(l, _)| l),
+            Some("Detach Recorder".to_owned())
+        );
+        let d = MenuView {
+            recorder_detached: true,
+            ..v.clone()
+        };
+        assert_eq!(
+            find(d.clone(), MenuAction::AttachRecorder).map(|(l, _)| l),
+            Some("Attach Recorder".to_owned())
+        );
+        assert_eq!(
+            find(d, MenuAction::DetachRecorder),
+            None,
+            "one row with two names, never both at once"
+        );
+        assert_eq!(
+            sub(v.clone(), "Recorder").1,
+            vec![
+                "Hide Recorder",
+                "Detach Recorder",
+                "Export...",
+                "Hide Elapsed Time",
+            ]
+        );
+        // The elapsed-time switch renames itself too.
+        assert_eq!(
+            find(
+                MenuView {
+                    hide_elapsed: true,
+                    ..v.clone()
+                },
+                MenuAction::ToggleHideElapsed
+            )
+            .map(|(l, _)| l),
+            Some("Show Elapsed Time".to_owned())
+        );
+        // Recorder is LAST of the subjects, after the whole display block, and
+        // Pre-roll is its sibling for the reason Wood/Tuning/Capo are the
+        // fretboard's. Asserted as the whole list, in order: an inserted
+        // category that shifts these is exactly what this catches.
+        assert_eq!(
+            category_names(fullest()),
+            vec![
+                "Window",
+                "Colors",
+                "Keyboard",
+                "Chords",
+                "Theory",
+                "Fretboard",
+                "Wood",
+                "Tuning",
+                "Capo",
+                "Recorder",
+                "Pre-roll",
+            ]
+        );
+    }
+
+    /// The subject is absent, not greyed, where no device may be opened. A
+    /// plugin must not reach for a camera behind the DAW's back, and a Minimal
+    /// build has not linked the code that would.
+    ///
+    /// `Caps::PLUGIN` and `Caps::MINIMAL` together, because they arrive at the
+    /// same answer from opposite directions and only one of them is obvious.
+    #[test]
+    fn the_recorder_category_is_absent_entirely_without_capture_devices() {
+        for caps in [Caps::PLUGIN, Caps::MINIMAL] {
+            let v = MenuView {
+                caps,
+                recorder_on: true,
+                recorder_detached: true,
+                ..view()
+            };
+            assert!(
+                !category_names(v.clone())
+                    .iter()
+                    .any(|n| n == "Recorder" || n == "Pre-roll"),
+                "a Recorder hover survived {caps:?}"
+            );
+            for gone in [
+                MenuAction::ToggleRecorder,
+                MenuAction::DetachRecorder,
+                MenuAction::AttachRecorder,
+                MenuAction::ShowExportDialog,
+                MenuAction::ToggleHideElapsed,
+                MenuAction::SetPreRoll(3),
+            ] {
+                assert_eq!(
+                    find(v.clone(), gone.clone()),
+                    None,
+                    "{gone:?} survived {caps:?}"
+                );
+            }
+        }
+    }
+
+    /// Capturing and opening a second window are separate permissions, and a
+    /// host can hold one without the other. The recorder must still be fully
+    /// usable there — only the row that needs a window goes.
+    ///
+    /// A configuration nobody ships today, which is why it is worth a test: the
+    /// gate is `capture_devices && detachable`, and writing it as one `if` is
+    /// the mistake that would take the whole band away from such a host.
+    #[test]
+    fn only_the_detach_row_goes_when_a_capturing_host_has_no_second_window() {
+        let v = MenuView {
+            caps: Caps {
+                detachable: false,
+                child_windows: false,
+                ..Caps::DESKTOP
+            },
+            recorder_on: true,
+            ..view()
+        };
+        assert_eq!(find(v.clone(), MenuAction::DetachRecorder), None);
+        assert_eq!(find(v.clone(), MenuAction::AttachRecorder), None);
+        assert_eq!(
+            sub(v.clone(), "Recorder").1,
+            vec!["Hide Recorder", "Export...", "Hide Elapsed Time"],
+            "everything that does not need a window stays"
+        );
+        assert!(category_names(v).iter().any(|n| n == "Pre-roll"));
+    }
+
+    /// The pre-roll hover says what it is set to rather than making you close
+    /// it again to find out — and says it exactly once. Two marks is a menu
+    /// that has lost track of its own state; none is a menu that never had it.
+    #[test]
+    fn the_preroll_hover_marks_exactly_one_choice() {
+        for &want in &crate::recorder::PREROLL_CHOICES {
+            let v = MenuView {
+                recorder_on: true,
+                preroll_s: want,
+                ..view()
+            };
+            let (labels, actions) = {
+                let s = sub(v.clone(), "Pre-roll");
+                (s.1, s.2)
+            };
+            assert_eq!(labels.len(), crate::recorder::PREROLL_CHOICES.len());
+            let marked: Vec<&String> =
+                labels.iter().filter(|l| l.ends_with('\u{2022}')).collect();
+            assert_eq!(marked.len(), 1, "{want}s marked {marked:?}");
+            let expect = if want == 0 {
+                "No countdown".to_owned()
+            } else {
+                format!("{want} seconds")
+            };
+            assert!(marked[0].starts_with(&expect), "{marked:?} is not {expect}");
+            assert_eq!(
+                actions,
+                crate::recorder::PREROLL_CHOICES
+                    .map(MenuAction::SetPreRoll)
+                    .to_vec()
+            );
+        }
+        // The wording the plan asks for, in order.
+        let v = MenuView {
+            recorder_on: true,
+            ..view()
+        };
+        assert_eq!(
+            sub(v, "Pre-roll").1,
+            vec!["No countdown", "3 seconds  \u{2022}", "5 seconds"]
         );
     }
 }

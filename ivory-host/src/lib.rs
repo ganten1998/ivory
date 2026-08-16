@@ -1,0 +1,22 @@
+//! Tangent's plugin host.
+//!
+//! Separate from `ivory-record` because it is the only part of the product that
+//! loads foreign code into the process, and because it is the feature's
+//! critical path — see `docs/RECORDER-PLAN.md` §8 and §12.
+//!
+//! **VST3, and MIT.** That combination became possible on 2025-10-29, when
+//! Steinberg relicensed the VST3 SDK from GPLv3-or-proprietary to MIT with VST
+//! 3.8. The bindings here are `vst3` 0.3.0 (MIT OR Apache-2.0), which ships
+//! pre-generated bindings and therefore needs no libclang, no SDK download and
+//! no C toolchain — so the existing `cargo xwin` cross-build survives.
+//!
+//! Two halves: [`scan`] finds modules and reads what they claim to be, and
+//! [`instance`] turns one of those claims into a running instrument.
+
+pub mod instance;
+pub mod ready;
+pub mod scan;
+
+pub use instance::{Bus, Instance, Note, Setup};
+pub use ready::{Policy, Readiness, State as ReadyState};
+pub use scan::{discover, ClassInfo, Module};

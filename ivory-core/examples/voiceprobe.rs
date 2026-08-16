@@ -100,7 +100,7 @@ fn main() {
         eprintln!("no tuning named {tuning}");
         std::process::exit(2);
     };
-    let spec = FretboardSpec { tuning: t, frets: 22, capo };
+    let spec = FretboardSpec { tuning: t.clone(), frets: 22, capo };
     let w = Weights::for_tuning(t);
     println!("{} frets 22 capo {capo}   (n) = folded, x = skipped, - = unused", t.name);
 

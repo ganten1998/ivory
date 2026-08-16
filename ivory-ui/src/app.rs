@@ -14,7 +14,9 @@ use crate::keys;
 use crate::menu::{self, ColorTarget, MenuAction, MenuState, MenuView};
 use crate::midi_event::MidiEvent;
 use crate::piano;
-use crate::ports::MidiPorts;
+use crate::ports::{CaptureDevices, MidiPorts};
+use crate::recorder;
+use crate::recorder_panel;
 use crate::settings::{Rgb, Settings};
 use crate::theory_panel;
 use egui::{Pos2, Rect, Vec2, ViewportCommand};
@@ -142,6 +144,10 @@ pub struct IvoryApp {
     /// The CHANNEL above is not optional: a plugin uses the same one, filled
     /// from `process()` instead of from a `midir` callback thread.
     ports: Option<Box<dyn MidiPorts>>,
+    /// Who can enumerate and select an audio input, and a camera. `None` in a
+    /// plugin and in a Minimal build, where the code to do it is not linked.
+    audio_devices: Option<Box<dyn CaptureDevices>>,
+    cameras: Option<Box<dyn CaptureDevices>>,
     /// What the host permits. Read at every branch point rather than compared
     /// against a host name, and captured once at construction so a frame
     /// cannot be half-drawn under one set of rules and half under another.
@@ -195,6 +201,56 @@ pub struct IvoryApp {
     fret_shown_at: Option<Instant>,
     fret_wm_managed: bool,
     startup_fret_detach_at: Option<Instant>,
+
+    /// The theory band is on screen in its own window, and the guard that says
+    /// whether its geometry is the user's or a tiling WM's.
+    ///
+    /// One `GeometryGuard` rather than the five loose fields the fretboard
+    /// popout still uses (`fret_shown_at`, `fret_wm_managed`, `fret_live_*`).
+    /// `theory_panel` shipped the guard as a type; taking it here is what makes
+    /// the third popout cheaper than the second rather than another copy of it.
+    theory_window_visible: bool,
+    theory_builder_size: Vec2,
+    theory_builder_pos: Option<Pos2>,
+    theory_guard: Option<theory_panel::GeometryGuard>,
+    startup_theory_detach_at: Option<Instant>,
+
+    /// The Recorder band, the fourth popout. Same shape as the theory window
+    /// above it, reusing `theory_panel::GeometryGuard` rather than growing a
+    /// fourth copy of the tiling-WM dance — the guard is about window managers,
+    /// not about theory diagrams, and the module it happens to live in is an
+    /// accident of which popout was written when.
+    recorder_window_visible: bool,
+    recorder_builder_size: Vec2,
+    recorder_builder_pos: Option<Pos2>,
+    recorder_guard: Option<theory_panel::GeometryGuard>,
+    startup_recorder_detach_at: Option<Instant>,
+    /// Everything the band shows, written each frame by whoever is hosting us.
+    /// Inert in a plugin, where nothing ever writes to it.
+    recorder: recorder::RecorderState,
+    /// One pending request for the host to perform after the frame. `Option`
+    /// rather than a queue on purpose: these are all user gestures, at most one
+    /// happens per frame, and a queue would let a stuck host accumulate a
+    /// backlog of Record presses to replay.
+    recorder_request: Option<recorder::RecorderRequest>,
+    /// A folder the host has been asked to choose. Drained after the frame so
+    /// the native panel's nested run loop never starts inside an egui frame.
+    dir_request: Option<crate::ports::DirRequest>,
+    /// An export spec chosen without ticking "use these settings for every
+    /// take": it governs every take **for the rest of this session** and is
+    /// never written to the settings file.
+    ///
+    /// Session-scoped rather than one-take-scoped, and that is a decision
+    /// rather than an oversight: somebody who turns something off for a
+    /// practice session should not have to turn it off again before every
+    /// single take. The tick is what makes it outlive the session.
+    export_override: Option<recorder::ExportSpec>,
+    /// The take-name field has keyboard focus.
+    ///
+    /// While this is true every single-letter shortcut is suppressed, or typing
+    /// "background" into the field would toggle the border, dark mode,
+    /// keytoggle, the guitar view and the note preference on the way past.
+    name_focused: bool,
 
     /// The detached chord window is actually on screen.
     detach_window_visible: bool,
@@ -257,6 +313,20 @@ impl IvoryApp {
         if !caps.detachable {
             settings.chord_window_detached = false;
             settings.fretboard_detached = false;
+            settings.theory_detached = false;
+            settings.recorder_detached = false;
+        }
+        // And the band itself, for a host that cannot open a device.
+        //
+        // Not the same question as detaching, and it has a worse failure. The
+        // band is 200 points tall; a plugin editor whose settings file says
+        // `show_recorder: true` would lay out 200 points of transport it can
+        // never populate, shrinking the piano to make room for a camera preview
+        // that will never arrive. `fit_bands` cannot tell the difference
+        // between a band that is empty and one that is off.
+        if !caps.capture_devices {
+            settings.show_recorder = false;
+            settings.recorder_detached = false;
         }
         crate::fonts::install(
             ctx,
@@ -289,11 +359,23 @@ impl IvoryApp {
         });
 
         let spec = settings.fretboard_spec();
-        let weights = Weights::for_tuning(spec.tuning);
+        let weights = Weights::for_tuning(&spec.tuning);
         let voicing = VoicingSession::new(spec, weights);
         let settings_fret_size = settings.fretboard_win_size();
         let settings_fret_pos = settings.fretboard_win_pos();
         let startup_fret_detach_at = (settings.fretboard_detached && settings.show_fretboard)
+            .then(|| Instant::now() + DEBOUNCE_100MS);
+        // Same one-shot for the theory window. Gated on the band having at
+        // least one diagram selected as well as being detached: a window
+        // restored with nothing in it is a blank rectangle the user has to
+        // close to find out what it was.
+        let startup_theory_detach_at = (settings.theory_detached
+            && settings.theory_views().any())
+        .then(|| Instant::now() + DEBOUNCE_100MS);
+        // And the recorder's. Gated on the band being SHOWN as well as
+        // detached, so "Hide Recorder" with the window remembered for next time
+        // does not reopen the window on its own at the next launch.
+        let startup_recorder_detach_at = (settings.recorder_detached && settings.show_recorder)
             .then(|| Instant::now() + DEBOUNCE_100MS);
 
         Self {
@@ -303,6 +385,8 @@ impl IvoryApp {
             midi_tx,
             midi_rx,
             ports: None,
+            audio_devices: None,
+            cameras: None,
             caps,
             pending_resize: None,
             last_pane: Vec2::ZERO,
@@ -328,6 +412,22 @@ impl IvoryApp {
             fret_shown_at: None,
             fret_wm_managed: false,
             startup_fret_detach_at,
+            theory_window_visible: false,
+            theory_builder_size: theory_panel::DETACHED_DEFAULT,
+            theory_builder_pos: None,
+            theory_guard: None,
+            startup_theory_detach_at,
+            recorder_window_visible: false,
+            recorder_builder_size: recorder_panel::DETACHED_DEFAULT,
+            recorder_builder_pos: None,
+            recorder_guard: None,
+            startup_recorder_detach_at,
+            recorder: recorder::RecorderState::default(),
+            recorder_request: None,
+            dir_request: None,
+            export_override: None,
+            name_focused: false,
+
             detach_window_visible: false,
             detached_builder_size,
             detached_builder_pos,
@@ -373,6 +473,33 @@ impl IvoryApp {
     /// than merely hidden.
     pub fn set_ports(&mut self, ports: Option<Box<dyn MidiPorts>>) {
         self.ports = ports;
+    }
+
+    /// Attach the thing that enumerates audio inputs.
+    ///
+    /// The same shape as `set_ports` and for the same reason: `cpal` may not be
+    /// reachable from this crate, so what arrives is a trait object. A plugin
+    /// never calls this, which is what makes the device rows inert rather than
+    /// merely hidden — and `Caps::capture_devices` is what makes them absent.
+    pub fn set_capture_devices(&mut self, devices: Option<Box<dyn CaptureDevices>>) {
+        self.audio_devices = devices;
+    }
+
+    /// And the cameras.
+    pub fn set_cameras(&mut self, devices: Option<Box<dyn CaptureDevices>>) {
+        self.cameras = devices;
+    }
+
+    /// Every audio input present right now, for the picker.
+    ///
+    /// Enumerated on demand rather than cached: an interface plugged in while
+    /// the band is open has to appear without a restart.
+    pub fn audio_device_list(&self) -> Vec<crate::ports::DeviceInfo> {
+        self.audio_devices.as_ref().map(|d| d.list()).unwrap_or_default()
+    }
+
+    pub fn camera_list(&self) -> Vec<crate::ports::DeviceInfo> {
+        self.cameras.as_ref().map(|d| d.list()).unwrap_or_default()
     }
 
     /// A size the user picked that the host has not been told about, if any.
@@ -578,7 +705,7 @@ impl IvoryApp {
         self.manual_positions.clear();
         self.voicing.set_pins(Vec::new());
         let spec = self.settings.fretboard_spec();
-        self.voicing.set_weights(Weights::for_tuning(spec.tuning));
+        self.voicing.set_weights(Weights::for_tuning(&spec.tuning));
         self.voicing.set_spec(spec);
         self.voicing_tick(true);
     }
@@ -716,6 +843,17 @@ impl IvoryApp {
         };
     }
 
+    /// Which shortcuts are live, for both the handler and the help card.
+    ///
+    /// One method rather than two call sites building it, so the card cannot
+    /// advertise a key the handler refuses — which is the whole reason
+    /// `keys.rs` keeps its bindings in one table.
+    fn key_gates(&self) -> keys::Gates {
+        keys::Gates {
+            recorder_shown: self.settings.show_recorder,
+        }
+    }
+
     fn menu_view(&self) -> MenuView {
         MenuView {
             dark_mode: self.settings.dark_mode,
@@ -730,11 +868,16 @@ impl IvoryApp {
             heart_on: self.settings.show_heart,
             fretboard_on: self.settings.show_fretboard,
             theory: self.settings.theory_views(),
+            theory_detached: self.settings.theory_detached,
             theory_follows_midi: self.settings.theory_follow_midi,
             wood: self.settings.fretboard_wood().key(),
             fretboard_detached: self.settings.fretboard_detached,
+            recorder_on: self.settings.show_recorder,
+            recorder_detached: self.settings.recorder_detached,
+            preroll_s: self.settings.preroll_seconds(),
+            hide_elapsed: self.settings.record_hide_elapsed,
             caps: self.caps,
-            tuning: self.settings.fretboard_spec().tuning.name,
+            tuning: self.settings.fretboard_spec().tuning.name.to_string(),
             capo: self.settings.fretboard_spec().capo,
             next_font: {
                 use crate::fonts::FontChoice;
@@ -779,6 +922,7 @@ impl IvoryApp {
         chord_rect: Option<Rect>,
         fret_rect: Option<Rect>,
         theory_rect: Option<Rect>,
+        recorder_rect: Option<Rect>,
     ) {
         let resp = ui.interact(
             ui.max_rect(),
@@ -857,6 +1001,33 @@ impl IvoryApp {
 
         if primary_pressed && !ctrl_as_context {
             if let Some(pos) = pointer {
+                // The Recorder band first, and NOT behind `keytoggle_enabled`.
+                // Its controls are buttons, not an instrument: the record
+                // button has to work whether or not the user has turned on
+                // clicking the piano to place notes.
+                if let Some(r) = recorder_rect.filter(|r| r.contains(pos)) {
+                    let hit = recorder_panel::hit_test(
+                        r,
+                        &self.recorder.view(
+                            self.settings.record_take_name.as_deref().unwrap_or_default(),
+                            self.name_focused,
+                            self.settings.preroll_seconds(),
+                            self.settings.record_hide_elapsed,
+                        ),
+                        pos,
+                    );
+                    // A press anywhere in the band that is not the name field
+                    // takes focus off it, which is what makes clicking away
+                    // commit the name the way every other text field does.
+                    self.name_focused = matches!(hit, Some(recorder_panel::Hit::NameField));
+                    if let Some(hit) = hit {
+                        self.apply_recorder_hit(hit);
+                    }
+                    return;
+                }
+                // Clicking anywhere else also drops the field's focus, or the
+                // next letter typed at the piano would go into the take name.
+                self.name_focused = false;
                 // The supporter heart cycles colour on click. Checked before the
                 // keytoggle hit-test because it sits in the chord strip, not the
                 // keyboard, so the two can never contend.
@@ -1014,6 +1185,394 @@ impl IvoryApp {
         self.save_settings();
     }
 
+    fn detach_theory(&mut self) {
+        self.settings.theory_detached = true;
+        self.theory_window_visible = true;
+        self.theory_builder_size = self.settings.theory_win_size();
+        self.theory_builder_pos = self.settings.theory_win_pos().map(|p| {
+            crate::settings::clamp_to_monitor(p, self.theory_builder_size, self.monitor_size)
+        });
+        // The guard is armed with the SAME size handed to the builder, and both
+        // must stay fixed for as long as the window lives: a guard measuring
+        // against a size that drifts cannot tell a tiling WM from a user.
+        self.theory_guard = Some(theory_panel::GeometryGuard::opened(
+            self.theory_builder_size,
+            Instant::now(),
+        ));
+        self.save_settings();
+    }
+
+    // ── The Recorder popout ────────────────────────────────────────────────
+    //
+    // Four fields and three methods, the same three the theory window has. The
+    // one difference worth noting is that this popout has a REASON beyond
+    // taste: a second monitor holding a big framing view of the camera while
+    // the piano stays where it is.
+
+    fn detach_recorder(&mut self) {
+        self.settings.recorder_detached = true;
+        self.recorder_window_visible = true;
+        self.recorder_builder_size = self.settings.recorder_win_size();
+        self.recorder_builder_pos = self.settings.recorder_win_pos().map(|p| {
+            crate::settings::clamp_to_monitor(p, self.recorder_builder_size, self.monitor_size)
+        });
+        self.recorder_guard = Some(theory_panel::GeometryGuard::opened(
+            self.recorder_builder_size,
+            Instant::now(),
+        ));
+        self.save_settings();
+        self.request_natural_size();
+    }
+
+    fn reattach_recorder(&mut self) {
+        if self.recorder_guard.as_ref().is_none_or(|g| !g.wm_managed()) {
+            self.remember_recorder_geometry();
+        }
+        self.settings.recorder_detached = false;
+        self.recorder_window_visible = false;
+        self.recorder_guard = None;
+        self.save_settings();
+        self.request_natural_size();
+    }
+
+    /// Write back the recorder popout's size and position.
+    fn remember_recorder_geometry(&mut self) -> bool {
+        let Some(g) = self.recorder_guard.as_ref() else {
+            return false;
+        };
+        let mut changed = false;
+        if let Some(size) = g.live_size() {
+            let (w, h) = (size.x.round() as i64, size.y.round() as i64);
+            if self.settings.recorder_win_w != Some(w) || self.settings.recorder_win_h != Some(h) {
+                self.settings.recorder_win_w = Some(w);
+                self.settings.recorder_win_h = Some(h);
+                changed = true;
+            }
+        }
+        if let Some(pos) = g.live_pos() {
+            let (x, y) = (pos.x.round() as i64, pos.y.round() as i64);
+            if self.settings.recorder_win_x != Some(x) || self.settings.recorder_win_y != Some(y) {
+                self.settings.recorder_win_x = Some(x);
+                self.settings.recorder_win_y = Some(y);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    // ── The host's side of the recorder ────────────────────────────────────
+
+    /// Everything the band shows, for the host to fill in each frame.
+    ///
+    /// `&mut` and public because the direction of travel is inward: the app
+    /// does not ask a device for anything, it is TOLD. That is what keeps
+    /// `cpal`, cameras and take directories out of this crate entirely.
+    pub fn recorder_state_mut(&mut self) -> &mut recorder::RecorderState {
+        &mut self.recorder
+    }
+
+    /// Take whatever the band asked for, if anything.
+    ///
+    /// Drained by the host AFTER `frame()` returns. A plugin refuses simply by
+    /// never calling this, which is why refusal needs no code of its own.
+    pub fn take_recorder_request(&mut self) -> Option<recorder::RecorderRequest> {
+        self.recorder_request.take()
+    }
+
+    /// Take a pending "choose a folder" request. Same contract.
+    pub fn take_directory_request(&mut self) -> Option<crate::ports::DirRequest> {
+        self.dir_request.take()
+    }
+
+    /// Whether the take-name field currently has keyboard focus, so the host
+    /// knows a space bar is a space and not a Record press.
+    pub fn recorder_name_focused(&self) -> bool {
+        self.name_focused
+    }
+
+    /// One click in the band.
+    ///
+    /// Everything that changes a SETTING happens here and now; everything that
+    /// touches a device or the filesystem becomes a request for the host. That
+    /// split is the same one `Caps` draws, and it is why a plugin could paint
+    /// this band harmlessly if it ever had reason to.
+    fn apply_recorder_hit(&mut self, hit: recorder_panel::Hit) {
+        use recorder_panel::Hit;
+        use recorder::RecorderRequest as R;
+        match hit {
+            Hit::Record => self.request_recorder(R::Toggle),
+            Hit::Stop => self.request_recorder(R::Stop),
+            Hit::ChooseFolder => self.ask_for_a_folder(),
+            Hit::ToggleDefaultDir => {
+                self.settings.record_dir_is_default = !self.settings.record_dir_is_default;
+                // Unticking it does NOT forget the folder. The tick means "keep
+                // using this next time"; clearing the path as well would throw
+                // away the choice the user just made in the act of saying they
+                // did not want it to be permanent.
+                self.save_settings();
+            }
+            Hit::NameField => self.name_focused = true,
+            Hit::PickCamera => self.open_device_picker(dialogs::DeviceKind::Camera),
+            Hit::PickAudio => self.open_device_picker(dialogs::DeviceKind::AudioInput),
+            Hit::CyclePreRoll => {
+                let choices = recorder::PREROLL_CHOICES;
+                let now = self.settings.preroll_seconds();
+                let next = choices
+                    .iter()
+                    .position(|c| *c == now)
+                    .map_or(choices[0], |i| choices[(i + 1) % choices.len()]);
+                self.settings.record_preroll_s = i64::from(next);
+                self.save_settings();
+            }
+            Hit::Export => self.open_export_dialog(),
+            Hit::ToggleHideElapsed => {
+                self.settings.record_hide_elapsed = !self.settings.record_hide_elapsed;
+                self.save_settings();
+            }
+        }
+    }
+
+    // ── What the host needs to read and write ──────────────────────────────
+    //
+    // Deliberately narrow. The host does not get `&mut Settings`: every one of
+    // these is a specific question with a specific answer, and a general
+    // accessor is how the desktop binary would end up quietly owning settings
+    // policy that the plugin also has to obey.
+
+    /// The Recorder band is showing, so the host should have an input open.
+    pub fn recorder_band_open(&self) -> bool {
+        self.settings.show_recorder
+    }
+
+    /// Where takes go, resolved.
+    pub fn record_root(&self) -> std::path::PathBuf {
+        self.settings.record_root()
+    }
+
+    /// Whether the chosen folder is meant to survive the session.
+    pub fn record_dir_is_default(&self) -> bool {
+        self.settings.record_dir_is_default
+    }
+
+    /// The typed take name, if any.
+    pub fn take_name(&self) -> Option<&str> {
+        self.settings.record_take_name.as_deref()
+    }
+
+    pub fn preroll_seconds(&self) -> u8 {
+        self.settings.preroll_seconds()
+    }
+
+    /// The stable uid of the audio input the user chose, if any.
+    pub fn chosen_audio_uid(&self) -> Option<&str> {
+        self.settings.record_audio_device.as_deref()
+    }
+
+    /// The user explicitly chose "None — record MIDI only".
+    ///
+    /// Distinct from `chosen_audio_uid() == None`, which is also what "has
+    /// never opened the picker" looks like — and those two want opposite
+    /// behaviour at startup: a default input so the meter is live, or no input
+    /// at all.
+    pub fn audio_explicitly_off(&self) -> bool {
+        self.settings.record_audio_source == "none"
+    }
+
+    pub fn chosen_camera_uid(&self) -> Option<&str> {
+        self.settings.record_camera_uid.as_deref()
+    }
+
+    /// Answer a [`crate::ports::DirRequest`].
+    ///
+    /// `remember` is the "Default" tick, and it is passed in rather than read
+    /// from settings because the host is answering a question the user asked
+    /// before the tick's current value was necessarily what they meant.
+    pub fn set_record_dir(&mut self, dir: std::path::PathBuf, remember: bool) {
+        self.settings.record_dir = Some(dir.to_string_lossy().into_owned());
+        self.settings.record_dir_is_default = remember;
+        self.save_settings();
+    }
+
+    // No `set_audio_uid` / `set_camera_uid` here, deliberately.
+    //
+    // There were two, `pub`, with no callers — so no `dead_code` warning — and
+    // they wrote the setting WITHOUT telling the device object, which is half
+    // of what `DialogAction::ChooseDevice` does. A remembered choice that never
+    // takes effect until the next launch is exactly the bug the comment there
+    // warns about, and an obvious-looking public setter is how the next host
+    // would have reintroduced it. Selection goes through the dialog action.
+
+    /// What the next take will write.
+    ///
+    /// The remembered spec unless the user has chosen something for this
+    /// session, which is the whole point of having a "use for every take" tick
+    /// rather than saving unconditionally.
+    pub fn export_spec(&self) -> recorder::ExportSpec {
+        self.export_override.unwrap_or(self.settings.record_export)
+    }
+
+    fn open_export_dialog(&mut self) {
+        let mut spec = self.export_spec();
+        // Seed the display panels from what is actually on screen, so the
+        // common case — "record what I am looking at" — needs no clicks. The
+        // dialog then overrides them FOR THE VIDEO ONLY.
+        spec.composite.shows = dialogs::shows_from_settings(&self.settings);
+        // `false, false`: this is the before-a-take dialog. The after-a-take
+        // one greys the camera controls because those frames were composited
+        // live and nothing kept them, and it is opened from the result strip,
+        // which does not exist until there is a result to strip.
+        self.dialog = Some(Dialog::export(spec, false, false));
+    }
+
+    /// Longest take name the field accepts.
+    ///
+    /// Not a filesystem limit — `ivory_record::take` handles those, including
+    /// the ones Windows invents. This is a legibility limit: the folder name
+    /// also carries a timestamp, and a 200-character name makes every take in
+    /// the finder unreadable.
+    const NAME_MAX: usize = 64;
+
+    /// The take-name field, driven from raw input.
+    fn edit_take_name(&mut self, ctx: &egui::Context) {
+        let events = ctx.input(|i| i.events.clone());
+        let mut name = self.settings.record_take_name.clone().unwrap_or_default();
+        let before = name.clone();
+        for event in events {
+            match event {
+                egui::Event::Text(text) => {
+                    for ch in text.chars() {
+                        // Control characters never reach a name. A tab or a
+                        // newline pasted in from a set list would survive
+                        // sanitisation as an invisible character in a folder
+                        // name, which is the sort of thing that is impossible
+                        // to see and impossible to type again.
+                        if !ch.is_control() && name.chars().count() < Self::NAME_MAX {
+                            name.push(ch);
+                        }
+                    }
+                }
+                egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    pressed: true,
+                    ..
+                } => {
+                    name.pop();
+                }
+                egui::Event::Key {
+                    key: egui::Key::Enter | egui::Key::Escape | egui::Key::Tab,
+                    pressed: true,
+                    ..
+                } => {
+                    self.name_focused = false;
+                }
+                _ => {}
+            }
+        }
+        if name != before {
+            // Empty is absent, not an empty string: the name is optional and
+            // the timestamp already makes every folder unique, so a field the
+            // user cleared must go back to producing unnamed takes rather than
+            // takes called "".
+            self.settings.record_take_name = (!name.is_empty()).then_some(name);
+            self.save_settings();
+        }
+    }
+
+    fn request_recorder(&mut self, request: recorder::RecorderRequest) {
+        // Refused rather than queued where the host cannot honour it. A plugin
+        // never drains, so an ungated request would sit here forever and the
+        // first thing a Toggle did after somebody added draining would be to
+        // start a take nobody asked for.
+        if !self.caps.capture_devices {
+            return;
+        }
+        self.recorder_request = Some(request);
+    }
+
+    /// Ask the host to raise a folder picker.
+    ///
+    /// Not a blocking call and not a `RecorderRequest`: `rfd`'s native panel
+    /// runs a nested run loop, so raising one from inside a frame means
+    /// re-entering the frame already on the stack. The host drains this after
+    /// `frame()` returns.
+    fn ask_for_a_folder(&mut self) {
+        if !self.caps.capture_devices || !self.caps.native_file_dialogs {
+            return;
+        }
+        self.dir_request = Some(crate::ports::DirRequest {
+            start_at: Some(self.settings.record_root()),
+            title: "Where should Tangent put your takes?".to_owned(),
+        });
+    }
+
+    /// Open the camera or audio-input picker, listing what is present RIGHT NOW.
+    ///
+    /// Enumerated at open rather than cached, for the same reason the MIDI
+    /// picker re-reads its ports: devices are plugged and unplugged while the
+    /// app runs, and on macOS a Continuity Camera appears and vanishes with the
+    /// phone.
+    fn open_device_picker(&mut self, kind: dialogs::DeviceKind) {
+        if !self.caps.capture_devices {
+            return;
+        }
+        let (devices, current) = match kind {
+            dialogs::DeviceKind::Camera => (
+                self.camera_list(),
+                self.settings.record_camera_uid.clone(),
+            ),
+            dialogs::DeviceKind::AudioInput => (
+                self.audio_device_list(),
+                self.settings.record_audio_device.clone(),
+            ),
+        };
+        // Preselect what is already chosen, so OK on an unchanged dialog is a
+        // no-op rather than a silent switch to None.
+        let selected = current
+            .as_deref()
+            .and_then(|uid| devices.iter().position(|d| d.uid == uid));
+        self.dialog = Some(Dialog::DevicePicker {
+            kind,
+            devices,
+            selected,
+            current,
+        });
+    }
+
+    fn reattach_theory(&mut self) {
+        if self.theory_guard.as_ref().is_none_or(|g| !g.wm_managed()) {
+            self.remember_theory_geometry();
+        }
+        self.settings.theory_detached = false;
+        self.theory_window_visible = false;
+        self.theory_guard = None;
+        self.save_settings();
+    }
+
+    /// Write back the theory popout's size and position.
+    fn remember_theory_geometry(&mut self) -> bool {
+        let Some(g) = self.theory_guard.as_ref() else {
+            return false;
+        };
+        let mut changed = false;
+        if let Some(size) = g.live_size() {
+            let (w, h) = (size.x.round() as i64, size.y.round() as i64);
+            if self.settings.theory_win_w != Some(w) || self.settings.theory_win_h != Some(h) {
+                self.settings.theory_win_w = Some(w);
+                self.settings.theory_win_h = Some(h);
+                changed = true;
+            }
+        }
+        if let Some(pos) = g.live_pos() {
+            let (x, y) = (pos.x.round() as i64, pos.y.round() as i64);
+            if self.settings.theory_win_x != Some(x) || self.settings.theory_win_y != Some(y) {
+                self.settings.theory_win_x = Some(x);
+                self.settings.theory_win_y = Some(y);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     fn reattach_fretboard(&mut self) {
         if !self.fret_wm_managed {
             self.remember_fretboard_geometry();
@@ -1146,6 +1705,11 @@ impl IvoryApp {
                 }
                 self.save_settings();
             }
+            // Space. Not routed through a `MenuAction`, because there is no
+            // menu row for it: pressing Record is what the BAND is for, and a
+            // menu row that starts a take would be reachable from a right-click
+            // over the piano with the recorder hidden.
+            K::ToggleRecording => self.request_recorder(recorder::RecorderRequest::Toggle),
             K::ToggleDarkMode => self.apply_menu_action(ctx, MenuAction::ToggleDarkMode),
             K::ToggleDetection => self.apply_menu_action(ctx, MenuAction::ToggleChordDetection),
             K::ToggleBorderless => self.apply_menu_action(ctx, MenuAction::ToggleBorderless),
@@ -1319,6 +1883,56 @@ impl IvoryApp {
             }
             MenuAction::DetachFretboard => self.detach_fretboard(),
             MenuAction::AttachFretboard => self.reattach_fretboard(),
+            MenuAction::DetachTheory => self.detach_theory(),
+            MenuAction::AttachTheory => self.reattach_theory(),
+            MenuAction::ToggleRecorder => {
+                // Refused while a take is running, and this is a safety rule
+                // rather than tidiness. Stop lives only in the band, so hiding
+                // it mid-take removes the only control that can end the take —
+                // and the host stops reconciling devices on the closed edge, so
+                // the microphone and the camera stay open with nothing on
+                // screen saying they are.
+                if self.recorder.state.is_active() {
+                    return;
+                }
+                self.settings.show_recorder = !self.settings.show_recorder;
+                // Hiding the band hides it everywhere, exactly as Hide
+                // Fretboard does: a popped-out recorder left on screen with the
+                // band gone is a window with no menu row that can reach it.
+                if !self.settings.show_recorder && self.recorder_window_visible {
+                    self.reattach_recorder();
+                    self.settings.recorder_detached = true; // remembered for next time
+                }
+                // Opening the BAND is what opens the audio input, not pressing
+                // Record — the meter has to be live before arming. The host
+                // reconciles that after the frame by watching this flag, so
+                // there is nothing to send from here.
+                self.save_settings();
+                self.request_natural_size();
+            }
+            MenuAction::DetachRecorder => self.detach_recorder(),
+            MenuAction::AttachRecorder => self.reattach_recorder(),
+            MenuAction::ShowExportDialog => self.open_export_dialog(),
+            MenuAction::SetPreRoll(seconds) => {
+                self.settings.record_preroll_s = i64::from(seconds);
+                self.save_settings();
+            }
+            MenuAction::ToggleHideElapsed => {
+                self.settings.record_hide_elapsed = !self.settings.record_hide_elapsed;
+                self.save_settings();
+            }
+            MenuAction::EditCustomTuning => {
+                // Seeded from whatever tuning is LIVE, because almost every
+                // custom tuning is "standard but…" and an empty grid would make
+                // the common case the slow one. `Dialog::custom_tuning` also
+                // renames a preset on the way in, so confirming cannot produce a
+                // tuning called "Standard" that the settings loader would then
+                // resolve back to the preset, silently discarding the pitches.
+                self.dialog = Some(Dialog::custom_tuning(
+                    &self.settings.fretboard_spec().tuning,
+                    self.settings.prefer_flats,
+                ));
+            }
             MenuAction::ToggleHeart => {
                 self.settings.show_heart = !self.settings.show_heart;
                 self.save_settings();
@@ -1609,6 +2223,49 @@ impl IvoryApp {
                 self.settings.show_welcome = show;
                 self.save_settings();
             }
+            DialogAction::ChooseDevice { kind, uid } => {
+                // Written to settings AND pushed to the device object. The
+                // first is what survives a restart; the second is what the
+                // host's reconciler acts on after the frame. Doing only the
+                // first would remember a choice that never took effect until
+                // the next launch.
+                match kind {
+                    dialogs::DeviceKind::Camera => {
+                        self.settings.record_camera_uid = uid.clone();
+                        if let Some(d) = self.cameras.as_mut() {
+                            let _ = d.open(uid.as_deref().unwrap_or(""));
+                        }
+                    }
+                    dialogs::DeviceKind::AudioInput => {
+                        // `record_audio_source` carries the None choice across
+                        // a restart. Without it, `record_audio_device: null` is
+                        // indistinguishable from "never chose", and the next
+                        // launch helpfully opens the system microphone for
+                        // somebody who explicitly asked for MIDI only.
+                        self.settings.record_audio_source = if uid.is_some() {
+                            "input".to_owned()
+                        } else {
+                            "none".to_owned()
+                        };
+                        self.settings.record_audio_device = uid.clone();
+                        if let Some(d) = self.audio_devices.as_mut() {
+                            let _ = d.open(uid.as_deref().unwrap_or(""));
+                        }
+                    }
+                }
+                self.save_settings();
+            }
+            // This session only. Deliberately NOT written to settings: the
+            // tick is what makes a choice outlive the session.
+            DialogAction::SetExport(spec) => self.export_override = Some(spec),
+            DialogAction::SetExportAndRemember(spec) => {
+                // The override is cleared as well as the setting written, or
+                // the session copy would keep shadowing the thing the user just
+                // asked to be permanent.
+                self.export_override = None;
+                self.settings.record_export = spec;
+                self.save_settings();
+            }
             DialogAction::InstallLicense { key } => {
                 // The dialog stays open on failure so the message can say what
                 // went wrong without the user losing what they pasted; a typo
@@ -1667,6 +2324,34 @@ impl IvoryApp {
             DialogAction::ForgetLearning => {
                 self.detector.reset_learning();
                 self.detection_tick(true);
+            }
+            DialogAction::SetCustomTuning(t) => {
+                // Store the pitches AND select the tuning, in that order. The
+                // selection is a sentinel (`Settings::CUSTOM_TUNING`) rather
+                // than the tuning's own name: a name that happened to match a
+                // preset would be resolved back to the preset on the next load
+                // and the user's pitches would be silently gone. The dialog
+                // renames a preset-derived tuning on the way IN for the same
+                // reason; this is the other half of that guard.
+                self.settings.fretboard_custom_name = Some(t.name.to_string());
+                self.settings.fretboard_custom_open = Some(
+                    t.open
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                self.settings.fretboard_tuning =
+                    Settings::CUSTOM_TUNING.to_owned();
+                self.dialog = None;
+                self.save_settings();
+                self.rebuild_voicing();
+                // A different string count changes the fretboard band's height,
+                // so the window has to be re-measured. `SetTuning` never needed
+                // this because every preset was six strings; with 4- to
+                // 12-string tunings it is the difference between the neck
+                // fitting and the piano being clipped.
+                self.request_natural_size();
             }
             DialogAction::ConnectPort(name) => {
                 if let Some(src) = self.ports.as_mut() {
@@ -1730,13 +2415,33 @@ fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
         0.0
     };
     let fret_h = if settings.show_fretboard && !settings.fretboard_detached {
-        fretboard_panel::band_height(w)
+        fretboard_panel::band_height(w, settings.fretboard_spec().tuning.strings())
     } else {
         0.0
     };
-    let theory_h = theory_panel::band_height(w, settings.theory_views());
+    // Zero while popped out, exactly like the chord strip and the neck above.
+    // Without this the diagrams render in BOTH places at once, and the main
+    // window keeps 300pt of height for a band that is somewhere else.
+    let theory_h = if settings.theory_detached {
+        0.0
+    } else {
+        theory_panel::band_height(w, settings.theory_views())
+    };
+    // Zero when hidden AND zero when popped out, like every band above it.
+    //
+    // There is no `caps` term here and there must not be: `IvoryApp::new`
+    // already forces `show_recorder` false wherever `capture_devices` is,
+    // so a host that cannot record has nothing to zero. Testing caps here as
+    // well would put the same rule in two places, and the two would disagree
+    // the first time somebody changed one of them.
+    let recorder_h = if settings.show_recorder && !settings.recorder_detached {
+        recorder_panel::band_height(w)
+    } else {
+        0.0
+    };
     Bands {
         w,
+        recorder_h,
         theory_h,
         chord_h,
         piano_h,
@@ -1780,6 +2485,12 @@ fn fit_bands(settings: &Settings, avail: Vec2) -> Bands {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Bands {
     w: f32,
+    /// Top of the stack, above the theory band.
+    ///
+    /// The recorder is the surface you set up BEFORE you play and glance at
+    /// WHILE you play, and both of those want it at the top of the window,
+    /// nearest the eyeline — not below the keyboard where the hands are.
+    recorder_h: f32,
     theory_h: f32,
     chord_h: f32,
     piano_h: f32,
@@ -1790,7 +2501,7 @@ impl Bands {
     fn total(self) -> Vec2 {
         Vec2::new(
             self.w,
-            self.theory_h + self.chord_h + self.piano_h + self.fret_h,
+            self.recorder_h + self.theory_h + self.chord_h + self.piano_h + self.fret_h,
         )
     }
 }
@@ -1858,6 +2569,50 @@ impl IvoryApp {
             }
         }
 
+        // And the same restore for the theory window.
+        if let Some(t) = self.startup_theory_detach_at {
+            if Instant::now() >= t {
+                self.startup_theory_detach_at = None;
+                if self.settings.theory_detached && self.settings.theory_views().any() {
+                    self.theory_window_visible = true;
+                    self.theory_builder_size = self.settings.theory_win_size();
+                    self.theory_builder_pos = self.settings.theory_win_pos().map(|p| {
+                        crate::settings::clamp_to_monitor(
+                            p,
+                            self.theory_builder_size,
+                            self.monitor_size,
+                        )
+                    });
+                    self.theory_guard = Some(theory_panel::GeometryGuard::opened(
+                        self.theory_builder_size,
+                        Instant::now(),
+                    ));
+                }
+            }
+        }
+
+        // And the same restore for the Recorder window.
+        if let Some(t) = self.startup_recorder_detach_at {
+            if Instant::now() >= t {
+                self.startup_recorder_detach_at = None;
+                if self.settings.recorder_detached && self.settings.show_recorder {
+                    self.recorder_window_visible = true;
+                    self.recorder_builder_size = self.settings.recorder_win_size();
+                    self.recorder_builder_pos = self.settings.recorder_win_pos().map(|p| {
+                        crate::settings::clamp_to_monitor(
+                            p,
+                            self.recorder_builder_size,
+                            self.monitor_size,
+                        )
+                    });
+                    self.recorder_guard = Some(theory_panel::GeometryGuard::opened(
+                        self.recorder_builder_size,
+                        Instant::now(),
+                    ));
+                }
+            }
+        }
+
         // Startup detach restore (100ms single-shot).
         if let Some(t) = self.startup_detach_at {
             if Instant::now() >= t {
@@ -1884,8 +2639,14 @@ impl IvoryApp {
         // Shortcuts, but never while a dialog or the context menu is up: those
         // are modal, and a stray K behind a modal changing the app underneath
         // it is the kind of thing that reads as a haunting.
-        if self.dialog.is_none() && self.menu_state.is_none() {
-            if let Some(action) = keys::pressed(&ctx) {
+        // `name_focused` joins the modal guard rather than the `Gates` struct,
+        // and the distinction matters. `Gates` decides whether a binding EXISTS
+        // — the help card is generated from the same answer — so gating on the
+        // text field there would make Space vanish from the card for as long as
+        // somebody was typing, which is a flicker, not a fact. Focus is a
+        // "swallow this frame's keys" condition, exactly like an open dialog.
+        if self.dialog.is_none() && self.menu_state.is_none() && !self.name_focused {
+            if let Some(action) = keys::pressed(&ctx, self.key_gates()) {
                 self.apply_key_action(&ctx, action);
             }
         }
@@ -1967,6 +2728,7 @@ impl IvoryApp {
         };
         let Bands {
             w,
+            recorder_h,
             theory_h,
             chord_h,
             piano_h,
@@ -2015,11 +2777,27 @@ impl IvoryApp {
         let band_at = |top: f32, h: f32| {
             Rect::from_min_size(Pos2::new(origin.x, origin.y + top), Vec2::new(w, h))
         };
-        let piano_rect = band_at(theory_h + chord_h, piano_h);
+        let piano_rect = band_at(recorder_h + theory_h + chord_h, piano_h);
         let mut chord_rect_for_hit: Option<Rect> = None;
-        let fret_rect_for_hit: Option<Rect> =
-            (fret_h > 0.0).then(|| band_at(theory_h + chord_h + piano_h, fret_h));
-        let theory_rect_for_hit: Option<Rect> = (theory_h > 0.0).then(|| band_at(0.0, theory_h));
+        let fret_rect_for_hit: Option<Rect> = (fret_h > 0.0)
+            .then(|| band_at(recorder_h + theory_h + chord_h + piano_h, fret_h));
+        let theory_rect_for_hit: Option<Rect> =
+            (theory_h > 0.0).then(|| band_at(recorder_h, theory_h));
+        let recorder_rect_for_hit: Option<Rect> =
+            (recorder_h > 0.0).then(|| band_at(0.0, recorder_h));
+        if let Some(rect) = recorder_rect_for_hit {
+            recorder_panel::draw(
+                ui.painter(),
+                rect,
+                &self.recorder.view(
+                    self.settings.record_take_name.as_deref().unwrap_or_default(),
+                    self.name_focused,
+                    self.settings.preroll_seconds(),
+                    self.settings.record_hide_elapsed,
+                ),
+                &self.settings,
+            );
+        }
         if let Some(theory_rect) = theory_rect_for_hit {
             theory_panel::draw(
                 ui.painter(),
@@ -2030,7 +2808,7 @@ impl IvoryApp {
             );
         }
         if chord_h > 0.0 {
-            let chord_rect = band_at(theory_h, chord_h);
+            let chord_rect = band_at(recorder_h + theory_h, chord_h);
             chord_rect_for_hit = Some(chord_rect);
             chord_strip::draw(
                 ui.painter(),
@@ -2069,7 +2847,18 @@ impl IvoryApp {
             chord_rect_for_hit,
             fret_rect_for_hit,
             theory_rect_for_hit,
+            recorder_rect_for_hit,
         );
+
+        // The take-name field, edited from raw input rather than with an egui
+        // widget. The band is a pure painter — that is what will let the
+        // compositor render it into a 1080p surface later — so it cannot own a
+        // `TextEdit`, and the field is worth having anyway: "type nocturne
+        // once, press record five times" is the workflow the whole naming
+        // scheme exists to support.
+        if self.name_focused {
+            self.edit_take_name(&ctx);
+        }
 
         // Held, not toggled: press to read, release and it slides away. Drawn
         // last so it is over everything, and asked for every frame so the
@@ -2079,7 +2868,13 @@ impl IvoryApp {
         // both entered the letter and slid the card down over the app.
         let help = keys::help_progress(&ctx, self.dialog.is_none() && self.menu_state.is_none());
         if help > 0.0 {
-            keys::draw_help(ui.painter(), ui.max_rect(), self.settings.dark_mode, help);
+            keys::draw_help(
+                ui.painter(),
+                ui.max_rect(),
+                self.settings.dark_mode,
+                help,
+                self.key_gates(),
+            );
         }
 
         // The popped-out neck. `caps.detachable` gates the DRAWING, not just
@@ -2123,6 +2918,86 @@ impl IvoryApp {
             }
             if outcome.close_requested {
                 self.reattach_fretboard(); // close-to-reattach, like the chord window
+            } else if let Some(pos) = outcome.context_menu_at {
+                if self.dialog.is_none() {
+                    self.open_menu_at(&ctx, pos);
+                }
+            }
+        }
+
+        // Detached theory window. Third popout, and the cheapest of the three:
+        // `theory_panel::GeometryGuard` owns the tiling-WM logic that the two
+        // above still open-code, so this block is the window plus one
+        // `observe`.
+        if self.theory_window_visible && self.caps.detachable {
+            let outcome = theory_panel::show_detached_window(
+                &ctx,
+                self.theory_builder_size,
+                self.theory_builder_pos,
+                self.settings.borderless_mode,
+                self.main_focused,
+                self.settings.theory_views(),
+                self.theory_input(&self.display_notes()),
+                &self.settings,
+            );
+            if let Some(g) = self.theory_guard.as_mut() {
+                if g.observe(&outcome, Instant::now()) {
+                    self.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
+                }
+            }
+            if outcome.close_requested {
+                self.reattach_theory(); // close-to-reattach, like the other two
+            } else if let Some(hit) = outcome.hit {
+                // The diagrams are inputs, and they stay inputs when popped
+                // out. The hit arrives already resolved against the WINDOW's
+                // rect, which is a different rectangle from the band's.
+                self.toggle_theory_hit(hit);
+            } else if let Some(pos) = outcome.context_menu_at {
+                if self.dialog.is_none() {
+                    self.open_menu_at(&ctx, pos);
+                }
+            }
+        }
+
+        // The popped-out Recorder. Its reason for existing is the best of the
+        // four: a big framing view of the camera on a second monitor while the
+        // piano stays where it is.
+        if self.recorder_window_visible && self.caps.detachable {
+            let view = self.recorder.view(
+                self.settings.record_take_name.as_deref().unwrap_or_default(),
+                self.name_focused,
+                self.settings.preroll_seconds(),
+                self.settings.record_hide_elapsed,
+            );
+            let outcome = recorder_panel::show_detached_window(
+                &ctx,
+                self.recorder_builder_size,
+                self.recorder_builder_pos,
+                self.settings.borderless_mode,
+                self.main_focused,
+                &view,
+                &self.settings,
+            );
+            if let Some(g) = self.recorder_guard.as_mut() {
+                if g.observe_geometry(outcome.inner_size, outcome.outer_pos, Instant::now()) {
+                    self.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
+                }
+            }
+            if outcome.close_requested {
+                self.reattach_recorder(); // close-to-reattach, like the other three
+            } else if let Some(hit) = outcome.hit.filter(|_| self.dialog.is_none()) {
+                // The hit arrives already resolved against the WINDOW's rect,
+                // which is a different rectangle from the band's.
+                //
+                // `dialog.is_none()` because the main window is modal to a
+                // dialog (`handle_main_interaction` returns early) and the
+                // popout has to be too. Without it, clicking Export in the
+                // detached recorder while the Export dialog is already open
+                // REPLACES it with a fresh one and discards everything typed.
+                // The recorder is the only popout whose hits open dialogs,
+                // which is what makes this a bug here and not in the other two.
+                self.name_focused = matches!(hit, recorder_panel::Hit::NameField);
+                self.apply_recorder_hit(hit);
             } else if let Some(pos) = outcome.context_menu_at {
                 if self.dialog.is_none() {
                     self.open_menu_at(&ctx, pos);
@@ -2202,6 +3077,16 @@ impl IvoryApp {
                 if self.fret_window_visible && !self.fret_wm_managed {
                     dirty |= self.remember_fretboard_geometry();
                 }
+                if self.theory_window_visible
+                    && self.theory_guard.as_ref().is_none_or(|g| !g.wm_managed())
+                {
+                    dirty |= self.remember_theory_geometry();
+                }
+                if self.recorder_window_visible
+                    && self.recorder_guard.as_ref().is_none_or(|g| !g.wm_managed())
+                {
+                    dirty |= self.remember_recorder_geometry();
+                }
                 if dirty {
                     self.save_settings();
                 }
@@ -2262,6 +3147,41 @@ mod tests {
         let ctx = egui::Context::default();
         let app = IvoryApp::new(&ctx, settings, caps);
         (ctx, app)
+    }
+
+    /// A desktop app with the Welcome dialog already dismissed.
+    ///
+    /// It matters for anything about keyboard shortcuts: `show_welcome`
+    /// defaults to true, the dialog is modal, and shortcuts are suppressed
+    /// while one is up. A shortcut test on a plain `headless()` passes for the
+    /// wrong reason — it is measuring the welcome screen.
+    fn recorder_app() -> (egui::Context, IvoryApp) {
+        headless_with(
+            Caps::DESKTOP,
+            Settings {
+                show_welcome: false,
+                ..Settings::default()
+            },
+        )
+    }
+
+    /// One frame with the space bar pressed, returning whatever it started.
+    fn space(ctx: &egui::Context, app: &mut IvoryApp) -> Option<recorder::RecorderRequest> {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Space,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        app.take_recorder_request()
     }
 
     fn run_one_frame(ctx: &egui::Context, app: &mut IvoryApp, size: Vec2) -> Vec<String> {
@@ -2496,7 +3416,7 @@ mod tests {
             MenuAction::ToggleTheoryView(theory_panel::View::Circle),
             MenuAction::ToggleChordDetection,
         ] {
-            app.apply_menu_action(&ctx, action);
+            app.apply_menu_action(&ctx, action.clone());
             let asked = app.take_pending_resize().unwrap_or_else(|| {
                 panic!("{action:?} changed the band stack without asking for room")
             });
@@ -2606,7 +3526,7 @@ mod tests {
             .iter()
             .enumerate()
             .find_map(|(i, (label, a))| {
-                (label.as_str() == "Dark Mode").then_some((i, label.clone(), *a))
+                (label.as_str() == "Dark Mode").then_some((i, label.clone(), a.clone()))
             })
             .expect("Dark Mode is in the menu");
         assert_eq!(want, MenuAction::ToggleDarkMode);
@@ -2761,6 +3681,230 @@ mod tests {
     /// the editor behind its back on the first frame. `MinInnerSize` and
     /// `MaxInnerSize` are swallowed there, which would have left exactly the
     /// one third of the mechanism that does damage.
+    /// A popped-out band must vacate the main window, or the diagrams render in
+    /// two places at once and the main window keeps 300pt of height for
+    /// something that is somewhere else.
+    #[test]
+    fn a_detached_theory_band_takes_no_height_in_the_main_window() {
+        let mut s = Settings::default();
+        s.theory_circle = true;
+        let attached = band_sizes_at(&s, 1300.0);
+        assert!(attached.theory_h > 0.0, "the band should be showing");
+
+        s.theory_detached = true;
+        let detached = band_sizes_at(&s, 1300.0);
+        assert_eq!(detached.theory_h, 0.0, "detached, so it is not in the stack");
+        assert_eq!(
+            detached.piano_h, attached.piano_h,
+            "detaching must not resize the piano"
+        );
+        assert!(
+            detached.total().y < attached.total().y,
+            "the window should get shorter when a band leaves it"
+        );
+    }
+
+    /// A plugin has no second window, so it must never start believing it has
+    /// one — a plugin instance is seeded from the same settings file the
+    /// desktop writes, so a user who left the theory band popped out on the
+    /// desktop would otherwise get a DAW editor with no theory band at all: the
+    /// band is zeroed by the flag, and the window it moved to cannot exist.
+    #[test]
+    fn a_plugin_never_starts_with_a_detached_theory_band() {
+        let ctx = egui::Context::default();
+        let mut s = Settings::default();
+        s.theory_circle = true;
+        s.theory_detached = true;
+        let app = IvoryApp::new(&ctx, s, Caps::PLUGIN);
+        assert!(
+            !app.settings.theory_detached,
+            "Caps::PLUGIN must clear it, as it already does for the chord \
+             window and the neck"
+        );
+    }
+
+    #[test]
+    fn the_recorder_band_is_only_in_the_stack_when_it_is_attached_and_shown() {
+        let mut s = Settings::default();
+        assert_eq!(
+            band_sizes_at(&s, 1300.0).recorder_h,
+            0.0,
+            "off by default — the band is 200pt tall and a window that grows \
+             on its own after an update is a geometry surprise"
+        );
+        s.show_recorder = true;
+        let shown = band_sizes_at(&s, 1300.0);
+        assert!(shown.recorder_h > 0.0);
+
+        s.recorder_detached = true;
+        let detached = band_sizes_at(&s, 1300.0);
+        assert_eq!(detached.recorder_h, 0.0, "it is somewhere else");
+        assert_eq!(
+            detached.piano_h, shown.piano_h,
+            "detaching must not resize the piano"
+        );
+        assert!(detached.total().y < shown.total().y);
+    }
+
+    /// The worst of the four seeding failures, because the recorder is the one
+    /// band a plugin can never populate: `capture_devices` is false there, so
+    /// there is no camera, no input and no take directory. A settings file
+    /// written by the desktop with `show_recorder: true` would otherwise cost a
+    /// DAW editor 200 points of empty transport, taken out of the piano.
+    #[test]
+    fn a_plugin_never_starts_with_a_recorder_band() {
+        let ctx = egui::Context::default();
+        let mut s = Settings::default();
+        s.show_recorder = true;
+        s.recorder_detached = true;
+        let app = IvoryApp::new(&ctx, s, Caps::PLUGIN);
+        assert!(!app.settings.show_recorder, "no device, no band");
+        assert!(!app.settings.recorder_detached, "and no window for it");
+        assert_eq!(band_sizes_at(&app.settings, 1300.0).recorder_h, 0.0);
+    }
+
+    /// A Minimal build is a desktop app with no recorder linked, so it has to
+    /// clear the band for exactly the same reason a plugin does — and it is the
+    /// case that would be missed, because a Minimal build DOES have windows.
+    #[test]
+    fn a_minimal_build_never_starts_with_a_recorder_band_either() {
+        let ctx = egui::Context::default();
+        let mut s = Settings::default();
+        s.show_recorder = true;
+        let app = IvoryApp::new(&ctx, s, Caps::MINIMAL);
+        assert!(!app.settings.show_recorder);
+        assert!(
+            app.settings.show_fretboard || !app.settings.show_fretboard,
+            "and nothing else is disturbed"
+        );
+    }
+
+    /// Hiding the band must not leave its window on screen: the Attach row
+    /// lives inside the Recorder category, which is only drawn while the band
+    /// is showing, so the window would have no way back.
+    #[test]
+    fn hiding_the_recorder_takes_its_window_with_it() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.show_recorder = true;
+        app.detach_recorder();
+        assert!(app.recorder_window_visible);
+
+        app.apply_menu_action(&ctx, MenuAction::ToggleRecorder);
+        assert!(!app.settings.show_recorder);
+        assert!(!app.recorder_window_visible, "the window went with it");
+        assert!(
+            app.settings.recorder_detached,
+            "but where it was is remembered, so turning it back on puts it back"
+        );
+    }
+
+    /// Space is the transport, and the band owns a text field. Typing a space
+    /// into a take name must not also start a take.
+    #[test]
+    fn a_focused_take_name_swallows_the_transport_key() {
+        let (ctx, mut app) = recorder_app();
+        app.settings.show_recorder = true;
+        assert_eq!(
+            space(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Toggle),
+            "with the band open and nothing focused, Space is the transport"
+        );
+
+        app.name_focused = true;
+        assert_eq!(
+            space(&ctx, &mut app),
+            None,
+            "a space typed into the take name must not also start a take"
+        );
+
+        // And the card does not flicker: `name_focused` guards the frame, it
+        // does not un-declare the binding.
+        assert!(app.key_gates().recorder_shown);
+    }
+
+    /// The other half of the same gate, and the one that protects people who
+    /// have never opened the recorder: Space is the widest key on the keyboard
+    /// and gets hit by accident constantly.
+    #[test]
+    fn space_does_nothing_until_the_band_has_been_opened() {
+        let (ctx, mut app) = recorder_app();
+        assert!(!app.settings.show_recorder);
+        assert_eq!(space(&ctx, &mut app), None);
+        // And the same app, one flag later, DOES respond — otherwise this test
+        // would go on passing if Space stopped working entirely.
+        app.settings.show_recorder = true;
+        assert_eq!(
+            space(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Toggle)
+        );
+    }
+
+    /// A plugin drains nothing, so a request it can never honour must not be
+    /// recorded at all — otherwise the first thing draining would do, whenever
+    /// somebody added it, is start a take nobody asked for.
+    #[test]
+    fn a_plugin_records_no_recorder_requests() {
+        let (_ctx, mut app) = headless(Caps::PLUGIN);
+        app.request_recorder(recorder::RecorderRequest::Toggle);
+        app.request_recorder(recorder::RecorderRequest::Stop);
+        assert_eq!(app.take_recorder_request(), None);
+        app.ask_for_a_folder();
+        assert_eq!(app.take_directory_request(), None);
+    }
+
+    /// The take name is optional, and clearing it has to go back to producing
+    /// unnamed takes rather than takes called "".
+    #[test]
+    fn clearing_the_take_name_makes_it_absent_rather_than_empty() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.record_take_name = Some("nocturne".into());
+        app.name_focused = true;
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }; 8],
+            ..Default::default()
+        });
+        app.edit_take_name(&ctx);
+        let _ = ctx.end_pass();
+        assert_eq!(app.settings.record_take_name, None, "not Some(\"\")");
+    }
+
+    /// The session-only spec must not leak into the file, and remembering must
+    /// clear the session copy — or the thing the user just made permanent would
+    /// go on being shadowed by the temporary one.
+    #[test]
+    fn an_export_spec_is_remembered_only_when_it_is_asked_to_be() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let one_off = recorder::ExportSpec {
+            tempo_bpm: 92.0,
+            ..Default::default()
+        };
+        app.apply_dialog_action(DialogAction::SetExport(one_off));
+        assert_eq!(app.export_spec(), one_off, "this take uses it");
+        assert_eq!(
+            app.settings.record_export,
+            recorder::ExportSpec::default(),
+            "and the file does not"
+        );
+
+        let forever = recorder::ExportSpec {
+            tempo_bpm: 76.0,
+            ..Default::default()
+        };
+        app.apply_dialog_action(DialogAction::SetExportAndRemember(forever));
+        assert_eq!(app.settings.record_export, forever);
+        assert_eq!(
+            app.export_spec(),
+            forever,
+            "the session copy must not go on shadowing it"
+        );
+    }
+
     #[test]
     fn a_plugin_frame_never_commands_the_hosts_window() {
         let (ctx, mut app) = headless(Caps::PLUGIN);
@@ -2833,7 +3977,7 @@ mod tests {
             assert_eq!(with.x, without.x, "the fretboard must not change the width");
             assert_eq!(
                 with.y - without.y,
-                fretboard_panel::band_height(w),
+                fretboard_panel::band_height(w, 6),
                 "band height at {pct}%"
             );
             assert_eq!(with.y, with.y.trunc(), "bands are whole pixels");
@@ -2846,7 +3990,7 @@ mod tests {
         s.show_fretboard = false;
         assert_eq!(
             piano_and_fret.y - initial_window_size(&s).y,
-            fretboard_panel::band_height(main_width(&s))
+            fretboard_panel::band_height(main_width(&s), s.fretboard_spec().tuning.strings())
         );
     }
 

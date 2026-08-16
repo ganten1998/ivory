@@ -127,8 +127,33 @@ impl CapoStyle {
 
 /// Height of the fretboard band for a window `w` points wide. Truncated like
 /// every other band in the layout (spec §3.2).
-pub fn band_height(w: f32) -> f32 {
-    (BAND_H_AT_1300 * w as f64 / 1300.0).trunc() as f32
+pub fn band_height(w: f32, strings: usize) -> f32 {
+    let base = BAND_H_AT_1300 * w as f64 / 1300.0;
+    (base * string_scale(strings)).trunc() as f32
+}
+
+/// How much taller the band gets for instruments with more than six strings.
+///
+/// **This exists because 7- and 8-string tunings do not fit.** The band was a
+/// pure function of width, sized for six strings, and at 200pt wide that is
+/// 20pt of neck: eight strings then sit 2.3pt apart while a note dot is 2.0pt
+/// across, leaving 0.3pt of daylight. A chord reads as one vertical smear
+/// rather than as notes. Caught by
+/// `dots_on_neighbouring_strings_stay_apart` the moment 7- and 8-string
+/// tunings were added, which is the argument for that test existing.
+///
+/// The band therefore grows with the string count, keeping per-string spacing
+/// roughly constant. Note what this is NOT: it is not the layout following a
+/// device's aspect ratio, which `docs/RECORDER-PLAN.md` §0 forbids for the
+/// camera preview. String count is application state the user chose, the height
+/// stays a deterministic function of `(width, strings)`, and every geometry test
+/// still pins exactly.
+///
+/// It never shrinks below the six-string height. A four-string bass keeps the
+/// familiar band and simply spaces its strings further apart — a band that got
+/// visibly shorter when you switched to bass would read as a bug.
+fn string_scale(strings: usize) -> f64 {
+    (strings.max(1) as f64 / 6.0).max(1.0)
 }
 
 /// No headstock. The nut sits on the window's left edge and every fret of the
@@ -948,17 +973,32 @@ mod tests {
     #[test]
     fn a_barre_is_never_narrower_than_the_dots_on_it() {
         for w in [400.0_f32, 900.0, 1300.0, 2600.0] {
-            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
+            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w, FretboardSpec::default().tuning.strings())));
             let g = Geom::new(r, &FretboardSpec::default()).unwrap();
+            // The bar's width and the dot's diameter, both taken from the
+            // geometry the drawing code uses, at each width.
+            //
+            // The previous version asserted `BARRE_W_IN_DOTS >= 2.0` inside
+            // this loop, which is a constant and made the loop, the rect and
+            // the `Geom` decoration — clippy called it a "constant value"
+            // assertion and clippy was right. This form is still ultimately
+            // about that constant, but it goes through `Geom::new` and
+            // `dot_r()` at four widths, so it also fails if either starts
+            // returning zero or panicking on a small band. What it does NOT
+            // prove is that `draw` uses these numbers; that would need the
+            // barre rect to be a function, and it is currently inline at :493.
+            let bar_w = g.dot_r() * BARRE_W_IN_DOTS;
+            let dot_d = g.dot_r() * 2.0;
             assert!(
-                BARRE_W_IN_DOTS >= 2.0,
-                "the barre is {BARRE_W_IN_DOTS} radii wide against a 2.0-radius \
-                 dot, so every dot on it bulges out"
+                g.dot_r() > 0.0,
+                "a zero-radius dot at width {w} means nothing is drawn at all"
             );
-            // And the bar reaches the outer edge of the end dots, so the line
-            // ends where the notes do rather than short of them.
-            let _ = g.dot_r();
-            let _ = w;
+            assert!(
+                bar_w >= dot_d,
+                "at width {w} the barre is {bar_w} wide against a {dot_d} dot, \
+                 so every dot on it bulges out and it reads as two blobs \
+                 joined by a stick"
+            );
         }
     }
 
@@ -967,7 +1007,7 @@ mod tests {
     #[test]
     fn the_capo_can_be_clicked_where_it_is_drawn() {
         for w in [400.0_f32, 900.0, 1300.0, 2600.0] {
-            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
+            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w, FretboardSpec::default().tuning.strings())));
             // No capo, nothing to hit.
             let none = FretboardSpec {
                 capo: 0,
@@ -1086,12 +1126,12 @@ mod tests {
 
     #[test]
     fn the_band_scales_with_the_window_like_every_other_one() {
-        assert_eq!(band_height(1300.0), 132.0);
-        assert_eq!(band_height(650.0), 66.0);
+        assert_eq!(band_height(1300.0, 6), 132.0);
+        assert_eq!(band_height(650.0, 6), 66.0);
         // Truncated, not rounded: the piano and the chord strip both are, and a
         // half-pixel band would put every string on a fractional row.
-        assert_eq!(band_height(1000.0), 101.0);
-        assert_eq!(band_height(0.0), 0.0);
+        assert_eq!(band_height(1000.0, 6), 101.0);
+        assert_eq!(band_height(0.0, 6), 0.0);
     }
 
     #[test]
@@ -1167,11 +1207,14 @@ mod tests {
         for t in TUNINGS {
             for w in [200.0_f32, 650.0, 1300.0, 2600.0] {
                 let spec = FretboardSpec {
-                    tuning: t,
+                    tuning: t.clone(),
                     frets: 22,
                     capo: 0,
                 };
-                let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
+                let r = Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(w, band_height(w, spec.tuning.strings())),
+                );
                 let Some(g) = Geom::new(r, &spec) else {
                     continue;
                 };
@@ -1192,11 +1235,14 @@ mod tests {
         for t in TUNINGS {
             for w in [650.0_f32, 1300.0, 2600.0] {
                 let spec = FretboardSpec {
-                    tuning: t,
+                    tuning: t.clone(),
                     frets: 22,
                     capo: 0,
                 };
-                let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
+                let r = Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(w, band_height(w, spec.tuning.strings())),
+                );
                 let Some(g) = Geom::new(r, &spec) else {
                     continue;
                 };
@@ -1313,11 +1359,11 @@ mod tests {
             for capo in [0u8, 4] {
                 for w in [650.0_f32, 1300.0, 2600.0] {
                     let spec = FretboardSpec {
-                        tuning: t,
+                        tuning: t.clone(),
                         frets: 22,
                         capo,
                     };
-                    let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
+                    let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w, FretboardSpec::default().tuning.strings())));
                     let Some(g) = Geom::new(r, &spec) else {
                         continue;
                     };
@@ -1366,11 +1412,11 @@ mod tests {
             for capo in [0u8, 3, 12, 21] {
                 for w in [200.0_f32, 650.0, 1300.0, 2600.0] {
                     let spec = FretboardSpec {
-                        tuning: t,
+                        tuning: t.clone(),
                         frets: 22,
                         capo,
                     };
-                    let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
+                    let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w, FretboardSpec::default().tuning.strings())));
                     let Some(g) = Geom::new(r, &spec) else {
                         panic!("{} lost its board at width {w}", t.name);
                     };
@@ -1407,13 +1453,13 @@ mod tests {
     #[test]
     fn a_stringless_or_fretless_board_does_not_divide_by_zero() {
         const NONE: Tuning = Tuning {
-            name: "None",
-            open: &[],
+            name: std::borrow::Cow::Borrowed("None"),
+            open: std::borrow::Cow::Borrowed(&[]),
         };
         assert!(Geom::new(
             rect(),
             &FretboardSpec {
-                tuning: &NONE,
+                tuning: NONE.clone(),
                 frets: 22,
                 capo: 0
             }
@@ -1432,13 +1478,13 @@ mod tests {
         assert!(g.wire_x(0).is_finite() && g.right > g.left);
         // A single-string tuning must not divide by (strings - 1).
         const ONE: Tuning = Tuning {
-            name: "One",
-            open: &[40],
+            name: std::borrow::Cow::Borrowed("One"),
+            open: std::borrow::Cow::Borrowed(&[40]),
         };
         let g = Geom::new(
             rect(),
             &FretboardSpec {
-                tuning: &ONE,
+                tuning: ONE.clone(),
                 frets: 22,
                 capo: 0,
             },
@@ -1470,7 +1516,7 @@ mod tests {
         for t in TUNINGS {
             for capo in [0u8, 5, 21] {
                 let spec = FretboardSpec {
-                    tuning: t,
+                    tuning: t.clone(),
                     frets: 22,
                     capo,
                 };

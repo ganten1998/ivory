@@ -9,14 +9,82 @@
 //! the solver's job (see `voicing.rs`); this module's job is to enumerate every
 //! candidate honestly and let the solver choose.
 
+use std::borrow::Cow;
+
 /// A tuning is the open (unfretted) MIDI pitch of each string, LOW to HIGH.
 /// Index 0 is the lowest-sounding string, which is drawn at the BOTTOM of a
 /// standard fretboard diagram, so the view flips this for display.
+///
+/// `Cow` rather than `&'static` so a user can build one at runtime. The presets
+/// below stay borrowed and cost nothing; a custom tuning owns its data. This is
+/// the whole reason the type is not two `&'static` fields any more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tuning {
-    pub name: &'static str,
-    pub open: &'static [u8],
+    pub name: Cow<'static, str>,
+    pub open: Cow<'static, [u8]>,
 }
+
+/// Why a proposed custom tuning was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuningError {
+    /// Fewer than one string, or more than [`MAX_STRINGS`].
+    StringCount(usize),
+    /// The open pitches are not non-decreasing from low to high.
+    ///
+    /// **This is not a style rule, it is the solver's load-bearing invariant.**
+    /// `voicing.rs` searches on the assumption that assignment is MONOTONE —
+    /// ascending sounding pitch on ascending strings — and that is not a
+    /// heuristic there, it *is* the search: it gives "at most one note per
+    /// string" for free, forbids voice crossings by construction, and is what
+    /// collapses the space small enough to enumerate exhaustively. Feed it a
+    /// tuning whose strings do not ascend and the enumeration silently stops
+    /// covering the real candidates.
+    ///
+    /// Carries the index of the offending string and the two pitches.
+    NotAscending { string: usize, previous: u8, found: u8 },
+    /// A pitch outside the MIDI range a fretted note could reach.
+    PitchRange(u8),
+    /// The name is empty or only whitespace.
+    EmptyName,
+}
+
+impl std::fmt::Display for TuningError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StringCount(n) => write!(
+                f,
+                "a tuning needs 1 to {MAX_STRINGS} strings, not {n}"
+            ),
+            Self::NotAscending { string, previous, found } => write!(
+                f,
+                "string {} is {found}, below string {} at {previous}: strings must \
+                 run low to high",
+                string + 1,
+                string
+            ),
+            Self::PitchRange(p) => write!(f, "{p} is outside the usable MIDI range"),
+            Self::EmptyName => write!(f, "a tuning needs a name"),
+        }
+    }
+}
+
+impl std::error::Error for TuningError {}
+
+/// The most strings a tuning may declare.
+///
+/// 12 covers every real instrument this view could plausibly draw — a 4-string
+/// bass through a 7-string guitar, an 8-string, and a 12-string treated as 12
+/// independent courses. The cap exists because the solver enumerates
+/// `C(n + strings, strings)` leaves: at 6 strings a ten-note voicing is 254
+/// leaves, and the count grows fast enough that an unbounded value entered in a
+/// text field is a hang rather than a mistake.
+pub const MAX_STRINGS: usize = 12;
+
+/// The highest open-string pitch that leaves room to fret above it.
+///
+/// A 24-fret neck adds two octaves, so an open string above this cannot be
+/// played at its top frets without leaving MIDI range.
+const MAX_OPEN_PITCH: u8 = 103;
 
 /// Standard first. Anything with a different string count works too: the
 /// geometry is driven by `open.len()`, never by a hard-coded 6.
@@ -26,19 +94,35 @@ pub struct Tuning {
 /// covers ~1.4x fewer frets than a 25.5" guitar. That coupling lives in
 /// `voicing::Weights::for_tuning`. If a baritone or short-scale tuning is added
 /// here, add a `Weights` preset for it there too.
-pub const TUNINGS: &[Tuning] = &[
-    Tuning { name: "Standard", open: &[40, 45, 50, 55, 59, 64] }, // E A D G B E
-    Tuning { name: "Drop D", open: &[38, 45, 50, 55, 59, 64] },
-    Tuning { name: "DADGAD", open: &[38, 45, 50, 55, 57, 62] },
-    Tuning { name: "Open G", open: &[38, 43, 50, 55, 59, 62] },
-    Tuning { name: "Open D", open: &[38, 45, 50, 54, 57, 62] },
-    Tuning { name: "Half Step Down", open: &[39, 44, 49, 54, 58, 63] },
-    Tuning { name: "Bass (4)", open: &[28, 33, 38, 43] },
+pub static TUNINGS: &[Tuning] = &[
+    t("Standard", &[40, 45, 50, 55, 59, 64]), // E A D G B E
+    t("Drop D", &[38, 45, 50, 55, 59, 64]),
+    t("DADGAD", &[38, 45, 50, 55, 57, 62]),
+    t("Open G", &[38, 43, 50, 55, 59, 62]),
+    t("Open D", &[38, 45, 50, 54, 57, 62]),
+    t("Half Step Down", &[39, 44, 49, 54, 58, 63]),
+    // Seven and eight string guitars: a low B, then a low F#.
+    t("7-String", &[35, 40, 45, 50, 55, 59, 64]), // B E A D G B E
+    t("8-String", &[30, 35, 40, 45, 50, 55, 59, 64]), // F# B E A D G B E
+    t("Bass (4)", &[28, 33, 38, 43]),             // E A D G
+    t("Bass (5)", &[23, 28, 33, 38, 43]),         // B E A D G
+    t("Bass (6)", &[23, 28, 33, 38, 43, 48]),     // B E A D G C
+    t("Bass (7)", &[18, 23, 28, 33, 38, 43, 48]), // F# B E A D G C
 ];
 
+/// A borrowed preset, in a `const fn` so `TUNINGS` stays a compile-time table.
+const fn t(name: &'static str, open: &'static [u8]) -> Tuning {
+    Tuning {
+        name: Cow::Borrowed(name),
+        open: Cow::Borrowed(open),
+    }
+}
+
 impl Tuning {
-    pub fn standard() -> &'static Tuning {
-        &TUNINGS[0]
+    /// Standard tuning, owned. Cloning a preset is two `Cow::Borrowed` copies,
+    /// so this is as cheap as the `&'static` it replaced.
+    pub fn standard() -> Tuning {
+        TUNINGS[0].clone()
     }
 
     pub fn by_name(name: &str) -> Option<&'static Tuning> {
@@ -48,12 +132,55 @@ impl Tuning {
     pub fn strings(&self) -> usize {
         self.open.len()
     }
+
+    /// Build a tuning from user input.
+    ///
+    /// Every rule here has a failure behind it rather than a preference; see
+    /// [`TuningError`], and in particular `NotAscending`, which protects the
+    /// voicing solver's search invariant rather than anyone's taste.
+    pub fn custom(name: impl Into<String>, open: Vec<u8>) -> Result<Tuning, TuningError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(TuningError::EmptyName);
+        }
+        if open.is_empty() || open.len() > MAX_STRINGS {
+            return Err(TuningError::StringCount(open.len()));
+        }
+        for p in &open {
+            if *p > MAX_OPEN_PITCH {
+                return Err(TuningError::PitchRange(*p));
+            }
+        }
+        for i in 1..open.len() {
+            if open[i] < open[i - 1] {
+                return Err(TuningError::NotAscending {
+                    string: i,
+                    previous: open[i - 1],
+                    found: open[i],
+                });
+            }
+        }
+        Ok(Tuning {
+            name: Cow::Owned(name.trim().to_string()),
+            open: Cow::Owned(open),
+        })
+    }
+
+    /// Whether this tuning came from the preset table.
+    ///
+    /// The UI uses it to decide whether the tuning menu should show a tick
+    /// beside a preset or beside "Custom...".
+    pub fn is_preset(&self) -> bool {
+        TUNINGS
+            .iter()
+            .any(|t| t.name == self.name && t.open == self.open)
+    }
 }
 
 /// How the board is laid out and what counts as reachable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FretboardSpec {
-    pub tuning: &'static Tuning,
+    pub tuning: Tuning,
     /// Highest fret drawn. 22 covers most electrics; 20 is typical acoustic.
     pub frets: u8,
     /// Capo position. 0 means none. A capo at n makes frets 1..n unreachable
@@ -308,7 +435,7 @@ mod tests {
         for t in TUNINGS {
             for frets in [0u8, 12, 22, 24] {
                 for capo in [0u8, 3, 12, 24, 47] {
-                    let spec = FretboardSpec { tuning: t, frets, capo };
+                    let spec = FretboardSpec { tuning: t.clone(), frets, capo };
                     for pitch in 0..=127u8 {
                         assert_eq!(
                             reachable(&spec, pitch),
@@ -331,7 +458,7 @@ mod tests {
             for w in t.open.windows(2) {
                 assert!(w[1] > w[0], "{}: strings must run low to high", t.name);
             }
-            let spec = FretboardSpec { tuning: t, ..Default::default() };
+            let spec = FretboardSpec { tuning: t.clone(), ..Default::default() };
             let (lo, hi) = range(&spec);
             assert!(hi > lo);
             // Every pitch in range must be playable somewhere, which is the

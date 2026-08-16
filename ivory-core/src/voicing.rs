@@ -536,7 +536,7 @@ pub fn spec_fingerprint(spec: &FretboardSpec) -> u64 {
         eat(*b);
     }
     eat(0);
-    for &o in spec.tuning.open {
+    for &o in spec.tuning.open.iter() {
         eat(o);
     }
     eat(0);
@@ -554,7 +554,7 @@ pub fn spec_fingerprint(spec: &FretboardSpec) -> u64 {
 /// `HashSet<u8>` on every call and `RandomState` is seeded per instance, so
 /// iteration order genuinely varies call to call.
 pub fn solve_cold(spec: &FretboardSpec, held: &[u8]) -> Voicing {
-    solve(spec, held, &History::NONE, &Weights::for_tuning(spec.tuning))
+    solve(spec, held, &History::NONE, &Weights::for_tuning(&spec.tuning))
 }
 
 pub fn solve(spec: &FretboardSpec, held: &[u8], hist: &History<'_>, w: &Weights) -> Voicing {
@@ -645,7 +645,7 @@ fn run(
     // `pitch_at` all agree about where the neck ends.
     let capped;
     let spec = if spec.frets > MAX_FRET {
-        capped = FretboardSpec { tuning: spec.tuning, frets: MAX_FRET, capo: spec.capo };
+        capped = FretboardSpec { tuning: spec.tuning.clone(), frets: MAX_FRET, capo: spec.capo };
         &capped
     } else {
         spec
@@ -1753,7 +1753,7 @@ mod tests {
         let mut rng = Lcg(0x1234_5678);
         for t in TUNINGS {
             for capo in [0u8, 2, 5] {
-                let spec = FretboardSpec { tuning: t, frets: 22, capo };
+                let spec = FretboardSpec { tuning: t.clone(), frets: 22, capo };
                 for _ in 0..300 {
                     let held = rng.set(30, 100, 9);
                     let v = solve_cold(&spec, &held);
@@ -1782,7 +1782,7 @@ mod tests {
         let mut rng = Lcg(0xfeed_face);
         for t in TUNINGS {
             for capo in [0u8, 3, 7] {
-                let spec = FretboardSpec { tuning: t, frets: 22, capo };
+                let spec = FretboardSpec { tuning: t.clone(), frets: 22, capo };
                 for _ in 0..300 {
                     let held = rng.set(20, 110, 8);
                     let v = solve_cold(&spec, &held);
@@ -1810,7 +1810,7 @@ mod tests {
     fn nothing_the_player_pressed_ever_vanishes() {
         let mut rng = Lcg(0xdead_beef);
         for t in TUNINGS {
-            let spec = FretboardSpec { tuning: t, frets: 22, capo: 0 };
+            let spec = FretboardSpec { tuning: t.clone(), frets: 22, capo: 0 };
             for _ in 0..400 {
                 let held = rng.set(0, 127, 16);
                 let v = solve_cold(&spec, &held);
@@ -1876,7 +1876,7 @@ mod tests {
         let mut rng = Lcg(0xabcd_1234);
         for t in TUNINGS {
             for capo in 0..=7u8 {
-                let spec = FretboardSpec { tuning: t, frets: 22, capo };
+                let spec = FretboardSpec { tuning: t.clone(), frets: 22, capo };
                 for _ in 0..120 {
                     let held = rng.set(30, 100, 8);
                     let first = solve_cold(&spec, &held);
@@ -2174,8 +2174,8 @@ mod tests {
         // and came out `Dropped { Excess }` — reported as a choice when it was
         // a collision. The board is capped at 254 so the note is genuinely out
         // of range and folds, which is the truth rather than a shrug.
-        const ZERO: Tuning = Tuning { name: "Zero", open: &[0] };
-        let spec = FretboardSpec { tuning: &ZERO, frets: 255, capo: 0 };
+        let zero: Tuning = Tuning { name: std::borrow::Cow::Borrowed("Zero"), open: std::borrow::Cow::Borrowed(&[0]) };
+        let spec = FretboardSpec { tuning: zero.clone(), frets: 255, capo: 0 };
         let v = solve_cold(&spec, &[255]);
         assert!(
             !matches!(v.notes[0].outcome, Outcome::Dropped { .. }),
@@ -2191,7 +2191,7 @@ mod tests {
         // loses hysteresis for good.
         assert_eq!(
             spec_fingerprint(&spec),
-            spec_fingerprint(&FretboardSpec { tuning: &ZERO, frets: 254, capo: 0 })
+            spec_fingerprint(&FretboardSpec { tuning: zero.clone(), frets: 254, capo: 0 })
         );
         let mut sess = VoicingSession::new(spec.clone(), Weights::DEFAULT);
         let warm = sess.update_sorted(&[255], 100).clone();
@@ -2280,7 +2280,7 @@ mod tests {
     #[test]
     fn a_note_above_a_bass_guitar_becomes_a_ghost_an_octave_down() {
         let spec = FretboardSpec {
-            tuning: Tuning::by_name("Bass (4)").unwrap(),
+            tuning: Tuning::by_name("Bass (4)").unwrap().clone(),
             ..Default::default()
         };
         let v = solve_cold(&spec, &[43, 50, 55, 59, 62, 67]);
@@ -2315,7 +2315,7 @@ mod tests {
         // On a 4-string bass the survivor is itself shed, so the merge is not
         // why the folded note is missing and it must not claim to be.
         let bass = FretboardSpec {
-            tuning: Tuning::by_name("Bass (4)").unwrap(),
+            tuning: Tuning::by_name("Bass (4)").unwrap().clone(),
             ..Default::default()
         };
         let v = solve_cold(&bass, &[43, 50, 55, 59, 62, 67]);
@@ -2380,10 +2380,12 @@ mod tests {
 
     #[test]
     fn hostile_specs_and_pitches_do_not_panic() {
-        const EMPTY: Tuning = Tuning { name: "Nothing", open: &[] };
+        const EMPTY: Tuning = Tuning { name: std::borrow::Cow::Borrowed("Nothing"), open: std::borrow::Cow::Borrowed(&[]) };
         const WIDE: Tuning = Tuning {
-            name: "Fourteen",
-            open: &[20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72],
+            name: std::borrow::Cow::Borrowed("Fourteen"),
+            open: std::borrow::Cow::Borrowed(&[
+                20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72,
+            ]),
         };
         let specs = [
             FretboardSpec { frets: 0, ..Default::default() },
@@ -2391,8 +2393,8 @@ mod tests {
             FretboardSpec { frets: 22, capo: 24, ..Default::default() },
             FretboardSpec { frets: 22, capo: 47, ..Default::default() },
             FretboardSpec { frets: 255, capo: 255, ..Default::default() },
-            FretboardSpec { tuning: &EMPTY, frets: 22, capo: 0 },
-            FretboardSpec { tuning: &WIDE, frets: 22, capo: 0 },
+            FretboardSpec { tuning: EMPTY,  frets: 22, capo: 0 },
+            FretboardSpec { tuning: WIDE,  frets: 22, capo: 0 },
         ];
         for spec in &specs {
             for held in [
@@ -2417,8 +2419,8 @@ mod tests {
     fn a_pitch_class_the_board_cannot_make_is_unreachable_not_a_panic() {
         // One string, no frets: this board sounds exactly one pitch. Any other
         // pitch CLASS has nowhere to fold to, at any octave.
-        const ONE: Tuning = Tuning { name: "One", open: &[60] };
-        let spec = FretboardSpec { tuning: &ONE, frets: 0, capo: 0 };
+        const ONE: Tuning = Tuning { name: std::borrow::Cow::Borrowed("One"), open: std::borrow::Cow::Borrowed(&[60]) };
+        let spec = FretboardSpec { tuning: ONE, frets: 0, capo: 0 };
         let v = solve_cold(&spec, &[61]);
         assert_eq!(v.notes[0].outcome, Outcome::Unreachable);
         assert_eq!(v.caption().as_deref(), Some("outside this instrument's range"));
@@ -2546,7 +2548,7 @@ mod tests {
         assert_ne!(
             fp,
             spec_fingerprint(&FretboardSpec {
-                tuning: Tuning::by_name("Drop D").unwrap(),
+                tuning: Tuning::by_name("Drop D").unwrap().clone(),
                 ..base.clone()
             })
         );

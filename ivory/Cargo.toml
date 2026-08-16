@@ -17,6 +17,21 @@ build = "build.rs"
 name = "tangent"
 path = "src/main.rs"
 
+[features]
+# Full is the default and the recommended install. `--no-default-features`
+# builds Minimal, which cannot open a camera, cannot host a plugin, and does not
+# link the code to do either — an exclusion the compiler enforces rather than a
+# flag anyone can flip.
+#
+# NOTE the asymmetry that keeps this honest: `#[cfg(feature = ...)]` is allowed
+# HERE and nowhere else. `ivory-ui` has a standing rule against feature cfgs
+# (PLUGIN-PLAN §1) because they are the seed of the two-GUI fork the egui 0.33
+# pin exists to prevent. The GUI compiles the Recorder band in every build and
+# switches it off through `Caps::MINIMAL`, exactly as the plugin already
+# switches off everything it cannot do.
+default = ["recorder"]
+recorder = ["dep:ivory-record", "dep:ivory-host"]
+
 [dependencies]
 # The GUI always enables the engine's `learning` feature — the re-ranker is a
 # user-facing option now, and it stays inert (adjustment exactly 0.0) until the
@@ -31,6 +46,18 @@ ivory-core = { path = "../ivory-core", features = ["learning", "license"] }
 # keeps only what genuinely belongs to a desktop binary — the window, the MIDI
 # device, the single-instance lock, the CLI.
 ivory-ui = { path = "../ivory-ui" }
+# The recorder and the plugin host. Platform-owning by design, so they live here
+# and NEVER in ivory-ui — see docs/RECORDER-PLAN.md §2.
+#
+# OPTIONAL, and that is the whole Minimal build (§12a). Not because of size:
+# measured against the real release profile, midly, cpal and rtrb are +16 KB
+# each and vst3 is +0 KB. It is because a Full build must ship
+# `disable-library-validation` and `allow-jit` to host plugins at all, plus
+# camera and microphone usage strings — and someone who wants a chord display
+# should not have to run a binary that can load arbitrary third-party code.
+# Minimal ships no entitlements, exactly as 3.0.0 does.
+ivory-record = { path = "../ivory-record", optional = true }
+ivory-host = { path = "../ivory-host", optional = true }
 # Same crate eframe already links; direct dep so modules can `use egui::...`.
 egui = { version = "0.33", default-features = false }
 eframe = { version = "0.33", default-features = false, features = [
@@ -62,7 +89,19 @@ ttf-parser = "0.25"
 # tangent.exe has no icon.
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+# `Win32_Storage_FileSystem` is for `GetDiskFreeSpaceExW`: the Recorder band
+# reports remaining space as a DURATION rather than as bytes, and there is no
+# portable way to ask how much room is left.
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Storage_FileSystem",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# `statvfs`, the other half of the same question. Already in the tree via cpal;
+# named here because a transitive dependency is not a nameable one.
+libc = "0.2"
 
 
 [lints]

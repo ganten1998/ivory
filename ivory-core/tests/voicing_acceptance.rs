@@ -47,7 +47,9 @@ fn shape_of(v: &Voicing) -> Vec<Option<u8>> {
 
 fn spec_for(tuning: &str, capo: u8) -> FretboardSpec {
     FretboardSpec {
-        tuning: Tuning::by_name(tuning).unwrap_or_else(|| panic!("no tuning named {tuning}")),
+        tuning: Tuning::by_name(tuning)
+            .unwrap_or_else(|| panic!("no tuning named {tuning}"))
+            .clone(),
         frets: 22,
         capo,
     }
@@ -251,7 +253,7 @@ fn a_ten_note_piano_voicing_keeps_the_bass_and_the_melody_and_says_what_it_lost(
 #[test]
 fn a_piano_chord_on_a_four_string_bass_is_honest_about_being_a_bass() {
     let spec = FretboardSpec {
-        tuning: Tuning::by_name("Bass (4)").unwrap(),
+        tuning: Tuning::by_name("Bass (4)").unwrap().clone(),
         frets: 22,
         capo: 0,
     };

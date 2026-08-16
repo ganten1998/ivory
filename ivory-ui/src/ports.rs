@@ -18,6 +18,71 @@
 use crate::midi_event::MidiEvent;
 use std::sync::mpsc;
 
+/// A device the user can pick from a list.
+///
+/// Two fields and the distinction between them is the whole point. `uid` is
+/// what gets written to the settings file; `name` is what gets drawn. Storing
+/// the name would break for two identical webcams — which is not a hypothetical,
+/// it is what happens the moment somebody adds a second camera for a side angle
+/// — and again when the OS language changes and "Built-in Microphone" comes
+/// back as "Micrófono integrado".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    /// Stable, opaque, platform-supplied. Never shown to the user.
+    pub uid: String,
+    /// What the user calls it.
+    pub name: String,
+    /// The one the platform would pick if nobody chose. Marked in the list
+    /// rather than auto-selected, so "System Default" stays a visible choice.
+    pub default: bool,
+}
+
+/// A source of capture devices — cameras, or audio inputs.
+///
+/// One trait for both because the app does exactly the same three things with
+/// each of them: list what is there, open one by uid, ask which is open. The
+/// alternative was two traits differing only in their doc comments.
+///
+/// `Send` for the same reason [`MidiPorts`] is: the app that owns it has to be.
+pub trait CaptureDevices: Send {
+    /// Everything present right now. Re-read each time a picker opens, because
+    /// devices are plugged and unplugged while the app runs — and on macOS a
+    /// Continuity Camera appears and disappears as the phone comes and goes.
+    fn list(&self) -> Vec<DeviceInfo>;
+
+    /// Open this device by uid, closing whatever was open. `Err` carries a
+    /// message written for the user.
+    ///
+    /// An empty uid means "close whatever is open and select nothing", which is
+    /// how the None row in the picker is expressed without a second method.
+    fn open(&mut self, uid: &str) -> Result<(), String>;
+
+    /// The uid currently open, if any.
+    fn current(&self) -> Option<String>;
+
+    /// The display name of the device currently open.
+    ///
+    /// Separate from `current` because the band needs to *draw* something, and
+    /// looking the uid back up through `list()` every frame means enumerating
+    /// hardware sixty times a second.
+    fn current_name(&self) -> Option<String>;
+}
+
+/// A folder the app has asked the host to choose.
+///
+/// The **request pattern**, not a blocking call. `rfd`'s native panel runs a
+/// nested run loop, and raising one from inside an egui frame means re-entering
+/// the frame that is already on the stack. So `ivory-ui` records that it wants
+/// a folder, the host drains it *after* `frame()` returns, and a plugin refuses
+/// simply by never draining — the same shape as the plugin's `pending_resize`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirRequest {
+    /// Where the picker should open. `None` means the platform decides.
+    pub start_at: Option<std::path::PathBuf>,
+    /// Title for the panel.
+    pub title: String,
+}
+
 /// A source of MIDI the app picks for itself.
 ///
 /// `Send` because the app that owns it has to be: `nih_plug_egui` requires the
@@ -91,5 +156,89 @@ mod tests {
     fn the_trait_object_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<Box<dyn MidiPorts>>();
+        assert_send::<Box<dyn CaptureDevices>>();
+    }
+
+    /// A fake camera list, for the same reason the fake MIDI port exists: the
+    /// Recorder band's device rows are otherwise untestable without hardware.
+    #[derive(Default)]
+    struct FakeDevices {
+        present: Vec<DeviceInfo>,
+        open: Option<String>,
+    }
+
+    impl CaptureDevices for FakeDevices {
+        fn list(&self) -> Vec<DeviceInfo> {
+            self.present.clone()
+        }
+        fn open(&mut self, uid: &str) -> Result<(), String> {
+            if uid.is_empty() {
+                self.open = None;
+                return Ok(());
+            }
+            if self.present.iter().any(|d| d.uid == uid) {
+                self.open = Some(uid.to_owned());
+                Ok(())
+            } else {
+                Err(format!("no device with uid '{uid}'"))
+            }
+        }
+        fn current(&self) -> Option<String> {
+            self.open.clone()
+        }
+        fn current_name(&self) -> Option<String> {
+            let uid = self.open.as_ref()?;
+            self.present
+                .iter()
+                .find(|d| &d.uid == uid)
+                .map(|d| d.name.clone())
+        }
+    }
+
+    /// Two cameras that call themselves the same thing is the case that decides
+    /// uid-not-name, so it is the case the fake is asked about.
+    #[test]
+    fn two_devices_sharing_a_name_are_still_told_apart() {
+        let mut d = FakeDevices {
+            present: vec![
+                DeviceInfo {
+                    uid: "0x1400000046d0825".into(),
+                    name: "HD Pro Webcam C920".into(),
+                    default: true,
+                },
+                DeviceInfo {
+                    uid: "0x1a11000046d0825".into(),
+                    name: "HD Pro Webcam C920".into(),
+                    default: false,
+                },
+            ],
+            open: None,
+        };
+        assert!(d.open("0x1a11000046d0825").is_ok());
+        assert_eq!(d.current().as_deref(), Some("0x1a11000046d0825"));
+        assert_eq!(d.current_name().as_deref(), Some("HD Pro Webcam C920"));
+        assert!(d.open("gone").is_err());
+        assert_eq!(
+            d.current().as_deref(),
+            Some("0x1a11000046d0825"),
+            "a failed open must not close the device that was working"
+        );
+    }
+
+    /// The None row. Expressed as an empty uid rather than a second method,
+    /// which is the kind of thing that is obvious for a week and then not.
+    #[test]
+    fn an_empty_uid_closes_the_device() {
+        let mut d = FakeDevices {
+            present: vec![DeviceInfo {
+                uid: "a".into(),
+                name: "A".into(),
+                default: true,
+            }],
+            open: Some("a".into()),
+        };
+        assert!(d.open("").is_ok());
+        assert_eq!(d.current(), None);
+        assert_eq!(d.current_name(), None);
     }
 }

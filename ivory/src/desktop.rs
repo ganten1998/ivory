@@ -17,7 +17,11 @@ use ivory_ui::host::Caps;
 use ivory_ui::midi_event::MidiEvent;
 use ivory_ui::ports::MidiPorts;
 use ivory_ui::settings::Settings;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
+// Only the recorder's camera-permission latch uses it, and a Minimal build has
+// no recorder — so an ungated import is an unused-import warning there.
+#[cfg(feature = "recorder")]
+use std::sync::Mutex;
 
 /// A real MIDI input, opened with `midir`.
 ///
@@ -27,17 +31,52 @@ use std::sync::mpsc;
 pub struct DeviceMidi {
     ctx: egui::Context,
     conn: Option<midi::MidiConnection>,
+    /// The recorder's raw feed. Owned here rather than by the recorder, and
+    /// **created once per app** rather than once per connection, because midir
+    /// seals a callback's captured state the moment the port opens — see
+    /// `midi::RawMidiTap`. Every connection gets a clone of this `Arc`, so
+    /// switching ports keeps the history the tick-0 controller snapshot needs.
+    tap: Arc<midi::RawMidiTap>,
+    /// The app's single time origin. See [`DeviceMidi::timebase`].
+    #[cfg(feature = "recorder")]
+    timebase: ivory_record::audio::Timebase,
 }
 
 impl DeviceMidi {
     pub fn new(ctx: egui::Context) -> Self {
-        Self { ctx, conn: None }
+        Self {
+            ctx,
+            conn: None,
+            // ~10 minutes of dense playing before anything is shed, which is
+            // far more than the pre-roll needs and cheap: a few hundred KB.
+            tap: Arc::new(midi::RawMidiTap::new(60_000)),
+            #[cfg(feature = "recorder")]
+            timebase: ivory_record::audio::Timebase::new(),
+        }
     }
 
     /// The startup priority chain (spec §10). Silent on failure by design: the
     /// app runs without MIDI rather than opening a dialog nobody asked for.
     pub fn auto_connect(&mut self, tx: mpsc::Sender<MidiEvent>) {
-        self.conn = midi::auto_connect(tx, self.ctx.clone());
+        self.conn = midi::auto_connect(tx, self.ctx.clone(), Arc::clone(&self.tap));
+    }
+
+    /// The raw feed, for the recorder.
+    #[cfg(feature = "recorder")]
+    pub fn tap(&self) -> Arc<midi::RawMidiTap> {
+        Arc::clone(&self.tap)
+    }
+
+    /// The one epoch every stamp in the app is measured against.
+    ///
+    /// Owned here rather than by the session because the MIDI tap starts
+    /// stamping the moment a port opens, which is before any recorder exists.
+    /// One `Timebase`, created once, shared: two of them would put the MIDI and
+    /// the audio in different worlds and every take would carry a constant
+    /// offset nobody could account for.
+    #[cfg(feature = "recorder")]
+    pub fn timebase(&self) -> ivory_record::audio::Timebase {
+        self.timebase
     }
 }
 
@@ -51,7 +90,12 @@ impl MidiPorts for DeviceMidi {
         // of the same device, so holding both across the switch fails on the
         // machines that matter and works on the ones that do not.
         self.conn = None;
-        self.conn = Some(midi::connect_by_name(name, tx, self.ctx.clone())?);
+        self.conn = Some(midi::connect_by_name(
+            name,
+            tx,
+            self.ctx.clone(),
+            Arc::clone(&self.tap),
+        )?);
         Ok(())
     }
 
@@ -60,8 +104,356 @@ impl MidiPorts for DeviceMidi {
     }
 }
 
+/// The recorder, and everything that has to happen around a frame to drive it.
+///
+/// Absent from a Minimal build, where `ivory-record` is not linked at all.
+#[cfg(feature = "recorder")]
+struct Recorder {
+    session: crate::record::Session,
+    audio: crate::devices::Shared,
+    camera: crate::devices::Shared,
+    /// Why enumeration failed last time, so the band can say "permission" and
+    /// not "no cameras" — two problems with completely different fixes.
+    camera_denied: Arc<Mutex<Option<String>>>,
+    /// A camera open that has been announced but not yet performed.
+    ///
+    /// `open_camera` blocks the calling thread for 63 ms on a built-in camera
+    /// and a measured 1.9-3.9 s on an external UVC one, and it runs on the UI
+    /// thread. Doing it the moment the selection goes stale freezes the window
+    /// for up to four seconds with the PREVIOUS frame still painted and nothing
+    /// saying why. So the intent is recorded on one frame — which paints
+    /// "starting the camera…" and asks for an immediate repaint — and the
+    /// blocking call happens on the next.
+    camera_opening: bool,
+    /// When the camera was first noticed to be running-but-silent, so the
+    /// warning waits a few seconds rather than firing on frame one.
+    camera_silent_since: Option<std::time::Instant>,
+    /// The uploaded preview frame.
+    ///
+    /// Kept between frames on purpose. A 30 fps camera in a 60 fps window
+    /// delivers nothing on half the frames, and a preview that cleared itself
+    /// on a `None` would strobe black at 30 Hz.
+    preview: Option<egui::TextureHandle>,
+    preview_px: egui::Vec2,
+    /// Whether the band was open on the previous frame, so opening and closing
+    /// the input happens on the EDGE rather than being re-decided sixty times a
+    /// second.
+    band_was_open: bool,
+    /// Recomputed on a timer rather than every frame: `statvfs` is a syscall,
+    /// and the answer changes by megabytes, not by pixels.
+    disk_checked_at: Option<std::time::Instant>,
+    disk_bytes: Option<u64>,
+}
+
 /// The standalone app: `IvoryApp`, plus the eframe trait impl it cannot carry.
-pub struct DesktopApp(IvoryApp);
+pub struct DesktopApp {
+    app: IvoryApp,
+    #[cfg(feature = "recorder")]
+    recorder: Recorder,
+}
+
+#[cfg(feature = "recorder")]
+const DISK_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(feature = "recorder")]
+impl DesktopApp {
+    /// Everything the band shows, refreshed from what is actually true.
+    ///
+    /// Pushed IN rather than pulled out, because `ivory-ui` cannot reach a
+    /// device or a filesystem and must not learn how.
+    fn fill_recorder_state(&mut self, ctx: &egui::Context) {
+        use ivory_record::take;
+
+        let root = self.app.record_root();
+        let spec = self.app.export_spec();
+        let name = self.app.take_name().map(str::to_owned);
+
+        // Free space, on a timer.
+        let now = std::time::Instant::now();
+        if self
+            .recorder
+            .disk_checked_at
+            .is_none_or(|t| now.duration_since(t) >= DISK_RECHECK)
+        {
+            self.recorder.disk_checked_at = Some(now);
+            self.recorder.disk_bytes = crate::record::available_bytes(&root);
+        }
+
+        // The camera. Uploaded here rather than in `after_frame` because the
+        // texture has to exist before the band that draws it is painted.
+        if let Some(frame) = self.recorder.session.next_frame() {
+            let size = [frame.width as usize, frame.height as usize];
+            // `from_rgba_unmultiplied`, not `_premultiplied`: a camera frame is
+            // opaque, so alpha is 255 everywhere and the two agree — but saying
+            // premultiplied would be a claim about the data that happens to be
+            // true, and it stops being true the moment anything composites.
+            let image = egui::ColorImage::from_rgba_unmultiplied(size, &frame.pixels);
+            self.recorder.preview_px = egui::Vec2::new(frame.width as f32, frame.height as f32);
+            match self.recorder.preview.as_mut() {
+                // `set` reuses the GPU allocation; `load_texture` makes a new
+                // one every frame, which at 30 fps is a texture leak with a
+                // frame rate.
+                Some(handle) => handle.set(image, egui::TextureOptions::LINEAR),
+                None => {
+                    self.recorder.preview = Some(ctx.load_texture(
+                        "tangent-camera-preview",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+            }
+        }
+
+        let camera_uid = self.app.chosen_camera_uid().map(str::to_owned);
+        // `camera_running`, not `camera_format().is_some()`. The format is
+        // cached at open and never becomes `None`, so testing it could not
+        // detect the case this exists for — a webcam unplugged mid-session left
+        // its last frame on screen looking live, indefinitely.
+        let camera_open = self.recorder.session.camera_running();
+        if self.recorder.session.camera_silent() {
+            self.recorder
+                .camera_silent_since
+                .get_or_insert_with(std::time::Instant::now);
+        } else {
+            self.recorder.camera_silent_since = None;
+        }
+        if !camera_open {
+            // Drop the stale picture when there is no camera behind it, or the
+            // last frame of an unplugged webcam stays on screen looking live.
+            self.recorder.preview = None;
+        }
+
+        let audio_uid = self.app.chosen_audio_uid().map(str::to_owned);
+        let open_name = self.recorder.session.audio_device_name().map(str::to_owned);
+        // "Missing" is a chosen device that is not open, which is a different
+        // thing from having chosen nothing — an interface unplugged between
+        // sessions must not silently look like a choice nobody made.
+        let audio_missing = audio_uid.is_some() && open_name.is_none();
+        // What the one status line says, worst news first: a device that will
+        // not open beats a device that is denied beats the last take's report.
+        let message = self
+            .recorder
+            .camera_opening
+            .then(|| {
+                "starting the camera — this can take a few seconds on a USB \
+                 webcam"
+                    .to_owned()
+            })
+            .or_else(|| self.recorder.session.audio_error().map(str::to_owned))
+            .or_else(|| self.recorder.session.camera_error().map(str::to_owned))
+            .or_else(|| {
+                // Only once it has had a moment: every camera delivers nothing
+                // for the first few frames after `startRunning` returns.
+                (self.recorder.camera_silent_since.is_some_and(|t| {
+                    std::time::Instant::now().duration_since(t)
+                        > std::time::Duration::from_secs(3)
+                }))
+                .then(|| {
+                    "the camera is open but sending no picture — check Camera \
+                     access in System Settings > Privacy & Security"
+                        .to_owned()
+                })
+            })
+            .or_else(|| {
+                self.recorder
+                    .camera_denied
+                    .lock()
+                    .ok()
+                    .and_then(|d| d.clone())
+            })
+            .or_else(|| self.recorder.session.last_summary().map(|s| s.message()));
+
+        let preview = self.recorder.preview.as_ref().map(|h| ivory_ui::recorder::Preview {
+            texture: h.id(),
+            size: self.recorder.preview_px,
+        });
+        let state = self.app.recorder_state_mut();
+        state.preview = preview;
+        state.camera_name = self
+            .recorder
+            .session
+            .camera_format()
+            .map(|f| format!("{}x{} @ {:.0}fps", f.width, f.height, f.fps))
+            .or_else(|| camera_uid.clone());
+        state.camera_missing = camera_uid.is_some() && !camera_open;
+        state.state = self.recorder.session.state();
+        state.elapsed_s = self.recorder.session.elapsed();
+        state.meters = self.recorder.session.meters();
+        state.dest = shorten_home(&root);
+        state.folder_preview = take::folder_name(
+            &take::WallTime::now_utc(),
+            name.as_deref().and_then(take::sanitise_slug).as_deref(),
+        );
+        state.audio_name = open_name.or(audio_uid);
+        state.audio_missing = audio_missing;
+        state.disk_minutes = self
+            .recorder
+            .disk_bytes
+            .and_then(|b| ivory_ui::recorder::minutes_on_disk(b, &spec));
+        state.message = message;
+        state.clip_warning = self.recorder.session.clipped();
+    }
+
+    /// Everything that must happen OUTSIDE a frame: opening devices, raising
+    /// native panels, creating directories.
+    fn after_frame(&mut self, ctx: &egui::Context) {
+        use ivory_ui::recorder::RecorderRequest as R;
+
+        // The always-on MIDI tap, drained whether or not a take is running.
+        self.recorder.session.pump_midi();
+
+        // Opening the BAND opens the input, not pressing Record — the meter
+        // has to be live before arming, which is what kills the "I recorded
+        // silence" failure class.
+        let open = self.app.recorder_band_open();
+        if open != self.recorder.band_was_open {
+            self.recorder.band_was_open = open;
+            if open {
+                self.reconcile_audio(true);
+                self.reconcile_camera(true, ctx);
+            } else {
+                self.recorder.session.close_input();
+                self.recorder.session.close_camera();
+                self.recorder.camera_opening = false;
+            }
+        } else if open {
+            self.reconcile_audio(false);
+            self.reconcile_camera(false, ctx);
+        }
+
+        let root = self.app.record_root();
+        let name = self.app.take_name().map(str::to_owned);
+
+        // The pre-roll countdown, which is the one thing here that animates
+        // with no input at all — so it also has to ask for the next frame.
+        if self.recorder.session.tick(&root, name.as_deref()) {
+            ctx.request_repaint();
+        }
+        // And a repaint while anything is live, or the meter and the clock
+        // update only when the mouse moves.
+        if self.recorder.session.is_recording() || open {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+
+        if let Some(request) = self.app.take_directory_request() {
+            let mut dialog = rfd::FileDialog::new().set_title(&request.title);
+            if let Some(start) = request.start_at.filter(|p| p.exists()) {
+                dialog = dialog.set_directory(start);
+            }
+            if let Some(dir) = dialog.pick_folder() {
+                // The tick is left where the user had it. Choosing a folder is
+                // not a statement about whether to go on choosing it, and
+                // silently ticking "use this by default" because somebody
+                // picked a folder once is how a temporary destination becomes
+                // permanent without anyone deciding it should.
+                let remember = self.app.record_dir_is_default();
+                self.app.set_record_dir(dir, remember);
+            }
+        }
+
+        while let Some(request) = self.app.take_recorder_request() {
+            match request {
+                R::Toggle => {
+                    let spec = self.app.export_spec();
+                    self.recorder.session.toggle(
+                        &root,
+                        name.as_deref(),
+                        self.app.preroll_seconds(),
+                        spec,
+                    );
+                }
+                R::Stop => self.recorder.session.stop(),
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    /// Open the camera the user asked for, if it is not already open.
+    ///
+    /// **`open_camera` blocks for 300-800 ms** (over two seconds for a
+    /// Continuity Camera), which is why this runs after the frame and why
+    /// opening the band rather than pressing Record is what triggers it.
+    ///
+    /// Unlike the audio path there is no "system default": a camera nobody
+    /// asked for must never be opened, because opening one turns on a light on
+    /// the front of the machine.
+    fn reconcile_camera(&mut self, force: bool, ctx: &egui::Context) {
+        let sel = crate::devices::selection(&self.recorder.camera);
+        if !sel.is_stale() && !force {
+            return;
+        }
+        let wanted = sel.wanted;
+        // Announce first, act next frame — but only when there is something to
+        // wait for. Closing is instant, so making the user watch a frame of
+        // "starting the camera…" in order to turn one OFF would be silly.
+        if wanted.is_some() && !self.recorder.camera_opening {
+            self.recorder.camera_opening = true;
+            ctx.request_repaint();
+            return;
+        }
+        self.recorder.camera_opening = false;
+        // No `if wanted.is_none() { return }` guard here, and the guard that
+        // used to be here was a bug: choosing "None — record without video"
+        // left the selection stale forever, so the camera went on running with
+        // its light on and its preview updating after the user said stop.
+        // `open_camera(None)` closes it, which is what None means.
+        self.recorder.session.open_camera(wanted.as_deref());
+        let name = self
+            .recorder
+            .session
+            .camera_format()
+            .map(|f| format!("{}x{}", f.width, f.height));
+        crate::devices::settle(
+            &self.recorder.camera,
+            wanted,
+            name,
+            self.recorder.session.camera_error().map(str::to_owned),
+        );
+    }
+
+    /// Open the audio input the user asked for, if it is not already open.
+    fn reconcile_audio(&mut self, force: bool) {
+        let stale = {
+            let sel = crate::devices::selection(&self.recorder.audio);
+            sel.is_stale()
+        };
+        if !stale && !force {
+            return;
+        }
+        match crate::devices::audio_selection(&self.recorder.audio) {
+            Some(selection) => self.recorder.session.open_input(&selection),
+            // The user picked "None — record MIDI only". Mapping that to the
+            // system default (which is what happened before `explicit` existed)
+            // opened the built-in microphone and put its name in the band.
+            None => self.recorder.session.close_input(),
+        }
+        let opened = crate::devices::selection(&self.recorder.audio).wanted;
+        crate::devices::settle(
+            &self.recorder.audio,
+            opened,
+            self.recorder.session.audio_device_name().map(str::to_owned),
+            self.recorder.session.audio_error().map(str::to_owned),
+        );
+    }
+}
+
+/// `/Users/x/Movies/Tangent` reads as `~/Movies/Tangent`.
+///
+/// Not cosmetic at this width: the band's destination line has room for about
+/// forty characters, and a home directory eats a quarter of them saying nothing
+/// the user does not already know.
+#[cfg(feature = "recorder")]
+fn shorten_home(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    let Some(home) = dirs::home_dir() else {
+        return text;
+    };
+    let home = home.to_string_lossy();
+    match text.strip_prefix(home.as_ref()) {
+        Some(rest) => format!("~{rest}"),
+        None => text,
+    }
+}
 
 impl DesktopApp {
     pub fn new(
@@ -91,6 +483,13 @@ impl DesktopApp {
         };
         let mut app = IvoryApp::new(&cc.egui_ctx, settings, caps);
         let mut device = DeviceMidi::new(cc.egui_ctx.clone());
+        // Grabbed BEFORE the connection is made and before the session exists,
+        // because everything that stamps a time has to share one epoch. Two
+        // `Timebase::new()` calls would silently place the MIDI and the audio
+        // in two different worlds, and the symptom would be a constant offset
+        // in every take that no test covers.
+        #[cfg(feature = "recorder")]
+        let (tap, timebase) = (device.tap(), device.timebase());
         // `-p NAME` beats the priority chain, and a bad name is not fatal: the
         // app opens with no MIDI, which is the same outcome as no device.
         match cli_port {
@@ -102,18 +501,76 @@ impl DesktopApp {
             None => device.auto_connect(app.midi_sender()),
         }
         app.set_ports(Some(Box::new(device)));
-        Self(app)
+
+        #[cfg(feature = "recorder")]
+        let recorder = {
+            let (inputs, audio) = crate::devices::AudioInputs::new();
+            let (cams, camera, camera_denied) = crate::devices::Cameras::new();
+            // Seed from what the settings file remembers, or the reconciler —
+            // which only ever acts on a difference — would never open the
+            // chosen device and the app would look like it had forgotten.
+            crate::devices::restore(
+                &audio,
+                app.chosen_audio_uid(),
+                app.audio_explicitly_off(),
+            );
+            // No `explicitly_off` for the camera: absent already means no
+            // camera there, because opening one turns on a light and a camera
+            // nobody asked for must never be opened.
+            crate::devices::restore(&camera, app.chosen_camera_uid(), false);
+            app.set_capture_devices(Some(Box::new(inputs)));
+            app.set_cameras(Some(Box::new(cams)));
+            Recorder {
+                session: crate::record::Session::new(tap, timebase),
+                audio,
+                camera,
+                camera_denied,
+                camera_opening: false,
+                camera_silent_since: None,
+                preview: None,
+                preview_px: egui::Vec2::ZERO,
+                band_was_open: false,
+                disk_checked_at: None,
+                disk_bytes: None,
+            }
+        };
+
+        Self {
+            app,
+            #[cfg(feature = "recorder")]
+            recorder,
+        }
     }
 }
 
 impl eframe::App for DesktopApp {
     /// eframe hands over a Context; everything below wants a Ui, and
     /// `IvoryApp::frame` is the bridge all three hosts share.
+    ///
+    /// The recorder brackets it: state in before, requests out after. Nothing
+    /// that opens a device, raises a native panel or creates a directory
+    /// happens between those two lines.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.0.frame(ctx);
+        #[cfg(feature = "recorder")]
+        self.fill_recorder_state(ctx);
+        self.app.frame(ctx);
+        #[cfg(feature = "recorder")]
+        self.after_frame(ctx);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         IvoryApp::CLEAR_COLOR
+    }
+
+    /// A take still running when the window is closed is FINISHED, not
+    /// abandoned.
+    ///
+    /// Without this the writer thread is torn down with the process and the
+    /// `.wav` keeps the placeholder sizes in its header — a file most players
+    /// treat as zero-length. Somebody who left the recorder running for a
+    /// practice session and then quit would lose the whole thing.
+    #[cfg(feature = "recorder")]
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.recorder.session.stop();
     }
 }

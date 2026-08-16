@@ -1,5 +1,5 @@
 [workspace]
-members = ["ivory-core", "ivory-ui", "ivory"]
+members = ["ivory-core", "ivory-ui", "ivory", "ivory-record", "ivory-host"]
 resolver = "2"
 
 [workspace.package]

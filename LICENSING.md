@@ -11,11 +11,42 @@ is written down once, precisely, rather than reconstructed from memory later.
 
 ## Why the plugin is GPLv3 and the app is not
 
-Steinberg dual-licenses the VST3 SDK: GPLv3, or a separate proprietary
-agreement with Steinberg. NIH-plug's VST3 wrapper takes the GPLv3 route, and
-its own documentation is explicit: "any VST3 plugins built with NIH-plug need
-to be able to comply with the terms of the GPLv3 license." NIH-plug itself is
-ISC; it is the VST3 bindings specifically that carry the copyleft.
+The copyleft comes from the **Rust bindings crate**, not from Steinberg.
+
+`plugin/` reaches `vst3-sys` (RustAudio) transitively through the pinned
+`nih_plug` revision, and that crate declares `license = "GPL-3.0"` in its own
+`Cargo.toml`. NIH-plug's documentation is explicit about the consequence: "any
+VST3 plugins built with NIH-plug need to be able to comply with the terms of the
+GPLv3 license." NIH-plug itself is ISC; it is those bindings specifically that
+carry the copyleft, and `Tangent.vst3` links them, so `Tangent.vst3` is GPLv3.
+That is still true and nothing below changes.
+
+**What is no longer true, corrected 2026-08-15.** This section used to say
+"Steinberg dual-licenses the VST3 SDK: GPLv3, or a separate proprietary
+agreement with Steinberg." That was accurate when written and stopped being
+accurate on **2025-10-29**, when Steinberg relicensed the VST3 SDK to **MIT**
+with VST 3.8. Verified at source: `steinbergmedia/vst3sdk/LICENSE.txt` and
+`steinbergmedia/vst3_pluginterfaces/LICENSE.txt` are both plain MIT
+("Copyright (c) 2026, Steinberg Media Technologies GmbH"), the GitHub API
+reports `spdx_id: MIT` on both repositories, and the SDK README states that
+"Licensing under GPLv3 and the Steinberg proprietary license is no longer
+available." There is no host/plug-in distinction under MIT; the old SDK licence
+had one.
+
+Two consequences worth writing down, because both are load-bearing for future
+work:
+
+1. `vst3-sys`'s GPLv3 is now a **historical artifact of a 2023 crate that has
+   not been touched since 2023-06-19**, not a requirement anyone still imposes.
+   The MIT-licensed `vst3` crate (coupler-rs, `MIT OR Apache-2.0`) exists and is
+   maintained. If `plugin/` ever moves off `nih_plug`/`vst3-sys`, the GPLv3
+   quarantine could be dissolved entirely. It is blocked today only because the
+   maintained successor (`nice-plug`, ISC, which uses the MIT `vst3` crate)
+   requires egui 0.35 and this project is pinned at 0.33.
+2. **An MIT application may host VST3 plugins.** That is what makes the Recorder
+   view's plugin-hosting workstream legally possible; see `docs/RECORDER-PLAN.md`
+   §8. The only surviving obligation is trademark, and it is now optional under
+   MIT — see the trademark section below, which still applies.
 
 Copyleft attaches to the **binary that does the linking**, not to source that
 happens to be compiled into it. MIT is GPL-compatible, so the same MIT sources

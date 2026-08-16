@@ -21,6 +21,7 @@
 use crate::fonts;
 use crate::settings::Settings;
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
+use std::time::{Duration, Instant};
 
 /// Band height for a 1300pt-wide window. Large, because these are diagrams
 /// rather than readouts: a circle of fifths with unreadable sector labels is
@@ -1099,6 +1100,390 @@ pub fn draw_bottom_edge(painter: &Painter, rect: Rect, s: &Settings) {
     );
 }
 
+// ── the popped-out window ──────────────────────────────────────────────────
+//
+// The third detachable band, and deliberately the same shape of code as the
+// other two (`chord_strip::show_detached_window`, `fretboard_panel::
+// show_detached_window`): same close-to-reattach, same right-click-anywhere
+// menu, same borderless drag-anywhere, same window level. Three popouts with
+// three sets of habits would be worse than none.
+//
+// What is NOT the same is that this one is an INPUT. The chord strip is a
+// readout and the neck's detached window is a picture; a click on a circle
+// name or a chord vertex places notes. Everything below that differs from the
+// other two windows — the hit reported in the outcome, the drag that has to
+// stand aside for it, the ctrl-click guard — exists for that one reason.
+
+/// Default size for the popped-out theory window when nothing is remembered.
+///
+/// Three panes of roughly 300x380 rather than a slice of the band. At 100% the
+/// band is 1300x300, so a pane is 433 wide and 300 tall — a shape chosen by the
+/// piano above it rather than by the diagrams. A circle and a hexagram both
+/// want to be square, and the Tonnetz wants height for its five rows. In its
+/// own window it should be legible, not a slice of the main one, which is the
+/// same argument `fretboard_panel::DETACHED_DEFAULT` makes for the neck.
+///
+/// Note this is not `band_height(900.0, ..)` (207) and must not become it: the
+/// window's height is the user's to choose and the band's is not.
+pub const DETACHED_DEFAULT: Vec2 = Vec2::new(900.0, 380.0);
+
+/// The smallest window that still holds all three diagrams at once.
+///
+/// Measured rather than guessed, and pinned by the test of the same name below.
+/// With three panes the pane is `w/3 - 16` wide, and `Lattice::fit` gives up
+/// below `a = 16`, which happens at about 374pt of window; the circle and the
+/// hexagram both give up below `r = 20` and reach it later. 400x240 clears all
+/// three with a little room to spare.
+///
+/// Below this a selected pane is a title over an empty rectangle, which reads
+/// as a rendering fault rather than as "too small" — the same failure the
+/// Tonnetz's own `Lattice::fit` bail-out produces, and the reason to put a
+/// floor under the window instead of letting the user find it.
+pub const DETACHED_MIN: Vec2 = Vec2::new(400.0, 240.0);
+
+pub fn viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("ivory-theory-window")
+}
+
+/// Outline for the popped-out window. The band's own background is near-black
+/// in dark mode and cream in light, so neither theme's fill can be relied on to
+/// separate the window from the desktop behind it. One neutral grey reads
+/// against both, exactly as it does for the other two popouts.
+pub const BORDER_COLOR: Color32 = Color32::from_gray(0x5A);
+
+/// What the app has to act on after showing the window.
+#[derive(Default, Debug, Clone, Copy, PartialEq)]
+pub struct DetachedOutcome {
+    /// The user closed the window. Close-to-reattach: the band comes back.
+    pub close_requested: bool,
+    /// Live inner size in points, recorded every frame. Feed it to
+    /// `GeometryGuard::observe` rather than to settings directly.
+    pub inner_size: Option<Vec2>,
+    /// Live outer position in monitor coordinates, recorded every frame.
+    pub outer_pos: Option<Pos2>,
+    /// Right-click (or ctrl-click on macOS) happened at this monitor-space
+    /// position, for the app context menu.
+    pub context_menu_at: Option<Pos2>,
+    /// A click landed on something. The window is an instrument like the band
+    /// is: `Hit::Pc` places one note, `Hit::Triad` places a whole chord. Feed
+    /// it to the same handler the band's clicks go to, with no extra gating —
+    /// keytoggle has already been consulted (see `show_detached_window`).
+    pub hit: Option<Hit>,
+}
+
+/// The two lines shown when no diagram is selected.
+///
+/// The band's answer to an empty selection is to take zero height and vanish,
+/// which is right for a band and impossible for a window: a window that is
+/// already open cannot un-exist, and shrinking it to nothing or leaving it
+/// blank both read as the app having crashed in that corner of the screen.
+/// So it says what happened, and how to undo it.
+const EMPTY_TITLE: &str = "NO DIAGRAMS SELECTED";
+const EMPTY_HINT: &str = "right-click here for the Theory menu";
+
+/// The window's contents.
+///
+/// **This calls the band's own `draw` with the window's rect and nothing else.**
+/// That is the whole defence for requirement that a click keeps landing on what
+/// it looks like it is on: `hit_test` is the inverse of `draw`, so the moment
+/// the window gets a second drawing path — its own spacing, its own title
+/// height, a "detached" layout tweak — the inverse stops being an inverse and
+/// every click in the window lands somewhere slightly wrong, invisibly. There
+/// is one picture, drawn at whatever rect it is handed.
+fn draw_detached(painter: &Painter, rect: Rect, views: Views, input: Input, s: &Settings) {
+    if views.any() {
+        draw(painter, rect, views, input, s);
+    } else {
+        let p = palette(s);
+        painter.rect_filled(rect, 0.0, p.bg);
+        // Sized off the window rather than fixed: this window can be dragged
+        // from 240pt tall to a full screen, and a 14pt notice is a whisper at
+        // one end and lost at the other.
+        let size = (rect.height() * 0.055).clamp(11.0, 22.0);
+        painter.text(
+            Pos2::new(rect.center().x, rect.center().y - size * 0.9),
+            Align2::CENTER_CENTER,
+            EMPTY_TITLE,
+            font(size),
+            p.ink.gamma_multiply(0.75),
+        );
+        painter.text(
+            Pos2::new(rect.center().x, rect.center().y + size * 0.9),
+            Align2::CENTER_CENTER,
+            EMPTY_HINT,
+            font_light(size * 0.8),
+            p.faint,
+        );
+    }
+}
+
+/// The theory diagrams in their own window.
+///
+/// `builder_size` and `builder_pos` must stay constant for the lifetime of one
+/// detachment, exactly as for the other two windows: egui diffs this builder
+/// against the previous frame's builder rather than against the window's real
+/// geometry, so a value that changed every frame would fight the user's own
+/// resizes and drags.
+///
+/// `main_focused` decides the window LEVEL. A detached window is a piece of the
+/// same app, so it rises and falls WITH the piano rather than being left
+/// wherever the window stack last put it. By level rather than by raising:
+/// always-on-top while we are frontmost is exactly "above our own window", and
+/// dropping to Normal when we are not means it never floats over other
+/// applications.
+#[allow(clippy::too_many_arguments)]
+pub fn show_detached_window(
+    ctx: &egui::Context,
+    builder_size: Vec2,
+    builder_pos: Option<Pos2>,
+    borderless: bool,
+    main_focused: bool,
+    views: Views,
+    input: Input,
+    s: &Settings,
+) -> DetachedOutcome {
+    let mut outcome = DetachedOutcome::default();
+    let mut builder = egui::ViewportBuilder::default()
+        .with_title("Tangent")
+        .with_inner_size(builder_size)
+        .with_min_inner_size(DETACHED_MIN)
+        .with_resizable(true)
+        .with_decorations(!borderless)
+        .with_window_level(if main_focused {
+            egui::viewport::WindowLevel::AlwaysOnTop
+        } else {
+            egui::viewport::WindowLevel::Normal
+        });
+    if let Some(pos) = builder_pos {
+        builder = builder.with_position(pos);
+    }
+
+    ctx.show_viewport_immediate(viewport_id(), builder, |vp, _class| {
+        crate::shell::viewport_ui(vp, |ui| {
+            // THE WINDOW'S OWN RECT, used for both the drawing and the hit
+            // test below. The band's rect is a completely different rectangle
+            // — different width, different height, different origin — and a
+            // hit test run against it would return the note that is under
+            // that point IN THE MAIN WINDOW, which is a note the user cannot
+            // see and did not point at. Nothing here may reach for a band
+            // rect, which is why none is passed in.
+            let rect = ui.max_rect();
+            draw_detached(ui.painter(), rect, views, input, s);
+            painter_border(ui.painter(), rect);
+
+            let (close, inner_rect, outer_rect, pressed, secondary, pointer, ctrl) =
+                ui.input(|i| {
+                    (
+                        i.viewport().close_requested(),
+                        i.viewport().inner_rect,
+                        i.viewport().outer_rect,
+                        i.pointer.primary_pressed(),
+                        i.pointer.secondary_clicked(),
+                        i.pointer.interact_pos(),
+                        i.modifiers.ctrl,
+                    )
+                });
+
+            outcome.close_requested = close;
+            // The fallback matters in a host that reports no window geometry
+            // at all: without it the guard sees `None` forever and the window
+            // is never remembered, rather than never poisoned.
+            outcome.inner_size = inner_rect.map(|r| r.size()).or(Some(rect.size()));
+            outcome.outer_pos = outer_rect.map(|r| r.min);
+
+            // Ctrl-click IS the right-click on macOS, and this window is the
+            // only detachable one where getting that wrong does damage: the
+            // main window guards it (`app.rs`: `primary_pressed &&
+            // !ctrl_as_context`) because a ctrl-click reaching the keytoggle
+            // hit test enters a note instead of opening the menu. The chord
+            // strip and the neck have no click targets, so they never needed
+            // it. This window has six chord vertices and twelve note names.
+            let ctrl_as_context = cfg!(target_os = "macos") && ctrl;
+            let menu = secondary || (pressed && ctrl_as_context);
+            if menu {
+                if let (Some(pos), Some(inner)) = (pointer, inner_rect) {
+                    outcome.context_menu_at = Some(inner.min + pos.to_vec2());
+                }
+            }
+
+            // Keytoggle is consulted HERE rather than by the caller, and the
+            // reason is the drag below. If the window reported a hit that the
+            // app then discarded because keytoggle is off, a borderless press
+            // on a chord vertex would stand aside for a drag that never
+            // happens and do nothing at all — a dead patch of window.
+            if pressed && !menu && s.keytoggle_enabled {
+                if let Some(p) = pointer {
+                    outcome.hit = hit_test(rect, views, input, p);
+                }
+            }
+
+            // Borderless drag-anywhere, minus the parts that are not "anywhere".
+            // With no title bar the whole window is the drag handle, so an
+            // unguarded StartDrag means clicking a chord vertex picks the
+            // window up and carries it off instead of placing the triad —
+            // which looks exactly like a broken diagram, since the note never
+            // appears. The press only becomes a drag when it hit nothing.
+            if borderless && pressed && !menu && outcome.hit.is_none() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+        });
+    });
+    outcome
+}
+
+fn painter_border(painter: &Painter, rect: Rect) {
+    painter.rect_stroke(
+        rect.shrink(0.5),
+        0.0,
+        Stroke::new(1.0_f32, BORDER_COLOR),
+        StrokeKind::Middle,
+    );
+}
+
+// ── whose size is it anyway ────────────────────────────────────────────────
+
+/// Slack when comparing the size a window actually has against the size it was
+/// asked for. Rounding and DPI scaling move things by a point or two.
+pub const WM_SIZE_TOLERANCE: f32 = 8.0;
+
+/// How long after the window appears a size mismatch still counts as the window
+/// manager's doing rather than the user's.
+///
+/// A tiling WM overrules the requested size at creation, within a frame or two.
+/// A person reaching for a window edge takes far longer than this. Size alone
+/// cannot tell the two apart — the observed size is just a number either way —
+/// so only timing can.
+pub const WM_GRACE: Duration = Duration::from_millis(600);
+
+/// Whether something other than us is sizing this window.
+///
+/// Under a tiling window manager (AeroSpace, yabai, i3) the size we ask for is
+/// simply overruled. Recording the result as if the user had chosen it is worse
+/// than recording nothing: the tiled geometry then follows them into every
+/// later session, including ones where nothing is tiling. That is exactly how a
+/// `detached_chord_height` of 1377 ended up in a settings file — a chord strip
+/// the height of a monitor, restored faithfully on a machine with no tiling WM
+/// running.
+pub fn wm_overrode_size(observed: Vec2, requested: Vec2) -> bool {
+    (observed.x - requested.x).abs() > WM_SIZE_TOLERANCE
+        || (observed.y - requested.y).abs() > WM_SIZE_TOLERANCE
+}
+
+/// Whether this window's geometry is the user's to remember.
+///
+/// The rule `app.rs` already applies to the chord and fretboard windows, made
+/// into a thing that can be TESTED. There it is six lines of `if let` inline in
+/// a 3000-line update loop, exercised only by running the app under a tiling
+/// WM; here the same rule takes an `Instant` as an argument, so
+/// `the_window_manager_cannot_write_its_own_size_into_settings` can drive it
+/// through both sides of the grace period in a millisecond.
+///
+/// The safety property is in the return types, not in the caller's discipline:
+/// `remembered_size` and `remembered_pos` yield `None` for the whole session
+/// once the WM has been caught sizing the window, so there is no path by which
+/// a tiled geometry reaches settings.json. A caller that forgets to ask stores
+/// nothing, rather than storing 1377.
+#[derive(Debug, Clone, Copy)]
+pub struct GeometryGuard {
+    /// The size the builder asked for, which is what the observed size is
+    /// judged against.
+    requested: Vec2,
+    /// When the window appeared. Cleared once the grace period is over, at
+    /// which point mismatches are the user resizing.
+    shown_at: Option<Instant>,
+    wm_managed: bool,
+    live_size: Option<Vec2>,
+    live_pos: Option<Pos2>,
+}
+
+impl GeometryGuard {
+    /// Call when the window is opened — on detach, and again on the frame that
+    /// recreates it at startup. `requested` is the `builder_size` handed to
+    /// `show_detached_window`, and must be the same value for as long as this
+    /// guard lives, for the same reason the builder itself must be.
+    pub fn opened(requested: Vec2, now: Instant) -> Self {
+        Self {
+            requested,
+            shown_at: Some(now),
+            wm_managed: false,
+            live_size: None,
+            live_pos: None,
+        }
+    }
+
+    /// Feed one frame's outcome. Returns true when the geometry CHANGED and is
+    /// ours to remember, which is the app's cue to arm its debounced save.
+    pub fn observe(&mut self, outcome: &DetachedOutcome, now: Instant) -> bool {
+        self.observe_geometry(outcome.inner_size, outcome.outer_pos, now)
+    }
+
+    /// The same thing, for a popout whose outcome type is not this module's.
+    ///
+    /// The guard is about window managers, not about theory diagrams — the
+    /// module it happens to live in is an accident of which popout was written
+    /// first. The Recorder band is the fourth surface to need exactly this
+    /// dance, and taking the two fields rather than a foreign struct is what
+    /// stops the fifth one from copying it again.
+    pub fn observe_geometry(
+        &mut self,
+        inner_size: Option<Vec2>,
+        outer_pos: Option<Pos2>,
+        now: Instant,
+    ) -> bool {
+        if let (Some(shown), Some(size)) = (self.shown_at, inner_size) {
+            if now.duration_since(shown) < WM_GRACE {
+                // `|=`, not `=`. A tiling WM can hand back the requested size
+                // on one frame and its own on the next (AeroSpace resizes
+                // after the window is mapped), and a guard that could be
+                // un-set by a single agreeing frame would let the next frame's
+                // tiled size through.
+                self.wm_managed |= wm_overrode_size(size, self.requested);
+            } else {
+                self.shown_at = None;
+            }
+        }
+        let moved = inner_size != self.live_size
+            || (outer_pos.is_some() && outer_pos != self.live_pos);
+        if let Some(size) = inner_size {
+            self.live_size = Some(size);
+        }
+        if let Some(pos) = outer_pos {
+            self.live_pos = Some(pos);
+        }
+        moved && !self.wm_managed
+    }
+
+    /// The last size the window reported, if any.
+    pub fn live_size(&self) -> Option<Vec2> {
+        self.live_size
+    }
+
+    /// The last position the window reported, if any.
+    pub fn live_pos(&self) -> Option<Pos2> {
+        self.live_pos
+    }
+
+    /// Whether a window manager has been caught sizing this window.
+    pub fn wm_managed(&self) -> bool {
+        self.wm_managed
+    }
+
+    /// The size to write to settings, or `None` when it is not ours to write.
+    pub fn remembered_size(&self) -> Option<Vec2> {
+        (!self.wm_managed).then_some(self.live_size).flatten()
+    }
+
+    /// The position to write to settings, or `None` when it is not ours.
+    ///
+    /// Tied to the same flag as the size, deliberately. A tiling WM moves a
+    /// window as well as resizing it, and remembering "the size is not mine
+    /// but the position is" would restore the window to the corner the tiler
+    /// happened to put it in, on a machine where nothing tiles.
+    pub fn remembered_pos(&self) -> Option<Pos2> {
+        (!self.wm_managed).then_some(self.live_pos).flatten()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1461,6 +1846,11 @@ mod tests {
         }
         drawn.extend("CIRCLE OF FIFTHS TONNETZ HARMONIC TRIANGLES".chars());
         drawn.extend("I IV V i iv v no key fits keys 0123456789m".chars());
+        // The empty detached window's notice. It is the only thing on screen
+        // when no diagram is selected, so a glyph missing from the chosen face
+        // would leave the user with a blank window and no way to know why.
+        drawn.extend(EMPTY_TITLE.chars());
+        drawn.extend(EMPTY_HINT.chars());
         drawn.sort_unstable();
         drawn.dedup();
 
@@ -1811,5 +2201,647 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── the popped-out window ──────────────────────────────────────────────
+
+    /// All eight selections, the empty one included. Every test below runs the
+    /// whole set: the window has to survive combinations the band never shows,
+    /// because the band with nothing selected is zero points tall and simply
+    /// is not there, while the window is still on the user's screen.
+    fn every_selection() -> Vec<Views> {
+        let mut out = Vec::new();
+        for circle in [false, true] {
+            for tonnetz in [false, true] {
+                for triangles in [false, true] {
+                    out.push(Views {
+                        circle,
+                        tonnetz,
+                        triangles,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Where the drawing puts every control inside `rect`, and what clicking it
+    /// must give back.
+    ///
+    /// Re-derived from the drawing code rather than read back out of
+    /// `hit_test`, exactly like the band's own click tests: a hit test compared
+    /// against itself proves nothing. If `draw_circle` moves the name ring or
+    /// `draw_triangles` moves a vertex, this goes stale and the assertions
+    /// below fail, which is the point.
+    fn controls(rect: Rect, views: Views, input: Input) -> Vec<(View, Pos2, Hit)> {
+        let mut out = Vec::new();
+        for (view, cell) in cells(rect, views) {
+            let body = body_rect(cell.shrink(8.0));
+            match view {
+                View::Circle => {
+                    let c = body.center();
+                    let r = body.width().min(body.height()) * 0.5 - 2.0;
+                    if r < 20.0 {
+                        continue;
+                    }
+                    for (i, &pc) in FIFTHS.iter().enumerate() {
+                        let a = circle_angle(i);
+                        let dir = Vec2::new(a.cos(), a.sin());
+                        // Where `draw_circle` centres the major name.
+                        out.push((view, c + dir * ((r * 0.80 + r * 0.56) * 0.5), Hit::Pc(pc)));
+                    }
+                }
+                View::Tonnetz => {
+                    let Some(l) = Lattice::fit(body) else {
+                        continue;
+                    };
+                    for v in 0..l.rows {
+                        for u in 0..l.cols {
+                            if l.shows(body, u, v) {
+                                out.push((view, l.at(u, v), Hit::Pc(tonnetz_pc(u, v, 0))));
+                            }
+                        }
+                    }
+                }
+                View::Triangles => {
+                    let c = body.center();
+                    let r = hexagram_radius(body);
+                    if r < 20.0 {
+                        continue;
+                    }
+                    let tonic = input.tonic();
+                    let roots = [tonic, (tonic + 5) % 12, (tonic + 7) % 12];
+                    for (k, &oi) in HEX_UP_ORDER.iter().enumerate() {
+                        let hit = Hit::Triad {
+                            root: roots[oi],
+                            minor: false,
+                        };
+                        out.push((view, hex_vertex(c, r, k, false), hit));
+                    }
+                    for (k, &oi) in HEX_DOWN_ORDER.iter().enumerate() {
+                        let hit = Hit::Triad {
+                            root: roots[oi],
+                            minor: true,
+                        };
+                        out.push((view, hex_vertex(c, r, k, true), hit));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// C major sounding, so the diagrams have something to light and the
+    /// triangles have a tonic to orient themselves around.
+    fn c_major() -> Input {
+        Input {
+            pcs: major_triad(0),
+            bass: Some(0),
+            root: Some(0),
+            minor: false,
+        }
+    }
+
+    /// Sizes the window can be that the BAND can never be.
+    ///
+    /// `band_height` is `trunc(300 * w / 1300)`, so a band 900 points wide is
+    /// 207 tall and nothing else. Every size here is deliberately off that
+    /// curve, which is what makes the test below able to tell "hit-tested
+    /// against the window" apart from "hit-tested against the band".
+    fn detached_sizes() -> Vec<Vec2> {
+        vec![
+            DETACHED_DEFAULT,
+            DETACHED_MIN,
+            Vec2::new(640.0, 300.0),
+            Vec2::new(1180.0, 520.0),
+            Vec2::new(520.0, 700.0), // taller than wide: a window can be
+        ]
+    }
+
+    /// The hit test must invert the drawing at the WINDOW's size, which is a
+    /// different rectangle from the band's in every dimension.
+    ///
+    /// This is the failure the detached window is most prone to and the least
+    /// visible when it happens: the picture still looks right, and the clicks
+    /// land on the note that would have been under that point in the main
+    /// window — a note that is not on screen. So the test walks every control
+    /// the drawing produces, at five window sizes no band ever has, and asks
+    /// the hit test what is there.
+    #[test]
+    fn the_detached_hit_test_inverts_the_detached_drawing_at_the_windows_own_size() {
+        let input = c_major();
+        let mut checked = 0;
+        for size in detached_sizes() {
+            // Proof that these really are shapes the band cannot take, so a
+            // hit test that quietly used band geometry could not pass.
+            for views in every_selection() {
+                assert_ne!(
+                    band_height(size.x, views),
+                    size.y,
+                    "{size:?} is a size the band can have, so this test cannot \
+                     tell the window's geometry from the band's"
+                );
+            }
+            // Off the origin as well: a viewport's content rect starts at zero,
+            // but nothing in the geometry may ASSUME that.
+            for origin in [Pos2::ZERO, Pos2::new(37.0, 11.0)] {
+                let rect = Rect::from_min_size(origin, size);
+                for views in every_selection() {
+                    let controls = controls(rect, views, input);
+                    for (view, at, want) in &controls {
+                        assert_eq!(
+                            hit_test(rect, views, input, *at),
+                            Some(*want),
+                            "{view:?} in a {size:?} window at {origin:?}: the \
+                             control drawn at {at:?} is not clickable"
+                        );
+                        checked += 1;
+                    }
+                    if views.any() && size.x >= DETACHED_MIN.x {
+                        assert!(
+                            !controls.is_empty(),
+                            "{views:?} produced no controls at all in a \
+                             {size:?} window"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(checked > 500, "only {checked} controls were checked");
+    }
+
+    /// ...and the band would have answered differently, which is what makes the
+    /// test above worth having.
+    ///
+    /// A hit test wired to the band's rect instead of the window's is not a
+    /// crash and not a blank pane: it is a click that places the wrong note.
+    /// This pins the two geometries apart, so the mistake cannot be invisible.
+    #[test]
+    fn the_band_and_the_window_do_not_agree_about_what_is_under_a_point() {
+        let input = c_major();
+        let views = Views {
+            circle: true,
+            tonnetz: true,
+            triangles: true,
+        };
+        let window = Rect::from_min_size(Pos2::ZERO, DETACHED_DEFAULT);
+        let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, band_height(1300.0, views)));
+        let controls = controls(window, views, input);
+        let wrong = controls
+            .iter()
+            .filter(|(_, at, want)| hit_test(band, views, input, *at) != Some(*want))
+            .count();
+        assert!(
+            wrong * 2 > controls.len(),
+            "only {wrong} of {} window controls would answer differently \
+             against the band, so a hit test run against the wrong rect would \
+             mostly still look correct",
+            controls.len()
+        );
+    }
+
+    /// The smallest window we let the user make must still hold three diagrams.
+    ///
+    /// `Lattice::fit` returns None below `a = 16`, and `draw_circle` and
+    /// `draw_triangles` both return early below `r = 20`. All three failures
+    /// look identical from outside: a pane title over an empty rectangle, which
+    /// reads as a rendering fault rather than as "the window is too small".
+    /// `DETACHED_MIN` is where that stops happening, so it is asserted rather
+    /// than remembered.
+    #[test]
+    fn the_smallest_window_still_holds_three_diagrams() {
+        let views = Views {
+            circle: true,
+            tonnetz: true,
+            triangles: true,
+        };
+        let rect = Rect::from_min_size(Pos2::ZERO, DETACHED_MIN);
+        let at_min = controls(rect, views, c_major());
+        for view in View::ALL {
+            let n = at_min.iter().filter(|(v, _, _)| *v == view).count();
+            assert!(
+                n > 0,
+                "{view:?} draws nothing at the minimum window size {:?}",
+                DETACHED_MIN
+            );
+        }
+        // And the floor is not wastefully high: a little under it, something
+        // does give up. Otherwise the minimum is just a number nobody checked.
+        let tighter = Rect::from_min_size(Pos2::ZERO, DETACHED_MIN - Vec2::new(60.0, 0.0));
+        let shrunk = controls(tighter, views, c_major());
+        assert!(
+            shrunk.len() < at_min.len(),
+            "nothing was lost 60pt below the minimum, so the minimum is set \
+             higher than it needs to be"
+        );
+    }
+
+    /// Where the test window sits on its monitor. Non-zero and not round, so a
+    /// context-menu position that forgot to add the window origin is obvious.
+    const WINDOW_ORIGIN: Pos2 = Pos2::new(120.0, 64.0);
+
+    /// One frame of the real detached window, headless.
+    ///
+    /// A bare `egui::Context` has `embed_viewports` set, so
+    /// `show_viewport_immediate` runs its closure inline against this same
+    /// context — which is the trap `host.rs` warns about in a plugin, and here
+    /// it is exactly what makes the window testable without a window manager.
+    fn run_detached(
+        size: Vec2,
+        views: Views,
+        input: Input,
+        s: &Settings,
+        events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
+        closing: bool,
+    ) -> (DetachedOutcome, egui::FullOutput) {
+        let raw = |events: Vec<egui::Event>, modifiers, closing| {
+            let mut info = egui::ViewportInfo {
+                inner_rect: Some(Rect::from_min_size(WINDOW_ORIGIN, size)),
+                outer_rect: Some(Rect::from_min_size(
+                    WINDOW_ORIGIN - Vec2::new(0.0, 28.0),
+                    size + Vec2::new(0.0, 28.0),
+                )),
+                ..Default::default()
+            };
+            if closing {
+                info.events.push(egui::ViewportEvent::Close);
+            }
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                viewports: std::iter::once((egui::ViewportId::ROOT, info)).collect(),
+                events,
+                modifiers,
+                ..Default::default()
+            }
+        };
+
+        let ctx = egui::Context::default();
+        // The window draws real glyphs, and a bare Context has no font families
+        // bound: painting one panics rather than failing an assertion.
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        // A warm-up pass, so the atlas exists before any text is laid out.
+        let _ = ctx.run(raw(Vec::new(), Default::default(), false), |_| {});
+
+        let mut outcome = DetachedOutcome::default();
+        let out = ctx.run(raw(events, modifiers, closing), |ctx| {
+            outcome =
+                show_detached_window(ctx, size, Some(WINDOW_ORIGIN), false, true, views, input, s);
+        });
+        (outcome, out)
+    }
+
+    fn click_at(
+        pos: Pos2,
+        button: egui::PointerButton,
+        modifiers: egui::Modifiers,
+    ) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed: true,
+                modifiers,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed: false,
+                modifiers,
+            },
+        ]
+    }
+
+    fn keytoggle_on() -> Settings {
+        Settings {
+            keytoggle_enabled: true,
+            ..Default::default()
+        }
+    }
+
+    /// A real click in the real window reports the chord printed on the vertex
+    /// it landed on — and reports the WINDOW's answer, not the band's.
+    ///
+    /// The end-to-end version of the geometry tests above: the position goes in
+    /// as a pointer event and comes back as a `Hit` through the outcome, so a
+    /// wiring mistake between the two (the wrong rect, the wrong pointer
+    /// position, a hit read on release instead of press) fails here.
+    #[test]
+    fn a_click_on_a_chord_vertex_in_the_window_places_that_triad() {
+        let s = keytoggle_on();
+        let input = c_major();
+        let views = Views {
+            circle: true,
+            tonnetz: true,
+            triangles: true,
+        };
+        let size = DETACHED_DEFAULT;
+        let rect = Rect::from_min_size(Pos2::ZERO, size);
+        let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, band_height(1300.0, views)));
+
+        let mut checked = 0;
+        for (view, at, want) in controls(rect, views, input) {
+            if view != View::Triangles {
+                continue;
+            }
+            let (outcome, _) = run_detached(
+                size,
+                views,
+                input,
+                &s,
+                click_at(at, egui::PointerButton::Primary, Default::default()),
+                Default::default(),
+                false,
+            );
+            assert_eq!(
+                outcome.hit,
+                Some(want),
+                "a click at {at:?} in a {size:?} window did not place the \
+                 chord drawn there"
+            );
+            // The same point in the band is a different pane entirely — the
+            // triangles sit at x 866..1300 there and 600..900 here — so this
+            // is the assertion that would fail if the window ever hit-tested
+            // against band geometry.
+            assert_ne!(
+                hit_test(band, views, input, at),
+                Some(want),
+                "the band happens to answer the same at {at:?}, so this case \
+                 cannot tell the two rects apart"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 6, "the hexagram has six vertices");
+    }
+
+    /// Keytoggle off is keytoggle off, in the window as in the band.
+    ///
+    /// It also decides whether a borderless press becomes a window drag: the
+    /// drag stands aside only for a press that hit something, so a hit reported
+    /// here and then discarded by the app would leave a patch of window that
+    /// neither places a note nor drags.
+    #[test]
+    fn a_click_is_not_a_note_when_keytoggle_is_off() {
+        let input = c_major();
+        let views = Views {
+            triangles: true,
+            ..Default::default()
+        };
+        let size = DETACHED_DEFAULT;
+        let rect = Rect::from_min_size(Pos2::ZERO, size);
+        let at = controls(rect, views, input)[0].1;
+        let (outcome, _) = run_detached(
+            size,
+            views,
+            input,
+            &Settings::default(),
+            click_at(at, egui::PointerButton::Primary, Default::default()),
+            Default::default(),
+            false,
+        );
+        assert!(
+            !Settings::default().keytoggle_enabled,
+            "this test is about the shipped default"
+        );
+        assert_eq!(outcome.hit, None, "a chord was placed with keytoggle off");
+    }
+
+    /// Right-click anywhere opens the app menu, at a position given in monitor
+    /// coordinates — the window's own origin plus where the pointer was.
+    ///
+    /// And on macOS, so does ctrl-click, WITHOUT also placing a note. The main
+    /// window guards that gesture for exactly this reason; this window is the
+    /// only popout with click targets for it to damage.
+    #[test]
+    fn a_right_click_asks_for_the_menu_in_monitor_coordinates_and_places_nothing() {
+        let s = keytoggle_on();
+        let input = c_major();
+        let views = Views {
+            triangles: true,
+            ..Default::default()
+        };
+        let size = DETACHED_DEFAULT;
+        let rect = Rect::from_min_size(Pos2::ZERO, size);
+        let at = controls(rect, views, input)[0].1;
+
+        let (outcome, _) = run_detached(
+            size,
+            views,
+            input,
+            &s,
+            click_at(at, egui::PointerButton::Secondary, Default::default()),
+            Default::default(),
+            false,
+        );
+        assert_eq!(
+            outcome.context_menu_at,
+            Some(WINDOW_ORIGIN + at.to_vec2()),
+            "the menu position must be in monitor coordinates"
+        );
+        assert_eq!(
+            outcome.hit, None,
+            "a right-click on a chord vertex also placed the chord"
+        );
+
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let (outcome, _) = run_detached(
+            size,
+            views,
+            input,
+            &s,
+            click_at(at, egui::PointerButton::Primary, ctrl),
+            ctrl,
+            false,
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                outcome.context_menu_at,
+                Some(WINDOW_ORIGIN + at.to_vec2()),
+                "ctrl-click is the right-click on macOS"
+            );
+            assert_eq!(
+                outcome.hit, None,
+                "ctrl-click placed a chord instead of opening the menu, which \
+                 is the bug app.rs guards with `!ctrl_as_context`"
+            );
+        } else {
+            assert_eq!(
+                outcome.hit,
+                Some(controls(rect, views, input)[0].2),
+                "off macOS, ctrl is not a context-menu gesture and the click \
+                 is an ordinary one"
+            );
+        }
+    }
+
+    /// Closing the window is the reattach signal, exactly as for the other two
+    /// popouts. Nothing else in the outcome may be disturbed by it.
+    #[test]
+    fn closing_the_window_is_how_the_band_comes_back() {
+        let (outcome, _) = run_detached(
+            DETACHED_DEFAULT,
+            Views {
+                circle: true,
+                ..Default::default()
+            },
+            c_major(),
+            &Settings::default(),
+            Vec::new(),
+            Default::default(),
+            true,
+        );
+        assert!(outcome.close_requested, "the close was not reported");
+        assert_eq!(outcome.hit, None);
+        assert_eq!(outcome.context_menu_at, None);
+    }
+
+    /// Every selection makes a window with something in it — including the
+    /// empty selection, which is the one the band cannot show at all.
+    ///
+    /// The band's answer to "nothing selected" is to be zero points tall and
+    /// disappear. A window cannot do that: it is already open, and a blank one
+    /// reads as the app having crashed in that corner of the screen. So the
+    /// empty window says what happened and how to undo it, and this counts the
+    /// text shapes to prove it rather than trusting the code to have drawn any.
+    #[test]
+    fn every_selection_including_none_makes_a_window_worth_looking_at() {
+        let s = keytoggle_on();
+        for views in every_selection() {
+            for size in detached_sizes() {
+                for input in [Input::default(), c_major()] {
+                    let (outcome, out) = run_detached(
+                        size,
+                        views,
+                        input,
+                        &s,
+                        Vec::new(),
+                        Default::default(),
+                        false,
+                    );
+                    let texts = out
+                        .shapes
+                        .iter()
+                        .filter(|s| matches!(s.shape, egui::Shape::Text(_)))
+                        .count();
+                    assert!(
+                        texts > 0,
+                        "{views:?} at {size:?} painted no text at all — a \
+                         blank window reads as a crash, not as a choice"
+                    );
+                    if !views.any() {
+                        // The notice is two lines, and both must survive: the
+                        // hint is the only thing that tells the user the
+                        // window is not broken but empty.
+                        assert!(
+                            texts >= 2,
+                            "the empty window drew {texts} lines, not the \
+                             title and the hint"
+                        );
+                    }
+                    assert_eq!(
+                        outcome.inner_size,
+                        Some(size),
+                        "the window reported a size that is not its own"
+                    );
+                    assert!(!outcome.close_requested);
+                }
+            }
+        }
+    }
+
+    /// Nothing in an empty window is clickable, at any size. The notice is a
+    /// notice, not a control, and a stray hit there would place a note the user
+    /// cannot see the name of.
+    #[test]
+    fn an_empty_window_has_nothing_to_click() {
+        for size in detached_sizes() {
+            let rect = Rect::from_min_size(Pos2::ZERO, size);
+            for x in 0..24 {
+                for y in 0..24 {
+                    let p = Pos2::new(
+                        rect.min.x + size.x * x as f32 / 23.0,
+                        rect.min.y + size.y * y as f32 / 23.0,
+                    );
+                    assert_eq!(
+                        hit_test(rect, Views::default(), c_major(), p),
+                        None,
+                        "something in the empty window at {p:?} is clickable"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A tiling window manager must not be able to write its own idea of the
+    /// window's size into settings.json.
+    ///
+    /// The owner runs AeroSpace, which overrules the size we ask for the moment
+    /// the window is mapped. Recording that as a user preference is how a
+    /// `detached_chord_height` of 1377 got into a settings file and then
+    /// followed the user onto machines with nothing tiling. The guard is a
+    /// timing test, because size alone cannot tell a tiler from a person: a
+    /// mismatch inside the grace period is the WM's, after it is the user's.
+    #[test]
+    fn the_window_manager_cannot_write_its_own_size_into_settings() {
+        let t0 = Instant::now();
+        let asked = DETACHED_DEFAULT;
+        let tiled = |size: Vec2| DetachedOutcome {
+            inner_size: Some(size),
+            outer_pos: Some(Pos2::new(0.0, 0.0)),
+            ..Default::default()
+        };
+
+        // The tiler: the very first frame comes back the height of a monitor.
+        let mut g = GeometryGuard::opened(asked, t0);
+        let armed = g.observe(&tiled(Vec2::new(asked.x, 1377.0)), t0);
+        assert!(!armed, "a tiled window armed the geometry save");
+        assert!(g.wm_managed());
+        assert_eq!(g.remembered_size(), None, "1377 reached settings.json");
+        assert_eq!(g.remembered_pos(), None, "the tiled position came with it");
+        // ...and it stays true for the session, even once the tiler hands back
+        // the size we asked for. A guard that could be cleared by one agreeing
+        // frame would let the next frame's tiled size through.
+        let _ = g.observe(&tiled(asked), t0 + Duration::from_millis(200));
+        assert!(g.wm_managed(), "one agreeing frame cleared the guard");
+        assert_eq!(g.remembered_size(), None);
+
+        // A window nobody interfered with: its geometry is the user's.
+        let mut g = GeometryGuard::opened(asked, t0);
+        assert!(g.observe(&tiled(asked), t0), "the first frame is a change");
+        assert!(!g.wm_managed());
+        assert_eq!(g.remembered_size(), Some(asked));
+        assert_eq!(g.remembered_pos(), Some(Pos2::ZERO));
+        // Rounding and DPI scaling move things by a point or two, and that is
+        // not a window manager.
+        let nudged = asked + Vec2::new(WM_SIZE_TOLERANCE - 1.0, 0.0);
+        let _ = g.observe(&tiled(nudged), t0 + Duration::from_millis(100));
+        assert!(!g.wm_managed(), "a {WM_SIZE_TOLERANCE}pt slack was refused");
+
+        // The user, dragging the window edge long after it appeared. Same
+        // numbers as the tiler, opposite meaning, and only the clock says so.
+        let mut g = GeometryGuard::opened(asked, t0);
+        let _ = g.observe(&tiled(asked), t0);
+        let later = t0 + WM_GRACE + Duration::from_millis(1);
+        let dragged = Vec2::new(asked.x, 1377.0);
+        assert!(
+            g.observe(&tiled(dragged), later),
+            "a real resize did not arm the save"
+        );
+        assert!(
+            !g.wm_managed(),
+            "a resize after the grace period was blamed on the WM"
+        );
+        assert_eq!(g.remembered_size(), Some(dragged));
+
+        // A frame in which nothing moved must not arm the save; otherwise the
+        // debounced write never settles and settings.json is rewritten forever.
+        assert!(
+            !g.observe(&tiled(dragged), later + Duration::from_millis(16)),
+            "an unchanged frame armed the geometry save"
+        );
     }
 }

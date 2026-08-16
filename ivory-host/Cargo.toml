@@ -1,0 +1,31 @@
+[package]
+# The plugin host. Separate from `ivory-record` on purpose: it is the largest
+# risk in the feature, it is the only part that loads FOREIGN CODE into the
+# process, and keeping it a crate of its own means it can be cut, feature-gated
+# or moved out of process without touching the recorder.
+#
+# MIT, and that is newly possible: Steinberg relicensed the VST3 SDK from
+# GPLv3-or-proprietary to MIT on 2025-10-29 (VST 3.8). See LICENSING.md.
+name = "ivory-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# MIT OR Apache-2.0. Ships a pre-generated `bindings.rs` (~670 KB) rather than
+# running bindgen, so there is NO build-time libclang, no SDK download and no C
+# toolchain — which is what lets `cargo xwin` keep cross-building Windows from
+# this Mac. That property is worth more here than any convenience wrapper.
+vst3 = "0.3"
+
+[dev-dependencies]
+# Examples only, and `check-firewall.sh` walks `--edges normal`, so this does
+# not put the recorder into the host's shipped dependency graph. It is here so
+# the spike can write a REAL take file with the real writer rather than a
+# throwaway WAV — proving the two lanes compose, and giving something to listen
+# to rather than a peak number to trust.
+ivory-record = { path = "../ivory-record" }
+
+[lints]
+workspace = true

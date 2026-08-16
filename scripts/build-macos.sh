@@ -119,6 +119,14 @@ case "$ARCH" in
 esac
 
 APP="dist/Tangent.app"
+
+# Hardened-runtime entitlements. Required from 3.1.0 onward: the Recorder view
+# opens a camera, a microphone and third-party plugin binaries, and under
+# `--options runtime` every one of those is refused WITHOUT A PROMPT unless the
+# matching key is present. Missing file = broken release, so fail loudly here
+# rather than shipping an app whose device list is mysteriously empty.
+ENTITLEMENTS="build/macos/tangent.entitlements"
+[ -f "$ENTITLEMENTS" ] || { echo "error: missing $ENTITLEMENTS" >&2; exit 1; }
 ZIP="dist/Tangent-${VERSION}-macos-${ARCH_NAME}.zip"
 DMG="dist/Tangent-${VERSION}-macos-${ARCH_NAME}.dmg"
 
@@ -187,10 +195,64 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key>    <string>11.0</string>
     <key>NSHighResolutionCapable</key>   <true/>
     <key>LSApplicationCategoryType</key> <string>public.app-category.music</string>
+    <!-- Recorder view. These gate the PROMPT; build/macos/tangent.entitlements
+         gates the DEVICE, and the two fail differently: a missing entitlement
+         is a silent refusal with no Privacy row, while a missing usage string
+         is a TCC PROCESS KILL ("attempted to access privacy-sensitive data
+         without a usage description"). Both are required. -->
+    <key>NSCameraUsageDescription</key>
+    <string>Tangent shows a live camera preview and records video of your performance.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Tangent records the audio of your performance.</string>
+    <!-- Opt in to AVCaptureDeviceTypeContinuityCamera (macOS 14+), so an iPhone
+         on a mount is offered as a camera. The key alone is not enough: the
+         device type must also be passed in the discovery session's array, and
+         its symbol must be resolved at RUNTIME rather than linked, because
+         LSMinimumSystemVersion above is 11.0 and a non-weak import of a 14.0
+         symbol breaks LAUNCH on 11/12/13, not merely the camera. -->
+    <key>NSCameraUseContinuityCameraDeviceType</key>
+    <true/>
     <key>NSPrincipalClass</key>          <string>NSApplication</string>
 </dict>
 </plist>
 PLIST
+
+# Read the entitlements back OUT of the finished signature, rather than trusting
+# that passing --entitlements worked. It can silently not work: an entitlements
+# file AMFI cannot parse aborts the codesign call, and a bundle re-signed later
+# by another step loses the keys entirely. The resulting app builds, notarizes,
+# launches, and then finds no camera, with no error anywhere — so this is the
+# difference between a bad build and a bad bug report three weeks later.
+verify_entitlements() {
+  local app="$1" out
+  out="$(codesign -d --entitlements - --xml "$app" 2>/dev/null || true)"
+  local key
+  for key in com.apple.security.device.camera \
+             com.apple.security.device.audio-input \
+             com.apple.security.cs.disable-library-validation \
+             com.apple.security.cs.allow-jit; do
+    case "$out" in
+      *"$key"*) ;;
+      *) echo "error: signed bundle is missing entitlement $key" >&2; exit 1 ;;
+    esac
+  done
+  # The hardened runtime is what makes the entitlements mean anything; without
+  # it they are inert and the app is not notarizable.
+  #
+  # Captured into a variable rather than piped into `grep -q`: under
+  # `set -o pipefail` that pipeline reports FAILURE on success, because grep -q
+  # exits at the first match and SIGPIPEs codesign. The check then fails on a
+  # perfectly good bundle, which is a maddening thing to debug from the message
+  # "does not have the hardened runtime" while `codesign -d -v` plainly shows
+  # flags=0x10000(runtime).
+  local flags
+  flags="$(codesign -d -v "$app" 2>&1 || true)"
+  case "$flags" in
+    *"flags="*"runtime"*) ;;
+    *) echo "error: signed bundle does not have the hardened runtime" >&2; exit 1 ;;
+  esac
+  echo "==> entitlements verified in signature (camera, mic, host x2; runtime on)"
+}
 
 # ── Sign ─────────────────────────────────────────────────────────────────────
 # A Developer ID signature PLUS notarization is what removes the Gatekeeper
@@ -214,16 +276,28 @@ if [ -n "$SIGN_ID" ]; then
   # bundle gains a helper. --options runtime (the hardened runtime) is a
   # prerequisite for notarization; --timestamp makes the signature outlive the
   # certificate's expiry, so old downloads keep working.
-  codesign --force --options runtime --timestamp -s "$SIGN_ID" "$APP/Contents/MacOS/tangent"
-  codesign --force --options runtime --timestamp -s "$SIGN_ID" "$APP"
+  codesign --force --options runtime --entitlements "$ENTITLEMENTS" --timestamp \
+    -s "$SIGN_ID" "$APP/Contents/MacOS/tangent"
+  codesign --force --options runtime --entitlements "$ENTITLEMENTS" --timestamp \
+    -s "$SIGN_ID" "$APP"
   codesign --verify --strict --verbose=2 "$APP"
   SIGNED_RELEASE=1
+  verify_entitlements "$APP"
 else
   echo "warn: no Developer ID Application certificate found — signing ad-hoc."
   echo "      This artifact WILL trip Gatekeeper. Do not publish it."
-  codesign --force --deep -s - "$APP"
+  # --options runtime and the entitlements are applied HERE TOO, deliberately.
+  # The ad-hoc branch used to omit both, which meant a local build was not
+  # hardened at all and could therefore do things the shipped app cannot — so
+  # "it works on my machine" carried no information about the release. Camera
+  # and microphone access are exactly that class of difference. Sign inner-out
+  # rather than --deep for the same reason the Developer ID branch does.
+  codesign --force --options runtime --entitlements "$ENTITLEMENTS" \
+    -s - "$APP/Contents/MacOS/tangent"
+  codesign --force --options runtime --entitlements "$ENTITLEMENTS" -s - "$APP"
   codesign --verify --strict "$APP"
   SIGNED_RELEASE=0
+  verify_entitlements "$APP"
 fi
 
 # ── Notarize ─────────────────────────────────────────────────────────────────

@@ -18,5 +18,15 @@ plugin/target
 # Installer staging. Kept out of the repo AND out of Dropbox by
 # scripts/build-installer.sh, which stages in a temp dir; this catches the
 # case where someone points it somewhere else.
-build/
-build/
+#
+# `build/*` and not `build/`, deliberately: git will not descend into an
+# excluded DIRECTORY, so a `!build/macos/` negation under `build/` is silently
+# powerless. Excluding the children instead is what makes the negation work.
+build/*
+# ...but NOT the macOS signing inputs, which are source.
+#
+# `scripts/build-macos.sh` fails fast if `build/macos/tangent.entitlements` is
+# missing, so without this a fresh clone cannot build the app at all — and the
+# file was untracked from the day it was written, because it happened to land
+# under a directory ignored for a completely unrelated reason.
+!build/macos/

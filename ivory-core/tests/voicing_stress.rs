@@ -25,15 +25,15 @@ use std::collections::HashSet;
 
 // Boards nothing in TUNINGS looks like, all reachable through a leaked
 // `&'static Tuning`, which is what `FretboardSpec` takes.
-static EMPTY: Tuning = Tuning { name: "empty", open: &[] };
-static ONE: Tuning = Tuning { name: "one", open: &[60] };
-static DUP: Tuning = Tuning { name: "dup", open: &[40, 40, 45, 45] };
-static DESC: Tuning = Tuning { name: "desc", open: &[64, 59, 55, 50, 45, 40] };
+static EMPTY: Tuning = Tuning { name: std::borrow::Cow::Borrowed("empty"), open: std::borrow::Cow::Borrowed(&[]) };
+static ONE: Tuning = Tuning { name: std::borrow::Cow::Borrowed("one"), open: std::borrow::Cow::Borrowed(&[60]) };
+static DUP: Tuning = Tuning { name: std::borrow::Cow::Borrowed("dup"), open: std::borrow::Cow::Borrowed(&[40, 40, 45, 45]) };
+static DESC: Tuning = Tuning { name: std::borrow::Cow::Borrowed("desc"), open: std::borrow::Cow::Borrowed(&[64, 59, 55, 50, 45, 40]) };
 static WIDE: Tuning = Tuning {
-    name: "wide",
-    open: &[10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70, 74, 78, 82, 86],
+    name: std::borrow::Cow::Borrowed("wide"),
+    open: std::borrow::Cow::Borrowed(&[10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70, 74, 78, 82, 86]),
 };
-static HIGH: Tuning = Tuning { name: "high", open: &[250, 251, 252] };
+static HIGH: Tuning = Tuning { name: std::borrow::Cow::Borrowed("high"), open: std::borrow::Cow::Borrowed(&[250, 251, 252]) };
 
 fn hostile_tunings() -> Vec<&'static Tuning> {
     let mut v: Vec<&'static Tuning> = TUNINGS.iter().collect();
@@ -48,7 +48,7 @@ fn specs(full: bool) -> Vec<FretboardSpec> {
     for t in hostile_tunings() {
         for &f in frets {
             for &c in capos {
-                v.push(FretboardSpec { tuning: t, frets: f, capo: c });
+                v.push(FretboardSpec { tuning: t.clone(), frets: f, capo: c });
             }
         }
     }
@@ -244,7 +244,7 @@ fn sweep(full: bool) {
     // Random input on the shipped boards, which is what users will actually hit.
     for _ in 0..(if full { 3000 } else { 600 }) {
         let spec = FretboardSpec {
-            tuning: &TUNINGS[rng.n() as usize % TUNINGS.len()],
+            tuning: TUNINGS[rng.n() as usize % TUNINGS.len()].clone(),
             frets: 22,
             capo: (rng.n() % 8) as u8,
         };
