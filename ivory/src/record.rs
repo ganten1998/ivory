@@ -124,10 +124,18 @@ struct StartArgs {
 
 /// Samples on their way to the video's audio track.
 ///
+/// The `allow(dead_code)` off macOS is not a shrug: the encoder and the
+/// compositor are macOS-only, so on Windows and Linux this really is written
+/// and never read. Keeping the plumbing compiled on every platform is what
+/// stops it rotting between now and the day those platforms get an encoder —
+/// the alternative is a second `cfg` maze through the writer.
+///
+///
 /// Sent to the UI thread, where the encoder lives. That direction is
 /// deliberate and it is a 600-fold difference in traffic: audio is 384 kB a
 /// second, and composited 1080p frames are 250 MB a second — so the audio
 /// crosses the thread boundary and the video never has to.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct AudioChunk {
     /// Index of the first frame here, counted from the start of the take —
     /// which is exactly its index in the `.wav`.
@@ -976,6 +984,7 @@ impl Session {
     /// ACTUALLY running, not one recomputed from the settings, or a take
     /// started before somebody changed the destination would write its video
     /// somewhere else.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn take_dir(&self) -> Option<&std::path::Path> {
         self.take.as_ref().map(|t| t.dir())
     }
@@ -1082,6 +1091,7 @@ impl Session {
     ///
     /// Drained by the UI thread every frame while a video take is rolling. See
     /// [`StartArgs::audio_tx`] for why the samples travel in this direction.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn video_audio(&self) -> Option<&mpsc::Receiver<AudioChunk>> {
         self.audio_for_video.as_ref()
     }
@@ -1091,6 +1101,7 @@ impl Session {
     /// The encoder needs this to describe what it is being handed, and it
     /// cannot be taken from the settings: the device decides it. A take at
     /// 44.1 kHz described as 48 would play back a semitone and a bit sharp.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn video_audio_spec(&self) -> Option<(u32, u16)> {
         self.video_audio_spec
     }
