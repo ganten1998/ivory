@@ -3921,9 +3921,18 @@ impl IvoryApp {
             // the pane and is not the same as one anchored at its corner. With
             // a band turned off, the two differ by half the slack and dialogs
             // landed up to 180 points away from the app they belong to.
+            //
+            // **Translated into MONITOR coordinates**, which is what
+            // `Placement::parent` is documented to be and what it was not.
+            // `last_drawn` comes from `ui.max_rect()`, so in a viewport it
+            // starts at the window's own origin — near (0, 0) — and handing it
+            // over raw centred every dialog on a rectangle sitting in the
+            // top-left of the SCREEN. On this machine that put the welcome card
+            // at x = (1300 - 470) / 2 = 415, which looks deliberate and is a
+            // window-sized coincidence.
             parent: self
                 .main_origin_known
-                .then_some(self.last_drawn)
+                .then(|| self.last_drawn.translate(self.main_inner_origin.to_vec2()))
                 .filter(|r: &Rect| r.is_positive()),
             monitor: self.monitor_size,
         };

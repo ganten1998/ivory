@@ -1580,19 +1580,33 @@ pub struct Placement {
 }
 
 impl Placement {
-    /// Centred on the parent, kept fully on the monitor. None when the parent
-    /// geometry is not known yet, in which case the OS places the window, which
-    /// on Windows means the top-left corner of the screen.
+    /// Centred on the parent, kept fully on the monitor — and centred on the
+    /// MONITOR when there is no parent to centre on yet.
     ///
     /// "Not known yet" has to mean exactly that. A viewport cannot see its own
     /// position on the first frames, so the app used to hand over a rect at
     /// (0, 0) rather than nothing — and the welcome dialog, which opens on the
     /// very first frame, centred itself on the top-left of the SCREEN. It was
     /// centred, on the wrong thing.
+    ///
+    /// Handing back `None` fixed that and left a smaller version of it: the
+    /// platform then places the window whatever it likes, which for the welcome
+    /// card — the ONE dialog that opens before the main window has a position —
+    /// meant it never looked centred either. Falling back to the middle of the
+    /// monitor is what it should have been all along. It is not a guess about
+    /// the parent; it is the right answer to a different question, which is
+    /// where to put a window that has nothing to belong to yet.
+    ///
+    /// `None` survives for the case that really has nowhere to go: no parent
+    /// AND no monitor, which is a host that has told us nothing at all.
     fn position_for(self, size: Vec2) -> Option<Pos2> {
-        let parent = self.parent?;
+        let centre = match (self.parent, self.monitor) {
+            (Some(parent), _) => parent.center(),
+            (None, Some(monitor)) => (monitor * 0.5).to_pos2(),
+            (None, None) => return None,
+        };
         Some(crate::settings::clamp_to_monitor(
-            parent.center() - size * 0.5,
+            centre - size * 0.5,
             size,
             self.monitor,
         ))
@@ -3517,11 +3531,28 @@ mod tests {
         let size = Vec2::new(400.0, 300.0);
         let monitor = Some(Vec2::new(2560.0, 1440.0));
 
-        // Parent unknown: no position, so the platform places it.
+        // **Parent unknown, monitor known: the middle of the screen.**
+        //
+        // This is the welcome card, and it is the only dialog that opens before
+        // the main window has a position to centre on. It used to hand back
+        // `None` and let the platform decide, which meant the first thing
+        // anybody saw was a window placed wherever.
+        let p = Placement {
+            parent: None,
+            monitor,
+            caps: crate::host::Caps::DESKTOP,
+        }
+        .position_for(size)
+        .expect("a known monitor is enough to place a dialog");
+        let centre = p + size * 0.5;
+        assert!((centre.x - 1280.0).abs() < 0.5, "off-centre in x: {centre:?}");
+        assert!((centre.y - 720.0).abs() < 0.5, "off-centre in y: {centre:?}");
+
+        // Neither: nothing to centre on, so the platform really does decide.
         assert_eq!(
             Placement {
                 parent: None,
-                monitor,
+                monitor: None,
                 caps: crate::host::Caps::DESKTOP
             }
             .position_for(size),
