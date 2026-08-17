@@ -187,15 +187,21 @@ impl Compositor {
             egui::Pos2::ZERO,
             egui::vec2(self.width as f32, self.height as f32),
         );
+        let camera_id = self.camera.as_ref().map(|c| (c.id, c.size));
         // The band's height comes from what is IN it, asked of the app rather
-        // than assumed here — see `Layout::split`.
+        // than assumed here; the inset's shape comes from the SENSOR, so a
+        // camera keeps its whole picture instead of being centre-cropped into
+        // whatever box the layout felt like. See `Layout::split`.
+        let camera_aspect = camera_id
+            .filter(|(_, (w, h))| *w > 0 && *h > 0)
+            .map_or(Layout::DEFAULT_CAMERA_ASPECT, |(_, (w, h))| {
+                w as f32 / h as f32
+            });
         let panes = layout.split(
             frame_rect,
-            want_camera,
-            want_display,
-            app.composite_aspect(shows),
+            want_camera.then_some(camera_aspect),
+            want_display.then(|| app.composite_aspect(shows)),
         );
-        let camera_id = self.camera.as_ref().map(|c| (c.id, c.size));
         let overlays = layout.overlays();
         let camera_on_top = layout.camera_on_top();
 

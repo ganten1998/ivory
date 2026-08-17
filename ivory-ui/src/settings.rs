@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 1;
+const SETTINGS_VERSION: u64 = 2;
 
 /// Recorder backgrounds this app shipped as defaults before [`SETTINGS_VERSION`]
 /// 1, and which are therefore not evidence that anybody chose them.
@@ -201,12 +201,16 @@ pub struct Settings {
     pub theory_triangles: bool,
     /// Whether the theory band follows what you are PLAYING.
     ///
-    /// Off by default, and that is the point of it. The band is something you
-    /// look at while you play — a key you are working in, a chord you are
-    /// trying to place — and a diagram that redraws on every note you touch is
-    /// one you cannot read while touching notes. With this off it shows only
-    /// what you put there, by clicking the piano, the neck or the diagrams
-    /// themselves, and stays put until you change it.
+    /// **On by default**, reversing the original argument. That argument was
+    /// that a diagram redrawing on every note is one you cannot read while
+    /// touching notes, so the band should show only what you put there by
+    /// clicking. It is a real objection and it describes the wrong user: with
+    /// this off, somebody who has never opened the app plays a chord, watches
+    /// three diagrams sit perfectly still, and concludes they are decoration.
+    /// The band's whole claim is that it tells you what you just played.
+    ///
+    /// Anybody who wants it to hold still turns it off, and it stays off —
+    /// which is the direction that survives being wrong.
     pub theory_follow_midi: bool,
     /// The Recorder band is showing.
     ///
@@ -476,7 +480,7 @@ impl Default for Settings {
             theory_circle: false,
             theory_tonnetz: false,
             theory_triangles: false,
-            theory_follow_midi: false,
+            theory_follow_midi: true,
             fretboard_win_w: None,
             fretboard_win_h: None,
             fretboard_win_x: None,
@@ -1006,6 +1010,12 @@ impl Settings {
             if self.record_export.composite.layout == crate::recorder::Layout::CameraAbove {
                 self.record_export.composite.layout = crate::recorder::Layout::default();
             }
+        }
+        if was < 2 {
+            // The theory band used to sit still until you clicked something,
+            // which meant the first thing a new user learned about it was that
+            // it does not respond to the piano. See `theory_follow_midi`.
+            self.theory_follow_midi = true;
         }
     }
 
@@ -1663,6 +1673,15 @@ mod tests {
             "the pre-3.10 export layout survived the migration"
         );
 
+        // And the theory band now answers the piano, which is the whole thing
+        // it claims to do. A pre-v2 file cannot distinguish "off because that
+        // was the default" from "off because I turned it off" — they are the
+        // same bool — so every pre-v2 file gets it, once.
+        assert!(
+            Settings::from_json(r#"{"theory_follow_midi": false}"#).theory_follow_midi,
+            "a pre-v2 file did not get the new theory default"
+        );
+
         // A colour nobody ever shipped is somebody's own, and survives.
         let mine = "#1b3a62";
         assert!(!V0_RECORDER_BG.contains(&mine), "pick an unshipped colour");
@@ -1688,6 +1707,7 @@ mod tests {
         let mut s = Settings::default();
         s.recorder_bg_color = Rgb::parse(V0_RECORDER_BG[0]).expect("hex");
         s.record_export.composite.layout = crate::recorder::Layout::CameraAbove;
+        s.theory_follow_midi = false;
 
         let json = s.to_json();
         assert!(json.contains("settings_version"), "the save is not stamped");
@@ -1700,6 +1720,10 @@ mod tests {
         assert_eq!(
             back.record_export.composite.layout,
             crate::recorder::Layout::CameraAbove
+        );
+        assert!(
+            !back.theory_follow_midi,
+            "a band deliberately told to hold still was set moving again"
         );
         // And the stamp does not leak into `extra`, which would write it twice.
         assert_eq!(json.matches("settings_version").count(), 1, "{json}");

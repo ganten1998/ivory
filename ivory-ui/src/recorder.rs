@@ -648,27 +648,49 @@ impl Layout {
     /// the composite; when only one is, it takes the whole frame, because a
     /// letterbox around the only thing in the video is a bug rather than a
     /// layout.
+    ///
+    /// **Each layer arrives as `Some(aspect)` or `None`.** It used to be two
+    /// bools and one float, and adding the camera's aspect would have made it
+    /// two bools and two adjacent floats of different meaning — the exact shape
+    /// that gets passed in the wrong order once and then silently lays out
+    /// every video slightly wrong. Presence and proportion are one fact per
+    /// layer, so they travel as one value.
     pub fn split(
         self,
         frame: egui::Rect,
-        camera: bool,
-        display: bool,
-        display_aspect: f32,
+        camera: Option<f32>,
+        display: Option<f32>,
     ) -> Panes {
         let portrait = frame.height() > frame.width();
         match (camera, display) {
-            (false, false) => Panes::default(),
-            (true, false) => Panes {
+            (None, None) => Panes::default(),
+            (Some(_), None) => Panes {
                 camera: Some(frame),
                 display: None,
             },
-            (false, true) => Panes {
+            (None, Some(_)) => Panes {
                 camera: None,
                 display: Some(frame),
             },
-            (true, true) => self.both(frame, portrait, display_aspect),
+            (Some(cam), Some(disp)) => self.both(frame, portrait, disp, cam),
         }
     }
+
+    /// How tall the `DisplayFull` inset is, as a fraction of the frame's short
+    /// edge.
+    ///
+    /// **Smaller than it looks.** At 16:9 this is a sixth of the height and
+    /// about a tenth of the width — a person in the corner of a screen, which
+    /// is the whole brief. It started at a quarter of the WIDTH, which put a
+    /// webcam over a sixth of the picture.
+    const INSET_H: f32 = 0.17;
+
+    /// What an inset is assumed to be shaped like when nothing has said.
+    ///
+    /// A webcam that has not delivered a frame yet has no size, and the inset
+    /// still has to be somewhere. 16:9 is what almost every camera on a desk
+    /// is, and it is the shape of the frame it sits in.
+    pub const DEFAULT_CAMERA_ASPECT: f32 = 16.0 / 9.0;
 
     /// How tall the display band should be inside a frame this wide.
     ///
@@ -692,7 +714,13 @@ impl Layout {
         natural.clamp(0.0, cap)
     }
 
-    fn both(self, frame: egui::Rect, portrait: bool, display_aspect: f32) -> Panes {
+    fn both(
+        self,
+        frame: egui::Rect,
+        portrait: bool,
+        display_aspect: f32,
+        camera_aspect: f32,
+    ) -> Panes {
         let band = Self::band_height(frame, portrait, display_aspect) / frame.height().max(1.0);
         match self {
             // The display gets the whole frame and the camera sits in a corner
@@ -705,24 +733,34 @@ impl Layout {
             // of it is the top octaves, which are the least played. Top-right
             // would sit over the chord name.
             Layout::DisplayFull => {
-                // **A SQUARE, off the short edge.** It was a quarter of the
-                // frame's width at 16:9, which is a slab: 25% of the width and
-                // 25% of the height, sitting on a sixth of the picture the
-                // layout exists to show. A square is the crop a face wants —
-                // `paint_camera` centre-crops rather than letterboxing, so a
-                // 16:9 sensor loses its empty sides rather than gaining bars —
-                // and taking the side off the SHORT edge is what keeps it the
-                // same apparent size in a 9:16 frame, where a fraction of the
-                // width would be a postage stamp.
-                let side = frame.width().min(frame.height()) * 0.26;
-                let margin = frame.width().min(frame.height()) * 0.025;
+                // **The camera's own shape, sized off the short edge, top
+                // right.**
+                //
+                // Its own shape because that is the only size at which nothing
+                // is thrown away: `paint_camera` centre-crops to whatever pane
+                // it is given, so a square inset silently binned the sides of
+                // every 16:9 webcam, and a 16:9 inset would do the same to a
+                // 4:3 one. The pane follows the sensor and the whole picture
+                // survives.
+                //
+                // Off the SHORT edge, so it is the same apparent size in a 9:16
+                // reel as in a 16:9 video — a fraction of the width would be a
+                // quarter of one frame and a postage stamp in the other. And
+                // capped at a third of the width so that a very wide camera
+                // cannot walk across the picture the layout exists to show.
+                //
+                // Top right rather than bottom right: the busiest thing in the
+                // app is the keyboard along the bottom with the fretboard under
+                // it, and both run full width. The top right corner is the end
+                // of the theory band, which is the one region with air in it.
+                let short = frame.width().min(frame.height());
+                let h = short * Self::INSET_H;
+                let w = (h * camera_aspect.max(0.05)).min(frame.width() * 0.33);
+                let margin = short * 0.025;
                 Panes {
                     camera: Some(egui::Rect::from_min_max(
-                        egui::Pos2::new(
-                            frame.right() - margin - side,
-                            frame.bottom() - margin - side,
-                        ),
-                        egui::Pos2::new(frame.right() - margin, frame.bottom() - margin),
+                        egui::Pos2::new(frame.right() - margin - w, frame.top() + margin),
+                        egui::Pos2::new(frame.right() - margin, frame.top() + margin + h),
                     )),
                     display: Some(frame),
                 }
@@ -763,7 +801,7 @@ impl Layout {
                 // is better than giving them the one they literally asked for
                 // and letting them find out at the export.
                 if portrait {
-                    return Layout::CameraAbove.both(frame, portrait, display_aspect);
+                    return Layout::CameraAbove.both(frame, portrait, display_aspect, camera_aspect);
                 }
                 let cut = frame.left() + frame.width() * 0.5;
                 Panes {
@@ -2032,6 +2070,9 @@ mod layout_tests {
     /// ratio. Measured from `band_sizes_at`: at 1300 wide the piano is 150 and
     /// the chord strip is 50, so the content is 1300:200.
     const PIANO_AND_CHORD: f32 = 1300.0 / 200.0;
+    /// What almost every camera on a desk is, and what these tests assume
+    /// unless they are about a camera that is not.
+    const CAM_16_9: f32 = 16.0 / 9.0;
 
     fn landscape() -> Rect {
         Rect::from_min_size(Pos2::ZERO, egui::vec2(1920.0, 1080.0))
@@ -2048,7 +2089,7 @@ mod layout_tests {
         for l in Layout::ALL {
             for frame in [landscape(), portrait()] {
                 for (cam, disp) in [(true, true), (true, false), (false, true), (false, false)] {
-                    let p = l.split(frame, cam, disp, PIANO_AND_CHORD);
+                    let p = l.split(frame, cam.then_some(CAM_16_9), disp.then_some(PIANO_AND_CHORD));
                     assert_eq!(p.camera.is_some(), cam, "{l:?} camera");
                     assert_eq!(p.display.is_some(), disp, "{l:?} display");
                 }
@@ -2062,8 +2103,8 @@ mod layout_tests {
     fn one_layer_alone_fills_the_frame() {
         for l in Layout::ALL {
             let f = landscape();
-            assert_eq!(l.split(f, true, false, PIANO_AND_CHORD).camera, Some(f), "{l:?}");
-            assert_eq!(l.split(f, false, true, PIANO_AND_CHORD).display, Some(f), "{l:?}");
+            assert_eq!(l.split(f, Some(CAM_16_9), None).camera, Some(f), "{l:?}");
+            assert_eq!(l.split(f, None, Some(PIANO_AND_CHORD)).display, Some(f), "{l:?}");
         }
     }
 
@@ -2073,7 +2114,7 @@ mod layout_tests {
     fn stacked_panes_tile_the_frame_exactly() {
         for l in [Layout::CameraAbove, Layout::DisplayAbove, Layout::SideBySide] {
             for frame in [landscape(), portrait()] {
-                let p = l.split(frame, true, true, PIANO_AND_CHORD);
+                let p = l.split(frame, Some(CAM_16_9), Some(PIANO_AND_CHORD));
                 let (c, d) = (p.camera.expect("camera"), p.display.expect("display"));
                 assert!(frame.contains_rect(c) && frame.contains_rect(d), "{l:?} escaped");
                 let covered = c.area() + d.area();
@@ -2099,7 +2140,7 @@ mod layout_tests {
     fn the_display_band_is_the_height_of_what_goes_in_it() {
         for frame in [landscape(), portrait()] {
             let d = Layout::CameraAbove
-                .split(frame, true, true, PIANO_AND_CHORD)
+                .split(frame, Some(CAM_16_9), Some(PIANO_AND_CHORD))
                 .display
                 .expect("display");
             let natural = frame.width() / PIANO_AND_CHORD;
@@ -2118,7 +2159,7 @@ mod layout_tests {
         // Aspect 1.0 is a square display, far taller than any real selection.
         let f = landscape();
         let d = Layout::CameraAbove
-            .split(f, true, true, 1.0)
+            .split(f, Some(CAM_16_9), Some(1.0))
             .display
             .expect("display");
         assert!(
@@ -2139,7 +2180,7 @@ mod layout_tests {
     #[test]
     fn the_vertical_camera_gets_the_bulk_of_the_frame() {
         let f = portrait();
-        let p = Layout::CameraAbove.split(f, true, true, PIANO_AND_CHORD);
+        let p = Layout::CameraAbove.split(f, Some(CAM_16_9), Some(PIANO_AND_CHORD));
         let cam = p.camera.expect("camera");
         let share = cam.height() / f.height();
         assert!(
@@ -2154,7 +2195,7 @@ mod layout_tests {
     #[test]
     fn the_vertical_camera_pane_is_not_a_letterbox_slot() {
         let cam = Layout::CameraAbove
-            .split(portrait(), true, true, PIANO_AND_CHORD)
+            .split(portrait(), Some(CAM_16_9), Some(PIANO_AND_CHORD))
             .camera
             .expect("camera");
         let aspect = cam.width() / cam.height();
@@ -2174,11 +2215,11 @@ mod layout_tests {
     /// literally asked for and letting the user find out at the export.
     #[test]
     fn side_by_side_stacks_when_the_frame_is_vertical() {
-        let p = Layout::SideBySide.split(portrait(), true, true, PIANO_AND_CHORD);
-        let stacked = Layout::CameraAbove.split(portrait(), true, true, PIANO_AND_CHORD);
+        let p = Layout::SideBySide.split(portrait(), Some(CAM_16_9), Some(PIANO_AND_CHORD));
+        let stacked = Layout::CameraAbove.split(portrait(), Some(CAM_16_9), Some(PIANO_AND_CHORD));
         assert_eq!(p, stacked, "side by side should have stacked in 9:16");
         // And in landscape it is genuinely side by side.
-        let wide = Layout::SideBySide.split(landscape(), true, true, PIANO_AND_CHORD);
+        let wide = Layout::SideBySide.split(landscape(), Some(CAM_16_9), Some(PIANO_AND_CHORD));
         let (c, d) = (wide.camera.unwrap(), wide.display.unwrap());
         assert!((c.height() - landscape().height()).abs() < 1.0);
         assert!(c.right() <= d.left() + 1.0, "they did not sit side by side");
@@ -2189,7 +2230,7 @@ mod layout_tests {
     #[test]
     fn the_overlay_keeps_the_camera_whole_and_sits_on_top_of_it() {
         let f = landscape();
-        let p = Layout::CameraFull.split(f, true, true, PIANO_AND_CHORD);
+        let p = Layout::CameraFull.split(f, Some(CAM_16_9), Some(PIANO_AND_CHORD));
         assert_eq!(p.camera, Some(f), "the camera should still fill the frame");
         let d = p.display.expect("display");
         assert!(f.contains_rect(d));
@@ -2211,7 +2252,7 @@ mod layout_tests {
     fn the_default_layout_gives_the_display_the_frame() {
         assert_eq!(Layout::default(), Layout::DisplayFull);
         for frame in [landscape(), portrait()] {
-            let p = Layout::DisplayFull.split(frame, true, true, PIANO_AND_CHORD);
+            let p = Layout::DisplayFull.split(frame, Some(CAM_16_9), Some(PIANO_AND_CHORD));
             assert_eq!(
                 p.display,
                 Some(frame),
@@ -2219,27 +2260,46 @@ mod layout_tests {
             );
             let cam = p.camera.expect("camera");
             assert!(frame.contains_rect(cam), "the inset escaped the frame");
-            // **Square**, and `paint_camera` centre-crops to it, so a 16:9
-            // sensor loses its empty sides rather than gaining bars.
-            assert!(
-                (cam.width() - cam.height()).abs() < 0.01,
-                "the inset is {}x{} and should be square",
-                cam.width(),
-                cam.height()
-            );
+            // **The SENSOR's shape**, whatever that is, because the compositor
+            // centre-crops the camera into whatever pane it is handed — so a
+            // pane of the wrong shape silently throws away the sides or the top
+            // and bottom of every frame the camera delivers.
+            for sensor in [CAM_16_9, 4.0 / 3.0, 1.0] {
+                let c = Layout::DisplayFull
+                    .split(frame, Some(sensor), Some(PIANO_AND_CHORD))
+                    .camera
+                    .expect("camera");
+                assert!(
+                    (c.width() / c.height() - sensor).abs() < 0.01,
+                    "a {sensor}:1 sensor got a {}:1 pane",
+                    c.width() / c.height()
+                );
+            }
             // Small enough to be context, big enough to be a person — and the
             // SAME apparent size in both frames, which is the whole reason the
-            // side comes off the short edge. A fraction of the width would be a
-            // quarter of a 16:9 frame and a fifteenth of a 9:16 one.
+            // height comes off the short edge. A fraction of the width would be
+            // a quarter of a 16:9 frame and a fifteenth of a 9:16 one.
             let short = frame.width().min(frame.height());
-            let share = cam.width() / short;
+            let share = cam.height() / short;
             assert!(
-                (0.20..=0.30).contains(&share),
-                "the inset takes {share} of the short edge"
+                (0.14..=0.22).contains(&share),
+                "the inset is {share} of the short edge tall"
             );
-            // Clear of the edges, and in the bottom right.
-            assert!(cam.right() < frame.right() && cam.bottom() < frame.bottom());
-            assert!(cam.left() > frame.center().x && cam.top() > frame.center().y);
+            // It cannot walk across the picture however wide the camera is.
+            let widest = Layout::DisplayFull
+                .split(frame, Some(40.0), Some(PIANO_AND_CHORD))
+                .camera
+                .expect("camera");
+            assert!(
+                widest.width() <= frame.width() * 0.34,
+                "a very wide camera took {} of the frame",
+                widest.width() / frame.width()
+            );
+            // Clear of the edges, and in the TOP right: the keyboard and the
+            // fretboard run full width along the bottom, and the top right is
+            // the end of the theory band, which is where the air is.
+            assert!(cam.right() < frame.right() && cam.top() > frame.top());
+            assert!(cam.left() > frame.center().x && cam.bottom() < frame.center().y);
         }
     }
 
@@ -2267,7 +2327,7 @@ mod layout_tests {
             for h in [0.0_f32, 1.0] {
                 let f = Rect::from_min_size(Pos2::ZERO, egui::vec2(w, h));
                 for l in Layout::ALL {
-                    let p = l.split(f, true, true, PIANO_AND_CHORD);
+                    let p = l.split(f, Some(CAM_16_9), Some(PIANO_AND_CHORD));
                     for r in [p.camera, p.display].into_iter().flatten() {
                         assert!(
                             r.width() >= 0.0 && r.height() >= 0.0,
