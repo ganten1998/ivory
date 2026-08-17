@@ -116,38 +116,63 @@ pub fn band_height(w: f32, set: &StaffSet) -> f32 {
 /// The seven letters, as an offset from C within an octave.
 const LETTERS: [&str; 7] = ["C", "D", "E", "F", "G", "A", "B"];
 
-/// How a pitch class is spelled with sharps: `(letter index, alteration)`.
-const SHARP_SPELLING: [(i32, i8); 12] = [
-    (0, 0),
-    (0, 1),
-    (1, 0),
-    (1, 1),
-    (2, 0),
-    (3, 0),
-    (3, 1),
-    (4, 0),
-    (4, 1),
-    (5, 0),
-    (5, 1),
-    (6, 0),
-];
+// -- key signatures ---------------------------------------------------------
 
-/// The same twelve with flats. Note that the naturals are identical — only the
-/// five black keys differ, which is the whole of what `prefer_flats` decides.
-const FLAT_SPELLING: [(i32, i8); 12] = [
-    (0, 0),
-    (1, -1),
-    (1, 0),
-    (2, -1),
-    (2, 0),
-    (3, 0),
-    (4, -1),
-    (4, 0),
-    (5, -1),
-    (5, 0),
-    (6, -1),
-    (6, 0),
-];
+/// The natural pitch class of each letter, C first.
+const NATURAL_PC: [i32; 7] = [0, 2, 4, 5, 7, 9, 11];
+
+/// The order sharps are added to a signature, as letter indices: F C G D A E B.
+const SHARP_ORDER: [usize; 7] = [3, 0, 4, 1, 5, 2, 6];
+
+/// The order flats are added: B E A D G C F -- the sharps' order reversed,
+/// which is not a coincidence and is the whole reason one table generates both.
+const FLAT_ORDER: [usize; 7] = [6, 2, 5, 1, 4, 0, 3];
+
+/// The furthest a key signature goes in either direction.
+///
+/// **A signature is one integer, not a tonic.** It says nothing about major or
+/// minor -- one sharp is G major and E minor and they are the same signature --
+/// so storing a tonic would be storing a fact this app cannot know and has no
+/// use for. The names below are for the menu; the number is the music.
+pub const MAX_KEY: i32 = 7;
+
+/// What each signature is called, from seven flats to seven sharps.
+pub fn key_label(key: i32) -> &'static str {
+    const NAMES: [&str; 15] = [
+        "Cb / Abm  (7b)",
+        "Gb / Ebm  (6b)",
+        "Db / Bbm  (5b)",
+        "Ab / Fm  (4b)",
+        "Eb / Cm  (3b)",
+        "Bb / Gm  (2b)",
+        "F / Dm  (1b)",
+        "C / Am",
+        "G / Em  (1#)",
+        "D / Bm  (2#)",
+        "A / F#m  (3#)",
+        "E / C#m  (4#)",
+        "B / G#m  (5#)",
+        "F# / D#m  (6#)",
+        "C# / A#m  (7#)",
+    ];
+    NAMES[(key.clamp(-MAX_KEY, MAX_KEY) + MAX_KEY) as usize]
+}
+
+/// What the signature does to each letter: -1, 0 or +1.
+fn key_alterations(key: i32) -> [i8; 7] {
+    let mut out = [0_i8; 7];
+    let n = (key.unsigned_abs().min(MAX_KEY as u32)) as usize;
+    if key > 0 {
+        for &l in SHARP_ORDER.iter().take(n) {
+            out[l] = 1;
+        }
+    } else {
+        for &l in FLAT_ORDER.iter().take(n) {
+            out[l] = -1;
+        }
+    }
+    out
+}
 
 /// A MIDI note, spelled: which line-or-space it lives on and what has to be
 /// printed in front of it.
@@ -159,28 +184,74 @@ const FLAT_SPELLING: [(i32, i8); 12] = [
 pub struct Spelled {
     pub midi: u8,
     pub step: i32,
+    /// How far the letter is bent to reach this pitch: the note's actual
+    /// alteration, which by itself decides nothing about what is drawn.
     pub alter: i8,
+    /// **What is PRINTED in front of the note**, which is a different question.
+    /// `None` when the key signature already says it -- that is what a key
+    /// signature is for -- and `Some(0)` for a natural, the sign that exists
+    /// precisely to contradict one.
+    pub printed: Option<i8>,
     pub letter: &'static str,
 }
 
-/// Spell a MIDI note. `prefer_flats` decides the five black keys and nothing
-/// else.
-pub fn spell(midi: u8, prefer_flats: bool) -> Spelled {
-    let table = if prefer_flats {
-        FLAT_SPELLING
-    } else {
-        SHARP_SPELLING
-    };
-    let (letter, alter) = table[(midi % 12) as usize];
-    // MIDI 60 is C4, so the octave is `midi / 12 - 1`. Middle C therefore
-    // lands on step 4 * 7 + 0 = 28.
-    let octave = i32::from(midi) / 12 - 1;
+/// Spell a MIDI note in a key.
+///
+/// **The signature does two jobs here and they are easy to confuse.** It
+/// chooses the SPELLING -- in E flat major a black key is A flat and never G
+/// sharp -- and it decides what is PRINTED, because a note the signature
+/// already alters needs no accidental in front of it, and a note the signature
+/// alters and this one does not needs a natural. Both fall out of one
+/// comparison: the alteration the letter needs, against the alteration the
+/// signature gives it.
+///
+/// `prefer_flats` decides the five black keys when there is no signature to
+/// decide them, and nothing else.
+pub fn spell_in_key(midi: u8, key: i32, prefer_flats: bool) -> Spelled {
+    let pc = i32::from(midi % 12);
+    let alters = key_alterations(key);
+    // Flats when the signature has flats, sharps when it has sharps, and the
+    // user's own preference only when the signature is silent.
+    let use_flats = if key == 0 { prefer_flats } else { key < 0 };
+
+    let mut best = (0_usize, 0_i32);
+    let mut best_score = i32::MAX;
+    for letter in 0..7_usize {
+        // The alteration this letter would need, brought into -6..=5 so that
+        // "B sharp for C" scores as +1 rather than as -11.
+        let alter = (pc - NATURAL_PC[letter] + 6).rem_euclid(12) - 6;
+        if alter.abs() > 1 {
+            continue;
+        }
+        let printed = alter != i32::from(alters[letter]);
+        let wrong_way = printed && alter != 0 && ((alter > 0) == use_flats);
+        // Printing nothing is best; then going the way the key goes; then the
+        // smaller alteration. A natural counts as an alteration of zero, which
+        // is why it beats a sharp in a key full of flats.
+        let score = i32::from(printed) * 4 + i32::from(wrong_way) * 2 + alter.abs();
+        if score < best_score {
+            best_score = score;
+            best = (letter, alter);
+        }
+    }
+    let (letter, alter) = best;
+    let printed = (alter != i32::from(alters[letter])).then_some(alter as i8);
+    // MIDI 60 is C4, so the octave is `midi / 12 - 1` -- and a B sharp below
+    // middle C belongs to the octave BELOW it, which is what taking the
+    // alteration off the pitch first corrects for.
+    let octave = (i32::from(midi) - alter) / 12 - 1;
     Spelled {
         midi,
-        step: octave * 7 + letter,
-        alter,
-        letter: LETTERS[letter as usize],
+        step: octave * 7 + letter as i32,
+        alter: alter as i8,
+        printed,
+        letter: LETTERS[letter],
     }
+}
+
+/// Spell with no key signature at all.
+pub fn spell(midi: u8, prefer_flats: bool) -> Spelled {
+    spell_in_key(midi, 0, prefer_flats)
 }
 
 // ── clefs ──────────────────────────────────────────────────────────────────
@@ -481,7 +552,7 @@ impl Column {
         // the rightmost column that has room for it, which is what this is.
         let mut columns: Vec<Vec<i32>> = Vec::new();
         for i in (0..placed.len()).rev() {
-            if placed[i].note.alter == 0 {
+            if placed[i].note.printed.is_none() {
                 continue;
             }
             let pos = placed[i].pos;
@@ -597,7 +668,7 @@ pub fn draw(painter: &Painter, rect: Rect, notes: &HashSet<u8>, s: &Settings) {
     sorted.sort_unstable();
     let spelled: Vec<Spelled> = sorted
         .iter()
-        .map(|n| spell(*n, s.prefer_flats))
+        .map(|n| spell_in_key(*n, s.staff_key, s.prefer_flats))
         .collect();
     let per_staff = distribute(&set, &spelled);
 
@@ -686,7 +757,14 @@ fn draw_staff(
             Stroke::new(hair, p.ink),
         );
     }
-    let after_clef = draw_clef(painter, g, clef, p);
+    let after_clef = draw_key_signature(
+        painter,
+        g,
+        clef,
+        s.staff_key,
+        draw_clef(painter, g, clef, p),
+        p,
+    );
 
     let column = Column::place(clef, notes);
     if column.notes.is_empty() {
@@ -731,12 +809,12 @@ fn draw_column(
             p,
         );
 
-        if placed.note.alter != 0 {
+        if let Some(sign) = placed.note.printed {
             draw_accidental(
                 painter,
                 Pos2::new(x - g.space * 1.15 - placed.acc_col as f32 * acc_step, y),
                 g.space,
-                placed.note.alter,
+                sign,
                 p.ink,
             );
         }
@@ -891,6 +969,35 @@ fn draw_octave_signs(
 fn draw_accidental(painter: &Painter, c: Pos2, space: f32, alter: i8, ink: Color32) {
     let thin = Stroke::new((space * 0.1).max(1.0), ink);
     let thick = Stroke::new((space * 0.22).max(1.2), ink);
+    if alter == 0 {
+        // A natural: two uprights that do not meet, joined by two thick bars.
+        // The gaps are the point -- a natural whose stems ran the whole way
+        // would be a sharp with the slant taken out of it.
+        painter.line_segment(
+            [
+                Pos2::new(c.x - space * 0.22, c.y - space * 0.9),
+                Pos2::new(c.x - space * 0.22, c.y + space * 0.42),
+            ],
+            thin,
+        );
+        painter.line_segment(
+            [
+                Pos2::new(c.x + space * 0.22, c.y - space * 0.42),
+                Pos2::new(c.x + space * 0.22, c.y + space * 0.9),
+            ],
+            thin,
+        );
+        for dy in [-0.34_f32, 0.2] {
+            painter.line_segment(
+                [
+                    Pos2::new(c.x - space * 0.24, c.y + (dy + 0.1) * space),
+                    Pos2::new(c.x + space * 0.24, c.y + (dy - 0.06) * space),
+                ],
+                thick,
+            );
+        }
+        return;
+    }
     if alter > 0 {
         // Two uprights and two thick slanted crossbars — the slant is what
         // distinguishes a sharp from a hash at ten points.
@@ -930,6 +1037,58 @@ fn draw_accidental(painter: &Painter, c: Pos2, space: f32, alter: i8, ink: Color
 }
 
 // ── the clefs ──────────────────────────────────────────────────────────────
+
+/// Where the accidentals of a key signature go, per clef family.
+///
+/// **Tabled rather than derived**, and that is deliberate. There IS a rule --
+/// each accidental is a fourth up or a fifth down from the last, whichever
+/// keeps it inside the clef's own band -- but the band is a different height
+/// for every clef and the tenor clef breaks the pattern outright, putting its
+/// first sharp at the BOTTOM of the staff so that the rest have somewhere to
+/// go. A table states the four answers; the test below proves every entry
+/// spells the letter it is supposed to, which is the part a typo would break.
+fn key_positions(clef: Clef, sharps: bool) -> [i32; 7] {
+    match (clef, sharps) {
+        (Clef::Treble | Clef::Treble8vb, true) => [8, 5, 9, 6, 3, 7, 4],
+        (Clef::Treble | Clef::Treble8vb, false) => [4, 7, 3, 6, 2, 5, 1],
+        (Clef::Bass | Clef::Bass8vb, true) => [6, 3, 7, 4, 1, 5, 2],
+        (Clef::Bass | Clef::Bass8vb, false) => [2, 5, 1, 4, 0, 3, -1],
+        (Clef::Alto, true) => [7, 4, 8, 5, 2, 6, 3],
+        (Clef::Alto, false) => [3, 6, 2, 5, 1, 4, 0],
+        // The tenor exception: starting high would put the second sharp off
+        // the top of the staff, so the whole signature drops an octave.
+        (Clef::Tenor, true) => [2, 6, 3, 7, 4, 1, 5],
+        (Clef::Tenor, false) => [5, 1, 4, 0, 3, -1, 2],
+    }
+}
+
+/// The key signature, after the clef. Returns the x it reached.
+fn draw_key_signature(painter: &Painter, g: Geometry, clef: Clef, key: i32, x: f32, p: &Palette) -> f32 {
+    let n = (key.unsigned_abs().min(MAX_KEY as u32)) as usize;
+    if n == 0 {
+        return x;
+    }
+    let sharps = key > 0;
+    let positions = key_positions(clef, sharps);
+    // Sharps are wider than flats and need more room between them, which is
+    // why a seven-sharp signature is visibly longer than a seven-flat one on
+    // real paper too.
+    let step = g.space * if sharps { 0.95 } else { 0.78 };
+    // Clear of the clef before the first one. A signature that touches the
+    // clef reads as part of it, and the first thing a reader does with a staff
+    // is separate those two.
+    let from = x + g.space * 0.45;
+    for (i, pos) in positions.iter().take(n).enumerate() {
+        draw_accidental(
+            painter,
+            Pos2::new(from + step * (i as f32 + 0.5), g.y(*pos)),
+            g.space,
+            if sharps { 1 } else { -1 },
+            p.ink,
+        );
+    }
+    from + step * n as f32 + g.space * 0.5
+}
 
 /// Draw `clef` at the left of the staff and return the x its right edge
 /// reached, so the music can start after it.
@@ -1123,14 +1282,135 @@ fn bezier(a: Pos2, b: Pos2, c: Pos2, d: Pos2, steps: usize) -> Vec<Pos2> {
         .collect()
 }
 
-/// What the band is showing, or nothing when it is off.
-pub fn visible_set(s: &Settings) -> Option<StaffSet> {
-    s.show_staff.then(|| s.staff_set())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A key signature decides both the spelling and what is printed.**
+    ///
+    /// Two jobs, one comparison, and the failures look completely different: a
+    /// spelling mistake puts the note on the wrong line, and a printing mistake
+    /// puts an accidental in front of a note that the signature already covers
+    /// — which is not wrong so much as illiterate, and is the thing a musician
+    /// notices in the first half-second.
+    #[test]
+    fn a_key_signature_spells_the_notes_and_silences_the_accidentals() {
+        // E flat major: three flats. B flat, E flat and A flat are in the key,
+        // so they are spelled with those letters and printed bare.
+        for (midi, letter) in [(63_u8, "E"), (70, "B"), (68, "A")] {
+            let sp = spell_in_key(midi, -3, false);
+            assert_eq!(sp.letter, letter, "{midi} is spelled wrong in E flat");
+            assert_eq!(sp.alter, -1);
+            assert_eq!(
+                sp.printed, None,
+                "{midi} printed an accidental the signature already gives it"
+            );
+        }
+        // And the naturals of that key print nothing either.
+        for midi in [60_u8, 62, 65, 67] {
+            assert_eq!(spell_in_key(midi, -3, false).printed, None);
+        }
+        // E natural in E flat major is a note OUTSIDE the key, and the sign
+        // that says so is a natural — not a sharp on D, and not nothing.
+        let e = spell_in_key(64, -3, false);
+        assert_eq!(e.letter, "E");
+        assert_eq!(e.alter, 0);
+        assert_eq!(e.printed, Some(0), "E natural in E flat needs a natural");
+
+        // A major: three sharps. F sharp is bare; F natural needs a natural.
+        assert_eq!(spell_in_key(66, 3, false).printed, None);
+        let f = spell_in_key(65, 3, false);
+        assert_eq!(f.letter, "F");
+        assert_eq!(f.printed, Some(0));
+
+        // With no signature at all, nothing changes from what the band did
+        // before key signatures existed: naturals bare, black keys spelled by
+        // the user's own preference.
+        assert_eq!(spell_in_key(60, 0, false).printed, None);
+        assert_eq!(spell_in_key(61, 0, false).letter, "C");
+        assert_eq!(spell_in_key(61, 0, false).printed, Some(1));
+        assert_eq!(spell_in_key(61, 0, true).letter, "D");
+        assert_eq!(spell_in_key(61, 0, true).printed, Some(-1));
+    }
+
+    /// **Every pitch is spellable in every key, on the right line.**
+    ///
+    /// The sweep that a hand-written table cannot replace: 128 notes times
+    /// fifteen signatures, checking that what comes back really is the pitch
+    /// that went in and that the step it lands on agrees with the letter it
+    /// claims. A spelling that is off by an octave — the B-sharp-below-middle-C
+    /// case — passes every spot check and fails this.
+    #[test]
+    fn every_note_in_every_key_lands_on_the_line_its_letter_names() {
+        for key in -MAX_KEY..=MAX_KEY {
+            for midi in 0..=127_u8 {
+                let sp = spell_in_key(midi, key, false);
+                // The letter and the alteration have to add back up to the
+                // pitch that was asked for.
+                let letter = LETTERS
+                    .iter()
+                    .position(|l| *l == sp.letter)
+                    .expect("a letter this module knows");
+                let pc = (NATURAL_PC[letter] + i32::from(sp.alter)).rem_euclid(12);
+                assert_eq!(
+                    pc,
+                    i32::from(midi % 12),
+                    "{midi} in key {key} came back as {}{}",
+                    sp.letter,
+                    sp.alter
+                );
+                // And the step it sits on has to be that letter, in the octave
+                // the pitch really belongs to.
+                assert_eq!(
+                    sp.step.rem_euclid(7),
+                    letter as i32,
+                    "{midi} in key {key} is spelled {} and sits on a {} line",
+                    sp.letter,
+                    LETTERS[sp.step.rem_euclid(7) as usize]
+                );
+                assert!(sp.alter.abs() <= 1, "{midi} in key {key} needs a double");
+            }
+        }
+    }
+
+    /// **Every accidental in a key signature is the letter it is supposed to
+    /// be, on every clef.**
+    ///
+    /// `key_positions` is a table, and a table is exactly the thing a typo
+    /// hides in: one wrong number draws a G sharp where an F sharp goes, which
+    /// is a signature nobody can read and which looks, at a glance, completely
+    /// normal.
+    #[test]
+    fn every_key_signature_accidental_lands_on_its_own_letter() {
+        for clef in Clef::ALL {
+            for sharps in [true, false] {
+                let order = if sharps { SHARP_ORDER } else { FLAT_ORDER };
+                for (i, pos) in key_positions(clef, sharps).iter().enumerate() {
+                    // Undo `Clef::position` to get back to a diatonic step,
+                    // then to a letter.
+                    let (ref_step, ref_line) = clef.reference();
+                    let step = pos - ref_line * 2 + ref_step;
+                    assert_eq!(
+                        step.rem_euclid(7) as usize,
+                        order[i],
+                        "{clef:?} {} number {} is on a {} and should be a {}",
+                        if sharps { "sharp" } else { "flat" },
+                        i + 1,
+                        LETTERS[step.rem_euclid(7) as usize],
+                        LETTERS[order[i]]
+                    );
+                    // And it has to be ON the staff, or near enough: a
+                    // signature that needs ledger lines is one nobody prints.
+                    assert!(
+                        (-1..=9).contains(pos),
+                        "{clef:?} {} number {} is at {pos}, off the staff",
+                        if sharps { "sharp" } else { "flat" },
+                        i + 1
+                    );
+                }
+            }
+        }
+    }
 
     /// **The clefs name the pitches they are named after.**
     ///

@@ -30,7 +30,7 @@ pub const BAND_H_AT_1300: f64 = 300.0;
 
 /// Height of the theory band for a window `w` points wide, or 0 when nothing
 /// is selected. Truncated like every other band in the layout.
-pub fn band_height(w: f32, views: Views) -> f32 {
+pub fn band_height(w: f32, views: &Views) -> f32 {
     if views.count() == 0 {
         return 0.0;
     }
@@ -205,53 +205,153 @@ pub fn parse_label(label: &str) -> Option<(u8, bool)> {
 
 // ── what is selected ───────────────────────────────────────────────────────
 
-/// Which diagrams are showing. Any combination, including none.
+/// **Which elements are in the band, IN ORDER.**
 ///
-/// Three independent flags rather than one enum: the request was explicitly to
-/// be able to see more than one at a time, and an enum would have to grow a
-/// variant per combination to say that.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Views {
-    pub circle: bool,
-    pub tonnetz: bool,
-    pub triangles: bool,
-}
+/// An ordered list and not a set of flags, and that is the whole design. The
+/// band used to be three bools, which can say what is showing and cannot say
+/// where — so the arrangement was whatever order the enum happened to be
+/// written in and there was no way for anybody to change it.
+///
+/// With a list, one interaction does both jobs: a number key removes its
+/// element if it is showing and APPENDS it if it is not. Turning something off
+/// and on again therefore moves it to the right, which is the whole of the
+/// reordering vocabulary and takes no second control to learn. See
+/// [`Views::toggled`].
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Views(Vec<View>);
 
 impl Views {
-    pub fn count(self) -> usize {
-        self.circle as usize + self.tonnetz as usize + self.triangles as usize
+    /// Every element, in the order the number keys are numbered.
+    pub fn all() -> Views {
+        Views(View::ALL.to_vec())
     }
 
-    pub fn any(self) -> bool {
-        self.count() > 0
+    pub fn of(order: Vec<View>) -> Views {
+        let mut seen = Vec::new();
+        for v in order {
+            if !seen.contains(&v) {
+                seen.push(v);
+            }
+        }
+        Views(seen)
     }
+
+    pub fn order(&self) -> &[View] {
+        &self.0
+    }
+
+    pub fn count(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn any(&self) -> bool {
+        !self.0.is_empty()
+    }
+
+    pub fn contains(&self, v: View) -> bool {
+        self.0.contains(&v)
+    }
+
+    /// Where `v` sits in the band, if it is in it. 0 is the leftmost.
+    pub fn position(&self, v: View) -> Option<usize> {
+        self.0.iter().position(|x| *x == v)
+    }
+
+    /// **Off if it is on; on at the RIGHT-HAND END if it is off.**
+    ///
+    /// Appending rather than restoring the element to its numbered place is the
+    /// entire reordering mechanism: press a number twice and that element moves
+    /// to the end, so any arrangement is reachable with nothing but the number
+    /// row. Restoring it to a fixed slot would make the band's order permanent
+    /// and the second press a no-op.
+    pub fn toggled(&self, v: View) -> Views {
+        let mut out = self.0.clone();
+        match out.iter().position(|x| *x == v) {
+            Some(i) => {
+                out.remove(i);
+            }
+            None => out.push(v),
+        }
+        Views(out)
+    }
+
+    /// The order, as it goes in the settings file.
+    pub fn keys(&self) -> String {
+        self.0
+            .iter()
+            .map(|v| v.key())
+            .collect::<Vec<_>>()
+            .join("+")
+    }
+
+    /// Read back what `keys` wrote. Unknown names are dropped rather than
+    /// refused, so a file written by a LATER build — one that knows a fifth
+    /// diagram — still opens here with the four this build understands.
+    pub fn from_keys(text: &str) -> Views {
+        Views::of(text.split('+').filter_map(View::from_key).collect())
+    }
+
 }
 
-/// One diagram, for the menu and for cycling.
+/// One element of the theory band, for the menu and for the number keys.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
     Circle,
     Tonnetz,
     Triangles,
+    /// The sheet music. A diagram like the others: it says what you are playing
+    /// in the notation everybody already reads, and it is the most concrete of
+    /// the four — which is why it is worth having beside the abstractions
+    /// rather than in a band of its own. One chord at a time does not need the
+    /// width of a window.
+    Staff,
 }
 
 impl View {
-    pub const ALL: [View; 3] = [View::Circle, View::Tonnetz, View::Triangles];
+    /// **The order the number keys are numbered in, and it must not be
+    /// reshuffled.** `1` is this array's first element on every machine
+    /// forever; moving one would silently rebind everybody's fingers. New
+    /// elements go on the END.
+    pub const ALL: [View; 4] = [View::Circle, View::Tonnetz, View::Triangles, View::Staff];
 
     pub fn label(self) -> &'static str {
         match self {
             View::Circle => "Circle of Fifths",
             View::Tonnetz => "Tonnetz",
             View::Triangles => "Harmonic Triangles",
+            View::Staff => "Sheet Music",
         }
     }
 
-    pub fn is_on(self, v: Views) -> bool {
+    pub fn key(self) -> &'static str {
         match self {
-            View::Circle => v.circle,
-            View::Tonnetz => v.tonnetz,
-            View::Triangles => v.triangles,
+            View::Circle => "circle",
+            View::Tonnetz => "tonnetz",
+            View::Triangles => "triangles",
+            View::Staff => "staff",
         }
+    }
+
+    pub fn from_key(k: &str) -> Option<View> {
+        View::ALL.into_iter().find(|v| v.key() == k)
+    }
+
+    /// The number key that toggles this element, 1-based.
+    pub fn number(self) -> usize {
+        View::ALL
+            .iter()
+            .position(|v| *v == self)
+            .expect("every view is in ALL")
+            + 1
+    }
+
+    /// Which element a number key means, if any.
+    pub fn from_number(n: usize) -> Option<View> {
+        (n >= 1).then(|| View::ALL.get(n - 1).copied()).flatten()
+    }
+
+    pub fn is_on(self, v: &Views) -> bool {
+        v.contains(self)
     }
 }
 
@@ -347,8 +447,8 @@ fn font_light(size: f32) -> FontId {
 
 /// Divide `rect` into one cell per selected view, left to right in a fixed
 /// order so turning one off never reshuffles the others.
-pub fn cells(rect: Rect, views: Views) -> Vec<(View, Rect)> {
-    let on: Vec<View> = View::ALL.into_iter().filter(|v| v.is_on(views)).collect();
+pub fn cells(rect: Rect, views: &Views) -> Vec<(View, Rect)> {
+    let on = views.order().to_vec();
     if on.is_empty() {
         return Vec::new();
     }
@@ -382,25 +482,38 @@ pub enum Hit {
 /// The exact inverse of `draw`, and deliberately in the same file a few lines
 /// from it: a hit test that lives somewhere else is a hit test that stops
 /// matching the picture the first time the picture moves.
-pub fn hit_test(rect: Rect, views: Views, input: Input, pos: Pos2) -> Option<Hit> {
-    let (view, cell) = cells(rect, views)
+pub fn hit_test(rect: Rect, views: &Views, input: Input, pos: Pos2) -> Option<Hit> {
+    let (view, cell) = cells(rect, &views)
         .into_iter()
         .find(|(_, c)| c.contains(pos))?;
     let body = body_rect(cell.shrink(8.0));
     match view {
         View::Circle => circle_hit(body, pos).map(Hit::Pc),
         View::Tonnetz => tonnetz_hit(body, pos).map(Hit::Pc),
+        // The sheet music is a READOUT, not a control. There is nothing on a
+        // staff to click that would mean anything — a note on it is a note you
+        // are already holding — and a cell that swallowed clicks would make the
+        // band's behaviour depend on which panel happened to be under the
+        // pointer.
+        View::Staff => None,
         // The only one that needs to know what is playing: I, IV and V are
         // relative to a tonic, and the tonic comes from the notes.
         View::Triangles => triangles_hit(body, input.tonic(), pos),
     }
 }
 
-pub fn draw(painter: &Painter, rect: Rect, views: Views, input: Input, s: &Settings) {
+pub fn draw(
+    painter: &Painter,
+    rect: Rect,
+    views: &Views,
+    input: Input,
+    notes: &std::collections::HashSet<u8>,
+    s: &Settings,
+) {
     let p = palette(s);
     painter.rect_filled(rect, 0.0, p.bg);
 
-    let cells = cells(rect, views);
+    let cells = cells(rect, &views);
     for (i, (view, cell)) in cells.iter().enumerate() {
         // A hairline between panes, so three diagrams read as three and not as
         // one crowded one. Not drawn on the first, which has the band edge.
@@ -418,6 +531,25 @@ pub fn draw(painter: &Painter, rect: Rect, views: Views, input: Input, s: &Setti
             View::Circle => draw_circle(painter, inner, input, &p, s),
             View::Tonnetz => draw_tonnetz(painter, inner, input, &p, s),
             View::Triangles => draw_triangles(painter, inner, input, &p, s),
+            // The one element that needs the notes themselves rather than
+            // their pitch classes: an octave is exactly what a staff is FOR,
+            // and `Input` has thrown it away by design.
+            //
+            // Its title is drawn HERE rather than inside `staff::draw`, so the
+            // four panels share one title in one font at one height. The legend
+            // says which staves and which key, because those are two settings
+            // that live in a right-click menu and would otherwise be invisible
+            // — a band showing E flat major with nothing saying so is a band
+            // that looks wrong to anybody who did not set it.
+            View::Staff => {
+                let legend = format!(
+                    "{}  \u{2014}  {}",
+                    s.staff_set().label(),
+                    crate::staff::key_label(s.staff_key)
+                );
+                let body = title(painter, inner, "SHEET MUSIC", &legend, &p);
+                crate::staff::draw(painter, body, notes, s);
+            }
         }
     }
 
@@ -1212,9 +1344,16 @@ const EMPTY_HINT: &str = "right-click here for the Theory menu";
 /// height, a "detached" layout tweak — the inverse stops being an inverse and
 /// every click in the window lands somewhere slightly wrong, invisibly. There
 /// is one picture, drawn at whatever rect it is handed.
-fn draw_detached(painter: &Painter, rect: Rect, views: Views, input: Input, s: &Settings) {
+fn draw_detached(
+    painter: &Painter,
+    rect: Rect,
+    views: &Views,
+    input: Input,
+    notes: &std::collections::HashSet<u8>,
+    s: &Settings,
+) {
     if views.any() {
-        draw(painter, rect, views, input, s);
+        draw(painter, rect, views, input, notes, s);
     } else {
         let p = palette(s);
         painter.rect_filled(rect, 0.0, p.bg);
@@ -1260,8 +1399,9 @@ pub fn show_detached_window(
     builder_pos: Option<Pos2>,
     borderless: bool,
     main_focused: bool,
-    views: Views,
+    views: &Views,
     input: Input,
+    notes: &std::collections::HashSet<u8>,
     s: &Settings,
 ) -> DetachedOutcome {
     let mut outcome = DetachedOutcome::default();
@@ -1290,7 +1430,7 @@ pub fn show_detached_window(
             // see and did not point at. Nothing here may reach for a band
             // rect, which is why none is passed in.
             let rect = ui.max_rect();
-            draw_detached(ui.painter(), rect, views, input, s);
+            draw_detached(ui.painter(), rect, views, input, notes, s);
             painter_border(ui.painter(), rect);
 
             let (close, inner_rect, outer_rect, pressed, secondary, pointer, ctrl) =
@@ -1335,7 +1475,7 @@ pub fn show_detached_window(
             // happens and do nothing at all — a dead patch of window.
             if pressed && !menu && s.keytoggle_enabled {
                 if let Some(p) = pointer {
-                    outcome.hit = hit_test(rect, views, input, p);
+                    outcome.hit = hit_test(rect, &views, input, p);
                 }
             }
 
@@ -1509,6 +1649,7 @@ impl GeometryGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     /// The circle really is fifths, all the way round and back to the start.
     /// A typo in that table would still look like a circle of fifths.
@@ -1674,17 +1815,110 @@ mod tests {
         }
     }
 
+    /// **The whole interaction, walked through as somebody would.**
+    ///
+    /// Four number keys, and between them they choose what is showing AND
+    /// arrange it — because a toggle that appends is a reorder. This is the
+    /// sequence the owner described, asserted step by step, and it is the one
+    /// test in this file that would catch "on" quietly meaning "back in its
+    /// numbered slot", which would make the band's order permanent and the
+    /// second press of a number do nothing.
+    #[test]
+    fn the_number_keys_both_choose_and_arrange_the_band() {
+        // Everything, in the numbered order.
+        let mut band = Views::all();
+        assert_eq!(band.order(), View::ALL);
+
+        // 1 takes the first element away and the other three close up.
+        band = band.toggled(View::Circle);
+        assert_eq!(band.order(), &[View::Tonnetz, View::Triangles, View::Staff]);
+
+        // Empty it entirely. This is a real state: the band collapses and the
+        // window gives its height back.
+        for v in [View::Tonnetz, View::Triangles, View::Staff] {
+            band = band.toggled(v);
+        }
+        assert!(!band.any(), "the band did not collapse");
+        assert_eq!(band.count(), 0);
+
+        // From empty, ANY number puts that one element in full view.
+        band = band.toggled(View::Triangles);
+        assert_eq!(band.order(), &[View::Triangles]);
+
+        // And the next one goes to its RIGHT, whatever its number is. This is
+        // the reordering: 3 then 2 puts the Tonnetz after the triangles, which
+        // no arrangement of flags could have said.
+        band = band.toggled(View::Tonnetz);
+        assert_eq!(band.order(), &[View::Triangles, View::Tonnetz]);
+        band = band.toggled(View::Staff);
+        assert_eq!(band.order(), &[View::Triangles, View::Tonnetz, View::Staff]);
+
+        // Pressing a number twice moves that element to the end, which is the
+        // whole vocabulary: any arrangement is reachable from any other.
+        band = band.toggled(View::Triangles).toggled(View::Triangles);
+        assert_eq!(band.order(), &[View::Tonnetz, View::Staff, View::Triangles]);
+
+        // The numbers are FIXED to elements, not to positions. If this ever
+        // became "the nth showing panel", every rearrangement would rebind the
+        // keys under the user's fingers.
+        for (i, v) in View::ALL.iter().enumerate() {
+            assert_eq!(View::from_number(i + 1), Some(*v));
+            assert_eq!(v.number(), i + 1);
+        }
+        assert_eq!(View::from_number(0), None);
+        assert_eq!(View::from_number(View::ALL.len() + 1), None);
+    }
+
+    /// The order survives the settings file, and a file from a build that knows
+    /// a fifth element still opens here.
+    #[test]
+    fn the_band_order_round_trips_and_tolerates_what_it_does_not_know() {
+        for band in every_selection() {
+            assert_eq!(Views::from_keys(&band.keys()), band, "{}", band.keys());
+        }
+        // A name this build has never heard of is DROPPED, not refused: the
+        // alternative is a file written by a later version resetting somebody's
+        // whole arrangement because one word in it was unfamiliar.
+        assert_eq!(
+            Views::from_keys("staff+spectrogram+circle"),
+            Views::of(vec![View::Staff, View::Circle])
+        );
+        assert_eq!(Views::from_keys(""), Views::default());
+        // And a name repeated is not two panels.
+        assert_eq!(
+            Views::from_keys("circle+circle"),
+            Views::of(vec![View::Circle])
+        );
+    }
+
+    /// **The cells divide the whole band and keep the order they were given.**
+    #[test]
+    fn the_cells_follow_the_order_and_leave_no_gap() {
+        let rect = Rect::from_min_size(Pos2::new(11.0, 7.0), Vec2::new(900.0, 300.0));
+        for band in every_selection() {
+            let cells = cells(rect, &band);
+            assert_eq!(
+                cells.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+                band.order(),
+                "the cells came out in a different order from the band"
+            );
+            if band.any() {
+                let total: f32 = cells.iter().map(|(_, r)| r.width()).sum();
+                assert!((total - rect.width()).abs() < 0.01, "the band has a gap");
+                assert!((cells[0].1.left() - rect.left()).abs() < 0.01);
+                let last = cells.last().expect("a cell").1;
+                assert!((last.right() - rect.right()).abs() < 0.01);
+            }
+        }
+    }
+
     /// Panes are laid out in a fixed order, so turning one off never makes the
     /// other two swap places under the user's eyes.
     #[test]
     fn panes_keep_their_order_and_fill_the_band() {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 300.0));
-        let all = Views {
-            circle: true,
-            tonnetz: true,
-            triangles: true,
-        };
-        let got = cells(rect, all);
+        let all = Views::all();
+        let got = cells(rect, &all);
         assert_eq!(
             got.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
             View::ALL.to_vec()
@@ -1693,31 +1927,21 @@ mod tests {
         assert!((total - rect.width()).abs() < 0.5, "panes left a gap");
 
         // Dropping the middle one keeps the outer two in the same order.
-        let two = Views {
-            circle: true,
-            tonnetz: false,
-            triangles: true,
-        };
+        let two = Views::of(vec![View::Circle, View::Triangles]);
         assert_eq!(
-            cells(rect, two).iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            cells(rect, &two).iter().map(|(v, _)| *v).collect::<Vec<_>>(),
             vec![View::Circle, View::Triangles]
         );
-        assert!(cells(rect, Views::default()).is_empty());
+        assert!(cells(rect, &Views::default()).is_empty());
     }
 
     /// The band takes no height when nothing is selected — the window must not
     /// grow by 300 points to show three empty panes.
     #[test]
     fn an_empty_selection_takes_no_band() {
-        assert_eq!(band_height(1300.0, Views::default()), 0.0);
+        assert_eq!(band_height(1300.0, &Views::default()), 0.0);
         assert!(
-            band_height(
-                1300.0,
-                Views {
-                    circle: true,
-                    ..Default::default()
-                }
-            ) > 0.0
+            band_height(1300.0, &Views::of(vec![View::Circle])) > 0.0
         );
     }
 
@@ -1728,14 +1952,10 @@ mod tests {
         for pct in [50i64, 75, 100, 125, 150, 175, 200] {
             let w = (1300.0 * pct as f64 / 100.0).trunc() as f32;
             for n in 1..=3usize {
-                let views = Views {
-                    circle: true,
-                    tonnetz: n >= 2,
-                    triangles: n >= 3,
-                };
-                let h = band_height(w, views);
+                let views = Views::of(vec![View::Circle]);
+                let h = band_height(w, &views);
                 let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
-                for (_, cell) in cells(band, views) {
+                for (_, cell) in cells(band, &views) {
                     // What draw() hands each diagram, and then what title()
                     // leaves below itself.
                     let inner = cell.shrink(8.0);
@@ -1909,13 +2129,9 @@ mod tests {
         for pct in [50i64, 75, 100, 125, 150, 175, 200] {
             let w = (1300.0 * pct as f64 / 100.0).trunc() as f32;
             for n in 1..=3usize {
-                let views = Views {
-                    circle: n >= 2,
-                    tonnetz: true,
-                    triangles: n >= 3,
-                };
-                let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w, views)));
-                for (v, cell) in cells(band, views) {
+                let views = Views::of(vec![View::Tonnetz]);
+                let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w, &views)));
+                for (v, cell) in cells(band, &views) {
                     if v == View::Tonnetz {
                         out.push((band, cell));
                     }
@@ -1997,13 +2213,10 @@ mod tests {
     /// asks the hit test what is at its exact centre.
     #[test]
     fn a_click_on_a_tonnetz_node_finds_that_note() {
-        let views = Views {
-            tonnetz: true,
-            ..Default::default()
-        };
+        let views = Views::of(vec![View::Tonnetz]);
         for pane in real_panes() {
             let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(pane.width() + 16.0, 300.0));
-            let cell = cells(band, views)[0].1;
+            let cell = cells(band, &views)[0].1;
             let body = body_rect(cell.shrink(8.0));
             let Some(l) = Lattice::fit(body) else {
                 continue;
@@ -2016,7 +2229,7 @@ mod tests {
                     }
                     let c = l.at(u, v);
                     assert_eq!(
-                        hit_test(band, views, Input::default(), c),
+                        hit_test(band, &views, Input::default(), c),
                         Some(Hit::Pc(tonnetz_pc(u, v, 0))),
                         "clicking the centre of node ({u},{v}) missed it"
                     );
@@ -2031,12 +2244,9 @@ mod tests {
     /// both rings, all the way round.
     #[test]
     fn a_click_on_a_circle_name_finds_that_note() {
-        let views = Views {
-            circle: true,
-            ..Default::default()
-        };
+        let views = Views::of(vec![View::Circle]);
         let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(440.0, 300.0));
-        let body = body_rect(cells(band, views)[0].1.shrink(8.0));
+        let body = body_rect(cells(band, &views)[0].1.shrink(8.0));
         let c = body.center();
         let r = body.width().min(body.height()) * 0.5 - 2.0;
         for (i, &pc) in FIFTHS.iter().enumerate() {
@@ -2046,32 +2256,29 @@ mod tests {
             let major_at = c + dir * ((r * 0.80 + r * 0.56) * 0.5);
             let minor_at = c + dir * ((r * 0.56 + r * 0.34) * 0.5);
             assert_eq!(
-                hit_test(band, views, Input::default(), major_at),
+                hit_test(band, &views, Input::default(), major_at),
                 Some(Hit::Pc(pc)),
                 "the major name at position {i} is not clickable"
             );
             // The relative-minor ring is a label. Every pitch class is
             // already reachable on the major ring, so nothing is lost.
             assert_eq!(
-                hit_test(band, views, Input::default(), minor_at),
+                hit_test(band, &views, Input::default(), minor_at),
                 None,
                 "the relative-minor label at position {i} acts as a control"
             );
         }
         // The hub and the signature ring are labels, not controls.
-        assert_eq!(hit_test(band, views, Input::default(), c), None);
+        assert_eq!(hit_test(band, &views, Input::default(), c), None);
     }
 
     /// Each vertex of the hexagram gives back the chord printed on it, in
     /// every key — and the two triangles must not answer for each other.
     #[test]
     fn a_click_on_a_chord_vertex_gives_that_chord() {
-        let views = Views {
-            triangles: true,
-            ..Default::default()
-        };
+        let views = Views::of(vec![View::Triangles]);
         let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(440.0, 300.0));
-        let body = body_rect(cells(band, views)[0].1.shrink(8.0));
+        let body = body_rect(cells(band, &views)[0].1.shrink(8.0));
         let c = body.center();
         let r = hexagram_radius(body);
         for tonic in 0..12u8 {
@@ -2084,7 +2291,7 @@ mod tests {
             let roots = [tonic, (tonic + 5) % 12, (tonic + 7) % 12];
             for (k, &oi) in HEX_UP_ORDER.iter().enumerate() {
                 assert_eq!(
-                    hit_test(band, views, input, hex_vertex(c, r, k, false)),
+                    hit_test(band, &views, input, hex_vertex(c, r, k, false)),
                     Some(Hit::Triad {
                         root: roots[oi],
                         minor: false
@@ -2094,7 +2301,7 @@ mod tests {
             }
             for (k, &oi) in HEX_DOWN_ORDER.iter().enumerate() {
                 assert_eq!(
-                    hit_test(band, views, input, hex_vertex(c, r, k, true)),
+                    hit_test(band, &views, input, hex_vertex(c, r, k, true)),
                     Some(Hit::Triad {
                         root: roots[oi],
                         minor: true
@@ -2114,13 +2321,9 @@ mod tests {
     /// exactly that reason.
     #[test]
     fn a_click_belongs_to_the_pane_it_landed_in() {
-        let all = Views {
-            circle: true,
-            tonnetz: true,
-            triangles: true,
-        };
+        let all = Views::of(vec![View::Circle, View::Tonnetz, View::Triangles]);
         let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 300.0));
-        let panes = cells(band, all);
+        let panes = cells(band, &all);
         let triangles_cell = panes
             .iter()
             .find(|(v, _)| *v == View::Triangles)
@@ -2134,7 +2337,7 @@ mod tests {
         for x in (0..1300).step_by(7) {
             for y in (0..300).step_by(7) {
                 let p = Pos2::new(x as f32, y as f32);
-                match hit_test(band, all, Input::default(), p) {
+                match hit_test(band, &all, Input::default(), p) {
                     Some(Hit::Triad { .. }) => {
                         assert!(
                             triangles_cell.contains(p),
@@ -2166,7 +2369,7 @@ mod tests {
                 assert_eq!(
                     hit_test(
                         band,
-                        Views::default(),
+                        &Views::default(),
                         Input::default(),
                         Pos2::new(x as f32, y as f32)
                     ),
@@ -2189,25 +2392,12 @@ mod tests {
         let s = Settings::default();
         for w in [40.0_f32, 120.0, 400.0, 1300.0, 2600.0] {
             for views in [
-                Views {
-                    circle: true,
-                    ..Default::default()
-                },
-                Views {
-                    tonnetz: true,
-                    ..Default::default()
-                },
-                Views {
-                    triangles: true,
-                    ..Default::default()
-                },
-                Views {
-                    circle: true,
-                    tonnetz: true,
-                    triangles: true,
-                },
+                Views::of(vec![View::Circle]),
+                Views::of(vec![View::Tonnetz]),
+                Views::of(vec![View::Triangles]),
+                Views::of(vec![View::Circle, View::Tonnetz, View::Triangles]),
             ] {
-                let h = band_height(w, views);
+                let h = band_height(w, &views);
                 let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
                 for pcs in [0u16, 0b0000_1001_0001, 0xFFF, 0b1000_0000_0001] {
                     let input = Input {
@@ -2218,7 +2408,7 @@ mod tests {
                     };
                     let _ = ctx.run(Default::default(), |ctx| {
                         let painter = ctx.layer_painter(egui::LayerId::background());
-                        draw(&painter, rect, views, input, &s);
+                        draw(&painter, rect, &views, input, &HashSet::new(), &s);
                     });
                 }
             }
@@ -2231,19 +2421,25 @@ mod tests {
     /// whole set: the window has to survive combinations the band never shows,
     /// because the band with nothing selected is zero points tall and simply
     /// is not there, while the window is still on the user's screen.
+    /// **Every ordered subset of the band**, which is what the band can now
+    /// be: sixty-five of them, from empty to all four in each of their
+    /// twenty-four arrangements. It used to be the eight combinations three
+    /// flags could express, and order was not one of the things it could
+    /// express — so nothing here could have caught a hit test that was right
+    /// about WHICH panels and wrong about where they were.
     fn every_selection() -> Vec<Views> {
-        let mut out = Vec::new();
-        for circle in [false, true] {
-            for tonnetz in [false, true] {
-                for triangles in [false, true] {
-                    out.push(Views {
-                        circle,
-                        tonnetz,
-                        triangles,
-                    });
+        fn grow(prefix: Vec<View>, out: &mut Vec<Views>) {
+            out.push(Views::of(prefix.clone()));
+            for v in View::ALL {
+                if !prefix.contains(&v) {
+                    let mut next = prefix.clone();
+                    next.push(v);
+                    grow(next, out);
                 }
             }
         }
+        let mut out = Vec::new();
+        grow(Vec::new(), &mut out);
         out
     }
 
@@ -2255,7 +2451,7 @@ mod tests {
     /// against itself proves nothing. If `draw_circle` moves the name ring or
     /// `draw_triangles` moves a vertex, this goes stale and the assertions
     /// below fail, which is the point.
-    fn controls(rect: Rect, views: Views, input: Input) -> Vec<(View, Pos2, Hit)> {
+    fn controls(rect: Rect, views: &Views, input: Input) -> Vec<(View, Pos2, Hit)> {
         let mut out = Vec::new();
         for (view, cell) in cells(rect, views) {
             let body = body_rect(cell.shrink(8.0));
@@ -2273,6 +2469,8 @@ mod tests {
                         out.push((view, c + dir * ((r * 0.80 + r * 0.56) * 0.5), Hit::Pc(pc)));
                     }
                 }
+                // The sheet music has nothing to click on: it is a readout.
+                View::Staff => {}
                 View::Tonnetz => {
                     let Some(l) = Lattice::fit(body) else {
                         continue;
@@ -2358,7 +2556,7 @@ mod tests {
             // hit test that quietly used band geometry could not pass.
             for views in every_selection() {
                 assert_ne!(
-                    band_height(size.x, views),
+                    band_height(size.x, &views),
                     size.y,
                     "{size:?} is a size the band can have, so this test cannot \
                      tell the window's geometry from the band's"
@@ -2369,17 +2567,23 @@ mod tests {
             for origin in [Pos2::ZERO, Pos2::new(37.0, 11.0)] {
                 let rect = Rect::from_min_size(origin, size);
                 for views in every_selection() {
-                    let controls = controls(rect, views, input);
+                    let controls = controls(rect, &views, input);
                     for (view, at, want) in &controls {
                         assert_eq!(
-                            hit_test(rect, views, input, *at),
+                            hit_test(rect, &views, input, *at),
                             Some(*want),
                             "{view:?} in a {size:?} window at {origin:?}: the \
                              control drawn at {at:?} is not clickable"
                         );
                         checked += 1;
                     }
-                    if views.any() && size.x >= DETACHED_MIN.x {
+                    // A band with something CLICKABLE in it must produce
+                    // controls. The sheet music is a readout and has none, so a
+                    // band of nothing but sheet music legitimately produces
+                    // none — which is a different thing from a diagram that
+                    // silently stopped drawing.
+                    let clickable = views.order().iter().any(|v| *v != View::Staff);
+                    if clickable && size.x >= DETACHED_MIN.x {
                         assert!(
                             !controls.is_empty(),
                             "{views:?} produced no controls at all in a \
@@ -2389,7 +2593,7 @@ mod tests {
                 }
             }
         }
-        assert!(checked > 500, "only {checked} controls were checked");
+        assert!(checked > 300, "only {checked} controls were checked");
     }
 
     /// ...and the band would have answered differently, which is what makes the
@@ -2401,17 +2605,13 @@ mod tests {
     #[test]
     fn the_band_and_the_window_do_not_agree_about_what_is_under_a_point() {
         let input = c_major();
-        let views = Views {
-            circle: true,
-            tonnetz: true,
-            triangles: true,
-        };
+        let views = Views::of(vec![View::Circle, View::Tonnetz, View::Triangles]);
         let window = Rect::from_min_size(Pos2::ZERO, DETACHED_DEFAULT);
-        let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, band_height(1300.0, views)));
-        let controls = controls(window, views, input);
+        let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, band_height(1300.0, &views)));
+        let controls = controls(window, &views, input);
         let wrong = controls
             .iter()
-            .filter(|(_, at, want)| hit_test(band, views, input, *at) != Some(*want))
+            .filter(|(_, at, want)| hit_test(band, &views, input, *at) != Some(*want))
             .count();
         assert!(
             wrong * 2 > controls.len(),
@@ -2432,14 +2632,13 @@ mod tests {
     /// than remembered.
     #[test]
     fn the_smallest_window_still_holds_three_diagrams() {
-        let views = Views {
-            circle: true,
-            tonnetz: true,
-            triangles: true,
-        };
+        let views = Views::of(vec![View::Circle, View::Tonnetz, View::Triangles]);
         let rect = Rect::from_min_size(Pos2::ZERO, DETACHED_MIN);
-        let at_min = controls(rect, views, c_major());
-        for view in View::ALL {
+        let at_min = controls(rect, &views, c_major());
+        // The sheet music is not in this list and cannot be: it has no
+        // controls to count. It is a readout, and `controls` only knows about
+        // things you can click.
+        for view in View::ALL.into_iter().filter(|v| *v != View::Staff) {
             let n = at_min.iter().filter(|(v, _, _)| *v == view).count();
             assert!(
                 n > 0,
@@ -2450,7 +2649,7 @@ mod tests {
         // And the floor is not wastefully high: a little under it, something
         // does give up. Otherwise the minimum is just a number nobody checked.
         let tighter = Rect::from_min_size(Pos2::ZERO, DETACHED_MIN - Vec2::new(60.0, 0.0));
-        let shrunk = controls(tighter, views, c_major());
+        let shrunk = controls(tighter, &views, c_major());
         assert!(
             shrunk.len() < at_min.len(),
             "nothing was lost 60pt below the minimum, so the minimum is set \
@@ -2470,7 +2669,7 @@ mod tests {
     /// it is exactly what makes the window testable without a window manager.
     fn run_detached(
         size: Vec2,
-        views: Views,
+        views: &Views,
         input: Input,
         s: &Settings,
         events: Vec<egui::Event>,
@@ -2508,7 +2707,17 @@ mod tests {
         let mut outcome = DetachedOutcome::default();
         let out = ctx.run(raw(events, modifiers, closing), |ctx| {
             outcome =
-                show_detached_window(ctx, size, Some(WINDOW_ORIGIN), false, true, views, input, s);
+                show_detached_window(
+                    ctx,
+                    size,
+                    Some(WINDOW_ORIGIN),
+                    false,
+                    true,
+                    &views,
+                    input,
+                    &HashSet::new(),
+                    s,
+                );
         });
         (outcome, out)
     }
@@ -2553,23 +2762,19 @@ mod tests {
     fn a_click_on_a_chord_vertex_in_the_window_places_that_triad() {
         let s = keytoggle_on();
         let input = c_major();
-        let views = Views {
-            circle: true,
-            tonnetz: true,
-            triangles: true,
-        };
+        let views = Views::of(vec![View::Circle, View::Tonnetz, View::Triangles]);
         let size = DETACHED_DEFAULT;
         let rect = Rect::from_min_size(Pos2::ZERO, size);
-        let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, band_height(1300.0, views)));
+        let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, band_height(1300.0, &views)));
 
         let mut checked = 0;
-        for (view, at, want) in controls(rect, views, input) {
+        for (view, at, want) in controls(rect, &views, input) {
             if view != View::Triangles {
                 continue;
             }
             let (outcome, _) = run_detached(
                 size,
-                views,
+                &views,
                 input,
                 &s,
                 click_at(at, egui::PointerButton::Primary, Default::default()),
@@ -2587,7 +2792,7 @@ mod tests {
             // is the assertion that would fail if the window ever hit-tested
             // against band geometry.
             assert_ne!(
-                hit_test(band, views, input, at),
+                hit_test(band, &views, input, at),
                 Some(want),
                 "the band happens to answer the same at {at:?}, so this case \
                  cannot tell the two rects apart"
@@ -2606,16 +2811,13 @@ mod tests {
     #[test]
     fn a_click_is_not_a_note_when_keytoggle_is_off() {
         let input = c_major();
-        let views = Views {
-            triangles: true,
-            ..Default::default()
-        };
+        let views = Views::of(vec![View::Triangles]);
         let size = DETACHED_DEFAULT;
         let rect = Rect::from_min_size(Pos2::ZERO, size);
-        let at = controls(rect, views, input)[0].1;
+        let at = controls(rect, &views, input)[0].1;
         let (outcome, _) = run_detached(
             size,
-            views,
+            &views,
             input,
             &Settings::default(),
             click_at(at, egui::PointerButton::Primary, Default::default()),
@@ -2639,17 +2841,14 @@ mod tests {
     fn a_right_click_asks_for_the_menu_in_monitor_coordinates_and_places_nothing() {
         let s = keytoggle_on();
         let input = c_major();
-        let views = Views {
-            triangles: true,
-            ..Default::default()
-        };
+        let views = Views::of(vec![View::Triangles]);
         let size = DETACHED_DEFAULT;
         let rect = Rect::from_min_size(Pos2::ZERO, size);
-        let at = controls(rect, views, input)[0].1;
+        let at = controls(rect, &views, input)[0].1;
 
         let (outcome, _) = run_detached(
             size,
-            views,
+            &views,
             input,
             &s,
             click_at(at, egui::PointerButton::Secondary, Default::default()),
@@ -2672,7 +2871,7 @@ mod tests {
         };
         let (outcome, _) = run_detached(
             size,
-            views,
+            &views,
             input,
             &s,
             click_at(at, egui::PointerButton::Primary, ctrl),
@@ -2693,7 +2892,7 @@ mod tests {
         } else {
             assert_eq!(
                 outcome.hit,
-                Some(controls(rect, views, input)[0].2),
+                Some(controls(rect, &views, input)[0].2),
                 "off macOS, ctrl is not a context-menu gesture and the click \
                  is an ordinary one"
             );
@@ -2706,10 +2905,7 @@ mod tests {
     fn closing_the_window_is_how_the_band_comes_back() {
         let (outcome, _) = run_detached(
             DETACHED_DEFAULT,
-            Views {
-                circle: true,
-                ..Default::default()
-            },
+            &Views::of(vec![View::Circle]),
             c_major(),
             &Settings::default(),
             Vec::new(),
@@ -2737,7 +2933,7 @@ mod tests {
                 for input in [Input::default(), c_major()] {
                     let (outcome, out) = run_detached(
                         size,
-                        views,
+                        &views,
                         input,
                         &s,
                         Vec::new(),
@@ -2789,7 +2985,7 @@ mod tests {
                         rect.min.y + size.y * y as f32 / 23.0,
                     );
                     assert_eq!(
-                        hit_test(rect, Views::default(), c_major(), p),
+                        hit_test(rect, &Views::default(), c_major(), p),
                         None,
                         "something in the empty window at {p:?} is clickable"
                     );

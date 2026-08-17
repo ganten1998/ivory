@@ -290,6 +290,8 @@ pub struct IvoryApp {
     /// The last right-click landed on the Recorder band, so its category leads
     /// the menu. Read once when the menu is built and then irrelevant.
     menu_over_recorder: bool,
+    /// The last right-click landed on the sheet music panel.
+    menu_over_staff: bool,
     /// A numeric field being typed into, if any.
     ///
     /// Mutually exclusive with `name_focused` in practice, because a press
@@ -504,6 +506,7 @@ impl IvoryApp {
             grabbed: None,
             num_edit: None,
             menu_over_recorder: false,
+            menu_over_staff: false,
             audio_status: recorder::AudioStatus::default(),
             fullscreen_sent: None,
             plugin_list: Vec::new(),
@@ -992,7 +995,7 @@ impl IvoryApp {
             recorder_on: self.settings.show_recorder,
             camera_pane_on: self.settings.show_camera_pane,
             extra_plugin_folders: self.settings.plugin_paths.len(),
-            staff_on: self.settings.show_staff,
+            staff_on: self.settings.theory_views().contains(theory_panel::View::Staff),
             staff_note_names: self.settings.staff_note_names,
             staff_set: self.settings.staff_set.clone(),
             // Offered only when there IS one — a "Custom" row that does nothing
@@ -1015,6 +1018,8 @@ impl IvoryApp {
             count_in_bars: self.settings.count_in_bars(),
             count_in_in_take: self.settings.record_count_in_in_take,
             recorder_first: self.menu_over_recorder && self.settings.show_recorder,
+            staff_first: self.menu_over_staff,
+            staff_key: self.settings.staff_key,
             record_sources: self.settings.record_sources.clone(),
             metronome_on: self.settings.metronome_on,
             metronome_in_take: self.settings.metronome_in_take,
@@ -1097,6 +1102,16 @@ impl IvoryApp {
                 // followed by a hunt down a list of subjects that are mostly
                 // about the piano.
                 self.menu_over_recorder = recorder_rect.is_some_and(|r| r.contains(pos));
+                // And the same for the sheet music: right-clicking the staff
+                // leads with its own controls, which is where the key signature
+                // lives. Sixteen key signatures are worth reaching from the
+                // thing they are printed on rather than from a list of subjects
+                // that are mostly about the piano.
+                self.menu_over_staff = theory_rect.is_some_and(|r| {
+                    theory_panel::cells(r, &self.settings.theory_views())
+                        .into_iter()
+                        .any(|(v, cell)| v == theory_panel::View::Staff && cell.contains(pos))
+                });
                 self.open_menu_at(ctx, global);
             }
             return;
@@ -1261,7 +1276,7 @@ impl IvoryApp {
                         let display = self.display_notes();
                         theory_panel::hit_test(
                             r,
-                            self.settings.theory_views(),
+                            &self.settings.theory_views(),
                             self.theory_input(&display),
                             pos,
                         )
@@ -1774,6 +1789,19 @@ impl IvoryApp {
         spec
     }
 
+    /// Put the sheet music in the band if it is not there.
+    ///
+    /// Every control that changes what the staff SHOWS calls this: turning the
+    /// clef on a panel that is not on screen is the one thing those keys could
+    /// do that would look broken, and "nothing happened" is indistinguishable
+    /// from "the key does not work".
+    fn show_the_staff(&mut self) {
+        use crate::theory_panel::View;
+        if !self.settings.theory_views().contains(View::Staff) {
+            self.settings.toggle_theory_view(View::Staff);
+        }
+    }
+
     /// Debounce a settings write. See `settings_save_at`.
     fn save_settings_soon(&mut self) {
         self.settings_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
@@ -2229,52 +2257,20 @@ impl IvoryApp {
             }
             K::ToggleFretboard => self.apply_menu_action(ctx, MenuAction::ToggleFretboard),
             K::ToggleCameraPane => self.apply_menu_action(ctx, MenuAction::ToggleCameraPane),
-            K::ToggleStaff => self.apply_menu_action(ctx, MenuAction::ToggleStaff),
             K::CycleClef => self.apply_menu_action(ctx, MenuAction::CycleClef),
             K::ToggleNoteNames => self.apply_menu_action(ctx, MenuAction::ToggleNoteNames),
-            // One key, five states, in the order someone discovering the band
-            // would want them: nothing, each diagram alone, then all three.
-            // Three independent toggles have eight states and no natural
-            // order, so the key walks a path through them rather than trying
-            // to enumerate them; the menu is there for the other three.
-            K::CycleTheory => {
-                use theory_panel::{View, Views};
-                const CYCLE: [Views; 5] = [
-                    Views {
-                        circle: true,
-                        tonnetz: false,
-                        triangles: false,
-                    },
-                    Views {
-                        circle: false,
-                        tonnetz: true,
-                        triangles: false,
-                    },
-                    Views {
-                        circle: false,
-                        tonnetz: false,
-                        triangles: true,
-                    },
-                    Views {
-                        circle: true,
-                        tonnetz: true,
-                        triangles: true,
-                    },
-                    Views {
-                        circle: false,
-                        tonnetz: false,
-                        triangles: false,
-                    },
-                ];
-                let now = self.settings.theory_views();
-                let next = CYCLE
-                    .iter()
-                    .position(|v| *v == now)
-                    .map_or(CYCLE[0], |i| CYCLE[(i + 1) % CYCLE.len()]);
-                for v in View::ALL {
-                    self.settings.set_theory_view(v, v.is_on(next));
+            // **Every element back, in the numbered order.** It used to walk a
+            // five-state cycle through combinations of three diagrams, which
+            // existed because three independent flags have eight states and no
+            // natural order. The number keys are that control now, and they do
+            // it better — so this key is the way OUT of any arrangement,
+            // including the empty one you cannot press a number to escape from
+            // without knowing which number.
+            K::CycleTheory => self.apply_menu_action(ctx, MenuAction::ShowAllTheory),
+            K::ToggleTheoryElement(n) => {
+                if let Some(v) = theory_panel::View::from_number(n) {
+                    self.apply_menu_action(ctx, MenuAction::ToggleTheoryView(v));
                 }
-                self.save_settings();
             }
             // Space. Not routed through a `MenuAction`, because there is no
             // menu row for it: pressing Record is what the BAND is for, and a
@@ -2433,8 +2429,17 @@ impl IvoryApp {
                 self.save_settings();
             }
             MenuAction::ToggleTheoryView(v) => {
-                let on = !v.is_on(self.settings.theory_views());
-                self.settings.set_theory_view(v, on);
+                self.settings.toggle_theory_view(v);
+                self.save_settings();
+                // The band's HEIGHT does not change with the count — the cells
+                // divide its width — but it goes to zero when the last element
+                // leaves and comes back when the first one returns, so the
+                // window still has to be re-measured.
+                self.request_natural_size();
+            }
+            MenuAction::ShowAllTheory => {
+                self.settings
+                    .set_theory_views(&theory_panel::Views::all());
                 self.save_settings();
                 self.request_natural_size();
             }
@@ -2460,17 +2465,12 @@ impl IvoryApp {
                 // diagrams draw into a row that is the wrong shape for them.
                 self.request_natural_size();
             }
-            MenuAction::ToggleStaff => {
-                self.settings.show_staff = !self.settings.show_staff;
-                self.save_settings();
-                self.request_natural_size();
-            }
             MenuAction::CycleClef => {
                 // Turning the clef on a band you cannot see is the one thing
                 // this key could do that would look broken, so it opens it.
                 let next = self.settings.staff_set().next();
                 self.settings.set_staff_set(&next);
-                self.settings.show_staff = true;
+                self.show_the_staff();
                 self.save_settings();
                 // The staff count changes with the set — one staff or two — so
                 // the window has to be asked for a new height.
@@ -2487,7 +2487,7 @@ impl IvoryApp {
                 } else {
                     key.to_owned()
                 };
-                self.settings.show_staff = true;
+                self.show_the_staff();
                 self.save_settings();
                 self.request_natural_size();
             }
@@ -2510,10 +2510,16 @@ impl IvoryApp {
                             self.settings.custom_staff_set = None;
                         }
                     }
-                    self.settings.show_staff = true;
+                    self.show_the_staff();
                     self.save_settings();
                     self.request_natural_size();
                 }
+            }
+            MenuAction::SetStaffKey(k) => {
+                self.settings.staff_key = k.clamp(-staff::MAX_KEY, staff::MAX_KEY);
+                self.show_the_staff();
+                self.save_settings();
+                self.request_natural_size();
             }
             MenuAction::ToggleNoteNames => {
                 self.settings.staff_note_names = !self.settings.staff_note_names;
@@ -3177,7 +3183,7 @@ fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
     let theory_h = if settings.theory_detached {
         0.0
     } else {
-        theory_panel::band_height(w - camera_w, settings.theory_views())
+        theory_panel::band_height(w - camera_w, &settings.theory_views())
     };
     // The ROW, which is the taller of the two things in it. With the theory
     // band off or empty the pane still needs its row, or turning the diagrams
@@ -3199,14 +3205,11 @@ fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
     } else {
         0.0
     };
-    let staff_h = staff::visible_set(settings)
-        .map_or(0.0, |set| staff::band_height(w, &set));
     Bands {
         w,
         recorder_h,
         theory_h,
         camera_w,
-        staff_h,
         chord_h,
         piano_h,
         fret_h,
@@ -3274,7 +3277,6 @@ fn fill_bands(settings: &Settings, avail: Vec2) -> Bands {
         w,
         recorder_h: natural.recorder_h * k,
         theory_h: natural.theory_h * k,
-        staff_h: natural.staff_h * k,
         // Scaled by `k` as well, and it has to be. `k` stretches every band's
         // height to fill the screen, so the theory row ends up `h*k` tall — and
         // a pane whose width did NOT follow stops being 16:9 and starts putting
@@ -3328,10 +3330,6 @@ struct Bands {
     theory_h: f32,
     /// How much of that row the camera pane takes. Zero when it is off.
     camera_w: f32,
-    /// The sheet music, between the diagrams and the chord name — which is
-    /// where it belongs in a window that goes from keys at the bottom to the
-    /// most abstract thing at the top.
-    staff_h: f32,
     chord_h: f32,
     piano_h: f32,
     fret_h: f32,
@@ -3375,12 +3373,7 @@ impl Bands {
     fn total(self) -> Vec2 {
         Vec2::new(
             self.w,
-            self.recorder_h
-                + self.theory_h
-                + self.staff_h
-                + self.chord_h
-                + self.piano_h
-                + self.fret_h,
+            self.recorder_h + self.theory_h + self.chord_h + self.piano_h + self.fret_h,
         )
     }
 }
@@ -3455,25 +3448,20 @@ impl IvoryApp {
         s.chord_window_detached = false;
         s.show_fretboard = shows.fretboard;
         s.fretboard_detached = false;
-        s.show_staff = shows.staff;
         s.theory_detached = false;
-        // The theory band is three flags and no "show theory" bool — it exists
-        // exactly when one of its diagrams is on — so the override has to work
-        // in both directions by hand.
+        // The theory band has no "show theory" bool — it exists exactly when
+        // something is in it — so the override has to work in both directions
+        // by hand.
         if shows.theory {
-            // Asked for and nothing selected: show all three, which is what a
+            // Asked for and nothing selected: show everything, which is what a
             // fresh install shows. Forcing it off was symmetric and wrong —
             // ticking "theory" in the Export dialog and getting no theory is
             // the tick doing nothing.
             if !s.theory_views().any() {
-                s.theory_circle = true;
-                s.theory_tonnetz = true;
-                s.theory_triangles = true;
+                s.set_theory_views(&crate::theory_panel::Views::all());
             }
         } else {
-            s.theory_circle = false;
-            s.theory_tonnetz = false;
-            s.theory_triangles = false;
+            s.theory_order = String::new();
         }
         s
     }
@@ -3525,8 +3513,9 @@ impl IvoryApp {
                 theory_panel::draw(
                     painter,
                     theory,
-                    s.theory_views(),
+                    &s.theory_views(),
                     self.theory_input(&display),
+                    &display,
                     &s,
                 );
             }
@@ -3546,18 +3535,10 @@ impl IvoryApp {
                 );
             }
         }
-        if bands.staff_h > 0.0 && shows.staff {
-            staff::draw(
-                painter,
-                band_at(bands.theory_h, bands.staff_h),
-                &display,
-                &s,
-            );
-        }
         if bands.chord_h > 0.0 && shows.chord {
             chord_strip::draw(
                 painter,
-                band_at(bands.theory_h + bands.staff_h, bands.chord_h),
+                band_at(bands.theory_h, bands.chord_h),
                 self.current_chord.as_deref(),
                 s.chord_text_color.to_color32(),
                 // No heart and no transpose arrows in the video. Both are
@@ -3572,7 +3553,7 @@ impl IvoryApp {
         if shows.piano {
             piano::draw(
                 painter,
-                band_at(bands.theory_h + bands.staff_h + bands.chord_h, bands.piano_h),
+                band_at(bands.theory_h + bands.chord_h, bands.piano_h),
                 &display,
                 self.notes.sustain_down(),
                 &s,
@@ -3581,7 +3562,7 @@ impl IvoryApp {
         if bands.fret_h > 0.0 {
             let spec = s.fretboard_spec();
             let r = band_at(
-                bands.theory_h + bands.staff_h + bands.chord_h + bands.piano_h,
+                bands.theory_h + bands.chord_h + bands.piano_h,
                 bands.fret_h,
             );
             fretboard_panel::draw(
@@ -3814,7 +3795,6 @@ impl IvoryApp {
             recorder_h,
             theory_h,
             camera_w: _,
-            staff_h,
             chord_h,
             piano_h,
             fret_h,
@@ -3889,10 +3869,10 @@ impl IvoryApp {
         let band_at = |top: f32, h: f32| {
             Rect::from_min_size(Pos2::new(origin.x, origin.y + top), Vec2::new(w, h))
         };
-        let piano_rect = band_at(recorder_h + theory_h + staff_h + chord_h, piano_h);
+        let piano_rect = band_at(recorder_h + theory_h + chord_h, piano_h);
         let mut chord_rect_for_hit: Option<Rect> = None;
         let fret_rect_for_hit: Option<Rect> = (fret_h > 0.0)
-            .then(|| band_at(recorder_h + theory_h + staff_h + chord_h + piano_h, fret_h));
+            .then(|| band_at(recorder_h + theory_h + chord_h + piano_h, fret_h));
         // The row, then the two halves of it. The camera pane is not a hit
         // target — there is nothing to click on a picture of yourself — so only
         // the diagrams' half goes to the hit test.
@@ -3939,8 +3919,9 @@ impl IvoryApp {
             theory_panel::draw(
                 ui.painter(),
                 theory_rect,
-                self.settings.theory_views(),
+                &self.settings.theory_views(),
                 self.theory_input(&display),
+                &display,
                 &self.settings,
             );
         }
@@ -3954,16 +3935,8 @@ impl IvoryApp {
                 &self.settings,
             );
         }
-        if staff_h > 0.0 {
-            staff::draw(
-                ui.painter(),
-                band_at(recorder_h + theory_h, staff_h),
-                &display,
-                &self.settings,
-            );
-        }
         if chord_h > 0.0 {
-            let chord_rect = band_at(recorder_h + theory_h + staff_h, chord_h);
+            let chord_rect = band_at(recorder_h + theory_h, chord_h);
             chord_rect_for_hit = Some(chord_rect);
             chord_strip::draw(
                 ui.painter(),
@@ -4138,14 +4111,16 @@ impl IvoryApp {
         // above still open-code, so this block is the window plus one
         // `observe`.
         if self.theory_window_visible && self.caps.detachable {
+            let held = self.display_notes();
             let outcome = theory_panel::show_detached_window(
                 &ctx,
                 self.theory_builder_size,
                 self.theory_builder_pos,
                 self.settings.borderless_mode,
                 self.main_focused,
-                self.settings.theory_views(),
-                self.theory_input(&self.display_notes()),
+                &self.settings.theory_views(),
+                self.theory_input(&held),
+                &held,
                 &self.settings,
             );
             if let Some(g) = self.theory_guard.as_mut() {
@@ -4375,7 +4350,7 @@ mod tests {
     #[test]
     fn the_camera_pane_keeps_its_shape_when_the_layout_is_stretched_to_fill() {
         let mut s = Settings::default();
-        s.theory_circle = true;
+        s.set_theory_views(&theory_panel::Views::of(vec![theory_panel::View::Circle]));
         s.show_camera_pane = true;
         for avail in [
             Vec2::new(1920.0, 1080.0),
@@ -4412,9 +4387,12 @@ mod tests {
     fn the_camera_pane_is_sixteen_by_nine_and_the_diagrams_fit_beside_it() {
         for views in [1_u32, 2, 3] {
             let mut on = Settings::default();
-            on.theory_circle = true;
-            on.theory_tonnetz = views >= 2;
-            on.theory_triangles = views >= 3;
+            on.set_theory_views(&theory_panel::Views::of(
+                theory_panel::View::ALL
+                    .into_iter()
+                    .take(views as usize)
+                    .collect(),
+            ));
             on.show_camera_pane = true;
             let mut off = on.clone();
             off.show_camera_pane = false;
@@ -4464,9 +4442,7 @@ mod tests {
         // With the diagrams off entirely the pane still has its row, or `T`
         // would take the camera away with the circle of fifths.
         let mut only_camera = Settings::default();
-        only_camera.theory_circle = false;
-        only_camera.theory_tonnetz = false;
-        only_camera.theory_triangles = false;
+        only_camera.theory_order = String::new();
         only_camera.show_camera_pane = true;
         let b = band_sizes_at(&only_camera, 1300.0);
         assert!(b.camera_w > 0.0 && b.theory_h > 0.0, "the camera lost its row");
@@ -4553,9 +4529,11 @@ mod tests {
             let settings = Settings {
                 show_welcome: false,
                 show_fretboard: fret,
-                theory_circle: theory,
-                theory_tonnetz: theory,
-                theory_triangles: theory,
+                theory_order: if theory {
+                    theory_panel::Views::all().keys()
+                } else {
+                    String::new()
+                },
                 ..Settings::default()
             };
             let (ctx, mut app) = headless_with(Caps::PLUGIN, settings.clone());
@@ -4968,7 +4946,7 @@ mod tests {
         let mut s = Settings::default();
         for (fret, theory) in [(false, false), (true, false), (true, true)] {
             s.show_fretboard = fret;
-            s.theory_circle = theory;
+            s.theory_order = if theory { crate::theory_panel::Views::all().keys() } else { String::new() };
             for avail in [
                 Vec2::new(900.0, 260.0),  // the editor's default
                 Vec2::new(400.0, 200.0),  // a narrow rack
@@ -5026,7 +5004,7 @@ mod tests {
     #[test]
     fn a_detached_theory_band_takes_no_height_in_the_main_window() {
         let mut s = Settings::default();
-        s.theory_circle = true;
+        s.theory_order = if true { crate::theory_panel::Views::all().keys() } else { String::new() };
         let attached = band_sizes_at(&s, 1300.0);
         assert!(attached.theory_h > 0.0, "the band should be showing");
 
@@ -5052,7 +5030,7 @@ mod tests {
     fn a_plugin_never_starts_with_a_detached_theory_band() {
         let ctx = egui::Context::default();
         let mut s = Settings::default();
-        s.theory_circle = true;
+        s.theory_order = if true { crate::theory_panel::Views::all().keys() } else { String::new() };
         s.theory_detached = true;
         let app = IvoryApp::new(&ctx, s, Caps::PLUGIN);
         assert!(
@@ -5292,7 +5270,7 @@ mod tests {
     fn resetting_lands_where_a_fresh_install_lands() {
         let mut s = crate::settings::Settings::default();
         s.show_fretboard = false;
-        s.theory_circle = false;
+        s.theory_order = if false { crate::theory_panel::Views::all().keys() } else { String::new() };
         s.dark_mode = true;
         s.reset_to_defaults();
 
@@ -5301,9 +5279,10 @@ mod tests {
         assert_eq!(s.theory_views().count(), fresh.theory_views().count());
         assert_eq!(s.show_recorder, fresh.show_recorder);
         assert!(s.show_fretboard, "a reset hid the guitar view");
-        assert!(
-            s.theory_views().count() == 3,
-            "a reset hid the theory band"
+        assert_eq!(
+            s.theory_views(),
+            theory_panel::Views::all(),
+            "a reset did not restore every theory element"
         );
     }
 
@@ -5874,11 +5853,11 @@ mod tests {
     fn size_math_matches_python_int_truncation() {
         // The piano and the chord strip alone: this test is about the size
         // ARITHMETIC — the truncation Python did — and every other band is a
-        // separate term added to the same total. Leaving the sheet music on
-        // would be testing that the staff band exists, which its own module
-        // does, while making a failure here unreadable.
+        // separate term added to the same total. Leaving the theory band on
+        // would be testing that it exists, which its own tests do, while making
+        // a failure here unreadable.
         let mut s = Settings::default();
-        s.show_staff = false;
+        s.theory_order = String::new();
         let table = [
             (50, 650.0, 75.0, 25.0),
             (75, 975.0, 112.0, 37.0),

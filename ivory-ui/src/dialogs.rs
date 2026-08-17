@@ -872,7 +872,6 @@ pub fn shows_from_settings(s: &crate::settings::Settings) -> DisplayShows {
         // Tonnetz showing — hence `Views::any`, which is the same question the
         // band itself asks.
         theory: s.theory_views().any(),
-        staff: s.show_staff,
     }
 }
 
@@ -3399,13 +3398,6 @@ pub fn show(
                                             &mut spec.composite.shows.theory,
                                             "Theory",
                                         );
-                                        export_check(
-                                            ui,
-                                            &t,
-                                            shows_on,
-                                            &mut spec.composite.shows.staff,
-                                            "Sheet music",
-                                        );
                                     });
 
                                     // ── frame size and rate ─────────────────
@@ -4063,7 +4055,6 @@ mod tests {
                         chord: false,
                         fretboard: false,
                         theory: false,
-                        staff: true,
                     },
                     ..Default::default()
                 },
@@ -4305,9 +4296,11 @@ mod tests {
         assert!(shows.piano && shows.chord, "the panels that are never off");
         assert!(!shows.fretboard && !shows.theory);
         s.show_fretboard = true;
-        // Only the Tonnetz. Seeding from `theory_circle` alone would drop this
+        // Only the Tonnetz. Seeding from one element alone would drop this
         // user's band out of their video without saying anything.
-        s.theory_tonnetz = true;
+        s.set_theory_views(&crate::theory_panel::Views::of(vec![
+            crate::theory_panel::View::Tonnetz,
+        ]));
         let shows = shows_from_settings(&s);
         assert!(shows.fretboard && shows.theory);
     }

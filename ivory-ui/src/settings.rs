@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 3;
+const SETTINGS_VERSION: u64 = 4;
 
 /// Recorder backgrounds this app shipped as defaults before [`SETTINGS_VERSION`]
 /// 1, and which are therefore not evidence that anybody chose them.
@@ -196,9 +196,14 @@ pub struct Settings {
     /// band is 300 points tall at full width, and a window that grows on its
     /// own after an update is the geometry surprise this app has been bitten
     /// by before (see `show_fretboard`).
-    pub theory_circle: bool,
-    pub theory_tonnetz: bool,
-    pub theory_triangles: bool,
+    /// The theory band's elements, in order, as `Views::keys` writes them.
+    ///
+    /// **A string of names rather than a bool per diagram.** Flags can say what
+    /// is showing and cannot say WHERE, so the band's arrangement used to be
+    /// whatever order the enum was written in. A list says both, and one
+    /// interaction — a number key — edits both. An empty string is a collapsed
+    /// band, which is a real state and not a broken one.
+    pub theory_order: String,
     /// Whether the theory band follows what you are PLAYING.
     ///
     /// **On by default**, reversing the original argument. That argument was
@@ -234,8 +239,6 @@ pub struct Settings {
     /// Searched BEFORE the standard paths, so a folder somebody pointed at
     /// deliberately shadows a copy of the same plugin in a system directory.
     pub plugin_paths: Vec<String>,
-    /// The sheet music band is showing.
-    pub show_staff: bool,
     /// Which staves it shows, as `StaffSet::key` writes it.
     ///
     /// A string rather than an enum because a custom set is a LIST of clefs and
@@ -245,6 +248,13 @@ pub struct Settings {
     pub staff_set: String,
     /// Letter names printed inside the noteheads.
     pub staff_note_names: bool,
+    /// The key signature: sharps positive, flats negative, zero for none.
+    ///
+    /// Default zero, and that is a real choice rather than a missing feature.
+    /// This band shows whatever is being played with no idea what key it is in,
+    /// and a signature the app guessed would be a claim about the music that
+    /// nothing here can support. It is the player's to declare.
+    pub staff_key: i32,
     /// The user's own stack of clefs, remembered separately from the one that
     /// is showing.
     ///
@@ -523,13 +533,11 @@ impl Default for Settings {
                 .to_owned(),
             fretboard_detached: false,
             theory_detached: false,
-            theory_circle: false,
-            theory_tonnetz: false,
-            theory_triangles: false,
+            theory_order: String::new(),
             theory_follow_midi: true,
-            show_staff: true,
             staff_set: "grand".to_owned(),
             staff_note_names: false,
+            staff_key: 0,
             custom_staff_set: None,
             plugin_paths: Vec::new(),
             show_camera_pane: false,
@@ -681,9 +689,7 @@ impl Settings {
     pub fn first_launch() -> Self {
         Self {
             show_fretboard: true,
-            theory_circle: true,
-            theory_tonnetz: true,
-            theory_triangles: true,
+            theory_order: crate::theory_panel::Views::all().keys(),
             show_recorder: true,
             ..Self::default()
         }
@@ -724,6 +730,10 @@ impl Settings {
 
     fn from_map(mut map: Map<String, Value>) -> Self {
         let mut s = Self::default();
+        // Whether the FILE carried an explicit theory order. A file that did
+        // not is one written before the band was a list, and only such a file
+        // is migrated from the three bools — see `migrate_from`.
+        let mut saw_order = false;
         // Absent means version 0 — every file every build before this one
         // wrote. Removed from the map like every other known key, so it does
         // not also survive in `extra` and get written twice.
@@ -861,9 +871,19 @@ impl Settings {
             &mut s.teach_apply_all_keys,
         );
         take_bool(&mut map, "show_fretboard", &mut s.show_fretboard);
-        take_bool(&mut map, "theory_circle", &mut s.theory_circle);
-        take_bool(&mut map, "theory_tonnetz", &mut s.theory_tonnetz);
-        take_bool(&mut map, "theory_triangles", &mut s.theory_triangles);
+        // The three bools this used to be. Read but never written: they are
+        // the input to the version-4 migration and nothing else. See
+        // `migrate_from`.
+        let mut legacy = [false; 3];
+        take_bool(&mut map, "theory_circle", &mut legacy[0]);
+        take_bool(&mut map, "theory_tonnetz", &mut legacy[1]);
+        take_bool(&mut map, "theory_triangles", &mut legacy[2]);
+        if let Some(v) = map.remove("theory_order") {
+            if let Some(k) = v.as_str() {
+                s.theory_order = k.to_owned();
+                saw_order = true;
+            }
+        }
         take_bool(&mut map, "theory_follow_midi", &mut s.theory_follow_midi);
         if let Some(Value::Array(v)) = map.remove("plugin_paths") {
             s.plugin_paths = v
@@ -872,8 +892,10 @@ impl Settings {
                 .filter(|x| !x.trim().is_empty())
                 .collect();
         }
-        take_bool(&mut map, "show_staff", &mut s.show_staff);
         take_bool(&mut map, "staff_note_names", &mut s.staff_note_names);
+        if let Some(n) = map.remove("staff_key").and_then(|v| v.as_i64()) {
+            s.staff_key = (n as i32).clamp(-crate::staff::MAX_KEY, crate::staff::MAX_KEY);
+        }
         if let Some(v) = map.remove("staff_set") {
             if let Some(k) = v.as_str() {
                 s.staff_set = k.to_owned();
@@ -1062,7 +1084,7 @@ impl Settings {
         if !saw_bars {
             s.convert_count_in_to_bars();
         }
-        s.migrate_from(was);
+        s.migrate_from(was, legacy, saw_order);
         s
     }
 
@@ -1076,7 +1098,33 @@ impl Settings {
     /// stamped on the next save. That is the cost, and it is worth paying: the
     /// alternative is what this app did until now, which is that a default,
     /// once shipped, could never be corrected for anybody who already had it.
-    fn migrate_from(&mut self, was: u64) {
+    fn migrate_from(&mut self, was: u64, legacy_theory: [bool; 3], saw_order: bool) {
+        if was < 4 && !saw_order {
+            // **The three bools become an ordered list.** Whatever diagrams
+            // somebody had chosen, they keep — in the numbered order, because
+            // flags never said anything about arrangement and inventing one for
+            // them would be inventing a preference they never expressed. The
+            // sheet music is APPENDED, since it is new and nobody has an
+            // opinion about it yet.
+            //
+            // Nothing at all selected is the one case that becomes everything:
+            // that is a fresh file, or one from before the theory band existed,
+            // and an empty band is not what it should open as.
+            use crate::theory_panel::{View, Views};
+            let had: Vec<View> = View::ALL
+                .into_iter()
+                .take(3)
+                .zip(legacy_theory)
+                .filter_map(|(v, on)| on.then_some(v))
+                .collect();
+            self.theory_order = if had.is_empty() {
+                Views::all().keys()
+            } else {
+                let mut order = had;
+                order.push(View::Staff);
+                Views::of(order).keys()
+            };
+        }
         if was >= SETTINGS_VERSION {
             return;
         }
@@ -1091,12 +1139,6 @@ impl Settings {
             if self.record_export.composite.layout == crate::recorder::Layout::CameraAbove {
                 self.record_export.composite.layout = crate::recorder::Layout::default();
             }
-        }
-        if was < 3 {
-            // The sheet music band. New, and on by default — a notation view
-            // nobody can see is the same as one nobody wrote, which is the
-            // failure this whole version stamp exists because of. `O` hides it.
-            self.show_staff = true;
         }
         if was < 2 {
             // The theory band used to sit still until you clicked something,
@@ -1194,17 +1236,14 @@ impl Settings {
             Value::Bool(self.teach_apply_all_keys),
         );
         map.insert("show_fretboard".into(), Value::Bool(self.show_fretboard));
-        map.insert("theory_circle".into(), Value::Bool(self.theory_circle));
-        map.insert("theory_tonnetz".into(), Value::Bool(self.theory_tonnetz));
         map.insert(
-            "theory_triangles".into(),
-            Value::Bool(self.theory_triangles),
+            "theory_order".into(),
+            Value::String(self.theory_order.clone()),
         );
         map.insert(
             "theory_follow_midi".into(),
             Value::Bool(self.theory_follow_midi),
         );
-        map.insert("show_staff".into(), Value::Bool(self.show_staff));
         map.insert("staff_set".into(), Value::String(self.staff_set.clone()));
         // Absent rather than null when there is none, the same rule the custom
         // tuning follows, so an older build never meets a key it cannot read.
@@ -1218,6 +1257,7 @@ impl Settings {
             "staff_note_names".into(),
             Value::Bool(self.staff_note_names),
         );
+        map.insert("staff_key".into(), Value::Number(self.staff_key.into()));
         map.insert(
             "plugin_paths".into(),
             Value::Array(
@@ -1662,25 +1702,21 @@ impl Settings {
         crate::fretboard_panel::CapoStyle::from_key(&self.capo_style)
     }
 
-    /// D-UI-17: the selected theory diagrams, as one value.
+    /// D-UI-17: the theory band's elements, in the order they are drawn.
     pub fn theory_views(&self) -> crate::theory_panel::Views {
-        crate::theory_panel::Views {
-            circle: self.theory_circle,
-            tonnetz: self.theory_tonnetz,
-            triangles: self.theory_triangles,
-        }
+        crate::theory_panel::Views::from_keys(&self.theory_order)
     }
 
-    /// Turn one diagram on or off. Keeping the mapping in one place means the
-    /// menu, the keyboard shortcut and the settings file cannot disagree about
-    /// which flag is which.
-    pub fn set_theory_view(&mut self, v: crate::theory_panel::View, on: bool) {
-        use crate::theory_panel::View;
-        match v {
-            View::Circle => self.theory_circle = on,
-            View::Tonnetz => self.theory_tonnetz = on,
-            View::Triangles => self.theory_triangles = on,
-        }
+    /// Toggle one element: off if it is on, on at the RIGHT-HAND END if it is
+    /// not. Keeping this in one place means the number keys and the menu cannot
+    /// disagree about what a toggle does — and what it does is the whole of the
+    /// band's reordering vocabulary. See `Views::toggled`.
+    pub fn toggle_theory_view(&mut self, v: crate::theory_panel::View) {
+        self.theory_order = self.theory_views().toggled(v).keys();
+    }
+
+    pub fn set_theory_views(&mut self, views: &crate::theory_panel::Views) {
+        self.theory_order = views.keys();
     }
 
     /// The value `fretboard_tuning` holds when the custom tuning is selected.
@@ -1939,9 +1975,10 @@ mod tests {
             first.show_fretboard,
             "the guitar view is invisible on a fresh install"
         );
-        assert!(
-            first.theory_views().count() == 3,
-            "the theory band is invisible on a fresh install"
+        assert_eq!(
+            first.theory_views(),
+            crate::theory_panel::Views::all(),
+            "a fresh install does not open with every theory element"
         );
         assert!(
             first.show_recorder,
@@ -1953,9 +1990,7 @@ mod tests {
         // would mean a first launch had grown a PREFERENCE of its own.
         let same = Settings {
             show_fretboard: false,
-            theory_circle: false,
-            theory_tonnetz: false,
-            theory_triangles: false,
+            theory_order: String::new(),
             show_recorder: false,
             ..first.clone()
         };
@@ -1983,7 +2018,6 @@ mod tests {
         let mut s = Settings::default();
         s.dark_mode = true;
         s.window_size_percent = 150;
-        s.theory_tonnetz = true;
         s.fretboard_tuning = "DADGAD".to_owned();
         s.extra.insert(
             "a_key_from_a_later_build".into(),

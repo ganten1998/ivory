@@ -24,9 +24,10 @@ pub enum KeyAction {
     ClearNotes,
     ToggleFretboard,
     ToggleCameraPane,
-    ToggleStaff,
     CycleClef,
     ToggleNoteNames,
+    /// One of the theory band's elements, by its number key.
+    ToggleTheoryElement(usize),
     CycleTheory,
     ToggleDarkMode,
     ToggleDetection,
@@ -141,7 +142,19 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // letters that each ALMOST stand for something.
     (Key::U, "U", KeyAction::ToggleNoteNames, true),
     (Key::I, "I", KeyAction::CycleClef, true),
-    (Key::O, "O", KeyAction::ToggleStaff, true),
+    // **The number row is the theory band.** One key per element, in the order
+    // `View::ALL` lists them, and pressing one removes that element or puts it
+    // back at the RIGHT-HAND END — so the same four keys both choose what is
+    // showing and arrange it. Listed as a single row rather than four, because
+    // four rows saying "circle of fifths", "Tonnetz"... is a help card that
+    // teaches the names of things instead of the mechanism.
+    (Key::Num1, "1-4", KeyAction::ToggleTheoryElement(1), true),
+    // 2, 3 and 4 are unlisted ALIASES of the row above in the help card's
+    // sense: they are four keys doing one job, and four rows naming four
+    // diagrams would teach the names instead of the mechanism.
+    (Key::Num2, "2", KeyAction::ToggleTheoryElement(2), false),
+    (Key::Num3, "3", KeyAction::ToggleTheoryElement(3), false),
+    (Key::Num4, "4", KeyAction::ToggleTheoryElement(4), false),
     (Key::T, "T", KeyAction::CycleTheory, true),
     (Key::C, "C", KeyAction::ToggleDetection, true),
     (Key::D, "D", KeyAction::ToggleDarkMode, true),
@@ -194,6 +207,20 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     (Key::Escape, "Esc", KeyAction::CloseHelp, false),
 ];
 
+impl KeyAction {
+    /// The action with any per-key payload flattened away.
+    ///
+    /// Two bindings are the same CONTROL when their families match, which is
+    /// how four number keys can share one row on the help card without the
+    /// "every bound key is described" rule losing its teeth for anything else.
+    fn family(self) -> KeyAction {
+        match self {
+            KeyAction::ToggleTheoryElement(_) => KeyAction::ToggleTheoryElement(1),
+            other => other,
+        }
+    }
+}
+
 /// One line of help text per binding, written where the binding is defined so
 /// they cannot drift apart.
 fn describe(a: KeyAction) -> &'static str {
@@ -203,9 +230,10 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ClearNotes => "clear every note you placed",
         KeyAction::ToggleFretboard => "guitar view",
         KeyAction::ToggleCameraPane => "camera",
-        KeyAction::ToggleStaff => "sheet music",
         KeyAction::CycleClef => "clef",
         KeyAction::ToggleNoteNames => "note names",
+        // The row reads `1-4`, not `1`, because the four keys are one control.
+        KeyAction::ToggleTheoryElement(_) => "theory panel on/off (1-4)",
         KeyAction::CycleTheory => "cycle the theory band",
         KeyAction::ToggleDarkMode => "dark mode",
         KeyAction::ToggleDetection => "chord detection",
@@ -513,7 +541,14 @@ mod tests {
         }
         for &(_, label, action, is_shown) in BINDINGS {
             if !is_shown && action != KeyAction::CloseHelp {
-                assert!(shown.contains(&action), "{label} is bound but never listed");
+                // By FAMILY, not by exact action. The number row is four keys
+                // doing one job — the card names the job once, `1-4`, because
+                // four rows naming four diagrams would teach their names
+                // instead of the mechanism.
+                assert!(
+                    shown.iter().any(|a| a.family() == action.family()),
+                    "{label} is bound but never listed"
+                );
             }
         }
     }
@@ -606,7 +641,6 @@ mod tests {
             (Key::W, KeyAction::ToggleCameraPane),
             (Key::U, KeyAction::ToggleNoteNames),
             (Key::I, KeyAction::CycleClef),
-            (Key::O, KeyAction::ToggleStaff),
         ] {
             for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
                 assert_eq!(press(key, gates), Some(want), "{key:?} under {gates:?}");

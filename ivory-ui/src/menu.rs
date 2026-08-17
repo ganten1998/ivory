@@ -72,14 +72,14 @@ pub enum MenuAction {
     ToggleFretboard,
     /// Show or hide the camera pane beside the theory band.
     ToggleCameraPane,
-    /// Show or hide the sheet music band.
-    ToggleStaff,
     /// Step to the next clef preset.
     CycleClef,
     /// Set the staves outright, by key.
     SetStaffSet(&'static str),
     /// Add or remove one clef from the user's own stack.
     ToggleCustomClef(&'static str),
+    /// The key signature, as a count of sharps (positive) or flats (negative).
+    SetStaffKey(i32),
     /// Letter names inside the noteheads.
     ToggleNoteNames,
     /// Look for VST3 bundles again, now.
@@ -106,6 +106,9 @@ pub enum MenuAction {
     /// D-UI-17: turn one theory diagram on or off. Independent, because any
     /// combination of the three may be showing at once.
     ToggleTheoryView(crate::theory_panel::View),
+    /// Put every theory element back, in the numbered order. The way out of a
+    /// collapsed band without having to remember which number is which.
+    ShowAllTheory,
     /// D-UI-17: whether the theory band follows live playing or stays put.
     ToggleTheoryFollowsMidi,
     /// D-UI-16: pop the guitar view into its own window, and put it back.
@@ -237,6 +240,10 @@ pub struct MenuView {
     pub staff_custom_label: Option<String>,
     /// Which clefs are on screen right now, by key, for the Staves list.
     pub staff_clefs: Vec<String>,
+    /// The right-click landed on the sheet music panel.
+    pub staff_first: bool,
+    /// The key signature, sharps positive.
+    pub staff_key: i32,
     /// §5: the Recorder band is in its own window.
     ///
     /// Needed for the same reason `theory_detached` is: the Detach row renames
@@ -777,18 +784,24 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     // D-UI-17: the theory band. Each row renames itself the way every other
     // toggle here does, so the hover says what is showing without a checkmark
     // column.
+    // Each row carries its NUMBER KEY and, when it is showing, where in the
+    // band it sits. The position is the part that would otherwise be invisible:
+    // the same four elements in a different order is a different window, and a
+    // menu that only says on-or-off cannot describe it.
     let mut theory: Vec<SubItem> = crate::theory_panel::View::ALL
         .iter()
         .map(|v| SubItem {
-            label: if v.is_on(view.theory) {
-                format!("Hide {}", v.label())
-            } else {
-                format!("Show {}", v.label())
+            label: match view.theory.position(*v) {
+                Some(i) => format!("{}. Hide {}  [{}]", v.number(), v.label(), i + 1),
+                None => format!("{}. Show {}", v.number(), v.label()),
             },
             action: MenuAction::ToggleTheoryView(*v),
             enabled: true,
         })
         .collect();
+    if view.theory.count() < crate::theory_panel::View::ALL.len() {
+        theory.push(row("Show Everything (T)", MenuAction::ShowAllTheory));
+    }
     // Whether the band tracks your playing sits with the diagrams rather than
     // in the keyboard block, because it is a property of this display and of
     // nothing else.
@@ -823,26 +836,19 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     // Its own subject, between Theory and Fretboard, in the order the bands
     // themselves are stacked — a menu that lists panels in a different order
     // from the window is a menu you have to translate.
-    let mut staff = vec![row(
-        if view.staff_on {
-            "Hide Sheet Music (O)"
-        } else {
-            "Show Sheet Music (O)"
-        },
-        MenuAction::ToggleStaff,
-    )];
     if view.staff_on {
-        staff.push(row(
-            if view.staff_note_names {
-                "Hide Note Names (U)"
-            } else {
-                "Show Note Names (U)"
-            },
-            MenuAction::ToggleNoteNames,
-        ));
-    }
-    push_category(&mut e, "Sheet music", staff);
-    if view.staff_on {
+        push_category(
+            &mut e,
+            "Sheet music",
+            vec![row(
+                if view.staff_note_names {
+                    "Hide Note Names (U)"
+                } else {
+                    "Show Note Names (U)"
+                },
+                MenuAction::ToggleNoteNames,
+            )],
+        );
         // Every preset, marked, plus whatever custom stack the user built —
         // which is listed and marked like the rest rather than hidden behind
         // the word "custom", because a set you cannot see is one you cannot
@@ -871,6 +877,26 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
             });
         }
         push_category(&mut e, "Clef", clefs);
+        // **Every key, on the thing it is printed on.** Fifteen rows is a long
+        // hover and it is the right shape for this: they are one exclusive
+        // choice, they have an order everybody already knows -- flats down,
+        // sharps up, C in the middle -- and the marked one says where you are
+        // in it.
+        push_category(
+            &mut e,
+            "Key",
+            (-crate::staff::MAX_KEY..=crate::staff::MAX_KEY)
+                .map(|k| SubItem {
+                    label: if k == view.staff_key {
+                        format!("{}  \u{2022}", crate::staff::key_label(k))
+                    } else {
+                        crate::staff::key_label(k).to_owned()
+                    },
+                    action: MenuAction::SetStaffKey(k),
+                    enabled: true,
+                })
+                .collect(),
+        );
         // **A staff each, for a room with more than one instrument in it.**
         // Ticking a second clef here stacks it under the first and every staff
         // shows every note — so a violist reads alto while the pianist reads
@@ -1260,6 +1286,12 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     if view.recorder_first {
         move_recorder_to_the_front(&mut e);
     }
+    // Checked AFTER the recorder, so a click that is somehow both lands on the
+    // sheet music -- the more specific of the two, and the one with a control
+    // you cannot reach any other way.
+    if view.staff_first && view.staff_on {
+        move_staff_to_the_front(&mut e);
+    }
     e
 }
 
@@ -1291,6 +1323,24 @@ pub const STAFF_PRESETS: &[(&str, &str)] = &[
     ("treble8vb", "Treble 8vb (guitar, tenor)"),
     ("bass8vb", "Bass 8vb (double bass)"),
 ];
+
+/// Bring the sheet music's own categories to the front, for a right-click that
+/// landed on it. Same rule and same reasons as `move_recorder_to_the_front`:
+/// reorder, never filter.
+fn move_staff_to_the_front(e: &mut Vec<Entry>) {
+    const OURS: [&str; 3] = ["Clef", "Key", "Staves"];
+    let mut moved: Vec<Entry> = Vec::new();
+    for name in OURS {
+        if let Some(i) = e.iter().position(|x| match x {
+            Entry::Submenu { label, .. } => label == name,
+            _ => false,
+        }) {
+            moved.push(e.remove(i));
+        }
+    }
+    moved.extend(e.drain(..));
+    *e = moved;
+}
 
 fn move_recorder_to_the_front(e: &mut Vec<Entry>) {
     const OURS: [&str; 5] = [
@@ -1863,6 +1913,8 @@ mod tests {
             staff_set: "grand".to_owned(),
             staff_custom_label: None,
             staff_clefs: Vec::new(),
+            staff_first: false,
+            staff_key: 0,
             recorder_detached: false,
             count_in_beats: 4,
             time_signature: crate::recorder::TimeSignature::default(),
@@ -2114,8 +2166,8 @@ mod tests {
                 "Keyboard",
                 "Chords",
                 "Theory",
-                "Sheet music",
                 "Clef",
+                "Key",
                 "Staves"
             ],
             "no fretboard hovers while the fretboard is off"
@@ -2139,8 +2191,8 @@ mod tests {
                 "Keyboard",
                 "Chords",
                 "Theory",
-                "Sheet music",
                 "Clef",
+                "Key",
                 "Staves",
                 "Fretboard",
                 "Wood",
@@ -2315,14 +2367,14 @@ mod tests {
         // Raise this only for a reason that can be written down in the same
         // breath.
         assert!(
-            count(fullest()) <= 25,
+            count(fullest()) <= 27,
             "the fullest menu is back to {} top-level rows",
             count(fullest())
         );
         // The everyday menu gains the two the sheet music costs, and it is
         // the band the app now opens with.
         assert!(
-            count(view()) <= 14,
+            count(view()) <= 16,
             "the everyday menu is {} top-level rows",
             count(view())
         );
@@ -2357,8 +2409,10 @@ mod tests {
         assert_eq!(find(p.clone(), MenuAction::DetachTheory), None);
         assert_eq!(
             sub(p, "Theory").1.len(),
-            crate::theory_panel::View::ALL.len() + 1,
-            "the diagrams and Follow MIDI, and nothing that needs a window"
+            // Every element, "Show Everything" while any are off, and Follow
+            // MIDI. Nothing that needs a window.
+            crate::theory_panel::View::ALL.len() + 2,
+            "the elements, Show Everything and Follow MIDI, and nothing else"
         );
     }
 
@@ -2543,8 +2597,8 @@ mod tests {
                 "Keyboard",
                 "Chords",
                 "Theory",
-                "Sheet music",
                 "Clef",
+                "Key",
                 "Staves",
                 "Fretboard",
                 "Wood",
@@ -2565,9 +2619,11 @@ mod tests {
         assert_eq!(
             sub(v.clone(), "Theory").1,
             vec![
-                "Show Circle of Fifths",
-                "Show Tonnetz",
-                "Show Harmonic Triangles",
+                "1. Show Circle of Fifths",
+                "2. Show Tonnetz",
+                "3. Show Harmonic Triangles",
+                "4. Show Sheet Music",
+                "Show Everything (T)",
                 "Follow MIDI",
                 // Where the band LIVES comes last: the toggles above it are
                 // what the band is.
@@ -2578,6 +2634,7 @@ mod tests {
             .iter()
             .map(|x| MenuAction::ToggleTheoryView(*x))
             .collect();
+        want.push(MenuAction::ShowAllTheory);
         want.push(MenuAction::ToggleTheoryFollowsMidi);
         want.push(MenuAction::DetachTheory);
         assert_eq!(sub(v.clone(), "Theory").2, want);
@@ -2588,6 +2645,11 @@ mod tests {
         assert!(!view().theory_follows_midi);
         let following = MenuView {
             theory_follows_midi: true,
+            // Everything showing, so "Show Everything" is absent and the
+            // follow row sits directly after the elements. Indexing past a row
+            // that comes and goes is how this assertion would start checking
+            // the wrong string without failing.
+            theory: Views::all(),
             ..view()
         };
         assert_eq!(
@@ -2595,19 +2657,31 @@ mod tests {
             "Stop Following MIDI"
         );
 
-        v.theory = Views {
-            circle: true,
-            tonnetz: false,
-            triangles: true,
-        };
+        // **The rows say the number, the state AND the position.** An order
+        // is the thing flags could never express, and it is the thing the
+        // number keys edit: circle is showing first, triangles second, and the
+        // Tonnetz is not in the band at all.
+        v.theory = Views::of(vec![View::Circle, View::Triangles]);
+        assert_eq!(
+            sub(v.clone(), "Theory").1[..4],
+            [
+                "1. Hide Circle of Fifths  [1]",
+                "2. Show Tonnetz",
+                "3. Hide Harmonic Triangles  [2]",
+                "4. Show Sheet Music"
+            ],
+            "the rows do not each follow their own element"
+        );
+        // And the same two elements the other way round say so.
+        v.theory = Views::of(vec![View::Triangles, View::Circle]);
         assert_eq!(
             sub(v.clone(), "Theory").1[..3],
             [
-                "Hide Circle of Fifths",
-                "Show Tonnetz",
-                "Hide Harmonic Triangles"
+                "1. Hide Circle of Fifths  [2]",
+                "2. Show Tonnetz",
+                "3. Hide Harmonic Triangles  [1]"
             ],
-            "the rows do not each follow their own flag"
+            "reordering the band did not reach the menu"
         );
     }
 
@@ -2908,8 +2982,8 @@ mod tests {
                 "Keyboard",
                 "Chords",
                 "Theory",
-                "Sheet music",
                 "Clef",
+                "Key",
                 "Staves",
                 "Fretboard",
                 "Wood",
