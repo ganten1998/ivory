@@ -375,6 +375,19 @@ pub struct MenuState {
     /// Which submenu is showing, as an index into `subs`. At most one, which
     /// is why they can all share a single viewport id.
     submenu_open: Option<usize>,
+    /// A submenu the pointer is on but which has not been switched to yet.
+    ///
+    /// **The diagonal-travel fix.** Submenus open to the RIGHT, so reaching one
+    /// means moving right and usually down or up — and every row crossed on the
+    /// way is a row that hovers. Without a dwell, the submenu under the pointer
+    /// changes on the way to the one that was wanted, and what opens is
+    /// whichever row the path happened to end on. The owner's report was that
+    /// hovering anything gave the TOP category about eight times in ten.
+    ///
+    /// So a switch to a DIFFERENT submenu waits until the pointer has stayed on
+    /// the new row. Opening the first one is instant, because there is nothing
+    /// being travelled away from.
+    pending_sub: Option<(usize, Instant)>,
     /// Kept so a submenu can be clamped too, not just the menu. Tuning and
     /// Capo sit near the BOTTOM of a long menu and Capo is ten rows deep, so
     /// unclamped they run off the screen and their lower rows cannot be
@@ -394,6 +407,72 @@ pub struct MenuState {
 
 /// Stable surface identities. On the desktop these are viewport ids; in a
 /// plugin they are `Area` ids. One string each, so the two paths cannot drift.
+/// Decide which submenu is open, given what the pointer is on.
+///
+/// Its own function because it is the whole of the bug the owner reported and
+/// none of it is about drawing: hovering a submenu opened the TOP category
+/// about eight times in ten, because reaching a panel that opens to the RIGHT
+/// means crossing the rows in between, and each one hovered.
+///
+/// Returns whether a switch is still pending, so the caller can ask for the
+/// frame that will complete it.
+fn settle_submenu(
+    open: &mut Option<usize>,
+    pending: &mut Option<(usize, Instant)>,
+    hovered: Option<usize>,
+    hovered_plain_row: bool,
+    now: Instant,
+) -> bool {
+    match hovered {
+        // Already showing: nothing to decide, and any pending switch is stale.
+        Some(i) if *open == Some(i) => {
+            *pending = None;
+            false
+        }
+        // Nothing open yet, so there is no journey to protect. Instant, because
+        // a delay on the FIRST submenu would just feel like lag.
+        Some(i) if open.is_none() => {
+            *open = Some(i);
+            *pending = None;
+            false
+        }
+        // A different one, with a submenu already open. The case that was
+        // firing by accident.
+        Some(i) => match *pending {
+            Some((j, at)) if j == i && now.duration_since(at) >= SUB_SWITCH_DWELL => {
+                *open = Some(i);
+                *pending = None;
+                false
+            }
+            Some((j, _)) if j == i => true,
+            _ => {
+                *pending = Some((i, now));
+                true
+            }
+        },
+        None => {
+            *pending = None;
+            // A plain row — one with no submenu — closes whatever is open. The
+            // pointer being nowhere at all does not: that is what passing over
+            // the gap between the menu and the panel looks like.
+            if hovered_plain_row {
+                *open = None;
+            }
+            false
+        }
+    }
+}
+
+/// How long the pointer must stay on a different submenu row before it opens.
+///
+/// Short enough to feel immediate when it is where you meant to go, long enough
+/// to survive crossing two or three rows on the way to the one that is already
+/// open. Apple's own menus use a shape (a triangle toward the open panel)
+/// rather than a delay; a delay is a fraction of the code and covers the same
+/// gesture, and unlike the triangle it also survives a submenu that opened to
+/// the LEFT because it was clamped against the screen edge.
+const SUB_SWITCH_DWELL: std::time::Duration = std::time::Duration::from_millis(140);
+
 const MENU_ID: &str = "ivory-menu";
 const SUBMENU_ID: &str = "ivory-menu-sub";
 
@@ -1055,6 +1134,7 @@ impl MenuState {
             font_scale,
             subs,
             submenu_open: None,
+            pending_sub: None,
             monitor: monitor_size,
             dark_mode: view.dark_mode,
             opened_at: Instant::now(),
@@ -1293,10 +1373,16 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
     });
     close |= menu_report.close;
 
-    if let Some(i) = hover_open_submenu {
-        state.submenu_open = Some(i);
-    } else if hover_close_submenu {
-        state.submenu_open = None;
+    if settle_submenu(
+        &mut state.submenu_open,
+        &mut state.pending_sub,
+        hover_open_submenu,
+        hover_close_submenu,
+        Instant::now(),
+    ) {
+        // Still waiting out the dwell. Ask for the frame that will end it, or a
+        // pointer that has stopped moving would sit there forever.
+        ctx.request_repaint_after(SUB_SWITCH_DWELL);
     }
 
     // ── Submenu (sibling, Qt-style to the right) ──────────────────────────
@@ -1321,9 +1407,22 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         // whichever submenu had taken its place — silently setting a capo
         // nobody asked for. The row's own rect is the only thing that knows
         // where the row ended up.
+        // **Beside the row where it actually IS**, on both hosts.
+        //
+        // The desktop used to place it from `row_top`, measured when the menu
+        // opened. That is only right while the measurement and the layout agree
+        // about row heights, separators and font scale — and when they drift,
+        // the submenu appears beside a different row, so reaching for it drags
+        // the pointer across the rows in between. The inline host already had
+        // this fix and the comment explaining it; the desktop had the bug.
+        //
+        // `x` still comes from the menu's own width rather than the row rect:
+        // a justified button stops short of the frame's padding, and hanging
+        // the submenu off THAT leaves it overlapping the menu by a few points.
         let mut sub_pos = match sub_row_rects.get(sub_i) {
             Some(r) if !caps.child_windows => Pos2::new(r.max.x, r.min.y),
-            _ => Pos2::new(state.pos.x + state.size.x, state.pos.y + row_top),
+            Some(r) => Pos2::new(state.pos.x + state.size.x, state.pos.y + r.min.y),
+            None => Pos2::new(state.pos.x + state.size.x, state.pos.y + row_top),
         };
         if let Some(mon) = state.monitor {
             sub_pos = clamp_submenu(sub_pos, sub_size, state.pos.x, mon);
@@ -2187,6 +2286,72 @@ mod tests {
     /// earlier draft of the recorder shipped with no way to switch it on at
     /// all. So: it exists, it renames itself rather than growing a checkmark,
     /// and the band's other controls arrive with it.
+    /// **Crossing rows on the way to a submenu must not change which one is
+    /// open.**
+    ///
+    /// The owner's report: hovering any submenu gave the TOP category about
+    /// eight times in ten. Submenus open to the RIGHT, so reaching one means
+    /// travelling across the rows between here and there, and every one of them
+    /// hovered — what opened was whichever row the path happened to end on.
+    #[test]
+    fn travelling_across_rows_does_not_switch_the_open_submenu() {
+        let t0 = Instant::now();
+        let mut open = None;
+        let mut pending = None;
+
+        // The first one opens at once. A delay here would just feel like lag.
+        assert!(!settle_submenu(&mut open, &mut pending, Some(3), false, t0));
+        assert_eq!(open, Some(3));
+
+        // Now the pointer crosses rows 2, 1 and 0 on its way to the panel. None
+        // of them may take over, because none was dwelt on.
+        let mut t = t0;
+        for row in [2usize, 1, 0] {
+            t += std::time::Duration::from_millis(20);
+            assert!(
+                settle_submenu(&mut open, &mut pending, Some(row), false, t),
+                "row {row} should have started a wait, not a switch"
+            );
+            assert_eq!(open, Some(3), "row {row} stole the submenu in transit");
+        }
+
+        // Arriving and STAYING is a different thing, and it does switch.
+        let arrive = t + std::time::Duration::from_millis(20);
+        assert!(settle_submenu(&mut open, &mut pending, Some(0), false, arrive));
+        let settled = arrive + SUB_SWITCH_DWELL;
+        assert!(!settle_submenu(&mut open, &mut pending, Some(0), false, settled));
+        assert_eq!(open, Some(0), "a deliberate hover must still work");
+    }
+
+    /// Hovering the row that is ALREADY open changes nothing and cancels any
+    /// half-finished switch — which is what moving back to it means.
+    #[test]
+    fn returning_to_the_open_row_cancels_a_pending_switch() {
+        let t = Instant::now();
+        let mut open = Some(2);
+        let mut pending = Some((5, t));
+        assert!(!settle_submenu(&mut open, &mut pending, Some(2), false, t));
+        assert_eq!(open, Some(2));
+        assert!(pending.is_none(), "the abandoned switch was still armed");
+    }
+
+    /// A plain row closes the submenu; being over NOTHING does not.
+    ///
+    /// The gap between the menu and its panel is "nothing", and closing there
+    /// would make the panel impossible to reach on any host that does not
+    /// place them flush.
+    #[test]
+    fn a_plain_row_closes_the_submenu_but_empty_space_does_not() {
+        let t = Instant::now();
+        let mut open = Some(1);
+        let mut pending = None;
+        assert!(!settle_submenu(&mut open, &mut pending, None, false, t));
+        assert_eq!(open, Some(1), "the gap between menu and panel closed it");
+
+        assert!(!settle_submenu(&mut open, &mut pending, None, true, t));
+        assert_eq!(open, None, "a plain row should have closed it");
+    }
+
     #[test]
     fn the_recorder_row_renames_itself_and_brings_its_controls_with_it() {
         let mut v = view();
