@@ -795,7 +795,7 @@ impl DesktopApp {
 /// so it travels with them.
 #[cfg(feature = "recorder")]
 fn state_path(slot: usize) -> std::path::PathBuf {
-    let dir = ivory_ui::settings::Settings::path()
+    let dir = Settings::path()
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default();
