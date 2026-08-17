@@ -16,7 +16,15 @@ const NO_ENCODER: &str = "this build cannot write video yet — audio and MIDI \
 pub struct Encoder;
 
 impl Encoder {
-    pub fn create(_path: &std::path::Path, _spec: super::VideoSpec) -> Result<Self, String> {
+    pub fn create(
+        _path: &std::path::Path,
+        _spec: super::VideoSpec,
+        _audio: Option<super::AudioSpec>,
+    ) -> Result<Self, String> {
+        Err(NO_ENCODER.to_owned())
+    }
+
+    pub fn push_audio(&mut self, _interleaved: &[f32], _first_frame: u64) -> Result<(), String> {
         Err(NO_ENCODER.to_owned())
     }
 
@@ -41,6 +49,3 @@ impl Encoder {
     }
 }
 
-pub fn mux(_m: &super::Mux) -> Result<(), String> {
-    Err(NO_ENCODER.to_owned())
-}

@@ -92,6 +92,11 @@ objc2-av-foundation = { version = "0.3", default-features = false, features = [
     "AVCaptureVideoDataOutput",
     "AVMediaFormat",
     "AVVideoSettings",
+    # `AVAudioSettings` is enabled for completeness, but note that the crate
+    # generates NOTHING for it: the settings-dictionary keys the AAC input
+    # needs (`AVFormatIDKey` and friends) have no bindings, so `encode/macos.rs`
+    # links the symbols itself rather than hard-coding their string values.
+    "AVAudioSettings",
     "dispatch2",
     "objc2-core-media",
     # Without this the pixel-buffer adaptor has no `pixelBufferPool` and no
@@ -108,9 +113,22 @@ objc2-core-media = { version = "0.3", default-features = false, features = [
     # "no method named image_buffer" rather than as a missing feature.
     "objc2-core-video",
     "CMBase",
+    # The audio half of a take's video file. `CMBlockBuffer` holds the PCM and
+    # `objc2-core-audio-types` is where `AudioStreamBasicDescription` lives —
+    # without the latter, `CMAudioFormatDescriptionCreate` and
+    # `CMAudioSampleBufferCreateReadyWithPacketDescriptions` are both absent
+    # and the absence reads as a missing function rather than a missing
+    # feature.
+    "CMBlockBuffer",
+    "objc2-core-audio-types",
     "CMFormatDescription",
     "CMSampleBuffer",
     "CMTime",
+] }
+# Already in the tree via cpal's CoreAudio backend; named here because a
+# transitive dependency is not a nameable one.
+objc2-core-audio-types = { version = "0.3", default-features = false, features = [
+    "std",
 ] }
 objc2-core-video = { version = "0.3", default-features = false, features = [
     "std",

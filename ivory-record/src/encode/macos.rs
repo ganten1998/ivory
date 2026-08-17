@@ -40,7 +40,49 @@ use objc2_core_video::{
     CVPixelBufferGetBytesPerRow, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
     CVPixelBufferPool, CVPixelBufferUnlockBaseAddress,
 };
+use objc2_core_audio_types::AudioStreamBasicDescription;
+use objc2_core_media::{
+    kCMBlockBufferAssureMemoryNowFlag, CMAudioFormatDescriptionCreate,
+    CMAudioSampleBufferCreateReadyWithPacketDescriptions, CMBlockBuffer,
+    CMBlockBufferCreateWithMemoryBlock, CMBlockBufferReplaceDataBytes, CMFormatDescription,
+    CMSampleBuffer,
+};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
+
+// The settings-dictionary keys the AAC input needs.
+//
+// `objc2-av-foundation` generates NOTHING for `AVAudioSettings.h` — the file is
+// two lines of header comment — so these are linked here. LINKED, not
+// hard-coded: their values do happen to equal their own names, but a string
+// literal would be an assumption about Apple's implementation, and the symbol
+// is the fact. Unlike the macOS 14+ camera constants that forced
+// `camera/macos.rs` into runtime lookups, every one of these has existed since
+// macOS 10.7, so binding them eagerly is safe on every OS this app supports.
+#[link(name = "AVFoundation", kind = "framework")]
+extern "C" {
+    static AVFormatIDKey: Option<&'static NSString>;
+    static AVSampleRateKey: Option<&'static NSString>;
+    static AVNumberOfChannelsKey: Option<&'static NSString>;
+    static AVEncoderBitRateKey: Option<&'static NSString>;
+}
+
+/// AAC at 192 kbit/s stereo.
+///
+/// Chosen rather than defaulted: AVFoundation's own default for AAC is 64
+/// kbit/s, which is fine for speech and audibly poor on a piano — the decay of
+/// a held chord is exactly what a low-rate AAC encoder throws away first. The
+/// `.wav` beside it is still the master; this is the copy people will upload.
+const AAC_BITRATE: u32 = 192_000;
+
+/// `kAudioFormatMPEG4AAC`, and `kAudioFormatLinearPCM`.
+const FORMAT_AAC: u32 = u32::from_be_bytes(*b"aac ");
+const FORMAT_LPCM: u32 = u32::from_be_bytes(*b"lpcm");
+/// `kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked`.
+///
+/// No `kAudioFormatFlagIsBigEndian`, which is correct on every machine this
+/// ships to and would be wrong on none of them: Apple has not shipped a
+/// big-endian target since 2006.
+const LPCM_FLOAT_PACKED: u32 = 1 | 8;
 
 /// The timescale every presentation time is expressed in.
 ///
@@ -59,6 +101,11 @@ pub struct Encoder {
     height: usize,
     /// Nominal rate, kept only to size the backpressure wait.
     fps: u32,
+    /// The audio input and the format its samples are in, when the file is to
+    /// have sound. `None` for a silent video, which is a real request — people
+    /// who score to picture — and a common mistake, so it is a decision the
+    /// export spec states rather than one this file infers.
+    audio: Option<AudioTrack>,
     /// The last presentation time appended, so a frame that goes backwards can
     /// be spotted. `None` until the first frame lands.
     last_pts: Option<Nanos>,
@@ -68,7 +115,11 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    pub fn create(path: &std::path::Path, spec: super::VideoSpec) -> Result<Self, String> {
+    pub fn create(
+        path: &std::path::Path,
+        spec: super::VideoSpec,
+        audio: Option<super::AudioSpec>,
+    ) -> Result<Self, String> {
         // AVAssetWriter REFUSES to write where a file already exists, and says
         // so with an error that reads like a permissions problem. The take
         // directory is fresh, but a retried export into the same folder is not,
@@ -108,6 +159,20 @@ impl Encoder {
         }
         unsafe { writer.addInput(&input) };
 
+        // The audio input is added BEFORE `startWriting`, which is not optional:
+        // AVAssetWriter refuses new inputs once writing has begun, and the
+        // failure is a thrown Objective-C exception rather than a `false`.
+        let audio = match audio {
+            Some(spec) if spec.is_usable() => Some(AudioTrack::add_to(&writer, spec)?),
+            Some(spec) => {
+                return Err(format!(
+                    "{} Hz in {} channels is not audio this can write",
+                    spec.sample_rate, spec.channels
+                ))
+            }
+            None => None,
+        };
+
         if !unsafe { writer.startWriting() } {
             return Err(status_error(&writer, "could not start writing"));
         }
@@ -122,6 +187,7 @@ impl Encoder {
             width: spec.width as usize,
             height: spec.height as usize,
             fps: spec.fps,
+            audio,
             last_pts: None,
             out_of_order: 0,
             dropped_not_ready: 0,
@@ -226,6 +292,19 @@ impl Encoder {
         }
     }
 
+    /// Append interleaved `f32` audio.
+    ///
+    /// `first_frame` is the index of the FIRST frame in `interleaved`, counted
+    /// from the start of the take — the same index the `.wav` writes it at.
+    /// That is the whole sync story for audio: not "aligned to" the wav, the
+    /// same samples at the same index.
+    pub fn push_audio(&mut self, interleaved: &[f32], first_frame: u64) -> Result<(), String> {
+        let Some(track) = self.audio.as_mut() else {
+            return Ok(());
+        };
+        track.push(interleaved, first_frame)
+    }
+
     pub fn out_of_order(&self) -> u64 {
         self.out_of_order
     }
@@ -240,6 +319,9 @@ impl Encoder {
 
     pub fn finish(self) -> Result<(), String> {
         unsafe { self.input.markAsFinished() };
+        if let Some(track) = self.audio.as_ref() {
+            unsafe { track.input.markAsFinished() };
+        }
         // The BLOCKING finish, deliberately. The asynchronous one would need a
         // block and a completion handler, and the caller is the writer thread
         // at Stop — which has nothing else to do and must not return until the
@@ -340,6 +422,212 @@ fn status_error(writer: &AVAssetWriter, what: &str) -> String {
     }
 }
 
-pub fn mux(_m: &super::Mux) -> Result<(), String> {
-    Err("muxing is not written yet".to_owned())
+
+/// The AAC track: an input, and the LPCM format its samples arrive in.
+struct AudioTrack {
+    input: Retained<AVAssetWriterInput>,
+    format: Retained<CMFormatDescription>,
+    channels: usize,
+    sample_rate: u32,
+    /// Where the next block is expected, so a caller that skips or repeats a
+    /// range is caught rather than producing a file that drifts silently.
+    next_frame: u64,
+    gaps: u64,
+}
+
+impl AudioTrack {
+    fn add_to(
+        writer: &AVAssetWriter,
+        spec: super::AudioSpec,
+    ) -> Result<Self, String> {
+        let settings = audio_settings(spec)?;
+        let media_type = unsafe { objc2_av_foundation::AVMediaTypeAudio }
+            .ok_or("AVMediaTypeAudio is missing")?;
+        let input = unsafe {
+            AVAssetWriterInput::assetWriterInputWithMediaType_outputSettings(
+                media_type,
+                Some(&settings),
+            )
+        };
+        unsafe { input.setExpectsMediaDataInRealTime(true) };
+        if !unsafe { writer.canAddInput(&input) } {
+            return Err("the audio encoder refused its own settings".to_owned());
+        }
+        unsafe { writer.addInput(&input) };
+        Ok(Self {
+            input,
+            format: lpcm_format(spec)?,
+            channels: usize::from(spec.channels),
+            sample_rate: spec.sample_rate,
+            next_frame: 0,
+            gaps: 0,
+        })
+    }
+
+    fn push(&mut self, interleaved: &[f32], first_frame: u64) -> Result<(), String> {
+        if interleaved.is_empty() {
+            return Ok(());
+        }
+        if interleaved.len() % self.channels != 0 {
+            return Err(format!(
+                "{} samples is not a whole number of {}-channel frames",
+                interleaved.len(),
+                self.channels
+            ));
+        }
+        // Noticed rather than smoothed over. A block that does not start where
+        // the last one ended means the caller skipped or repeated a range, and
+        // the resulting file drifts against the `.wav` by exactly that much —
+        // which is the one failure this whole design exists to make impossible.
+        if first_frame != self.next_frame {
+            self.gaps += 1;
+        }
+        let frames = interleaved.len() / self.channels;
+        // Audio is NOT dropped when the encoder is behind. A dropped video
+        // frame is a judder; dropped audio is a hole in the recording, and the
+        // AAC input is never the bottleneck — it is a rounding error beside the
+        // video encode it shares a writer with.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                interleaved.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(interleaved),
+            )
+        };
+        let block = block_buffer(bytes)?;
+        let pts = (first_frame as i128 * 1_000_000_000 / i128::from(self.sample_rate)) as Nanos;
+        let mut out: *mut CMSampleBuffer = std::ptr::null_mut();
+        let status = unsafe {
+            CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+                None,
+                &block,
+                &self.format,
+                frames as isize,
+                cm_time(pts),
+                // Null: LPCM is constant bit rate, so every packet is the same
+                // size and AVFoundation derives the layout from the format
+                // description. Packet descriptions are for the variable-rate
+                // formats this deliberately is not.
+                std::ptr::null(),
+                std::ptr::NonNull::from(&mut out),
+            )
+        };
+        if status != 0 || out.is_null() {
+            return Err(format!("could not wrap {frames} audio frames ({status})"));
+        }
+        let sample = unsafe { Retained::from_raw(out) }
+            .ok_or_else(|| "an audio sample buffer vanished".to_owned())?;
+        let ok = unsafe { self.input.appendSampleBuffer(&sample) };
+        if !ok {
+            return Err("audio could not be written".to_owned());
+        }
+        self.next_frame = first_frame + frames as u64;
+        Ok(())
+    }
+}
+
+/// `{AVFormatIDKey: aac, AVSampleRateKey: r, AVNumberOfChannelsKey: n,
+/// AVEncoderBitRateKey: 192k}`.
+fn audio_settings(
+    spec: super::AudioSpec,
+) -> Result<Retained<NSDictionary<NSString, AnyObject>>, String> {
+    let fmt_key = unsafe { AVFormatIDKey }.ok_or("AVFormatIDKey is missing")?;
+    let rate_key = unsafe { AVSampleRateKey }.ok_or("AVSampleRateKey is missing")?;
+    let chan_key = unsafe { AVNumberOfChannelsKey }.ok_or("AVNumberOfChannelsKey is missing")?;
+    let rate_bits = unsafe { AVEncoderBitRateKey }.ok_or("AVEncoderBitRateKey is missing")?;
+    let fmt = NSNumber::new_u32(FORMAT_AAC);
+    let rate = NSNumber::new_f64(f64::from(spec.sample_rate));
+    let chans = NSNumber::new_u32(u32::from(spec.channels));
+    let bits = NSNumber::new_u32(AAC_BITRATE);
+    Ok(unsafe {
+        NSDictionary::from_slices::<NSString>(
+            &[fmt_key, rate_key, chan_key, rate_bits],
+            &[
+                &*(&*fmt as &AnyObject as *const AnyObject),
+                &*(&*rate as &AnyObject as *const AnyObject),
+                &*(&*chans as &AnyObject as *const AnyObject),
+                &*(&*bits as &AnyObject as *const AnyObject),
+            ],
+        )
+    })
+}
+
+/// The format the samples ARRIVE in — interleaved native-endian `f32`.
+///
+/// Not the format they are written in. AVFoundation reads this to know how to
+/// decode what it is handed, then encodes to whatever `audio_settings` asked
+/// for; the two are deliberately different and confusing them produces a file
+/// of noise rather than an error.
+fn lpcm_format(spec: super::AudioSpec) -> Result<Retained<CMFormatDescription>, String> {
+    let channels = u32::from(spec.channels);
+    let bytes_per_frame = 4 * channels;
+    let mut asbd = AudioStreamBasicDescription {
+        mSampleRate: f64::from(spec.sample_rate),
+        mFormatID: FORMAT_LPCM,
+        mFormatFlags: LPCM_FLOAT_PACKED,
+        mBytesPerPacket: bytes_per_frame,
+        mFramesPerPacket: 1,
+        mBytesPerFrame: bytes_per_frame,
+        mChannelsPerFrame: channels,
+        mBitsPerChannel: 32,
+        mReserved: 0,
+    };
+    let mut out: *const objc2_core_media::CMAudioFormatDescription = std::ptr::null();
+    let status = unsafe {
+        CMAudioFormatDescriptionCreate(
+            None,
+            std::ptr::NonNull::from(&mut asbd),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            None,
+            std::ptr::NonNull::from(&mut out),
+        )
+    };
+    if status != 0 || out.is_null() {
+        return Err(format!("could not describe the audio format ({status})"));
+    }
+    unsafe { Retained::from_raw(out.cast_mut()) }
+        .ok_or_else(|| "an audio format description vanished".to_owned())
+}
+
+/// A `CMBlockBuffer` holding a COPY of `bytes`.
+///
+/// A copy and not a borrow, deliberately. Handing CoreMedia a pointer into the
+/// caller's buffer would mean the samples must outlive an append whose lifetime
+/// this code does not control, and the buffer it would be pointing into is the
+/// writer's scratch — reused on the very next block.
+fn block_buffer(bytes: &[u8]) -> Result<Retained<CMBlockBuffer>, String> {
+    let mut out: *mut CMBlockBuffer = std::ptr::null_mut();
+    let status = unsafe {
+        CMBlockBufferCreateWithMemoryBlock(
+            None,
+            std::ptr::null_mut(),
+            bytes.len(),
+            None,
+            std::ptr::null(),
+            0,
+            bytes.len(),
+            kCMBlockBufferAssureMemoryNowFlag,
+            std::ptr::NonNull::from(&mut out),
+        )
+    };
+    if status != 0 || out.is_null() {
+        return Err(format!("could not allocate an audio block ({status})"));
+    }
+    let block = unsafe { Retained::from_raw(out) }
+        .ok_or_else(|| "an audio block vanished".to_owned())?;
+    let status = unsafe {
+        CMBlockBufferReplaceDataBytes(
+            std::ptr::NonNull::new(bytes.as_ptr().cast_mut().cast())
+                .ok_or("an empty audio block")?,
+            &block,
+            0,
+            bytes.len(),
+        )
+    };
+    if status != 0 {
+        return Err(format!("could not fill an audio block ({status})"));
+    }
+    Ok(block)
 }

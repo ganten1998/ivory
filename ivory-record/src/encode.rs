@@ -6,21 +6,36 @@
 //! video-only file. The audio is muxed in at Stop by [`mux`], from the `.wav`
 //! that was being written anyway.
 //!
-//! # Why the audio is not encoded live too
+//! # How sync is guaranteed, rather than measured
 //!
-//! The first design (RECORDER-PLAN §7) appended audio to the same writer as it
-//! ran, which means building a `CMSampleBuffer` around PCM on the writer thread
-//! and getting its timestamp right sixty times a second. Muxing at the end is
-//! simpler and *more* accurate, for a reason worth stating plainly: the `.wav`
-//! is already sample-accurate against the take clock, because
-//! `FrameCursor`/`WritePlan` pad dropouts so that file sample N is device frame
-//! N. Anything derived from it inherits that. A live audio path would be a
-//! second, independent chance to get the same alignment wrong.
+//! **Both tracks are indexed from the take's own start, so there is no offset
+//! to get wrong.**
 //!
-//! So sync reduces to ONE number — how far the first video frame is from the
-//! first audio sample — and that number is known exactly, because camera frames
-//! and audio callbacks both carry `host_ns` off the same [`crate::clock`]
-//! timebase. See [`Mux::video_offset_ns`].
+//! *Audio*: the samples pushed here are the SAME ones written to the `.wav`,
+//! in the same order, and the presentation time is their index divided by the
+//! sample rate. `FrameCursor`/`WritePlan` already pad dropouts so that file
+//! sample N is device frame N, so the muxed audio inherits that exactly. Not
+//! "aligned to" the wav — the same bytes at the same index.
+//!
+//! *Video*: composited frames are produced on a fixed tick from take start,
+//! whatever the camera is doing. A camera takes between 63 ms and four seconds
+//! to deliver its first frame; during that time the frame is still composited
+//! and still encoded, with the camera's part of it dark. So the video track
+//! also starts at zero, and the late camera is a dark opening rather than a
+//! timing problem.
+//!
+//! That is what removes the whole class of bug this design was most likely to
+//! have. An earlier draft carried a `video_offset_ns` — the gap between the
+//! first audio sample and the first camera frame — to be applied at mux time.
+//! It would have worked, and getting its SIGN wrong would have doubled the
+//! error instead of removing it. Ticking from take start means the number does
+//! not exist.
+//!
+//! The one residual error is bounded and stated: a tick uses the newest camera
+//! frame available at that instant, so a frame can be shown up to one tick
+//! interval (33 ms at 30 fps) after the moment it was captured. That is below
+//! the ~45 ms where audio leading video becomes perceptible, and it is the same
+//! bound every live compositor carries.
 //!
 //! # Platforms
 //!
@@ -91,14 +106,27 @@ impl Encoder {
     /// The extension is the caller's, and it must match what the platform
     /// writes — `.mp4` on macOS. Not chosen here, because the take's file
     /// layout is `take.rs`'s business.
-    pub fn create(path: &std::path::Path, spec: VideoSpec) -> Result<Self, String> {
+    pub fn create(
+        path: &std::path::Path,
+        spec: VideoSpec,
+        audio: Option<AudioSpec>,
+    ) -> Result<Self, String> {
         if !spec.is_usable() {
             return Err(format!(
                 "{}x{} at {} fps is not a video",
                 spec.width, spec.height, spec.fps
             ));
         }
-        sys::Encoder::create(path, spec.even()).map(Encoder)
+        sys::Encoder::create(path, spec.even(), audio).map(Encoder)
+    }
+
+    /// Append interleaved `f32` audio, indexed from the start of the take.
+    ///
+    /// `first_frame` is the index of the first frame in `interleaved` — the
+    /// same index the `.wav` writes it at, which is what makes the two agree by
+    /// construction rather than by adjustment. A silent video ignores this.
+    pub fn push_audio(&mut self, interleaved: &[f32], first_frame: u64) -> Result<(), String> {
+        self.0.push_audio(interleaved, first_frame)
     }
 
     /// Append one frame, as tightly-packed BGRA8.
@@ -137,34 +165,20 @@ impl Encoder {
     }
 }
 
-/// Combine a video-only file and a `.wav` into one playable file.
+/// The audio track, if the file is to have one.
 ///
-/// The video track is copied through **without re-encoding** — it is already
-/// H.264 and re-compressing it would cost quality and minutes for nothing. Only
-/// the audio is encoded, from LPCM to AAC.
-pub struct Mux {
-    /// The video-only file the take wrote.
-    pub video: std::path::PathBuf,
-    /// The take's `.wav`.
-    pub audio: std::path::PathBuf,
-    pub out: std::path::PathBuf,
-    /// **The sync number.** How far the first video frame is behind the first
-    /// audio sample, in nanoseconds, on the take's own clock.
-    ///
-    /// Positive means the camera started late, which is the normal case: an
-    /// audio device is running before the take begins and a camera takes
-    /// between 63 ms and four seconds to produce its first frame. The video
-    /// track is offset by exactly this much so that what was simultaneous
-    /// stays simultaneous.
-    ///
-    /// Getting the SIGN wrong here doubles the error rather than removing it,
-    /// which is why `a_late_camera_is_pushed_later_not_earlier` exists.
-    pub video_offset_ns: Nanos,
+/// Interleaved `f32` at `sample_rate`, which is what the recorder already has
+/// in hand: the samples handed to [`Encoder::push_audio`] are the SAME ones
+/// written to the `.wav`, in the same order, indexed the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioSpec {
+    pub sample_rate: u32,
+    pub channels: u16,
 }
 
-impl Mux {
-    pub fn run(&self) -> Result<(), String> {
-        sys::mux(self)
+impl AudioSpec {
+    pub fn is_usable(self) -> bool {
+        self.sample_rate >= 8_000 && (1..=2).contains(&self.channels)
     }
 }
 
@@ -218,10 +232,141 @@ mod tests {
             let dir = std::env::temp_dir().join("tangent-encode-refused");
             let _ = std::fs::create_dir_all(&dir);
             assert!(
-                Encoder::create(&dir.join("x.mp4"), bad).is_err(),
+                Encoder::create(&dir.join("x.mp4"), bad, None).is_err(),
                 "{bad:?} was accepted"
             );
         }
+    }
+
+    /// **Both tracks, in one file, of the same length.**
+    ///
+    /// The sync test. It writes three seconds of video ticked from take start
+    /// and three seconds of audio indexed from take start, and then asks
+    /// `ffprobe` whether the two tracks agree — which is the only question that
+    /// matters and the one this code cannot answer about itself.
+    #[test]
+    #[ignore = "writes a real video file with the platform encoder"]
+    fn video_and_audio_start_together_and_end_together() {
+        let dir = std::env::temp_dir().join("tangent-encode-av");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("av.mp4");
+
+        const W: u32 = 320;
+        const H: u32 = 240;
+        const FPS: u32 = 30;
+        const RATE: u32 = 48_000;
+        const CH: usize = 2;
+        const SECONDS: u64 = 3;
+
+        let mut enc = Encoder::create(
+            &path,
+            VideoSpec {
+                width: W,
+                height: H,
+                fps: FPS,
+            },
+            Some(AudioSpec {
+                sample_rate: RATE,
+                channels: CH as u16,
+            }),
+        )
+        .expect("create");
+
+        // Interleaved: one video frame, then the audio for that frame's worth
+        // of time, exactly as the recorder will do it.
+        let frame = vec![0x40u8; (W * H * 4) as usize];
+        let per_tick = (RATE / FPS) as usize;
+        let mut audio = vec![0.0f32; per_tick * CH];
+        let mut written_frames: u64 = 0;
+        for i in 0..(SECONDS * u64::from(FPS)) {
+            enc.push(&frame, (i as i64 * 1_000_000_000) / i64::from(FPS))
+                .expect("push video");
+            // A 440 Hz tone, so the file has something in it that a person can
+            // check by ear if a number ever looks wrong.
+            for (n, s) in audio.chunks_exact_mut(CH).enumerate() {
+                let t = (written_frames + n as u64) as f64 / f64::from(RATE);
+                let v = (t * 440.0 * std::f64::consts::TAU).sin() as f32 * 0.2;
+                s.fill(v);
+            }
+            enc.push_audio(&audio, written_frames).expect("push audio");
+            written_frames += per_tick as u64;
+        }
+        enc.finish().expect("finish");
+
+        let Ok(out) = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,start_time,duration",
+                // `key=value`, one per line, and NOT csv. The first version of
+                // this test asked for csv and indexed the columns, which put
+                // start_time where duration was expected and reported a
+                // perfectly good three-second video as zero seconds long.
+                // ffprobe emits fields in its OWN order, not the order they
+                // were asked for.
+                "-of",
+                "default=nw=1",
+            ])
+            .arg(&path)
+            .output()
+        else {
+            eprintln!("ffprobe is not installed — the tracks were not verified");
+            return;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut tracks: Vec<(String, f64, f64)> = Vec::new();
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            match k {
+                "codec_type" => tracks.push((v.to_owned(), f64::NAN, f64::NAN)),
+                "start_time" => {
+                    if let Some(t) = tracks.last_mut() {
+                        t.1 = v.parse().unwrap_or(f64::NAN);
+                    }
+                }
+                "duration" => {
+                    if let Some(t) = tracks.last_mut() {
+                        t.2 = v.parse().unwrap_or(f64::NAN);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let find = |kind: &str| {
+            tracks
+                .iter()
+                .find(|t| t.0 == kind)
+                .map(|t| (t.1, t.2))
+                .unwrap_or_else(|| panic!("no {kind} track in {text:?}"))
+        };
+        let (v_start, v_dur) = find("video");
+        let (a_start, a_dur) = find("audio");
+
+        assert!(
+            (v_dur - SECONDS as f64).abs() < 0.06,
+            "the video is {v_dur}s, not {SECONDS}"
+        );
+        assert!(
+            (a_dur - SECONDS as f64).abs() < 0.06,
+            "the audio is {a_dur}s, not {SECONDS}"
+        );
+        // **The assertions this test exists for.** Two tracks that begin at
+        // different times, or run for different lengths, are two tracks out of
+        // sync. Ticking video from take start and indexing audio from take
+        // start is what makes both hold with no correction anywhere.
+        assert!(
+            v_start.abs() < 0.001 && a_start.abs() < 0.001,
+            "the tracks do not both start at zero: video {v_start}, audio {a_start}"
+        );
+        assert!(
+            (v_dur - a_dur).abs() < 0.06,
+            "the tracks are {:.3}s apart in length — video {v_dur}, audio {a_dur}",
+            (v_dur - a_dur).abs()
+        );
     }
 
     /// **A real file, written by the real encoder, checked by something that is
@@ -254,7 +399,7 @@ mod tests {
             height: H,
             fps: FPS,
         };
-        let mut enc = Encoder::create(&path, spec).expect("create");
+        let mut enc = Encoder::create(&path, spec, None).expect("create");
         let mut frame = vec![0u8; (W * H * 4) as usize];
         for i in 0..N {
             // A moving band, so a file that is all one colour is visibly wrong
