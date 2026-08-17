@@ -65,6 +65,30 @@
 //! [`Engine::output_delay_ns`] is the backend's own number, and RECORDER-PLAN
 //! §3a is explicit about why a claimed latency is worse than an absent one.
 //!
+//! # The editor, and how it reaches a plugin the audio thread owns
+//!
+//! Shape (a) has a consequence nobody had to pay until the plugin needed a UI:
+//! **there is no `&Instance` on this thread**. `IEditController::createView` is
+//! a main-thread call on an object that left for the audio callback five
+//! seconds ago.
+//!
+//! The answer is that the controller is a *separate, reference-counted COM
+//! object*, so [`Engine::load_plugin`] takes a second reference to it — an
+//! [`ivory_host::EditorHandle`] — in the last moment before `inst` is moved
+//! into a [`PluginBox`], and keeps it here. Opening an editor later touches
+//! that handle and never the instance. Nothing stops, nothing is retired, and
+//! not one block of audio is missed by opening or closing a window.
+//!
+//! It also does not weaken [`PluginBox`]'s safety argument, because condition 3
+//! is unchanged: the audio thread calls `process` and nothing else, and every
+//! call this file makes on the controller is on this thread — which is the
+//! split VST3 specifies in the first place.
+//!
+//! The lifetime rule that comes with it is one line and it is enforced in
+//! [`Engine::unload_plugin`]: **the editor closes before the instrument is
+//! released**, because the window holds an `IPlugView` belonging to a
+//! controller that `Instance::drop` is about to terminate.
+//!
 //! # What the callback may not do, and how each rule is kept
 //!
 //! **Never allocate.** Every buffer here is sized once, in [`Engine::start`] or
@@ -1363,6 +1387,21 @@ pub struct Engine {
     tap: Option<RecorderTap>,
     fault: Arc<Mutex<Option<String>>>,
 
+    /// The open editor window, if the user has asked for one.
+    ///
+    /// The engine owns it because the engine owns the plugin, and the two have
+    /// a lifetime rule: an editor must never outlive the instance whose
+    /// controller built its view. Everything that unloads goes through
+    /// [`Engine::close_editor`] first, and this is declared **before**
+    /// `editor_handle` so that even a plain `drop(engine)` releases the window
+    /// and its `IPlugView` before the controller reference that made them.
+    editor: Option<ivory_host::Editor>,
+    /// A reference to the loaded plugin's edit controller, taken in
+    /// [`Engine::load_plugin`] **before** the instance is handed to the audio
+    /// thread — see [`Engine::open_editor`], where that is the whole trick.
+    /// `None` when nothing is loaded.
+    editor_handle: Option<ivory_host::EditorHandle>,
+
     /// Meter hold, decayed on the UI thread because that is where it is read.
     hold: Cell<(f32, f32)>,
     hold_at: Cell<Instant>,
@@ -1480,6 +1519,8 @@ impl Engine {
                 dropped: shared,
             }),
             fault,
+            editor: None,
+            editor_handle: None,
             hold: Cell::new((0.0, 0.0)),
             hold_at: Cell::new(Instant::now()),
         })
@@ -1568,6 +1609,34 @@ impl Engine {
             peak: gate.peak_seen(),
         };
 
+        // ── the editor's only chance to get a reference ─────────────────────
+        //
+        // **Taken here and nowhere else.** One line below, `inst` is moved into
+        // a `Hosted`, into a `PluginBox`, and across a ring into the audio
+        // callback, and from that moment there is no `&Instance` on this thread
+        // and no safe way to make one. `IEditController` is a reference-counted
+        // COM object, so a second reference costs an atomic increment and keeps
+        // working after the instance has gone; it is `!Send`, so it can only
+        // ever be used from here.
+        //
+        // The alternatives were considered and are worse:
+        //
+        // * **Retire the plugin to borrow it back.** `hand_off(PluginBox(None))`
+        //   would return the instance, but the callback renders silence for the
+        //   whole round trip and any note in the MIDI ring during it is dropped
+        //   — a click and a hole in the middle of playing, every time somebody
+        //   opens a window.
+        // * **Create the view at load time.** Builds Pianoteq's entire UI on
+        //   every load whether or not anyone wants it, and leaves a view alive
+        //   with nowhere to be attached.
+        //
+        // The audio thread's side of this is unchanged: it calls `process` and
+        // nothing else, which is condition 3 of `PluginBox`'s safety argument
+        // and is exactly the split VST3 specifies — the controller is a
+        // main-thread object and every call this file makes on it is on this
+        // thread.
+        let editor_handle = inst.editor_handle();
+
         let loaded = Loaded {
             bundle: bundle.to_path_buf(),
             class: class.name.clone(),
@@ -1584,20 +1653,105 @@ impl Engine {
             channels,
         };
 
+        // Whatever was loaded before is going away, so its editor must go
+        // first — see `unload_plugin`.
+        self.close_editor();
         self.hand_off(PluginBox(Some(Box::new(hosted))));
+        self.editor_handle = editor_handle;
         self.loaded = Some(loaded.clone());
         self.warm = Some(warm);
         Ok(loaded)
     }
 
     /// Take the instrument out of the running stream and release it here.
+    ///
+    /// **The editor closes first, and that ordering is not optional.** The
+    /// window holds an `IPlugView` the plugin's edit controller made, and the
+    /// instance's `Drop` calls `IEditController::terminate`. Unloading with a
+    /// window still open would leave a view — and a plugin's `NSView` inside our
+    /// `NSView` — belonging to a terminated object, and the crash would land
+    /// wherever AppKit next asked it to draw.
     pub fn unload_plugin(&mut self) {
+        self.close_editor();
+        self.editor_handle = None;
         if self.loaded.is_none() {
             return;
         }
         self.loaded = None;
         self.warm = None;
         self.hand_off(PluginBox(None));
+    }
+
+    // ── the plugin's own editor ─────────────────────────────────────────────
+
+    /// Whether the loaded instrument offers an editor to open.
+    ///
+    /// `false` with nothing loaded, and `false` for a plugin that has no UI —
+    /// which is the honest thing to grey a menu row on. The first call after a
+    /// load is not free (VST3 has no `hasEditor`, so the only way to ask is to
+    /// build a view and throw it away); every call after that is a cached bool.
+    pub fn has_editor(&self) -> bool {
+        self.editor_handle.as_ref().is_some_and(|h| h.has_editor())
+    }
+
+    /// Open the instrument's own editor, or bring it to the front if it is
+    /// already open.
+    ///
+    /// **Main thread, and not from inside the audio callback** — but that is
+    /// already true of every `&mut self` method here, because `Engine` is
+    /// `!Send`.
+    ///
+    /// The window is independent of the audio: opening it does not interrupt a
+    /// single block, and closing it does not stop the instrument. Call
+    /// [`Engine::poll_editor`] once a frame so a window the user closes is
+    /// noticed and released.
+    pub fn open_editor(&mut self) -> Result<(), String> {
+        // A window the user closed one frame ago is still `Some` here until
+        // something notices. Noticing first is what stops "Open" reviving a
+        // window that then vanishes again on the next `poll_editor`.
+        self.poll_editor();
+        if let Some(editor) = &self.editor {
+            // Already open. Raising it is what "open the editor" means the
+            // second time somebody clicks the row.
+            editor.focus();
+            return Ok(());
+        }
+        let Some(handle) = &self.editor_handle else {
+            return Err("no instrument is loaded".to_string());
+        };
+        let title = match &self.loaded {
+            Some(l) => format!("{} — Tangent", l.class),
+            None => "Instrument — Tangent".to_string(),
+        };
+        let editor =
+            ivory_host::Editor::open_handle(handle, &title).map_err(|e| e.to_string())?;
+        self.editor = Some(editor);
+        Ok(())
+    }
+
+    /// Close the editor window if one is open. Safe to call when none is.
+    ///
+    /// Dropping the [`ivory_host::Editor`] is the teardown: `IPlugView::removed`
+    /// and then the window, in that order.
+    pub fn close_editor(&mut self) {
+        self.editor = None;
+    }
+
+    /// Is an editor window open right now?
+    pub fn editor_open(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    /// Notice a window the user closed and let go of it. Call once a frame.
+    ///
+    /// Cheap: one bool read when a window is open, nothing at all when it is
+    /// not. Without it a closed editor stays "open" as far as
+    /// [`Engine::editor_open`] is concerned, and the menu row keeps saying
+    /// Close for a window that is not there.
+    pub fn poll_editor(&mut self) {
+        if self.editor.as_ref().is_some_and(|e| e.closed()) {
+            self.editor = None;
+        }
     }
 
     /// Give the callback `next` and wait for whatever it was holding, so the old
@@ -2190,6 +2344,25 @@ pub fn plugin_test(filter: Option<String>) {
         *peak = scratch.iter().fold(*peak, |a, s| a.max(s.abs()));
     }
 
+    // ── the plugin's own editor ─────────────────────────────────────────────
+    //
+    // Opened here because this probe is the only place the whole chain exists
+    // at once: a signed bundle (which is what a plugin with a licence check
+    // will talk to), a real output device, and a window. A human can open
+    // Pianoteq's UI, change the instrument, and hear it change — which is the
+    // one claim about this feature that no test can make.
+    println!("editor:   {}", if engine.has_editor() { "yes" } else { "this plugin has none" });
+    if engine.has_editor() {
+        // This process will never call `[NSApp run]`: `main.rs` exits before
+        // eframe starts. Without this the window opens behind everything, never
+        // takes the keyboard, and looks broken.
+        ivory_host::editor::become_foreground();
+        match engine.open_editor() {
+            Ok(()) => println!("          open. Close the window to end this probe."),
+            Err(why) => println!("          could not open it: {why}"),
+        }
+    }
+
     println!("counting in 4 beats at 96 bpm...");
     engine.start_count_in(4, 96.0);
     let mut shown = 0;
@@ -2201,36 +2374,88 @@ pub fn plugin_test(filter: Option<String>) {
             }
         }
         drain(&mut tap, &mut scratch, &mut tap_frames, &mut tap_peak);
-        std::thread::sleep(Duration::from_millis(2));
+        // `pump` and not `sleep`: with a plugin editor on screen this is the
+        // only thing servicing its window, and two and a half seconds of
+        // count-in with nobody running the event loop is two and a half seconds
+        // of a frozen, undrawn window.
+        ivory_host::editor::pump(Duration::from_millis(2));
     }
     let click_in_tap = tap_peak;
     println!("go.");
     engine.set_metronome_enabled(true);
 
-    // The same ii-V-I `record_plugin.rs` plays, and for the same reason: the
-    // chord onsets are deliberately not multiples of the block size, so every
-    // event has to be placed by the clock rather than by rounding.
-    let t0 = engine.timebase().now() + 200_000_000;
-    let chords: [(&[u8], i64); 4] = [
-        (&[50, 62, 65, 69, 72], 0),
-        (&[43, 62, 65, 67, 71], 913),
-        (&[48, 64, 67, 71, 74], 1_847),
-        (&[36, 48, 55, 64, 67], 2_791),
-    ];
-    for (notes, at) in chords {
-        for (i, pitch) in notes.iter().enumerate() {
-            let on = t0 + (at + i as i64 * 7) * 1_000_000;
-            engine.send_midi(on, &[0x90, *pitch, 72 + i as u8 * 6]);
-            engine.send_midi(on + 880_000_000, &[0x80, *pitch, 64]);
+    /// The same ii-V-I `record_plugin.rs` plays, and for the same reason: the
+    /// chord onsets are deliberately not multiples of the block size, so every
+    /// event has to be placed by the clock rather than by rounding.
+    ///
+    /// A function rather than a straight line of code because with an editor
+    /// open it is played over and over: somebody changing the instrument needs
+    /// something to hear it on.
+    fn play_phrase(engine: &Engine) {
+        let t0 = engine.timebase().now() + 200_000_000;
+        let chords: [(&[u8], i64); 4] = [
+            (&[50, 62, 65, 69, 72], 0),
+            (&[43, 62, 65, 67, 71], 913),
+            (&[48, 64, 67, 71, 74], 1_847),
+            (&[36, 48, 55, 64, 67], 2_791),
+        ];
+        for (notes, at) in chords {
+            for (i, pitch) in notes.iter().enumerate() {
+                let on = t0 + (at + i as i64 * 7) * 1_000_000;
+                engine.send_midi(on, &[0x90, *pitch, 72 + i as u8 * 6]);
+                engine.send_midi(on + 880_000_000, &[0x80, *pitch, 64]);
+            }
         }
     }
 
-    let until = Instant::now() + Duration::from_secs(5);
+    play_phrase(&engine);
+    // Five seconds when there is nothing to look at, which is what this probe
+    // always did. With an editor open it runs until the window is closed, and
+    // the phrase repeats so there is always something playing while the
+    // instrument is being changed underneath it.
+    let deadline = if engine.editor_open() {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_secs(5))
+    };
+    let mut next_phrase = Instant::now() + Duration::from_secs(6);
     let mut peak = 0.0f32;
-    while Instant::now() < until {
+    loop {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+        // 16 ms, so this loop runs at the rate the app's own frame loop would.
+        ivory_host::editor::pump(Duration::from_millis(16));
+        engine.poll_editor();
+        if deadline.is_none() && !engine.editor_open() {
+            println!("\neditor closed.");
+            break;
+        }
         peak = peak.max(engine.meters().peak());
         drain(&mut tap, &mut scratch, &mut tap_frames, &mut tap_peak);
-        std::thread::sleep(Duration::from_millis(16));
+        if Instant::now() >= next_phrase {
+            next_phrase = Instant::now() + Duration::from_secs(6);
+            play_phrase(&engine);
+        }
+    }
+    // Closing the window must not have stopped anything. The instrument is
+    // still loaded and still rendering, and the next two seconds prove it.
+    if deadline.is_none() {
+        let check = Instant::now() + Duration::from_secs(2);
+        let before = engine.callbacks();
+        play_phrase(&engine);
+        let mut after_peak = 0.0f32;
+        while Instant::now() < check {
+            after_peak = after_peak.max(engine.meters().peak());
+            drain(&mut tap, &mut scratch, &mut tap_frames, &mut tap_peak);
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        println!(
+            "after the editor: {} more callbacks, peak {after_peak:.4} — the instrument \
+             is a running instrument, not a window",
+            engine.callbacks() - before
+        );
+        peak = peak.max(after_peak);
     }
 
     println!("\npeak heard:      {peak:.4} (device mix: instrument plus click)");

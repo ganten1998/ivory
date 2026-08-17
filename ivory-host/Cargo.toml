@@ -19,6 +19,46 @@ rust-version.workspace = true
 # this Mac. That property is worth more here than any convenience wrapper.
 vst3 = "0.3"
 
+# ── the editor window, macOS only ────────────────────────────────────────────
+#
+# TARGET-GATED, and that is not tidiness. This crate is cross-compiled to
+# Windows with `cargo xwin`, and an unconditional AppKit dependency would fail
+# to resolve there rather than simply going unused. `check-firewall.sh` and
+# `cargo tree -p ivory-host --target x86_64-pc-windows-msvc` must both stay
+# free of every line below.
+#
+# All three versions are ALREADY in the lock file (eframe/winit pull the 0.2
+# line, arboard/glutin/rfd pull this 0.3 one), so this adds no new crate to the
+# graph and no new compile. Deliberately on the 0.3/objc2-0.6 line rather than
+# winit's 0.2/objc2-0.5: two Rust wrappers over the same Objective-C classes
+# coexist without trouble — they are both just `objc_msgSend` — and matching
+# the newer line is what the rest of the workspace's leaves already do.
+#
+# Features are enumerated rather than defaulted: `default` on objc2-app-kit is
+# *every* AppKit header, which is a minute of compile time for a window and a
+# view.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSEvent",
+    "NSGraphics",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSDate",
+    "NSGeometry",
+    "NSNotification",
+    "NSObject",
+    "NSRunLoop",
+    "NSString",
+] }
+
 [dev-dependencies]
 # Examples only, and `check-firewall.sh` walks `--edges normal`, so this does
 # not put the recorder into the host's shipped dependency graph. It is here so

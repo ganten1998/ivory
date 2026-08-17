@@ -124,6 +124,16 @@ struct Recorder {
     /// The bundle path the engine currently has loaded, so a change in settings
     /// can be noticed on the edge rather than re-decided every frame.
     plugin_loaded: Option<String>,
+    /// A plugin load that has been announced but not yet performed.
+    ///
+    /// `load_plugin` blocks for **about five seconds** — the module's own
+    /// initialiser, then a warm-up, because four of six instruments on this
+    /// machine render silence if recorded cold. That happens on the UI thread,
+    /// so doing it the moment the selection changes freezes the window for five
+    /// seconds with the previous frame still painted and nothing on screen
+    /// saying why. Same two-phase treatment the camera already gets: announce
+    /// on one frame, block on the next.
+    plugin_opening: bool,
     audio: crate::devices::Shared,
     camera: crate::devices::Shared,
     /// Why enumeration failed last time, so the band can say "permission" and
@@ -247,12 +257,28 @@ impl DesktopApp {
         // not open beats a device that is denied beats the last take's report.
         let message = self
             .recorder
-            .camera_opening
+            .plugin_opening
+            .then(|| {
+                // Named, because "loading…" with no subject is the least
+                // informative thing a status line can say.
+                match self.app.chosen_plugin() {
+                    Some(p) => format!(
+                        "loading {} — instruments warm up for a few seconds so \
+                         the first take is not silent",
+                        std::path::Path::new(p)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.to_owned())
+                    ),
+                    None => "loading the instrument…".to_owned(),
+                }
+            })
+            .or_else(|| self.recorder.camera_opening
             .then(|| {
                 "starting the camera — this can take a few seconds on a USB \
                  webcam"
                     .to_owned()
-            })
+            }))
             .or_else(|| self.recorder.session.audio_error().map(str::to_owned))
             .or_else(|| self.recorder.engine_error.clone())
             .or_else(|| self.recorder.session.camera_error().map(str::to_owned))
@@ -332,6 +358,16 @@ impl DesktopApp {
             .and_then(|b| ivory_ui::recorder::minutes_on_disk(b, &spec));
         state.plugin_name = plugin_name;
         state.plugin_missing = plugin_missing;
+        state.plugin_has_editor = self
+            .recorder
+            .engine
+            .as_ref()
+            .is_some_and(crate::instrument::Engine::has_editor);
+        state.plugin_editor_open = self
+            .recorder
+            .engine
+            .as_ref()
+            .is_some_and(crate::instrument::Engine::editor_open);
         state.message = message;
         state.clip_warning = self.recorder.session.clipped();
     }
@@ -340,6 +376,13 @@ impl DesktopApp {
     /// native panels, creating directories.
     fn after_frame(&mut self, ctx: &egui::Context) {
         use ivory_ui::recorder::RecorderRequest as R;
+
+        // The instrument's own window, if it has one open. Polled rather than
+        // notified because the user closes it with the OS's close button, which
+        // the plugin's view knows about and we only find out by asking.
+        if let Some(e) = self.recorder.engine.as_mut() {
+            e.poll_editor();
+        }
 
         // The always-on MIDI tap, drained whether or not a take is running, and
         // fanned out to the monitor engine in the SAME drain — the tap is a
@@ -359,7 +402,7 @@ impl DesktopApp {
         if open != self.recorder.band_was_open {
             self.recorder.band_was_open = open;
             if open {
-                self.start_engine();
+                self.start_engine(ctx);
                 self.reconcile_audio(true);
                 self.reconcile_camera(true, ctx);
             } else {
@@ -375,7 +418,7 @@ impl DesktopApp {
         } else if open {
             self.reconcile_audio(false);
             self.reconcile_camera(false, ctx);
-            self.reconcile_plugin();
+            self.reconcile_plugin(ctx);
             self.push_monitor_settings();
             self.push_take_source();
         }
@@ -453,6 +496,24 @@ impl DesktopApp {
                     );
                 }
                 R::Stop => self.recorder.session.stop(),
+                R::OpenPluginEditor => {
+                    // The plugin's own window, created here rather than in the
+                    // frame: VST3 requires the main thread and AppKit will not
+                    // have a window built while an egui frame is on the stack.
+                    // The engine owns it, because the engine owns the plugin
+                    // the view belongs to.
+                    if let Some(e) = self.recorder.engine.as_mut() {
+                        // One row, two names, one action: open it, or close the
+                        // one that is open. A second menu row for closing a
+                        // window that has its own close button is clutter.
+                        if e.editor_open() {
+                            e.close_editor();
+                        } else if let Err(err) = e.open_editor() {
+                            self.recorder.engine_error =
+                                Some(format!("could not open the instrument window: {err}"));
+                        }
+                    }
+                }
             }
             ctx.request_repaint();
         }
@@ -464,7 +525,7 @@ impl DesktopApp {
     /// device, or one another app holds exclusively, still has a perfectly good
     /// chord display and a perfectly good recorder. The band says what happened
     /// and everything else carries on.
-    fn start_engine(&mut self) {
+    fn start_engine(&mut self, ctx: &egui::Context) {
         if self.recorder.engine.is_some() {
             return;
         }
@@ -474,7 +535,10 @@ impl DesktopApp {
                 self.recorder.engine_error = None;
                 self.recorder.plugin_loaded = None;
                 self.push_monitor_settings();
-                self.reconcile_plugin();
+                // Announces rather than loads on this frame: the band has just
+                // appeared and a remembered instrument would otherwise freeze
+                // it for five seconds before it had drawn once.
+                self.reconcile_plugin(ctx);
             }
             Err(e) => {
                 self.recorder.engine_error = Some(format!("no audio output: {e}"));
@@ -523,20 +587,36 @@ impl DesktopApp {
     /// **Blocking**, like the camera: `Module::open` runs a third-party
     /// library's initialiser and `Instance::create` can take seconds on a
     /// sampler. Hence after the frame, never inside one.
-    fn reconcile_plugin(&mut self) {
+    fn reconcile_plugin(&mut self, ctx: &egui::Context) {
         let wanted = self.app.chosen_plugin().map(str::to_owned);
         if wanted == self.recorder.plugin_loaded {
             return;
         }
+        // Announce first, act next frame — but only when there is a wait to
+        // explain. Unloading is instant, so making the user watch a frame of
+        // "loading…" in order to REMOVE an instrument would be silly.
+        if wanted.is_some() && !self.recorder.plugin_opening {
+            self.recorder.plugin_opening = true;
+            ctx.request_repaint();
+            return;
+        }
+        self.recorder.plugin_opening = false;
         let Some(e) = self.recorder.engine.as_mut() else {
             return;
         };
         match &wanted {
             None => {
+                // The editor FIRST: it is a view onto this instrument, and a
+                // window still attached to a plugin that has been terminated is
+                // a use-after-free with a title bar.
+                e.close_editor();
                 e.unload_plugin();
                 self.recorder.engine_error = None;
             }
-            Some(path) => match e.load_plugin(std::path::Path::new(path), None) {
+            Some(path) => match {
+                e.close_editor();
+                e.load_plugin(std::path::Path::new(path), None)
+            } {
                 Ok(_) => {
                 self.recorder.engine_error = None;
                 // The take has to be able to RECORD what it can now hear.
@@ -728,6 +808,7 @@ impl DesktopApp {
                 engine: None,
                 engine_error: None,
                 plugin_loaded: None,
+                plugin_opening: false,
                 camera_opening: false,
                 camera_silent_since: None,
                 preview: None,

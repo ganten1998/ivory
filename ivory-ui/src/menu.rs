@@ -126,6 +126,8 @@ pub enum MenuAction {
     ShowPluginPicker,
     /// Unload whatever instrument is loaded.
     UnloadPlugin,
+    /// Open the instrument's own editor window.
+    ShowPluginEditor,
     /// The click.
     ToggleMetronome,
     /// Whether the click is mixed into the FILE as well as the monitors.
@@ -205,6 +207,12 @@ pub struct MenuView {
     /// from "Change Instrument..." to "Load Instrument...", so the row is the
     /// state readout — the chrome rule again.
     pub plugin_name: Option<String>,
+    /// The loaded instrument has an editor to open. A plugin without one is
+    /// legal VST3, and a row that cannot work is worse than an absent row.
+    pub plugin_has_editor: bool,
+    /// Its window is on screen, so the row reads "Close" instead of "Open".
+    /// One row with two names, per the chrome rule at the top of this file.
+    pub plugin_editor_open: bool,
     /// The click is running.
     pub metronome_on: bool,
     /// The click is mixed into the recording as well as the monitors.
@@ -812,6 +820,20 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 },
                 MenuAction::ShowPluginPicker,
             ));
+            if view.plugin_name.is_some() && view.plugin_has_editor {
+                // The plugin's OWN window: its presets, its knobs, its sound.
+                // Without it a pianist is stuck on whatever preset the
+                // instrument happened to open with, which is the difference
+                // between hosting a piano and hosting one piano.
+                recorder.push(row(
+                    if view.plugin_editor_open {
+                        "Close Instrument Window"
+                    } else {
+                        "Instrument Window"
+                    },
+                    MenuAction::ShowPluginEditor,
+                ));
+            }
             if let Some(name) = view.plugin_name.as_deref() {
                 // Named rather than a bare "Unload", so the row says what is
                 // about to go away. A user with six pianos installed cannot
@@ -1409,6 +1431,8 @@ mod tests {
             recorder_detached: false,
             count_in_beats: 4,
             plugin_name: None,
+            plugin_has_editor: false,
+            plugin_editor_open: false,
             metronome_on: false,
             metronome_in_take: false,
             hide_elapsed: false,
@@ -1964,6 +1988,14 @@ mod tests {
             // `caps`, not because the flag happened to be false.
             recorder_on: true,
             recorder_detached: true,
+            // And an instrument LOADED, for the same reason: the settings file
+            // remembers a plugin path, so a plugin instance will be handed one.
+            // The Instrument Window and Unload rows have to be absent because
+            // of `caps`, not because nothing happened to be loaded.
+            plugin_name: Some("Pianoteq 9".to_owned()),
+            plugin_has_editor: true,
+            plugin_editor_open: true,
+            metronome_on: true,
             ..view()
         };
         // Detach/Attach Theory joins the list for exactly the reason the other
@@ -1995,9 +2027,18 @@ mod tests {
             MenuAction::AttachRecorder,
             MenuAction::ShowExportDialog,
             MenuAction::ToggleHideElapsed,
+            // The instrument rows. Loading one runs third-party code inside
+            // the process and opens a device; the editor opens a native window;
+            // and the click writes to an output stream. None of the three is
+            // anything a VST3 editor may do inside its host.
+            MenuAction::ShowPluginPicker,
+            MenuAction::ShowPluginEditor,
+            MenuAction::UnloadPlugin,
+            MenuAction::ToggleMetronome,
+            MenuAction::ToggleMetronomeInTake,
         ];
-        // Built from the table rather than spelled out, so a fourth pre-roll
-        // choice cannot be added to `PREROLL_CHOICES` and quietly arrive in a
+        // Built from the table rather than spelled out, so a fourth count-in
+        // choice cannot be added to `COUNT_IN_CHOICES` and quietly arrive in a
         // plugin unlisted here.
         forbidden.extend(crate::recorder::COUNT_IN_CHOICES.map(MenuAction::SetCountIn));
         for (label, action, _) in all_rows(v.clone()) {

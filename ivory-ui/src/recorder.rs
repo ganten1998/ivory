@@ -318,6 +318,12 @@ pub struct RecorderState {
     pub plugin_name: Option<String>,
     /// Named in settings but did not load this time.
     pub plugin_missing: bool,
+    /// The loaded instrument offers an editor of its own. Not all do — a
+    /// parameter-only plugin is legal VST3 — and offering a window that cannot
+    /// open is worse than not offering one.
+    pub plugin_has_editor: bool,
+    /// Its window is on screen.
+    pub plugin_editor_open: bool,
     pub audio_name: Option<String>,
     pub audio_missing: bool,
     pub preview: Option<Preview>,
@@ -401,11 +407,12 @@ impl Default for Knobs {
 /// creating a take directory and opening a device must not happen halfway
 /// through painting a frame. The plugin refuses simply by never draining.
 ///
-/// Deliberately only two variants. Everything else a click in the band can do —
-/// choosing a folder, choosing a device, changing the pre-roll, opening the
-/// Export dialog — is either a settings write or a dialog, and both of those
-/// are the app's own business. A request enum that carried them would be a
-/// second, weaker copy of the menu.
+/// Deliberately short. Everything else a click in the band can do — choosing a
+/// folder, choosing a device, changing the count-in, opening the Export dialog
+/// — is either a settings write or a dialog, and both of those are the app's
+/// own business. A request enum that carried them would be a second, weaker
+/// copy of the menu. What is here is what needs a THING the app does not own: a
+/// take, or a window belonging to somebody else's code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecorderRequest {
     /// The one button. Start a pre-roll, start a take, or stop one — the
@@ -415,6 +422,15 @@ pub enum RecorderRequest {
     /// distinct Stop control and "the button that stops it" must not also be
     /// able to start one.
     Stop,
+    /// Open the instrument's OWN editor — the plugin's window, with its presets
+    /// and its knobs.
+    ///
+    /// A request rather than a dialog, because the window is not ours: the
+    /// plugin draws into a native window the host creates after the frame. VST3
+    /// requires it on the main thread, and creating an AppKit window with an
+    /// egui frame still on the stack is the same re-entrancy the folder picker
+    /// avoids.
+    OpenPluginEditor,
 }
 
 // ── The export contract ─────────────────────────────────────────────────────

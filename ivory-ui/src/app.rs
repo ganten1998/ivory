@@ -896,6 +896,8 @@ impl IvoryApp {
             recorder_detached: self.settings.recorder_detached,
             count_in_beats: self.settings.count_in_beats(),
             plugin_name: self.recorder.plugin_name.clone(),
+            plugin_has_editor: self.recorder.plugin_has_editor,
+            plugin_editor_open: self.recorder.plugin_editor_open,
             metronome_on: self.settings.metronome_on,
             metronome_in_take: self.settings.metronome_in_take,
             hide_elapsed: self.settings.record_hide_elapsed,
@@ -2028,6 +2030,9 @@ impl IvoryApp {
                 self.save_settings();
             }
             MenuAction::ShowPluginPicker => self.open_plugin_picker(),
+            MenuAction::ShowPluginEditor => {
+                self.request_recorder(recorder::RecorderRequest::OpenPluginEditor);
+            }
             MenuAction::UnloadPlugin => {
                 self.settings.plugin_path = None;
                 self.save_settings();
