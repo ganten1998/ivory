@@ -19,20 +19,27 @@ pub struct Rgb {
     pub b: u8,
 }
 
-/// Recorder backgrounds this app has shipped as its DEFAULT, in the order it
-/// shipped them, and which are therefore not evidence that anybody chose them.
+/// What the settings file's shape is, so that a default this app changes can
+/// reach somebody who already has the app.
 ///
-/// Settings are written whole: every key the app knows goes into the file on
-/// every save, so a user who has ever changed anything at all has the day's
-/// default for every key they never touched. Without this list a default colour
-/// is a one-shot — changeable only for people who have never run the app —
-/// which is how two successive corrections to this band's brown reached nobody
-/// who already had it installed.
+/// **The problem this solves is not versioning, it is that a default is a
+/// one-shot.** The file is written whole: every key the app knows goes into it
+/// on every save, so the first save any user ever makes pins the day's default
+/// for every key they never touched, and no later default can ever reach them.
+/// Three changes to this app shipped into that hole — two corrections to the
+/// recorder's brown and the change that made the app rather than the camera the
+/// subject of a recording. The owner asked for the last one four times, was
+/// told four times that it was done, and it had never once been true for them.
 ///
-/// The cost is real and small: somebody who deliberately picked one of these
-/// exact values loses it once and picks it again. The alternative is a setting
-/// the app can never correct.
-const SUPERSEDED_RECORDER_BG: [&str; 2] = ["#4a3b2c", "#33271b"];
+/// A version stamp fixes it properly where a list of superseded values did not:
+/// the migration runs ONCE against a file written before the change, and after
+/// that the same value chosen deliberately is never touched again. A file with
+/// no stamp is version 0 — every file every previous build wrote.
+const SETTINGS_VERSION: u64 = 1;
+
+/// Recorder backgrounds this app shipped as defaults before [`SETTINGS_VERSION`]
+/// 1, and which are therefore not evidence that anybody chose them.
+const V0_RECORDER_BG: [&str; 2] = ["#4a3b2c", "#33271b"];
 
 impl Rgb {
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
@@ -651,6 +658,13 @@ impl Settings {
 
     fn from_map(mut map: Map<String, Value>) -> Self {
         let mut s = Self::default();
+        // Absent means version 0 — every file every build before this one
+        // wrote. Removed from the map like every other known key, so it does
+        // not also survive in `extra` and get written twice.
+        let was = map
+            .remove("settings_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
         let take_bool = |map: &mut Map<String, Value>, key: &str, dst: &mut bool| {
             if let Some(v) = map.remove(key) {
@@ -730,18 +744,7 @@ impl Settings {
         }
         if let Some(v) = map.remove("recorder_bg_color") {
             if let Some(c) = v.as_str().and_then(Rgb::parse) {
-                // A stored value that is EXACTLY a colour this app used to ship
-                // as its default is not a choice, it is a fossil: the file is
-                // written whole on every save, so the first save any user ever
-                // makes pins the default of the day for ever and no later
-                // default can reach them. Anybody still sitting on one moves to
-                // the current default; anybody who picked their own keeps it.
-                // See `SUPERSEDED_RECORDER_BG`.
-                s.recorder_bg_color = if SUPERSEDED_RECORDER_BG.contains(&c.to_hex().as_str()) {
-                    Settings::default().recorder_bg_color
-                } else {
-                    c
-                };
+                s.recorder_bg_color = c;
             }
         }
         if let Some(v) = map.remove("chord_text_color") {
@@ -974,7 +977,36 @@ impl Settings {
         if !saw_bars {
             s.convert_count_in_to_bars();
         }
+        s.migrate_from(was);
         s
+    }
+
+    /// Move a file written before [`SETTINGS_VERSION`] onto the defaults it
+    /// never got a chance to see.
+    ///
+    /// **Only values this app itself shipped as a default are touched**, and
+    /// only once. A user who deliberately picked the old walnut, or who really
+    /// does want the camera above the keyboard, loses that choice one time and
+    /// makes it again — and it sticks for ever after, because the file is
+    /// stamped on the next save. That is the cost, and it is worth paying: the
+    /// alternative is what this app did until now, which is that a default,
+    /// once shipped, could never be corrected for anybody who already had it.
+    fn migrate_from(&mut self, was: u64) {
+        if was >= SETTINGS_VERSION {
+            return;
+        }
+        if was < 1 {
+            if V0_RECORDER_BG.contains(&self.recorder_bg_color.to_hex().as_str()) {
+                self.recorder_bg_color = Self::default().recorder_bg_color;
+            }
+            // The camera was the subject of a recording and the app was a band
+            // underneath it. Since 3.10.0 it is the other way round — the app
+            // draws the thing worth watching and the camera is the context —
+            // and nobody who had already run the app ever saw that change.
+            if self.record_export.composite.layout == crate::recorder::Layout::CameraAbove {
+                self.record_export.composite.layout = crate::recorder::Layout::default();
+            }
+        }
     }
 
     fn to_map(&self) -> Map<String, Value> {
@@ -1232,6 +1264,13 @@ impl Settings {
             Value::Bool(self.record_hide_elapsed),
         );
         map.insert("record_export".into(), self.record_export.to_value());
+        // Last of the known keys, and written unconditionally: a file this
+        // build saves has seen every migration up to here, so the next build's
+        // migration must not run against it. See `SETTINGS_VERSION`.
+        map.insert(
+            "settings_version".into(),
+            Value::Number(SETTINGS_VERSION.into()),
+        );
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -1598,37 +1637,72 @@ mod tests {
     /// **A default that has never reached anybody is not a default.**
     ///
     /// The file is written whole, so the first save any user makes pins the
-    /// day's default for every key they never touched — and two successive
-    /// corrections to this band's brown reached nobody who had already run the
-    /// app. A stored value that is EXACTLY a colour this app once shipped as
-    /// its default is treated as that fossil and moves on; anything else is a
-    /// choice and is left alone.
+    /// day's default for every key they never touched. Three shipped changes
+    /// fell into that hole — two corrections to the recorder's brown and the
+    /// one that made the app rather than the camera the subject of a recording,
+    /// which the owner asked for four times and never once received. A file
+    /// written before the stamp gets those defaults; a stamped file is left
+    /// alone for ever after.
     #[test]
-    fn a_recorder_background_left_at_an_old_default_moves_to_the_new_one() {
-        let now = Settings::default().recorder_bg_color;
-        for fossil in SUPERSEDED_RECORDER_BG {
+    fn an_unstamped_file_gets_the_defaults_it_never_had_a_chance_to_see() {
+        let now = Settings::default();
+        for fossil in V0_RECORDER_BG {
             let json = format!("{{\"recorder_bg_color\": \"{fossil}\"}}");
             assert_eq!(
                 Settings::from_json(&json).recorder_bg_color,
-                now,
+                now.recorder_bg_color,
                 "{fossil} is a superseded default and should have moved"
             );
         }
+        // The one the owner has been recording with since 3.10.0 said it had
+        // changed: camera on top, the app in a band underneath.
+        let json = r#"{"record_export": {"layout": "camera_above"}}"#;
+        assert_eq!(
+            Settings::from_json(json).record_export.composite.layout,
+            crate::recorder::Layout::default(),
+            "the pre-3.10 export layout survived the migration"
+        );
+
         // A colour nobody ever shipped is somebody's own, and survives.
         let mine = "#1b3a62";
-        assert!(
-            !SUPERSEDED_RECORDER_BG.contains(&mine),
-            "pick a colour this app has never defaulted to"
-        );
+        assert!(!V0_RECORDER_BG.contains(&mine), "pick an unshipped colour");
         let json = format!("{{\"recorder_bg_color\": \"{mine}\"}}");
         assert_eq!(
             Settings::from_json(&json).recorder_bg_color.to_hex(),
             mine,
             "a chosen colour was overwritten by the migration"
         );
-        // And the current default is not in the list, or it would migrate to
-        // itself for ever and the next change would silently do nothing.
-        assert!(!SUPERSEDED_RECORDER_BG.contains(&now.to_hex().as_str()));
+        // And the current defaults are not themselves fossils, or the next
+        // change would migrate to itself and silently do nothing.
+        assert!(!V0_RECORDER_BG.contains(&now.recorder_bg_color.to_hex().as_str()));
+        assert_ne!(now.record_export.composite.layout, crate::recorder::Layout::CameraAbove);
+    }
+
+    /// **It runs ONCE.** Somebody who really does want the camera above the
+    /// keyboard, or the old walnut, chooses it again and keeps it — because the
+    /// file they save is stamped, and a stamped file is not migrated. Without
+    /// this the migration is not a migration, it is a setting the user is not
+    /// allowed to have.
+    #[test]
+    fn a_stamped_file_keeps_a_choice_that_matches_an_old_default() {
+        let mut s = Settings::default();
+        s.recorder_bg_color = Rgb::parse(V0_RECORDER_BG[0]).expect("hex");
+        s.record_export.composite.layout = crate::recorder::Layout::CameraAbove;
+
+        let json = s.to_json();
+        assert!(json.contains("settings_version"), "the save is not stamped");
+        let back = Settings::from_json(&json);
+        assert_eq!(
+            back.recorder_bg_color.to_hex(),
+            V0_RECORDER_BG[0],
+            "a deliberate re-pick was migrated away again"
+        );
+        assert_eq!(
+            back.record_export.composite.layout,
+            crate::recorder::Layout::CameraAbove
+        );
+        // And the stamp does not leak into `extra`, which would write it twice.
+        assert_eq!(json.matches("settings_version").count(), 1, "{json}");
     }
 
     /// A custom tuning survives a save/load round trip and is usable.
