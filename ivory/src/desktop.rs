@@ -188,6 +188,20 @@ struct Recorder {
     /// Without this the video would only ever contain frames that happened to
     /// land on the same window frame as a tick.
     camera_rgba: Option<(Vec<u8>, u32, u32)>,
+    /// When to try starting the monitor output again, and how many tries are
+    /// left.
+    ///
+    /// `start_engine` runs on the edge of the band opening, which is fine while
+    /// the only way to lose the engine is to close the band. Changing the
+    /// buffer size drops it deliberately and reopens the SAME CoreAudio device
+    /// in the same breath — the one moment a transient failure is likely — and
+    /// without a retry the app would sit there with no monitor and no
+    /// instrument until somebody thought to close the band and open it again.
+    ///
+    /// Bounded, because a device that is genuinely gone must not be reopened
+    /// sixty times a second for the rest of the session. The band shows the
+    /// error either way.
+    engine_retry: Option<(std::time::Instant, u8)>,
     /// The buffer size both streams were opened with.
     ///
     /// Changing it has to REOPEN them — a running stream cannot be resized —
@@ -223,6 +237,16 @@ pub struct DesktopApp {
 
 #[cfg(feature = "recorder")]
 const DISK_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long to wait before trying the monitor output again, and how many times.
+///
+/// Half a second is long enough for CoreAudio to finish releasing a device that
+/// was dropped a moment ago, and five tries is long enough to cover it without
+/// becoming a device that is reopened for ever.
+#[cfg(feature = "recorder")]
+const ENGINE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(feature = "recorder")]
+const ENGINE_TRIES: u8 = 5;
 
 #[cfg(feature = "recorder")]
 impl DesktopApp {
@@ -317,14 +341,31 @@ impl DesktopApp {
         // The buffer size, on the edge. Reopening both streams is expensive —
         // the output takes every instrument with it — so it happens when the
         // choice CHANGES and not while a take is rolling.
+        // A monitor that would not open a moment ago. See `engine_retry`.
+        if self.recorder.engine.is_none() && self.app.recorder_band_open() {
+            if let Some((at, _)) = self.recorder.engine_retry {
+                if std::time::Instant::now() >= at {
+                    self.start_engine(ctx);
+                }
+            }
+        }
+
         let want_buffer = self.app.buffer_frames();
         if self.recorder.buffer_open != want_buffer && !self.recorder.session.is_recording() {
             self.recorder.buffer_open = want_buffer;
-            // Dropping the engine stops the output stream; the next frame
-            // starts a new one at the new size and reloads the slots, exactly
-            // as it does when the band is reopened.
+            // Dropping the engine stops the output stream, and STARTING ONE
+            // AGAIN is not optional. `start_engine` otherwise runs only on the
+            // edge of the band opening, so dropping it here left the app with
+            // no monitor and no instrument until the band was closed and
+            // reopened — which is not a thing anybody would think to try.
+            //
+            // Both in the same call: the old stream's `Drop` releases the
+            // device before the new one asks for it, which is the ordering
+            // CoreAudio needs. The five-second instrument load still happens
+            // over the following frames, announced as usual.
             self.recorder.engine = None;
             self.recorder.plugin_loaded = std::array::from_fn(|_| None);
+            self.start_engine(ctx);
             self.reconcile_audio(true);
         }
 
@@ -729,6 +770,7 @@ impl DesktopApp {
             Ok(e) => {
                 self.recorder.engine = Some(e);
                 self.recorder.engine_error = None;
+                self.recorder.engine_retry = None;
                 self.recorder.plugin_loaded = [const { None }; ivory_ui::recorder::SLOTS];
                 self.push_monitor_settings();
                 // Announces rather than loads on this frame: the band has just
@@ -738,6 +780,14 @@ impl DesktopApp {
             }
             Err(e) => {
                 self.recorder.engine_error = Some(format!("no audio output: {e}"));
+                // Try again shortly, a few times. See `engine_retry`.
+                let left = self.recorder.engine_retry.map_or(ENGINE_TRIES, |(_, n)| n);
+                self.recorder.engine_retry = (left > 0).then(|| {
+                    (
+                        std::time::Instant::now() + ENGINE_RETRY_AFTER,
+                        left.saturating_sub(1),
+                    )
+                });
             }
         }
     }
@@ -803,6 +853,19 @@ impl DesktopApp {
             return;
         };
         let wanted = self.app.chosen_plugin(slot).map(str::to_owned);
+
+        // **No engine, nothing to load into.** Checked BEFORE announcing, and
+        // that ordering is the whole of a bug that looked like a failing
+        // plugin: announcing first meant frame one set "loading…", frame two
+        // found no engine and returned WITHOUT settling `plugin_loaded`, and
+        // frame three announced again — for ever, at sixty frames a second,
+        // each one asking for a repaint. What the user sees is an instrument
+        // flickering between loading and not, and it is not the instrument's
+        // fault at all.
+        if self.recorder.engine.is_none() {
+            self.recorder.plugin_opening = None;
+            return;
+        }
 
         // Announce first, act next frame — but only when there is a wait to
         // explain. Unloading is instant, so making the user watch a frame of
@@ -1081,6 +1144,7 @@ impl DesktopApp {
                 video: None,
                 video_tried: false,
                 camera_rgba: None,
+                engine_retry: None,
                 buffer_open: None,
                 seen_take: None,
                 dev_editor_done: false,
