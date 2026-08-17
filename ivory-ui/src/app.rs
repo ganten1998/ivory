@@ -910,6 +910,7 @@ impl IvoryApp {
         keys::Gates {
             recorder_shown: self.settings.show_recorder,
             recorder_available: self.caps.capture_devices,
+            window_sizing: self.caps.window_sizing,
         }
     }
 
@@ -2024,6 +2025,15 @@ impl IvoryApp {
             // Help is HELD, not toggled, so it never reaches here.
             K::ToggleHelp | K::CloseHelp => {}
             K::ToggleKeytoggle => self.apply_menu_action(ctx, MenuAction::ToggleKeytoggle),
+            // Read from the viewport rather than tracked in a field, so the
+            // toggle cannot disagree with the window: somebody who leaves
+            // fullscreen with the green button, or with the OS's own gesture,
+            // has changed the state without this app hearing about it, and a
+            // remembered bool would then need pressing twice to do anything.
+            K::ToggleFullscreen => {
+                let now = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!now));
+            }
             K::ToggleFretboard => self.apply_menu_action(ctx, MenuAction::ToggleFretboard),
             // One key, five states, in the order someone discovering the band
             // would want them: nothing, each diagram alone, then all three.
@@ -4607,6 +4617,46 @@ mod tests {
         app.commit_number_unless(Some(recorder_panel::Hit::Record));
         assert!(app.num_edit.is_none(), "clicking away left it open");
         assert!((app.settings.record_export.tempo_bpm - 144.0).abs() < 1e-9);
+    }
+
+    /// **Choosing "None" as the audio input has to survive a restart.**
+    ///
+    /// `record_audio_device: null` is also what "never opened the picker" looks
+    /// like, and the two want opposite behaviour at startup — no input at all,
+    /// or the system default so the meter is live. `record_input_off` is what
+    /// tells them apart, and if it does not round-trip then every launch
+    /// helpfully opens the system microphone for somebody who said not to.
+    #[test]
+    fn choosing_no_audio_input_survives_a_restart() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.apply_dialog_action(DialogAction::ChooseDevice {
+            kind: dialogs::DeviceKind::AudioInput,
+            uid: None,
+        });
+        assert!(
+            app.audio_explicitly_off(),
+            "picking None did not record that it was picked"
+        );
+        assert_eq!(app.chosen_audio_uid(), None);
+
+        // And through the FILE, which is the half that actually restarts.
+        // `Settings::path()` is redirected per-thread under `cfg(test)`, so
+        // this writes and reads a real file without touching the user's.
+        app.settings.save();
+        let reloaded = crate::settings::Settings::load();
+        assert!(
+            reloaded.record_input_off,
+            "the None choice did not survive being written and read back"
+        );
+        assert_eq!(reloaded.record_audio_device, None);
+
+        // Picking a real device clears it again, or the flag would outlive the
+        // choice it describes.
+        app.apply_dialog_action(DialogAction::ChooseDevice {
+            kind: dialogs::DeviceKind::AudioInput,
+            uid: Some("Scarlett#0".to_owned()),
+        });
+        assert!(!app.audio_explicitly_off());
     }
 
     /// The session-only spec must not leak into the file, and remembering must

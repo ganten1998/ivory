@@ -215,6 +215,13 @@ pub struct Settings {
     /// disable it before this key existed — which is exactly why the migration
     /// is safe to run once and unsafe to run twice.
     pub video_default_applied: bool,
+    /// Whether the "the video shows every panel" default has been applied.
+    ///
+    /// Its OWN key rather than reusing `video_default_applied`: that one is
+    /// already true for everybody who has launched 3.4.0, so folding a second
+    /// migration into it would silently skip them — which is exactly what
+    /// happened on the first attempt at this one.
+    pub shows_default_applied: bool,
     /// Show the take's folder in the file manager as soon as it is finished.
     ///
     /// Off by default. Somebody recording take after take does not want a
@@ -421,6 +428,7 @@ impl Default for Settings {
             record_dir: None,
             record_dir_is_default: false,
             video_default_applied: false,
+            shows_default_applied: false,
             record_open_when_done: false,
             record_take_name: None,
             record_camera_uid: None,
@@ -490,10 +498,12 @@ impl Settings {
             // empty file on the second launch.
             let mut s = Self::first_launch();
             s.video_default_applied = true;
+            s.shows_default_applied = true;
             return s;
         }
         let mut s = Self::load_from(&path);
         s.apply_video_default();
+        s.apply_shows_default();
         s
     }
 
@@ -511,6 +521,17 @@ impl Settings {
         if self.record_camera_uid.is_some() && self.record_export.video == crate::recorder::VideoMode::None {
             self.record_export.video = crate::recorder::VideoMode::Composite;
         }
+    }
+
+    /// A spec saved before the panel default changed still says
+    /// piano-and-chord, so somebody with every band on would go on getting two
+    /// of them.
+    fn apply_shows_default(&mut self) {
+        if self.shows_default_applied {
+            return;
+        }
+        self.shows_default_applied = true;
+        self.record_export.composite.shows = crate::recorder::DisplayShows::default();
     }
 
     /// What a brand-new install opens with: everything on.
@@ -767,6 +788,11 @@ impl Settings {
             "video_default_applied",
             &mut s.video_default_applied,
         );
+        take_bool(
+            &mut map,
+            "shows_default_applied",
+            &mut s.shows_default_applied,
+        );
         take_opt_str(&mut map, "record_take_name", &mut s.record_take_name);
         take_opt_str(&mut map, "record_camera_uid", &mut s.record_camera_uid);
         take_opt_str(&mut map, "record_audio_device", &mut s.record_audio_device);
@@ -1013,6 +1039,10 @@ impl Settings {
         map.insert(
             "video_default_applied".into(),
             Value::Bool(self.video_default_applied),
+        );
+        map.insert(
+            "shows_default_applied".into(),
+            Value::Bool(self.shows_default_applied),
         );
         map.insert(
             "record_sources".into(),

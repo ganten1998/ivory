@@ -2354,7 +2354,6 @@ mod tests {
 
     /// The state machine has to be right without a device, because that is the
     /// configuration every test machine and every first launch is in.
-    #[test]
     /// **The instrument tap survives the writer that was holding it.**
     ///
     /// It is the read end of a lock-free ring, so exactly one thread may own

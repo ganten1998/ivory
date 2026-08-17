@@ -836,14 +836,22 @@ pub struct DisplayShows {
 }
 
 impl Default for DisplayShows {
-    /// Piano and chord name. The two panels that are about what was just
-    /// played, which is what a video of a performance is for.
+    /// **Everything.**
+    ///
+    /// It was piano and chord name, on the reasoning that those are the two
+    /// panels about what was just played. That reasoning was fine and the
+    /// result was wrong: somebody who has turned every band on, and can see
+    /// them, presses Record and gets a video with two of them in it — and
+    /// nothing on screen ever said the video kept its own list.
+    ///
+    /// A video with a panel you did not want is a tick away from being fixed.
+    /// A video missing the panel you play from is a take you cannot get back.
     fn default() -> Self {
         Self {
             piano: true,
             chord: true,
-            fretboard: false,
-            theory: false,
+            fretboard: true,
+            theory: true,
         }
     }
 }

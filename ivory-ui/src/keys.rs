@@ -40,6 +40,12 @@ pub enum KeyAction {
     /// The first binding here that is not always live — see [`Gates`].
     ToggleRecording,
     ToggleRecorder,
+    /// Fill the screen, and come back.
+    ///
+    /// Gated on [`Gates::window_sizing`] for the same reason every other
+    /// window action is: a plugin editor lives inside somebody's DAW and has no
+    /// business taking their display.
+    ToggleFullscreen,
     TransposeUp,
     TransposeDown,
     CloseHelp,
@@ -80,6 +86,11 @@ pub struct Gates {
     /// the band being open. False in a plugin and in a Minimal build, where
     /// there is no recorder to show and the menu category is absent too.
     pub recorder_available: bool,
+    /// This host owns its window — `Caps::window_sizing`.
+    ///
+    /// Gates fullscreen. A plugin editor lives inside somebody's DAW and has
+    /// no business taking their display.
+    pub window_sizing: bool,
 }
 
 /// Whether a binding is live right now.
@@ -90,6 +101,7 @@ fn available(action: KeyAction, gates: Gates) -> bool {
     match action {
         KeyAction::ToggleRecording => gates.recorder_shown,
         KeyAction::ToggleRecorder => gates.recorder_available,
+        KeyAction::ToggleFullscreen => gates.window_sizing,
         _ => true,
     }
 }
@@ -139,6 +151,16 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // or Space. They move the notes you are holding, which is a thing you do
     // WHILE holding them — so they had to be keys you can reach without
     // letting go, and the arrow keys are the only ones that are.
+    // Fullscreen. `Z` for zoom, which is what the green button does and what
+    // macOS calls it; `F` is long since taken by the font cycle, and rebinding
+    // that to fill the screen would be a nasty surprise mid-practice.
+    //
+    // `F11` is the same key everywhere else in computing and is listed as an
+    // unlisted alias, exactly as `F1` is for help — on macOS an app never sees
+    // F11 unless the user has turned on "use function keys as standard", so a
+    // fullscreen bound only to it would be one most Mac users cannot press.
+    (Key::Z, "Z", KeyAction::ToggleFullscreen, true),
+    (Key::F11, "F11", KeyAction::ToggleFullscreen, false),
     (Key::ArrowUp, "Up", KeyAction::TransposeUp, true),
     (Key::ArrowDown, "Down", KeyAction::TransposeDown, true),
     (Key::V, "V", KeyAction::ToggleRecorder, true),
@@ -169,6 +191,7 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ToggleNotePreference => "sharps or flats",
         KeyAction::ToggleRecording => "start or stop recording",
         KeyAction::ToggleRecorder => "the recorder",
+        KeyAction::ToggleFullscreen => "fill the screen",
         KeyAction::TransposeUp => "transpose up a semitone",
         KeyAction::TransposeDown => "transpose down a semitone",
         KeyAction::CloseHelp => "close this card",
@@ -444,11 +467,18 @@ mod tests {
         // A gated binding must be a LISTED one, or the gate hides a shortcut
         // the card was never going to mention in the first place.
         for &(_, label, action, is_shown) in BINDINGS {
-            if !available(action, Gates { recorder_shown: true, recorder_available: true }) {
+            if !available(action, Gates { recorder_shown: true, recorder_available: true, window_sizing: true }) {
                 panic!("{label} is dead even with every gate open");
             }
             if !available(action, Gates::default()) {
-                assert!(is_shown, "{label} is gated but never listed");
+                // The ACTION has to be listed, not this particular key. An
+                // alias is unlisted by design — `F1` for help, `F11` for
+                // fullscreen — and what the rule is protecting against is a
+                // gate that hides something the card never mentioned at all.
+                assert!(
+                    shown.contains(&action),
+                    "{label} is gated and its action appears nowhere on the card"
+                );
             }
         }
         for &(_, label, action, is_shown) in BINDINGS {
@@ -481,7 +511,7 @@ mod tests {
             let mut got = Some(KeyAction::ClearNotes);
             // Every gate open, so this is testing the modifier and nothing else.
             let _ = ctx.run(input, |ctx| {
-                got = pressed(ctx, Gates { recorder_shown: true, recorder_available: true });
+                got = pressed(ctx, Gates { recorder_shown: true, recorder_available: true, window_sizing: true });
             });
             assert_eq!(got, None, "R fired with {mods:?} held");
         }
@@ -527,7 +557,7 @@ mod tests {
             "Space started a take on a recorder the user has never opened"
         );
         assert_eq!(
-            press(Key::Space, Gates { recorder_shown: true, recorder_available: true }),
+            press(Key::Space, Gates { recorder_shown: true, recorder_available: true, window_sizing: true }),
             Some(KeyAction::ToggleRecording)
         );
         // The gate is Space's alone: nothing else changes with it.
@@ -535,7 +565,7 @@ mod tests {
             (Key::K, KeyAction::ToggleKeytoggle),
             (Key::G, KeyAction::ToggleFretboard),
         ] {
-            for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true }] {
+            for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
                 assert_eq!(press(key, gates), Some(want), "{key:?} under {gates:?}");
             }
         }
@@ -551,6 +581,7 @@ mod tests {
         let can_record = Gates {
             recorder_shown: false,
             recorder_available: true,
+            window_sizing: true,
         };
         let hidden = card_rows(can_record);
         assert!(
@@ -572,7 +603,7 @@ mod tests {
             "Space is last, so appearing does not reflow every row above it"
         );
         // And every listed row is a live binding, in both states.
-        for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true }] {
+        for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
             for (label, _) in card_rows(gates) {
                 let (_, _, action, _) = BINDINGS
                     .iter()
@@ -592,7 +623,7 @@ mod tests {
         let size = 14.0_f32;
         // ~0.62 em per glyph is what the card's own column maths assumes.
         let glyph = size * 0.62;
-        for label in card_rows(Gates { recorder_shown: true, recorder_available: true })
+        for label in card_rows(Gates { recorder_shown: true, recorder_available: true, window_sizing: true })
             .iter()
             .map(|(l, _)| *l)
         {
@@ -617,7 +648,7 @@ mod tests {
     fn the_card_fits_the_window_at_every_size_and_row_count() {
         // The real maximum, taken through the gate rather than off the table:
         // the card is longest with every binding live.
-        let shown = card_rows(Gates { recorder_shown: true, recorder_available: true }).len();
+        let shown = card_rows(Gates { recorder_shown: true, recorder_available: true, window_sizing: true }).len();
         for w in [650.0_f32, 975.0, 1300.0, 1950.0, 2600.0] {
             for h in [w / 8.667, w / 8.667 + 50.0, w / 8.667 + 182.0, 90.0] {
                 let rect = Rect::from_min_size(Pos2::new(7.0, 11.0), Vec2::new(w, h));
@@ -682,7 +713,7 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     // Both gate states: they are two different row counts, and
                     // the shorter one is the card most users will ever see.
-                    for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true }] {
+                    for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
                         for t in [0.0, 0.01, 0.5, 0.999, 1.0] {
                             draw_help(ui.painter(), rect, false, t, gates);
                             draw_help(ui.painter(), rect, true, t, gates);

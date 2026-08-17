@@ -149,8 +149,23 @@ pub fn audio_selection(shared: &Shared) -> Option<ivory_record::audio::InputSele
     let sel = lock(shared);
     match sel.wanted.as_deref() {
         Some(uid) => Some(InputSelection::Key(DeviceKey::from_setting(uid))),
-        None if sel.explicit => None,
-        None => Some(InputSelection::Default),
+        // **Nothing chosen means nothing opened.** There used to be a fallback
+        // to `InputSelection::Default` here, for the case where the user had
+        // never opened the picker — the idea being that a live meter is a
+        // better first impression than a dead one.
+        //
+        // It is not worth what it costs. "The system default input" is whatever
+        // the OS happens to be pointing at, which on a machine with Loopback or
+        // a virtual device installed is a mic that records the wrong thing or
+        // nothing at all — and the user's complaint was exactly that: the app
+        // kept coming up on a Virtual Mic they had never chosen. It also meant
+        // raising the microphone permission prompt at launch, for a device
+        // nobody asked for.
+        //
+        // An app should not open your microphone until you say which one. The
+        // band already says "no audio input selected", which is a prompt rather
+        // than a fault, and a plugin-only take needs no input at all.
+        None => None,
     }
 }
 
@@ -347,36 +362,50 @@ mod tests {
         assert_eq!(a.current(), None);
     }
 
-    /// "None — record MIDI only" and "has never opened the picker" are both
-    /// `wanted: None`, and they want opposite things at startup. Getting this
-    /// wrong opens the system microphone for somebody who explicitly said not
-    /// to — and it only shows up after a restart, which is why it needs a test.
+    /// **No chosen input means no input opened — ever.**
+    ///
+    /// This test used to assert the opposite for the "never opened the picker"
+    /// case: it handed back `InputSelection::Default` so the meter would be
+    /// live before anybody armed anything. That is a nice idea and it was the
+    /// wrong one. "The system default input" is whatever the OS is pointing at,
+    /// and on a machine with Loopback or any virtual device installed that is a
+    /// mic recording the wrong thing — which is exactly what the owner hit, an
+    /// app that kept coming up on a Virtual Mic they had never chosen. It also
+    /// raised the microphone prompt at launch for a device nobody asked for.
+    ///
+    /// So all three cases below agree now, and that is the point: absent is
+    /// absent, however it got that way.
     #[test]
-    fn choosing_no_audio_input_survives_a_restart() {
+    fn no_chosen_input_means_no_input_is_ever_opened() {
         use ivory_record::audio::InputSelection;
         let (mut a, shared) = AudioInputs::new();
 
-        // Never asked: give them a default so the meter is live before arming.
-        assert!(matches!(
+        assert_eq!(
             audio_selection(&shared),
-            Some(InputSelection::Default)
-        ));
+            None,
+            "never asked must not open a microphone"
+        );
 
         a.open("").expect("ok");
         assert_eq!(audio_selection(&shared), None, "no device means no device");
 
-        // After a restart, seeded from settings: the uid is absent, but the
-        // "explicitly off" flag remembers that absence was a choice.
+        // Seeded from settings, both ways round: an explicit "None"...
         let (_b, restarted) = AudioInputs::new();
         restore(&restarted, None, true);
         assert_eq!(audio_selection(&restarted), None);
 
-        // Whereas a file from someone who never chose still gets a default.
+        // ...and a file from somebody who never chose. Same answer.
         let (_c, fresh) = AudioInputs::new();
         restore(&fresh, None, false);
+        assert_eq!(audio_selection(&fresh), None);
+
+        // A chosen device is still opened, which is the half that must not
+        // regress while fixing the other one.
+        let (_d, picked) = AudioInputs::new();
+        restore(&picked, Some("Scarlett 2i2#0"), false);
         assert!(matches!(
-            audio_selection(&fresh),
-            Some(InputSelection::Default)
+            audio_selection(&picked),
+            Some(InputSelection::Key(_))
         ));
     }
 
