@@ -484,7 +484,7 @@ fn rule_x(r: Rect, x: f32) -> Rect {
 /// the same change, since its INSTRUMENT picker is now each slot's name box.
 const MONITOR_W: f32 = 0.36;
 
-/// The three zones of a fader row: caption, track, value.
+/// The three zones of a fader row: icon, track, value.
 ///
 /// A function rather than nine more [`Layout`] fields, because only one of the
 /// three is a hit region and all three have to be the same rectangles in the
@@ -493,16 +493,39 @@ const MONITOR_W: f32 = 0.36;
 ///
 /// **The middle one is the hit region**, and its two ends are the two ends of
 /// the fader's travel. See [`along`].
+///
+/// **The first zone is a picture and not a word.** It was `CLICK` and `INPUT`
+/// in 5pt capitals — two labels that between them ate 29% of the monitor's
+/// width to say what a metronome and a microphone say at a glance from the
+/// bench. The zone is a SQUARE's worth of row rather than a caption's worth,
+/// and the eighth of the row it gave up is what pays for the two click
+/// switches now sitting in the click's own row. See [`CLICK_SWITCHES`].
 fn fader_zones(row: Rect) -> (Rect, Rect, Rect) {
     if !row.is_positive() {
         return (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING);
     }
     (
-        slice_h(row, 0.00, 0.29),
-        slice_h(row, 0.31, 0.75),
-        slice_h(row, 0.77, 1.00),
+        slice_h(row, 0.00, 0.085),
+        slice_h(row, 0.105, 0.415),
+        slice_h(row, 0.435, 0.600),
     )
 }
+
+/// Where the two click switches sit inside the CLICK fader's row: the tick that
+/// says whether you hear it, and the tick that says whether it lands in the
+/// file.
+///
+/// They used to be a row of their own under both faders, which read as two
+/// switches belonging to the monitor as a whole — and one of them (`In take`)
+/// then vanished when a take started while the other grew to full width, so the
+/// row changed shape as well as meaning. Beside the click's own level they are
+/// unambiguously the CLICK's two questions, and the row they vacated is what
+/// makes both faders a third taller.
+///
+/// A constant rather than two literals in [`Layout::fill_monitor`] because the
+/// test that proves nothing in this row overlaps has to slice the row the same
+/// way the painter does.
+const CLICK_SWITCHES: [(f32, f32); 2] = [(0.625, 0.805), (0.825, 1.000)];
 
 /// Text height in a fader row, as a fraction of the row. Shared by the painter
 /// and by the test that asserts the dB reading fits.
@@ -676,14 +699,22 @@ impl Layout {
         for (i, (from, to)) in SLOT_ROWS.into_iter().enumerate() {
             self.slots[i] = SlotRow::new(slice_v(m, from, to), &view.slots[i], rolling);
         }
-        self.metronome_row = slice_v(m, 0.465, 0.635);
-        self.input_row = slice_v(m, 0.650, 0.820);
-        let switches = slice_v(m, 0.845, 1.000);
+        // Two rows where there were three. The switches moved into the click's
+        // own row (see `CLICK_SWITCHES`), and the row they left is split
+        // between the two faders — which is why the tracks and their readings
+        // are a third taller than they were.
+        self.metronome_row = slice_v(m, 0.465, 0.700);
+        self.input_row = slice_v(m, 0.730, 0.965);
+        let [hear, in_take] = CLICK_SWITCHES;
         if rolling {
-            self.click = switches;
+            // `In take` decides what goes in the FILE, so it leaves with the
+            // rest of the destination and the switch that decides what you HEAR
+            // takes both slots. It is the one control in this band somebody
+            // reaches for mid-take with their eyes on their hands.
+            self.click = slice_h(self.metronome_row, hear.0, in_take.1);
         } else {
-            self.click = slice_h(switches, 0.00, 0.47);
-            self.click_in_take = slice_h(switches, 0.53, 1.00);
+            self.click = slice_h(self.metronome_row, hear.0, hear.1);
+            self.click_in_take = slice_h(self.metronome_row, in_take.0, in_take.1);
         }
     }
 
@@ -1420,20 +1451,26 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
         let typing = typing_for(view, NumField::Slot(i));
         draw_slot(painter, &l.slots[i], i, slot, l.rolling, typing, p);
     }
-    for (row, cap, gain, field) in [
+    for (row, icon, gain, field) in [
         (
             l.metronome_row,
-            "CLICK",
+            FaderIcon::Metronome,
             view.gains.metronome,
             NumField::Metronome,
         ),
-        (l.input_row, "INPUT", view.gains.input, NumField::Input),
+        (
+            l.input_row,
+            FaderIcon::Microphone,
+            view.gains.input,
+            NumField::Input,
+        ),
     ] {
-        draw_fader(painter, row, cap, gain, typing_for(view, field), p);
+        draw_fader(painter, row, icon, gain, typing_for(view, field), p);
     }
     // Two questions that sound like one and are not: whether you HEAR the
     // click, and whether it ends up in the file. The second is off by default
-    // because a click bleeding into a take is a ruined take.
+    // because a click bleeding into a take is a ruined take. Both sit in the
+    // metronome's own row — see `CLICK_SWITCHES`.
     draw_tick(painter, l.click, "Click", view.metronome_on, p);
     draw_tick(painter, l.click_in_take, "In take", view.metronome_in_take, p);
 }
@@ -1602,31 +1639,140 @@ fn draw_clear_button(painter: &Painter, r: Rect, p: &Palette) {
     );
 }
 
-/// One fader: a caption, a slotted track with a handle in it, and the level in
+/// Which of the two monitor faders a row is, which is the whole of what its
+/// leading square says.
+///
+/// An enum rather than a caption string: these are the only two faders in the
+/// band, each is drawn rather than typeset, and a `&str` parameter would invite
+/// a third one whose picture nobody had drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaderIcon {
+    Metronome,
+    Microphone,
+}
+
+/// One fader: its icon, a slotted track with a handle in it, and the level in
 /// dB. All three, because "clear volume knobs" was the brief and a bare strip
 /// of colour is none of them.
 ///
 /// The dB reading is the part that is easy to leave out and the part that makes
 /// the control usable: a handle two thirds along means nothing on its own, and
 /// `-6.0 dB` means something to everyone who has ever used a mixer.
-fn draw_fader(painter: &Painter, row: Rect, cap: &str, gain: f32, typing: Option<&str>, p: &Palette) {
+fn draw_fader(
+    painter: &Painter,
+    row: Rect,
+    icon: FaderIcon,
+    gain: f32,
+    typing: Option<&str>,
+    p: &Palette,
+) {
     if !row.is_positive() {
         return;
     }
-    let (cap_r, track, val_r) = fader_zones(row);
-
-    let size = fit_text(cap_r, cap, cap_r.height() * FADER_TEXT);
-    if size >= MIN_TEXT {
-        painter.text(
-            Pos2::new(cap_r.left(), cap_r.center().y),
-            Align2::LEFT_CENTER,
-            cap,
-            font_light(size),
-            p.faint,
-        );
-    }
+    let (icon_r, track, val_r) = fader_zones(row);
+    draw_fader_icon(painter, icon_r, icon, p);
     draw_gain_value(painter, val_r, gain, typing, p);
     draw_track(painter, track, gain, p);
+}
+
+/// The square at the head of a fader row.
+///
+/// **Drawn, not typeset.** The same reason [`draw_tick`] draws its check mark
+/// out of two line segments: no face this app bundles is guaranteed to carry a
+/// metronome or a microphone, and a tofu box at the head of the click fader
+/// would read as a broken control rather than as a missing glyph. These are a
+/// handful of line segments and one polygon, so they are the same picture on
+/// every platform and inside the offscreen compositor, which has no font
+/// fallback chain at all.
+///
+/// Both are inscribed in the largest square the zone will hold, so the two
+/// icons are the same size as each other whatever the row's aspect — a
+/// metronome larger than the microphone beside it would read as the louder of
+/// the two controls.
+fn draw_fader_icon(painter: &Painter, r: Rect, icon: FaderIcon, p: &Palette) {
+    if !r.is_positive() {
+        return;
+    }
+    let s = r.width().min(r.height()) * 0.92;
+    if s < 6.0 {
+        // Below this the shapes collapse into a blot, which reads worse than
+        // an empty margin. Same bargain as `MIN_TEXT`.
+        return;
+    }
+    let b = Rect::from_center_size(Pos2::new(r.left() + s * 0.5, r.center().y), Vec2::splat(s));
+    match icon {
+        FaderIcon::Metronome => draw_metronome(painter, b, p),
+        FaderIcon::Microphone => draw_microphone(painter, b, p),
+    }
+}
+
+/// A metronome: the tapered case, with the pendulum and its weight cut out of
+/// it in the background colour.
+///
+/// Cut out rather than stroked on top, because at 16 points a rod drawn in a
+/// second ink over a filled body is two shades of mud, while a gap in a solid
+/// shape stays a gap however small it gets.
+fn draw_metronome(painter: &Painter, b: Rect, p: &Palette) {
+    let s = b.width();
+    let (cx, top, bottom) = (b.center().x, b.top() + s * 0.06, b.bottom() - s * 0.06);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(cx - s * 0.14, top),
+            Pos2::new(cx + s * 0.14, top),
+            Pos2::new(cx + s * 0.38, bottom),
+            Pos2::new(cx - s * 0.38, bottom),
+        ],
+        p.faint,
+        Stroke::NONE,
+    ));
+    // The rod leans, because a metronome at rest is the one picture of a
+    // metronome nobody recognises.
+    let foot = Pos2::new(cx - s * 0.03, bottom - s * 0.07);
+    let head = Pos2::new(cx + s * 0.19, top + s * 0.05);
+    painter.line_segment([foot, head], Stroke::new((s * 0.075).max(1.0), p.bg));
+    let along = |t: f32| Pos2::new(foot.x + (head.x - foot.x) * t, foot.y + (head.y - foot.y) * t);
+    painter.rect_filled(
+        Rect::from_center_size(along(0.36), Vec2::new(s * 0.17, s * 0.085)),
+        1.0,
+        p.bg,
+    );
+}
+
+/// A microphone: capsule, cradle, stem, foot.
+///
+/// The cradle is what makes it a microphone rather than a pill — a capsule on
+/// its own reads as a battery — so it is an arc of eleven points rather than
+/// the three-segment bracket that would have been cheaper.
+fn draw_microphone(painter: &Painter, b: Rect, p: &Palette) {
+    let s = b.width();
+    let cx = b.center().x;
+    let top = b.top() + s * 0.04;
+    let capsule = Rect::from_min_max(
+        Pos2::new(cx - s * 0.17, top),
+        Pos2::new(cx + s * 0.17, top + s * 0.50),
+    );
+    painter.rect_filled(capsule, s * 0.17, p.faint);
+    let stroke = Stroke::new((s * 0.09).max(1.0), p.faint);
+    let (pivot_y, radius) = (top + s * 0.36, s * 0.30);
+    let arc: Vec<Pos2> = (0_u8..=10)
+        .map(|i| {
+            let t = std::f32::consts::PI * f32::from(i) / 10.0;
+            Pos2::new(cx - radius * t.cos(), pivot_y + radius * t.sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(arc, stroke));
+    let foot_y = b.bottom() - s * 0.04;
+    painter.line_segment(
+        [Pos2::new(cx, pivot_y + radius), Pos2::new(cx, foot_y)],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(cx - s * 0.22, foot_y),
+            Pos2::new(cx + s * 0.22, foot_y),
+        ],
+        stroke,
+    );
 }
 
 /// What a control is showing while it is being typed into, if it is.
@@ -3539,15 +3685,21 @@ mod tests {
         ] {
             for v in [idle(), rolling()] {
                 let l = Layout::new(r, &v);
-                for (row, cap_text) in [(l.metronome_row, "CLICK"), (l.input_row, "INPUT")] {
-                    let (cap, _, val) = fader_zones(row);
+                for (which, row) in [("click", l.metronome_row), ("input", l.input_row)] {
+                    let (icon, _, val) = fader_zones(row);
                     let size = fit_text(val, &widest, val.height() * FADER_TEXT);
                     assert!(
                         size >= MIN_TEXT,
                         "'{widest}' draws at {size}pt in {r:?}, which is a smudge"
                     );
-                    let cap_size = fit_text(cap, cap_text, cap.height() * FADER_TEXT);
-                    assert!(cap_size >= MIN_TEXT, "the caption draws at {cap_size}pt");
+                    // The icon is a picture and not a word, so what it needs is
+                    // a square it can be inscribed in — see `draw_fader_icon`,
+                    // which draws nothing at all below six points.
+                    let s = icon.width().min(icon.height()) * 0.92;
+                    assert!(
+                        s >= 6.0,
+                        "the {which} icon gets {s}pt of square in {r:?}, which is a blot"
+                    );
                 }
             }
         }
