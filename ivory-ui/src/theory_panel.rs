@@ -1293,7 +1293,11 @@ pub const DETACHED_DEFAULT: Vec2 = Vec2::new(900.0, 380.0);
 /// as a rendering fault rather than as "too small" — the same failure the
 /// Tonnetz's own `Lattice::fit` bail-out produces, and the reason to put a
 /// floor under the window instead of letting the user find it.
-pub const DETACHED_MIN: Vec2 = Vec2::new(400.0, 240.0);
+/// **Four panes, not three.** It was 400 when the band held three diagrams,
+/// and the sheet music made four without the constant moving — so the shipped
+/// default selection at the minimum size drew the Tonnetz as a title over an
+/// empty rectangle, which is precisely the failure this number exists to stop.
+pub const DETACHED_MIN: Vec2 = Vec2::new(540.0, 240.0);
 
 pub fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("ivory-theory-window")
@@ -1938,6 +1942,73 @@ mod tests {
     /// The band takes no height when nothing is selected — the window must not
     /// grow by 300 points to show three empty panes.
     #[test]
+    fn zz_tmp_octave_sign_bounds() {
+        for set in [
+            crate::staff::StaffSet::Single(crate::staff::Clef::Treble),
+            crate::staff::StaffSet::Grand,
+        ] {
+            for note in [100u8, 113, 41, 29] {
+                let mut s = crate::settings::Settings::first_launch();
+                s.staff_set = set.key();
+                let views = s.theory_views();
+                let w = 1300.0_f32;
+                let band =
+                    Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w, &views)));
+                let cells = cells(band, &views);
+                let Some((_, staff_cell)) = cells.iter().find(|(v, _)| *v == View::Staff)
+                else {
+                    continue;
+                };
+                let inner = staff_cell.shrink(8.0);
+                let body = body_rect(inner);
+                let h = (inner.height() * 0.075).clamp(9.0, 14.0);
+                let lh = h * 0.82;
+                let legend_centre_y = inner.min.y + h + lh * 0.5;
+                let notes: std::collections::HashSet<u8> = [note].into_iter().collect();
+                let ctx = egui::Context::default();
+                crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+                let out = ctx.run(egui::RawInput::default(), |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::debug());
+                    draw(
+                        &painter,
+                        band,
+                        &views,
+                        Input {
+                            pcs: 1 << (note % 12),
+                            bass: Some(note % 12),
+                            root: None,
+                            minor: false,
+                        },
+                        &notes,
+                        &s,
+                    );
+                });
+                let mut worst_top = f32::INFINITY;
+                let mut worst_bot = f32::NEG_INFINITY;
+                let mut texts = Vec::new();
+                for cs in &out.shapes {
+                    if let egui::Shape::Text(t) = &cs.shape {
+                        let r = t.visual_bounding_rect();
+                        texts.push((t.galley.job.text.clone(), r));
+                    }
+                    let r = cs.shape.visual_bounding_rect();
+                    if r.is_positive() && r.width() < 1e6 {
+                        worst_top = worst_top.min(r.top());
+                        worst_bot = worst_bot.max(r.bottom());
+                    }
+                }
+                eprintln!(
+                    "SET={:?} note={note} body={:?} legend_cy={:.2} inner_top={:.2} worst_top={:.2} worst_bot={:.2}",
+                    set.key(), body, legend_centre_y, inner.min.y, worst_top, worst_bot
+                );
+                for (txt, r) in texts {
+                    eprintln!("   text {txt:?} rect={r:?} above_body={:.2}", body.top() - r.top());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn an_empty_selection_takes_no_band() {
         assert_eq!(band_height(1300.0, &Views::default()), 0.0);
         assert!(
@@ -1951,8 +2022,12 @@ mod tests {
         let mut out = Vec::new();
         for pct in [50i64, 75, 100, 125, 150, 175, 200] {
             let w = (1300.0 * pct as f64 / 100.0).trunc() as f32;
-            for n in 1..=3usize {
-                let views = Views::of(vec![View::Circle]);
+            for n in 1..=View::ALL.len() {
+                // **Actually n panes.** This loop used to build a one-element
+                // band whatever `n` was, so every width in it was measured
+                // three times and the multi-pane split — the one that can
+                // starve a diagram — was never measured at all.
+                let views = Views::of(View::ALL.into_iter().take(n).collect());
                 let h = band_height(w, &views);
                 let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
                 for (_, cell) in cells(band, &views) {
@@ -2128,8 +2203,12 @@ mod tests {
         let mut out = Vec::new();
         for pct in [50i64, 75, 100, 125, 150, 175, 200] {
             let w = (1300.0 * pct as f64 / 100.0).trunc() as f32;
-            for n in 1..=3usize {
-                let views = Views::of(vec![View::Tonnetz]);
+            for n in 1..=View::ALL.len() {
+                // The Tonnetz in a band of `n` panes, not in a band of one
+                // pane `n` times — same bug as `real_panes` had.
+                let mut order = vec![View::Tonnetz];
+                order.extend(View::ALL.into_iter().filter(|v| *v != View::Tonnetz).take(n - 1));
+                let views = Views::of(order);
                 let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w, &views)));
                 for (v, cell) in cells(band, &views) {
                     if v == View::Tonnetz {
@@ -2632,7 +2711,12 @@ mod tests {
     /// than remembered.
     #[test]
     fn the_smallest_window_still_holds_three_diagrams() {
-        let views = Views::of(vec![View::Circle, View::Tonnetz, View::Triangles]);
+        // **Every element the app ships with**, not the three it used to have.
+        // `DETACHED_MIN` was measured for three panes; a fourth arrived and the
+        // constant did not move, so the shipped default selection at the
+        // minimum size drew the Tonnetz as a title over an empty rectangle —
+        // exactly the failure this constant exists to prevent.
+        let views = Views::all();
         let rect = Rect::from_min_size(Pos2::ZERO, DETACHED_MIN);
         let at_min = controls(rect, &views, c_major());
         // The sheet music is not in this list and cannot be: it has no

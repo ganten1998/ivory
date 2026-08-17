@@ -400,6 +400,13 @@ impl IvoryApp {
         if !caps.capture_devices {
             settings.show_recorder = false;
             settings.recorder_detached = false;
+            // And the camera pane, for exactly the same reason and with the
+            // same failure: it is laid out from this flag alone with no caps
+            // term, so a plugin editor would give a third of its theory row to
+            // a camera it can never open — and the only menu row that turns it
+            // off is itself inside the capture-devices gate, so there would be
+            // no way back.
+            settings.show_camera_pane = false;
         }
         crate::fonts::install(
             ctx,
@@ -442,9 +449,16 @@ impl IvoryApp {
         // least one diagram selected as well as being detached: a window
         // restored with nothing in it is a blank rectangle the user has to
         // close to find out what it was.
-        let startup_theory_detach_at = (settings.theory_detached
-            && settings.theory_views().any())
-        .then(|| Instant::now() + DEBOUNCE_100MS);
+        //
+        // **And NOT gated on there being a diagram in it.** That gate produced
+        // a state with no way out from the keyboard: a session saved detached
+        // and empty came back with no window and no band, and every 1/2/3/4/T
+        // press afterwards edited settings that nothing on screen was reading.
+        // The empty window says what it is and takes a number key; a window
+        // that never opens says nothing at all.
+        let startup_theory_detach_at = settings
+            .theory_detached
+            .then(|| Instant::now() + DEBOUNCE_100MS);
         // And the recorder's. Gated on the band being SHOWN as well as
         // detached, so "Hide Recorder" with the window remembered for next time
         // does not reopen the window on its own at the next launch.
@@ -2523,7 +2537,12 @@ impl IvoryApp {
             }
             MenuAction::ToggleNoteNames => {
                 self.settings.staff_note_names = !self.settings.staff_note_names;
+                // Like every other control that changes what the staff shows.
+                // Without this, `U` on a window with no sheet music in it
+                // silently flips a setting nothing is drawing.
+                self.show_the_staff();
                 self.save_settings();
+                self.request_natural_size();
             }
             MenuAction::RescanPlugins => {
                 self.plugin_rescan = true;
@@ -3139,7 +3158,11 @@ fn band_sizes(settings: &Settings) -> Bands {
 /// and every band's height is a fixed fraction of the width, so laying out
 /// into a given rect is the same arithmetic with a different starting number.
 fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
-    let piano_h = (w as f64 / (1300.0 / 150.0)).trunc() as f32;
+    let piano_h = if settings.show_piano {
+        (w as f64 / (1300.0 / 150.0)).trunc() as f32
+    } else {
+        0.0
+    };
     let chord_visible = settings.chord_detection_enabled && !settings.chord_window_detached;
     let chord_h = if chord_visible {
         (50.0 * w as f64 / 1300.0).trunc() as f32
@@ -3448,6 +3471,11 @@ impl IvoryApp {
         s.chord_window_detached = false;
         s.show_fretboard = shows.fretboard;
         s.fretboard_detached = false;
+        // **Unticking the piano has to remove its HEIGHT, not just its ink.**
+        // Every other flag here maps onto a setting that zeroes a band; the
+        // piano had none, so an unticked piano left a piano-sized hole in the
+        // middle of the video.
+        s.show_piano = shows.piano;
         s.theory_detached = false;
         // The theory band has no "show theory" bool — it exists exactly when
         // something is in it — so the override has to work in both directions
@@ -3914,6 +3942,14 @@ impl IvoryApp {
                 ),
                 &self.settings,
             );
+        }
+        // The row's own background FIRST, whatever is in it. The camera pane
+        // can hold this row open with the diagrams' half empty or detached, and
+        // in that case nothing else fills it — leaving the app's black backdrop
+        // showing through a band-shaped hole.
+        if let Some(row) = theory_row {
+            ui.painter()
+                .rect_filled(row, 0.0, theory_panel::band_bg(&self.settings));
         }
         if let Some(theory_rect) = theory_rect_for_hit {
             theory_panel::draw(

@@ -63,9 +63,11 @@ const STAFF_SPACES: f32 = 4.0;
 ///
 /// Not decoration. [`OCTAVE_AT`] lets a note reach three ledger lines past the
 /// staff, which is three spaces, and the `8va` sign sits a space and a half
-/// past that — so a band with less than this draws its ledger lines over the
-/// band above it.
-const OUTER_SPACES: f32 = 4.5;
+/// past that. **Plus the sign's own HEIGHT**: it is centre-anchored text, so
+/// budgeting only for where its baseline sits paints the top half of every
+/// `8va` outside the rect the band was measured for — over whatever is above
+/// it, which in the theory band is the panel's own title.
+const OUTER_SPACES: f32 = 5.2;
 
 /// The gap BETWEEN two staves of a grand staff.
 ///
@@ -239,7 +241,11 @@ pub fn spell_in_key(midi: u8, key: i32, prefer_flats: bool) -> Spelled {
     // MIDI 60 is C4, so the octave is `midi / 12 - 1` -- and a B sharp below
     // middle C belongs to the octave BELOW it, which is what taking the
     // alteration off the pitch first corrects for.
-    let octave = (i32::from(midi) - alter) / 12 - 1;
+    // `div_euclid`, not `/`: Rust truncates toward zero, so the one case where
+    // this goes negative -- MIDI 0 spelled as a B sharp, which the sharpest
+    // keys really do produce -- would round the wrong way and engrave the note
+    // a full octave above where it belongs.
+    let octave = (i32::from(midi) - alter).div_euclid(12) - 1;
     Spelled {
         midi,
         step: octave * 7 + letter as i32,
@@ -347,7 +353,11 @@ impl Clef {
     /// of a grand pair a note belongs to.
     fn centre_step(self) -> i32 {
         let (ref_step, ref_line) = self.reference();
-        ref_step + (2 - ref_line)
+        // The middle line is position 4, and one LINE is two positions, so the
+        // distance from the reference is `4 - 2 * ref_line` steps -- not
+        // `2 - ref_line`, which happens to be right for the alto clef and
+        // wrong, in both directions, for the other five.
+        ref_step + 4 - 2 * ref_line
     }
 }
 
@@ -502,32 +512,33 @@ struct Column {
 }
 
 impl Column {
-    /// Place `notes` on `clef`: transpose anything too far out into an octave
-    /// sign, then offset the seconds.
+    /// Place `notes` on `clef`: move the WHOLE column under an octave sign if
+    /// it needs one, then offset the seconds.
+    ///
+    /// **The shift is one decision for the whole chord, and it has to be.** The
+    /// first version decided it per note, which is wrong in a way that reads as
+    /// plausible until you actually read the staff: given E6, G6 and C7 in the
+    /// treble clef the E stays put and the other two come down an octave, so
+    /// the printed chord is G, C, E from the bottom -- the lowest sounding note
+    /// printed highest, under a bracket claiming the whole thing is up an
+    /// octave. Two notes an octave apart could land on the same line and print
+    /// as one. An `8va` applies to what is under it; anything else is not
+    /// notation.
     fn place(clef: Clef, notes: &[Spelled]) -> Column {
+        if notes.is_empty() {
+            return Column::default();
+        }
+        let raw: Vec<i32> = notes.iter().map(|n| clef.position(n.step)).collect();
+        let octave = Self::shift_for(&raw);
         let mut placed: Vec<Placed> = notes
             .iter()
-            .map(|n| {
-                let mut pos = clef.position(n.step);
-                let mut octave = 0;
-                // Above the top line by more than `OCTAVE_AT` ledger lines, or
-                // below the bottom by the same. Two octaves at most: past 15ma
-                // an engraver would change clef, and so should the user.
-                while pos > 8 + OCTAVE_AT * 2 && octave < 2 {
-                    pos -= 7;
-                    octave += 1;
-                }
-                while pos < -(OCTAVE_AT * 2) && octave > -2 {
-                    pos += 7;
-                    octave -= 1;
-                }
-                Placed {
-                    note: *n,
-                    pos,
-                    octave,
-                    offset: false,
-                    acc_col: 0,
-                }
+            .zip(&raw)
+            .map(|(n, pos)| Placed {
+                note: *n,
+                pos: pos - octave * 7,
+                octave,
+                offset: false,
+                acc_col: 0,
             })
             .collect();
         placed.sort_by_key(|p| (p.pos, p.note.midi));
@@ -539,8 +550,11 @@ impl Column {
         // its neighbour below is a second away AND was not itself offset — so a
         // cluster alternates rather than every note after the first drifting
         // right.
+        // Zero as well as one: an augmented unison -- C natural against C
+        // sharp -- puts two different pitches on the SAME line, and printed on
+        // the same side of the column one of them is simply not on the page.
         for i in 1..placed.len() {
-            if placed[i].pos - placed[i - 1].pos == 1 && !placed[i - 1].offset {
+            if placed[i].pos - placed[i - 1].pos <= 1 && !placed[i - 1].offset {
                 placed[i].offset = true;
             }
         }
@@ -571,6 +585,34 @@ impl Column {
         Column { notes: placed }
     }
 
+    /// How many octaves the whole column moves, if any.
+    ///
+    /// **All of it or none of it.** The shift is chosen so that every note in
+    /// the chord still fits after it; if no shift does -- a chord genuinely
+    /// spanning more than the staff plus its ledger lines can hold -- the
+    /// answer is none, and the reader gets ledger lines, which is what an
+    /// engraver would give them too. Ledger lines are honest; a bracket over a
+    /// chord that is only half transposed is not.
+    fn shift_for(positions: &[i32]) -> i32 {
+        let (lo, hi) = match (positions.iter().min(), positions.iter().max()) {
+            (Some(lo), Some(hi)) => (*lo, *hi),
+            _ => return 0,
+        };
+        let top = 8 + OCTAVE_AT * 2;
+        let bottom = -(OCTAVE_AT * 2);
+        if hi <= top && lo >= bottom {
+            return 0;
+        }
+        // Two octaves at most: past 15ma an engraver changes clef, and so
+        // should the user. Nearest first, so a chord that only just leaves the
+        // range gets 8va rather than 15ma.
+        for k in [1, -1, 2, -2] {
+            if hi - k * 7 <= top && lo - k * 7 >= bottom {
+                return k;
+            }
+        }
+        0
+    }
 }
 
 /// Split `notes` between the staves of `set`, or give every staff all of them.
@@ -774,7 +816,14 @@ fn draw_staff(
     // the staff: a reader's eye starts at the clef, and a chord adrift in the
     // centre of an otherwise empty system looks like a mistake.
     let head_w = g.space * 1.18;
-    let x = (after_clef + g.space * 3.0).min(g.right - head_w * 2.5);
+    // **Bounded at BOTH ends.** The `min` keeps the chord off the right edge;
+    // without the `max` a staff too narrow to hold clef, signature and chord
+    // silently pulled the notes back to the LEFT of the clef and engraved the
+    // music on top of it. Running off the right is a layout that ran out of
+    // room; printing over the clef is a layout that lied about having any.
+    let x = (after_clef + g.space * 3.0)
+        .min(g.right - head_w * 2.5)
+        .max(after_clef + g.space * 1.6);
     draw_column(painter, g, &column, x, s, p);
 }
 
@@ -1055,10 +1104,18 @@ fn key_positions(clef: Clef, sharps: bool) -> [i32; 7] {
         (Clef::Bass | Clef::Bass8vb, false) => [2, 5, 1, 4, 0, 3, -1],
         (Clef::Alto, true) => [7, 4, 8, 5, 2, 6, 3],
         (Clef::Alto, false) => [3, 6, 2, 5, 1, 4, 0],
-        // The tenor exception: starting high would put the second sharp off
-        // the top of the staff, so the whole signature drops an octave.
-        (Clef::Tenor, true) => [2, 6, 3, 7, 4, 1, 5],
-        (Clef::Tenor, false) => [5, 1, 4, 0, 3, -1, 2],
+        // **The tenor exception, and only where it really applies.** F sharp
+        // and G sharp drop an octave because at their ordinary height they
+        // would need ledger lines; E sharp does NOT -- it sits on the top line
+        // like everywhere else. Dropping it too, as the first version did,
+        // printed a signature that falls a seventh and jumps back up a fifth,
+        // which no engraver has ever printed.
+        (Clef::Tenor, true) => [2, 6, 3, 7, 4, 8, 5],
+        // And the FLATS are not irregular at all. Flats descend, so starting
+        // from B flat on the third space nothing ever runs off the top; the
+        // first version applied the sharps' exception to them and put three of
+        // the seven an octave low, with the C flat below the staff entirely.
+        (Clef::Tenor, false) => [5, 8, 4, 7, 3, 6, 2],
     }
 }
 
@@ -1407,6 +1464,34 @@ mod tests {
                         if sharps { "sharp" } else { "flat" },
                         i + 1
                     );
+                    // **And it is as HIGH as that clef allows.** This is the
+                    // assertion the letter check cannot make and the one that
+                    // matters: an accidental put an octave below where it
+                    // belongs is still the right letter, still on the staff,
+                    // and still completely wrong. Both tenor tables shipped
+                    // broken past a test that checked only the letter.
+                    //
+                    // The ceilings are the top of each clef's own signature
+                    // band. They are stated here rather than read from the
+                    // table, so a typo in the table cannot also be a typo in
+                    // what the table is checked against.
+                    let ceiling = match (clef, sharps) {
+                        (Clef::Treble | Clef::Treble8vb, true) => 9,
+                        (Clef::Treble | Clef::Treble8vb, false) => 7,
+                        (Clef::Bass | Clef::Bass8vb, true) => 7,
+                        (Clef::Bass | Clef::Bass8vb, false) => 5,
+                        (Clef::Alto, true) => 8,
+                        (Clef::Alto, false) => 6,
+                        (Clef::Tenor, _) => 8,
+                    };
+                    assert!(*pos <= ceiling, "{clef:?} number {} is above its band", i + 1);
+                    assert!(
+                        pos + 7 > ceiling,
+                        "{clef:?} {} number {} sits at {pos} when {} is free",
+                        if sharps { "sharp" } else { "flat" },
+                        i + 1,
+                        pos + 7
+                    );
                 }
             }
         }
@@ -1528,6 +1613,83 @@ mod tests {
         let plain: Vec<Spelled> = [60_u8, 64, 67].iter().map(|n| spell(*n, false)).collect();
         let col = Column::place(Clef::Treble, &plain);
         assert!(col.notes.iter().all(|p| p.acc_col == 0));
+    }
+
+    /// **An octave sign covers the WHOLE chord or none of it.**
+    ///
+    /// Deciding it per note is wrong in a way that looks right until you read
+    /// the result: the notes cross each other, two an octave apart can land on
+    /// one line, and the bracket claims the untransposed ones are transposed
+    /// too. This is the test that pins the property that actually matters --
+    /// the printed intervals are the sounding intervals.
+    #[test]
+    fn an_octave_sign_moves_the_whole_chord_and_never_reorders_it() {
+        let mk = |ns: &[u8]| -> Vec<Spelled> { ns.iter().map(|n| spell(*n, false)).collect() };
+
+        // E6 G6 C7 in the treble: the top two are past the limit and the E is
+        // not. Per-note shifting printed G, C, E bottom to top.
+        let col = Column::place(Clef::Treble, &mk(&[88, 91, 96]));
+        let octs: Vec<i32> = col.notes.iter().map(|p| p.octave).collect();
+        assert!(
+            octs.windows(2).all(|w| w[0] == w[1]),
+            "the chord was split across two octave signs: {octs:?}"
+        );
+        // The printed order is the sounding order, always.
+        let by_pos: Vec<u8> = col.notes.iter().map(|p| p.note.midi).collect();
+        let mut sorted = by_pos.clone();
+        sorted.sort_unstable();
+        assert_eq!(by_pos, sorted, "the printed chord is not in pitch order");
+
+        // C6 and C7 together: an octave, and it has to stay an octave.
+        let col = Column::place(Clef::Treble, &mk(&[84, 96]));
+        assert_eq!(col.notes.len(), 2);
+        assert_eq!(
+            col.notes[1].pos - col.notes[0].pos,
+            7,
+            "an octave was printed as a unison"
+        );
+
+        // Two pitches must never land on the same spot with the same offset,
+        // in any chord, in any clef.
+        for clef in Clef::ALL {
+            for chord in [
+                vec![60_u8, 61],
+                vec![84, 96],
+                vec![96, 108],
+                vec![88, 91, 96],
+                vec![24, 36, 48],
+                vec![21, 108],
+                vec![60, 62, 64, 65, 67],
+            ] {
+                let col = Column::place(clef, &mk(&chord));
+                for i in 0..col.notes.len() {
+                    for j in (i + 1)..col.notes.len() {
+                        let (a, b) = (col.notes[i], col.notes[j]);
+                        assert!(
+                            a.pos != b.pos || a.offset != b.offset,
+                            "{clef:?} {chord:?}: {} and {} print in the same place",
+                            a.note.midi,
+                            b.note.midi
+                        );
+                    }
+                }
+                // And nothing ends up outside the room the band reserved.
+                for n in &col.notes {
+                    assert!(
+                        (-(OCTAVE_AT * 2)..=8 + OCTAVE_AT * 2).contains(&n.pos)
+                            || Column::shift_for(
+                                &chord
+                                    .iter()
+                                    .map(|m| clef.position(spell(*m, false).step))
+                                    .collect::<Vec<_>>()
+                            ) == 0,
+                        "{clef:?} {chord:?}: {} is at {} , outside the band",
+                        n.note.midi,
+                        n.pos
+                    );
+                }
+            }
+        }
     }
 
     /// **Past three ledger lines the note moves and takes a sign with it.**
@@ -1656,7 +1818,10 @@ mod tests {
             // Every staff has room for its ledger lines and its octave sign:
             // the whole point of `OUTER_SPACES`.
             let space = one / total_spaces(1, false);
-            let reach = (8 + OCTAVE_AT * 2 + 3) as f32 * 0.5 - STAFF_SPACES;
+            // The sign's LINE, plus half its glyph: it is centre-anchored
+            // text at 1.15 spaces, so the top of it reaches another 0.6 spaces
+            // past where the dashes are.
+            let reach = (8 + OCTAVE_AT * 2 + 3) as f32 * 0.5 - STAFF_SPACES + 1.15 * 0.5;
             assert!(
                 OUTER_SPACES >= reach,
                 "a note at the top of its range and its 8va need {reach} spaces, not {OUTER_SPACES}"

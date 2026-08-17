@@ -248,6 +248,14 @@ pub struct Settings {
     pub staff_set: String,
     /// Letter names printed inside the noteheads.
     pub staff_note_names: bool,
+    /// The keyboard itself.
+    ///
+    /// **Not a user setting and deliberately not persisted.** The piano is the
+    /// app; there is no menu row for this and there must not be one. It exists
+    /// so that the Export dialog's "Piano" tick can take the band's HEIGHT away
+    /// in the composite's copy of the settings, which is what every other
+    /// panel's tick already does through its own flag.
+    pub show_piano: bool,
     /// The key signature: sharps positive, flats negative, zero for none.
     ///
     /// Default zero, and that is a real choice rather than a missing feature.
@@ -538,6 +546,7 @@ impl Default for Settings {
             staff_set: "grand".to_owned(),
             staff_note_names: false,
             staff_key: 0,
+            show_piano: true,
             custom_staff_set: None,
             plugin_paths: Vec::new(),
             show_camera_pane: false,
@@ -743,7 +752,7 @@ impl Settings {
             .unwrap_or(0);
 
         let take_bool = |map: &mut Map<String, Value>, key: &str, dst: &mut bool| {
-            if let Some(v) = map.remove(key) {
+            if let Some(v) = map.shift_remove(key) {
                 if let Some(b) = v.as_bool() {
                     *dst = b;
                 }
@@ -765,7 +774,7 @@ impl Settings {
         take_bool(&mut map, "keytoggle_enabled", &mut s.keytoggle_enabled);
 
         let take_color = |map: &mut Map<String, Value>, key: &str, dst: &mut Rgb| {
-            if let Some(v) = map.remove(key) {
+            if let Some(v) = map.shift_remove(key) {
                 if let Some(c) = v.as_str().and_then(Rgb::parse) {
                     *dst = c;
                 }
@@ -793,52 +802,52 @@ impl Settings {
         );
         take_color(&mut map, "sustain_color", &mut s.sustain_color);
 
-        if let Some(v) = map.remove("window_size_percent") {
+        if let Some(v) = map.shift_remove("window_size_percent") {
             if let Some(n) = v.as_i64() {
                 if n > 0 {
                     s.window_size_percent = n;
                 }
             }
         }
-        if let Some(v) = map.remove("detached_chord_height") {
+        if let Some(v) = map.shift_remove("detached_chord_height") {
             if let Some(n) = v.as_i64() {
                 // D-UI-1: honored (unlike Python, which overwrote it with 50 on
                 // init); values <= 0 fall back to 50 at the point of use.
                 s.detached_chord_height = n;
             }
         }
-        if let Some(v) = map.remove("custom_font_path") {
+        if let Some(v) = map.shift_remove("custom_font_path") {
             if let Some(p) = v.as_str() {
                 s.custom_font_path = Some(p.to_owned());
             }
         }
-        if let Some(v) = map.remove("font_choice") {
+        if let Some(v) = map.shift_remove("font_choice") {
             if let Some(f) = v.as_str() {
                 // Stored verbatim; an unknown key resolves to Courier at use.
                 s.font_choice = f.to_owned();
             }
         }
-        if let Some(v) = map.remove("recorder_bg_color") {
+        if let Some(v) = map.shift_remove("recorder_bg_color") {
             if let Some(c) = v.as_str().and_then(Rgb::parse) {
                 s.recorder_bg_color = c;
             }
         }
-        if let Some(v) = map.remove("chord_text_color") {
+        if let Some(v) = map.shift_remove("chord_text_color") {
             if let Some(c) = v.as_str().and_then(Rgb::parse) {
                 s.chord_text_color = c;
             }
         }
-        if let Some(v) = map.remove("show_welcome") {
+        if let Some(v) = map.shift_remove("show_welcome") {
             if let Some(b) = v.as_bool() {
                 s.show_welcome = b;
             }
         }
-        if let Some(v) = map.remove("show_heart") {
+        if let Some(v) = map.shift_remove("show_heart") {
             if let Some(b) = v.as_bool() {
                 s.show_heart = b;
             }
         }
-        if let Some(v) = map.remove("heart_color") {
+        if let Some(v) = map.shift_remove("heart_color") {
             if let Some(n) = v.as_i64() {
                 s.heart_color = n;
             }
@@ -850,7 +859,7 @@ impl Settings {
         // multi-monitor setups, so no sign check here; placement is clamped to
         // the monitor at the point of use instead.
         let take_opt_i64 = |map: &mut Map<String, Value>, key: &str, dst: &mut Option<i64>| {
-            if let Some(v) = map.remove(key) {
+            if let Some(v) = map.shift_remove(key) {
                 if let Some(n) = v.as_i64() {
                     *dst = Some(n);
                 }
@@ -878,14 +887,20 @@ impl Settings {
         take_bool(&mut map, "theory_circle", &mut legacy[0]);
         take_bool(&mut map, "theory_tonnetz", &mut legacy[1]);
         take_bool(&mut map, "theory_triangles", &mut legacy[2]);
-        if let Some(v) = map.remove("theory_order") {
+        // 4.0.0's `show_staff`, which shipped the sheet music as a band of its
+        // own with a key and a menu row. Read here so that somebody who turned
+        // it OFF is not handed it back by the migration below — the evidence of
+        // their choice would otherwise sit unread in `extra` for ever.
+        let mut legacy_staff = true;
+        take_bool(&mut map, "show_staff", &mut legacy_staff);
+        if let Some(v) = map.shift_remove("theory_order") {
             if let Some(k) = v.as_str() {
                 s.theory_order = k.to_owned();
                 saw_order = true;
             }
         }
         take_bool(&mut map, "theory_follow_midi", &mut s.theory_follow_midi);
-        if let Some(Value::Array(v)) = map.remove("plugin_paths") {
+        if let Some(Value::Array(v)) = map.shift_remove("plugin_paths") {
             s.plugin_paths = v
                 .into_iter()
                 .filter_map(|x| x.as_str().map(str::to_owned))
@@ -893,41 +908,41 @@ impl Settings {
                 .collect();
         }
         take_bool(&mut map, "staff_note_names", &mut s.staff_note_names);
-        if let Some(n) = map.remove("staff_key").and_then(|v| v.as_i64()) {
+        if let Some(n) = map.shift_remove("staff_key").and_then(|v| v.as_i64()) {
             s.staff_key = (n as i32).clamp(-crate::staff::MAX_KEY, crate::staff::MAX_KEY);
         }
-        if let Some(v) = map.remove("staff_set") {
+        if let Some(v) = map.shift_remove("staff_set") {
             if let Some(k) = v.as_str() {
                 s.staff_set = k.to_owned();
             }
         }
-        if let Some(v) = map.remove("custom_staff_set") {
+        if let Some(v) = map.shift_remove("custom_staff_set") {
             s.custom_staff_set = v.as_str().map(str::to_owned).filter(|k| !k.is_empty());
         }
         take_bool(&mut map, "show_camera_pane", &mut s.show_camera_pane);
         take_bool(&mut map, "camera_pane_left", &mut s.camera_pane_left);
-        if let Some(v) = map.remove("capo_style") {
+        if let Some(v) = map.shift_remove("capo_style") {
             if let Some(t) = v.as_str() {
                 s.capo_style = t.to_owned();
             }
         }
-        if let Some(Value::String(v)) = map.remove("fretboard_custom_name") {
+        if let Some(Value::String(v)) = map.shift_remove("fretboard_custom_name") {
             s.fretboard_custom_name = Some(v);
         }
-        if let Some(Value::String(v)) = map.remove("fretboard_custom_open") {
+        if let Some(Value::String(v)) = map.shift_remove("fretboard_custom_open") {
             s.fretboard_custom_open = Some(v);
         }
-        if let Some(v) = map.remove("fretboard_tuning") {
+        if let Some(v) = map.shift_remove("fretboard_tuning") {
             if let Some(t) = v.as_str() {
                 s.fretboard_tuning = t.to_owned();
             }
         }
-        if let Some(v) = map.remove("fretboard_capo") {
+        if let Some(v) = map.shift_remove("fretboard_capo") {
             if let Some(n) = v.as_i64() {
                 s.fretboard_capo = n;
             }
         }
-        if let Some(v) = map.remove("fretboard_wood") {
+        if let Some(v) = map.shift_remove("fretboard_wood") {
             if let Some(t) = v.as_str() {
                 s.fretboard_wood = t.to_owned();
             }
@@ -951,7 +966,7 @@ impl Settings {
         take_opt_i64(&mut map, "recorder_win_x", &mut s.recorder_win_x);
         take_opt_i64(&mut map, "recorder_win_y", &mut s.recorder_win_y);
         let take_opt_str = |map: &mut Map<String, Value>, key: &str, dst: &mut Option<String>| {
-            if let Some(Value::String(v)) = map.remove(key) {
+            if let Some(Value::String(v)) = map.shift_remove(key) {
                 // An empty string is not a path, a uid or a name. Written by
                 // hand or by an earlier build clearing a field, it would
                 // otherwise be "chosen" and resolve to the process's working
@@ -986,7 +1001,7 @@ impl Settings {
         take_opt_str(&mut map, "record_camera_uid", &mut s.record_camera_uid);
         take_opt_str(&mut map, "record_audio_device", &mut s.record_audio_device);
         take_bool(&mut map, "record_input_off", &mut s.record_input_off);
-        if let Some(v) = map.remove("record_sources") {
+        if let Some(v) = map.shift_remove("record_sources") {
             if let Some(t) = v.as_str() {
                 s.record_sources = t.to_owned();
             }
@@ -996,13 +1011,13 @@ impl Settings {
         // user: a field would have to round-trip, and two settings that differ
         // only in how they were loaded are not different settings.
         let mut saw_bars = false;
-        if let Some(v) = map.remove("record_count_in_bars") {
+        if let Some(v) = map.shift_remove("record_count_in_bars") {
             if let Some(n) = v.as_i64() {
                 s.record_count_in_bars = n;
                 saw_bars = true;
             }
         }
-        if let Some(Value::String(t)) = map.remove("record_time_signature") {
+        if let Some(Value::String(t)) = map.shift_remove("record_time_signature") {
             s.record_time_signature = t;
         }
         take_bool(
@@ -1010,12 +1025,12 @@ impl Settings {
             "record_count_in_in_take",
             &mut s.record_count_in_in_take,
         );
-        if let Some(v) = map.remove("record_buffer_frames") {
+        if let Some(v) = map.shift_remove("record_buffer_frames") {
             if let Some(n) = v.as_i64() {
                 s.record_buffer_frames = n;
             }
         }
-        if let Some(v) = map.remove("record_count_in_beats") {
+        if let Some(v) = map.shift_remove("record_count_in_beats") {
             if let Some(n) = v.as_i64() {
                 s.record_count_in_beats = n;
             }
@@ -1028,8 +1043,8 @@ impl Settings {
         // would migrate them a second time over whatever slot 0 had become.
         let mut legacy_path: Option<String> = None;
         take_opt_str(&mut map, "plugin_path", &mut legacy_path);
-        let legacy_gain = map.remove("plugin_gain").and_then(|v| v.as_f64());
-        match map.remove("plugin_slots") {
+        let legacy_gain = map.shift_remove("plugin_gain").and_then(|v| v.as_f64());
+        match map.shift_remove("plugin_slots") {
             Some(Value::Array(items)) => {
                 for (slot, item) in s.plugin_slots.iter_mut().zip(items) {
                     if let Value::String(path) = item {
@@ -1041,7 +1056,7 @@ impl Settings {
             }
             _ => s.plugin_slots[0] = legacy_path,
         }
-        if let Some(Value::Array(items)) = map.remove("plugin_gains") {
+        if let Some(Value::Array(items)) = map.shift_remove("plugin_gains") {
             for (gain, item) in s.plugin_gains.iter_mut().zip(items) {
                 if let Some(g) = item.as_f64() {
                     if g.is_finite() && (0.0..=MAX_GAIN).contains(&g) {
@@ -1059,7 +1074,7 @@ impl Settings {
         // audio buffer is not a display glitch — it is a burst of noise into
         // somebody's monitors at whatever level the interface is set to.
         let take_gain = |map: &mut Map<String, Value>, key: &str, dst: &mut f64| {
-            if let Some(g) = map.remove(key).and_then(|v| v.as_f64()) {
+            if let Some(g) = map.shift_remove(key).and_then(|v| v.as_f64()) {
                 if g.is_finite() && (0.0..=MAX_GAIN).contains(&g) {
                     *dst = g;
                 }
@@ -1067,7 +1082,7 @@ impl Settings {
         };
         take_gain(&mut map, "metronome_gain", &mut s.metronome_gain);
         take_gain(&mut map, "input_gain", &mut s.input_gain);
-        if let Some(v) = map.remove("transpose") {
+        if let Some(v) = map.shift_remove("transpose") {
             if let Some(n) = v.as_i64() {
                 s.transpose = n.clamp(-TRANSPOSE_MAX, TRANSPOSE_MAX);
             }
@@ -1076,15 +1091,22 @@ impl Settings {
         take_bool(&mut map, "metronome_on", &mut s.metronome_on);
         take_bool(&mut map, "metronome_in_take", &mut s.metronome_in_take);
         take_bool(&mut map, "record_hide_elapsed", &mut s.record_hide_elapsed);
-        if let Some(v) = map.remove("record_export") {
+        if let Some(v) = map.shift_remove("record_export") {
             s.record_export = crate::recorder::ExportSpec::from_value(&v);
         }
 
-        s.extra = map; // whatever is left, preserved in file order
+        // Whatever is left, in the order the FILE had it.
+        //
+        // `shift_remove` and not `remove` above, throughout: with the
+        // `preserve_order` feature, `Map::remove` is `swap_remove` — it moves
+        // the last entry into the hole — so thirty-five known-key removals
+        // would shuffle a later build's unknown keys into an arbitrary order
+        // every time this build opened the file.
+        s.extra = map;
         if !saw_bars {
             s.convert_count_in_to_bars();
         }
-        s.migrate_from(was, legacy, saw_order);
+        s.migrate_from(was, legacy, legacy_staff, saw_order);
         s
     }
 
@@ -1098,7 +1120,13 @@ impl Settings {
     /// stamped on the next save. That is the cost, and it is worth paying: the
     /// alternative is what this app did until now, which is that a default,
     /// once shipped, could never be corrected for anybody who already had it.
-    fn migrate_from(&mut self, was: u64, legacy_theory: [bool; 3], saw_order: bool) {
+    fn migrate_from(
+        &mut self,
+        was: u64,
+        legacy_theory: [bool; 3],
+        legacy_staff: bool,
+        saw_order: bool,
+    ) {
         if was < 4 && !saw_order {
             // **The three bools become an ordered list.** Whatever diagrams
             // somebody had chosen, they keep — in the numbered order, because
@@ -1107,9 +1135,12 @@ impl Settings {
             // sheet music is APPENDED, since it is new and nobody has an
             // opinion about it yet.
             //
-            // Nothing at all selected is the one case that becomes everything:
-            // that is a fresh file, or one from before the theory band existed,
-            // and an empty band is not what it should open as.
+            // Nothing at all selected becomes everything ONLY for a file with
+            // no version stamp on it. The three bools have existed since
+            // version 1, so a STAMPED file with all three false is somebody who
+            // collapsed the band on purpose, and handing them 300 points of
+            // diagrams on an update is the window-grows-on-its-own surprise
+            // every other default in this file is written to avoid.
             use crate::theory_panel::{View, Views};
             let had: Vec<View> = View::ALL
                 .into_iter()
@@ -1117,11 +1148,18 @@ impl Settings {
                 .zip(legacy_theory)
                 .filter_map(|(v, on)| on.then_some(v))
                 .collect();
-            self.theory_order = if had.is_empty() {
+            let mut order = had;
+            // And the sheet music comes along unless 4.0.0 was told to hide it
+            // — or unless the band was deliberately EMPTY, in which case a new
+            // panel would re-open a band somebody closed and grow the window on
+            // its own. A new element is worth arriving beside the ones they
+            // kept; it is not worth overruling them.
+            if legacy_staff && !order.is_empty() {
+                order.push(View::Staff);
+            }
+            self.theory_order = if order.is_empty() && was == 0 {
                 Views::all().keys()
             } else {
-                let mut order = had;
-                order.push(View::Staff);
                 Views::of(order).keys()
             };
         }
@@ -1846,6 +1884,73 @@ mod tests {
         // change would migrate to itself and silently do nothing.
         assert!(!V0_RECORDER_BG.contains(&now.recorder_bg_color.to_hex().as_str()));
         assert_ne!(now.record_export.composite.layout, crate::recorder::Layout::CameraAbove);
+    }
+
+    /// **A migration must not overturn a choice somebody made.**
+    ///
+    /// Three ways it did, all found by an audit rather than by use:
+    /// a collapsed theory band came back with everything in it, because "no
+    /// diagrams" was read as "never chose"; a sheet music band hidden in 4.0.0
+    /// came back, because the key that recorded it was read by nothing; and a
+    /// band with one diagram in it kept the diagram but gained the staff
+    /// whether or not it was wanted.
+    #[test]
+    fn the_theory_migration_keeps_what_the_user_actually_chose() {
+        use crate::theory_panel::{View, Views};
+        // A stamped file with everything off is somebody who collapsed the
+        // band. It stays collapsed.
+        let json = r#"{"settings_version": 2, "theory_circle": false,
+            "theory_tonnetz": false, "theory_triangles": false}"#;
+        assert_eq!(
+            Settings::from_json(json).theory_views(),
+            Views::default(),
+            "a deliberately empty band was filled back up"
+        );
+        // A file with NO stamp at all predates the version and predates the
+        // band; that one becomes everything.
+        let json = r#"{"theory_circle": false}"#;
+        assert_eq!(Settings::from_json(json).theory_views(), Views::all());
+
+        // One diagram is kept, and the sheet music joins it — it is new.
+        let json = r#"{"settings_version": 2, "theory_tonnetz": true}"#;
+        assert_eq!(
+            Settings::from_json(json).theory_views(),
+            Views::of(vec![View::Tonnetz, View::Staff])
+        );
+        // Unless 4.0.0 was told to hide it, in which case it stays hidden.
+        let json = r#"{"settings_version": 3, "theory_tonnetz": true, "show_staff": false}"#;
+        assert_eq!(
+            Settings::from_json(json).theory_views(),
+            Views::of(vec![View::Tonnetz]),
+            "a sheet music band the user hid was turned back on"
+        );
+
+        // And an explicit order is never migrated at all, whatever the stamp
+        // says: the file already speaks the current language.
+        let json = r#"{"theory_order": "staff+circle", "theory_circle": false}"#;
+        assert_eq!(
+            Settings::from_json(json).theory_views(),
+            Views::of(vec![View::Staff, View::Circle])
+        );
+    }
+
+    /// Unknown keys keep the order the FILE had them in.
+    ///
+    /// With `preserve_order`, `Map::remove` is `swap_remove` — it fills the
+    /// hole with the last entry — so the known-key removals in `from_map` would
+    /// shuffle a later build's keys every time this build opened the file.
+    #[test]
+    fn keys_this_build_does_not_know_keep_their_place() {
+        let json = r#"{"aaa": 1, "dark_mode": true, "bbb": 2, "transpose": 0, "ccc": 3}"#;
+        let back = Settings::from_json(json).to_json();
+        let order: Vec<usize> = ["\"aaa\"", "\"bbb\"", "\"ccc\""]
+            .iter()
+            .map(|k| back.find(k).unwrap_or(usize::MAX))
+            .collect();
+        assert!(
+            order[0] < order[1] && order[1] < order[2],
+            "unknown keys were shuffled: {back}"
+        );
     }
 
     /// **It runs ONCE.** Somebody who really does want the camera above the
