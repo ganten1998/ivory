@@ -81,6 +81,22 @@ pub struct DirRequest {
     pub start_at: Option<std::path::PathBuf>,
     /// Title for the panel.
     pub title: String,
+    /// What the chosen folder is FOR.
+    ///
+    /// One request type with a purpose on it rather than two nearly identical
+    /// ones: the host's job is the same either way — raise the native panel
+    /// after the frame — and the only thing that differs is which of the app's
+    /// setters gets the answer.
+    pub purpose: DirPurpose,
+}
+
+/// Why a folder is being asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirPurpose {
+    /// Where takes are written.
+    RecordRoot,
+    /// Another place to look for VST3 bundles.
+    PluginFolder,
 }
 
 /// A source of MIDI the app picks for itself.

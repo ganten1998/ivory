@@ -242,7 +242,20 @@ impl Compositor {
                                 egui::Color32::from_black_alpha(190),
                             );
                         }
-                        app.paint_composite(painter, pane, shows);
+                        // The camera as THIS context knows it. With the camera
+                        // pane on, the app draws the camera itself as one of
+                        // its own bands — so what the video shows is what the
+                        // window shows, and there is no second arrangement for
+                        // the two to disagree about.
+                        app.paint_composite(
+                            painter,
+                            pane,
+                            shows,
+                            camera_id.map(|(texture, (w, h))| ivory_ui::recorder::Preview {
+                                texture,
+                                size: egui::vec2(w as f32, h as f32),
+                            }),
+                        );
                     }
                     if camera_on_top {
                         if let (Some(pane), Some((id, size))) = (panes.camera, camera_id) {

@@ -294,6 +294,15 @@ struct Palette {
     root: Color32,
 }
 
+/// The theory band's own background.
+///
+/// Public so that the camera pane, which sits INSIDE this band, can letterbox
+/// against it. A camera surrounded by the Recorder's leather in the middle of a
+/// cream band reads as a hole cut in the window rather than as part of it.
+pub fn band_bg(s: &Settings) -> Color32 {
+    palette(s).bg
+}
+
 fn palette(s: &Settings) -> Palette {
     let lit = s.white_key_active_color.to_color32();
     // `faint` and `line` carry the outlines, the roman numerals and the key
@@ -446,6 +455,11 @@ fn body_rect(rect: Rect) -> Rect {
     Rect::from_min_max(Pos2::new(rect.min.x, rect.min.y + used), rect.max)
 }
 
+/// Advance width of one character as a fraction of the font size, for the
+/// bundled monospaced faces. The same number `recorder_panel` uses, for the
+/// same reason: sizing text to its box without laying it out first.
+const LEGEND_ADV: f32 = 0.62;
+
 fn title(painter: &Painter, rect: Rect, text: &str, legend: &str, p: &Palette) -> Rect {
     let h = (rect.height() * 0.075).clamp(9.0, 14.0);
     painter.text(
@@ -459,12 +473,20 @@ fn title(painter: &Painter, rect: Rect, text: &str, legend: &str, p: &Palette) -
     // Dropped rather than crammed when the pane is too short for it: an
     // unreadable legend is worse than none, and it is the first thing that
     // should give up its space.
-    if rect.height() > 150.0 && !legend.is_empty() {
+    //
+    // **And too NARROW, which is the case that used to be missed.** These are
+    // forty-odd characters of centred text; in a pane half the window's width
+    // they ran out of both sides and collided with the legends either side of
+    // them, so three diagrams read as one smear of overlapping type. Shrink to
+    // fit, then give up — the same bargain the height already made.
+    let fitted = (rect.width() * 0.98 / (legend.chars().count().max(1) as f32 * LEGEND_ADV))
+        .min(lh * 0.88);
+    if rect.height() > 150.0 && !legend.is_empty() && fitted >= 6.0 {
         painter.text(
             Pos2::new(rect.center().x, rect.min.y + h + lh * 0.5),
             Align2::CENTER_CENTER,
             legend,
-            font_light(lh * 0.88),
+            font_light(fitted),
             p.faint,
         );
     }

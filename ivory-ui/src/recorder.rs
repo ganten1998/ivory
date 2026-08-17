@@ -395,6 +395,20 @@ impl RecorderState {
     /// The take name, the pre-roll and the hide-elapsed flag come from the app
     /// rather than from here: they are settings and edit state the app already
     /// owns, and a second copy would be a second thing to keep in step.
+    /// What the camera is, as a label, without building a whole
+    /// [`RecorderView`] to ask.
+    ///
+    /// The camera pane is drawn from the app's band layout now, which has no
+    /// `RecorderView` in reach and no business making one — it needs one fact
+    /// about the device, and this is it.
+    pub fn camera_label(&self) -> DeviceLabel<'_> {
+        match self.camera_name.as_deref() {
+            None => DeviceLabel::None,
+            Some(n) if self.camera_missing => DeviceLabel::Missing(n),
+            Some(n) => DeviceLabel::Open(n),
+        }
+    }
+
     pub fn view<'a>(
         &'a self,
         take_name: &'a str,

@@ -90,7 +90,8 @@
 use crate::fonts;
 use crate::recorder::{
     disk_text, gain_text, gain_to_fader, timecode, DeviceLabel, ExportSpec, Level, Meters,
-    NumField, RecordState, RecorderView, SlotView, COUNT_IN_CHOICES, MAX_BPM, MIN_BPM, SLOTS,
+    NumField, Preview, RecordState, RecorderView, SlotView, COUNT_IN_CHOICES, MAX_BPM, MIN_BPM,
+    SLOTS,
 };
 use crate::settings::Settings;
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
@@ -1361,12 +1362,49 @@ fn label_text(painter: &Painter, r: Rect, cap: &str, value: &str, colour: Color3
     );
 }
 
+/// The camera, as a PANE OF THE WINDOW rather than a box in the Recorder band.
+///
+/// **This is the whole of the camera's presence in the app now.** It sits
+/// beside the theory diagrams, it is what you frame a shot in, and — because
+/// the video is the window's own bands laid into the video's frame — it is also
+/// exactly what lands in the recording. There is no second model of where the
+/// camera goes and therefore nothing for the two models to disagree about,
+/// which is what every camera-layout bug in this app has been.
+///
+/// Public because it is painted from `app.rs`, from the two places that draw
+/// bands: the live window and the offscreen compositor.
+pub fn draw_camera_pane(
+    painter: &Painter,
+    rect: Rect,
+    preview: Option<Preview>,
+    camera: DeviceLabel<'_>,
+    surround: Color32,
+    s: &Settings,
+) {
+    // The band it SITS in, not the band it came from. The letterbox bars round
+    // a 4:3 camera are the theory panel's own background, so the row reads as
+    // one band with a camera in it rather than as a hole cut in the window.
+    let mut p = palette(s);
+    p.bg = surround;
+    draw_camera(painter, rect, preview, camera, &p);
+}
+
 fn draw_preview(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palette) {
-    let r = l.preview;
+    draw_camera(painter, l.preview, view.preview, view.camera, p);
+}
+
+/// One camera box, wherever it is.
+fn draw_camera(
+    painter: &Painter,
+    r: Rect,
+    preview: Option<Preview>,
+    camera: DeviceLabel<'_>,
+    p: &Palette,
+) {
     if !r.is_positive() {
         return;
     }
-    match view.preview {
+    match preview {
         Some(pv) => {
             // The bars are the BAND's background, not a black mat: the box is
             // fixed by the layout and the frame is fitted into it, so whatever
@@ -1382,7 +1420,7 @@ fn draw_preview(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
             // Say what to do. An empty grey box is indistinguishable from a
             // camera pointed at a wall, and one of those is the user's problem
             // to fix while the other is not.
-            let (top, hint) = match view.camera {
+            let (top, hint) = match camera {
                 DeviceLabel::None => ("NO CAMERA SELECTED", "choose one on the right"),
                 DeviceLabel::Missing(_) => ("CAMERA NOT AVAILABLE", "it is not plugged in"),
                 DeviceLabel::Open(_) => ("WAITING FOR CAMERA", "the first frame has not arrived"),

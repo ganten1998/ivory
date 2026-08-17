@@ -34,6 +34,7 @@
 //! unmapped from under them. `Module` therefore does the pairing itself and
 //! deliberately leaks on the failure path.
 
+use std::collections::HashSet;
 use std::ffi::{c_void, CString, OsStr};
 use std::path::{Path, PathBuf};
 
@@ -56,8 +57,15 @@ const CONTENTS_SUBDIR: &str = "aarch64-linux";
 ///
 /// User-local first, so a user's own build shadows a system one — which is what
 /// every host does and what anyone debugging a plugin expects.
+///
+/// `VST3_PATH` comes first of all when it is set. It is the SDK's own documented
+/// override, every serious host honours it, and it is the one thing somebody
+/// with plugins in an unusual place will already have tried.
 pub fn search_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();
+    if let Some(env) = std::env::var_os("VST3_PATH") {
+        out.extend(std::env::split_paths(&env));
+    }
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = std::env::var_os("HOME") {
@@ -86,26 +94,93 @@ pub fn search_paths() -> Vec<PathBuf> {
     out
 }
 
-/// Every `.vst3` bundle under the standard paths.
+/// How deep to walk under a search path.
 ///
-/// Not recursive beyond one level: the SDK allows nested category folders, but
-/// a full walk of `/Library/Audio/Plug-Ins` on a machine with a large library
-/// is slow enough to be felt at startup and is not where anything installs.
-pub fn discover() -> Vec<PathBuf> {
+/// **Not one level, which is what this used to do.** The SDK allows vendor and
+/// category folders under the VST3 directory and the big installers all use
+/// them — Steinberg, Native Instruments, Waves, Applied Acoustics, Kilohearts.
+/// On the machine this was found on, 112 of 160 installed plugins were at the
+/// top level and the other 48 — HALion Sonic, Groove Agent, Lounge Lizard —
+/// simply did not exist as far as this app was concerned, with nothing on
+/// screen to suggest they were being skipped.
+///
+/// Three is deep enough for `VST3/Vendor/Category/Thing.vst3` and shallow
+/// enough that it cannot turn into a walk of somebody's home directory if they
+/// add one as a custom folder.
+const MAX_DEPTH: usize = 3;
+
+/// A cap on how many directories one scan will open.
+///
+/// The depth limit bounds the SHAPE of the walk and this bounds its SIZE, which
+/// are different failures: a custom folder pointed at a network volume or a
+/// build tree can be three levels deep and still contain tens of thousands of
+/// directories, and a picker that takes a minute to open is a hung app.
+const MAX_DIRS: usize = 4_000;
+
+/// Every `.vst3` bundle under the standard paths, plus any the user added.
+///
+/// Recursive, bounded, symlink-safe and deduplicated — see [`MAX_DEPTH`],
+/// [`MAX_DIRS`], and the `seen` set, which holds canonical paths so that a
+/// folder reachable two ways (a symlink into the system directory is the common
+/// one) is walked once and listed once.
+pub fn discover_in(extra: &[PathBuf]) -> Vec<PathBuf> {
+    // The user's own folders first, so a plugin they pointed at deliberately
+    // shadows a copy of the same thing in a system directory.
+    let mut roots: Vec<PathBuf> = extra.to_vec();
+    roots.extend(search_paths());
+
     let mut out = Vec::new();
-    for dir in search_paths() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut opened = 0_usize;
+    let mut queue: Vec<(PathBuf, usize)> = roots.into_iter().map(|d| (d, 0)).collect();
+
+    while let Some((dir, depth)) = queue.pop() {
+        if opened >= MAX_DIRS {
+            break;
+        }
+        // Canonicalised, so a symlink loop terminates and a directory reachable
+        // by two names is not scanned twice. A path that will not canonicalise
+        // does not exist, which is the normal case for a search path on a
+        // machine that has never had that vendor's installer run.
+        let Ok(real) = dir.canonicalize() else {
             continue;
         };
+        if !seen.insert(real.clone()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&real) else {
+            continue;
+        };
+        opened += 1;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension() == Some(OsStr::new("vst3")) {
+                // A bundle is a directory and is NOT descended into: the
+                // binary inside it is not another plugin, and some bundles
+                // carry a `Resources` tree deep enough to matter.
                 out.push(path);
+                continue;
+            }
+            // `is_dir` follows symlinks, which is what we want: people symlink
+            // their plugin folders, and refusing to follow one would be the
+            // same bug this whole change is about.
+            if depth + 1 <= MAX_DEPTH && path.is_dir() {
+                queue.push((path, depth + 1));
             }
         }
     }
+
+    // By canonical path, so the same bundle reached through a symlinked folder
+    // is one entry. Sorted by the path shown, so the picker is stable.
+    let mut unique: HashSet<PathBuf> = HashSet::new();
+    out.retain(|p| unique.insert(p.canonicalize().unwrap_or_else(|_| p.clone())));
     out.sort();
     out
+}
+
+/// Every `.vst3` bundle under the standard paths.
+pub fn discover() -> Vec<PathBuf> {
+    discover_in(&[])
 }
 
 /// The binary inside a bundle, or the bundle itself if it is already a plain
@@ -647,5 +722,75 @@ mod tests {
         };
         assert!(processor.is_audio_module());
         assert!(!controller.is_audio_module());
+    }
+
+    /// **The scan finds what is actually installed, not what is at the top.**
+    ///
+    /// The SDK allows vendor and category folders under the VST3 directory and
+    /// every large installer uses them. A one-level scan found 112 of the 160
+    /// plugins on the machine this was written on and said nothing about the
+    /// other 48 — they simply were not offered, which reads as "this host does
+    /// not support my plugin" rather than as a bug.
+    ///
+    /// Also pins the three things that make a recursive scan safe: it stops at
+    /// `MAX_DEPTH`, it does not walk INTO a bundle, and a folder reachable two
+    /// ways is listed once.
+    #[test]
+    fn the_scan_finds_nested_bundles_without_walking_the_whole_disk() {
+        let root = std::env::temp_dir().join("tangent-scan-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let mk = |p: &Path| std::fs::create_dir_all(p).expect("mkdir");
+
+        // One at the top, one under a vendor folder, one under a vendor AND a
+        // category folder — the three shapes that exist in the wild.
+        mk(&root.join("Top.vst3/Contents"));
+        mk(&root.join("Vendor/Nested.vst3/Contents"));
+        mk(&root.join("Vendor/Category/Deep.vst3/Contents"));
+        // Past the depth limit: present on disk, deliberately not found.
+        mk(&root.join("a/b/c/d/TooDeep.vst3/Contents"));
+        // A directory that is not a bundle and holds nothing.
+        mk(&root.join("Vendor/Presets"));
+        // And something inside a bundle that looks exactly like a bundle: the
+        // walk must not descend into a `.vst3` at all.
+        mk(&root.join("Top.vst3/Contents/Inner.vst3"));
+
+        let found = discover_in(&[root.clone()]);
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+
+        assert!(names.contains(&"Top.vst3".to_owned()), "{names:?}");
+        assert!(names.contains(&"Nested.vst3".to_owned()), "{names:?}");
+        assert!(names.contains(&"Deep.vst3".to_owned()), "{names:?}");
+        assert!(
+            !names.contains(&"Inner.vst3".to_owned()),
+            "the walk went inside a bundle: {names:?}"
+        );
+        assert!(
+            !names.contains(&"TooDeep.vst3".to_owned()),
+            "the walk went past MAX_DEPTH: {names:?}"
+        );
+
+        // The same folder twice is not the same plugin twice. This is the case
+        // a symlinked plugin directory produces, and a picker with every
+        // instrument listed twice is worse than one missing them.
+        let twice = discover_in(&[root.clone(), root.clone()]);
+        assert_eq!(twice.len(), found.len(), "duplicates: {twice:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A search path that does not exist is the normal case — most machines
+    /// have never had most vendors' installers run — and it must not be an
+    /// error, a panic, or a reason to stop looking in the others.
+    #[test]
+    fn a_missing_folder_is_skipped_rather_than_fatal() {
+        let nowhere = std::env::temp_dir().join("tangent-scan-does-not-exist");
+        let _ = std::fs::remove_dir_all(&nowhere);
+        let found = discover_in(&[nowhere]);
+        // Whatever is really installed on the machine running this, plus
+        // nothing from the folder that is not there.
+        assert_eq!(found, discover());
     }
 }

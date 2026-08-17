@@ -69,6 +69,14 @@ pub enum MenuAction {
     ToggleHeart,
     /// D-UI-15: the guitar view.
     ToggleFretboard,
+    /// Show or hide the camera pane beside the theory band.
+    ToggleCameraPane,
+    /// Look for VST3 bundles again, now.
+    RescanPlugins,
+    /// Add another folder to the list of places that are looked in.
+    AddPluginFolder,
+    /// Forget every folder the user added, back to the standard paths.
+    ClearPluginFolders,
     /// Name from `fretboard::TUNINGS`.
     /// `String`, not `&'static str`: a custom tuning's name is user input and
     /// has no static lifetime.
@@ -204,6 +212,10 @@ pub struct MenuView {
     /// comes from: the two rows behave identically, and this is the label's
     /// input, not the file's key.
     pub recorder_on: bool,
+    /// The camera pane beside the theory band is showing.
+    pub camera_pane_on: bool,
+    /// How many folders the user has added to the plugin search list.
+    pub extra_plugin_folders: usize,
     /// §5: the Recorder band is in its own window.
     ///
     /// Needed for the same reason `theory_detached` is: the Detach row renames
@@ -984,6 +996,17 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 },
                 MenuAction::ToggleCountInInTake,
             ));
+            recorder.push(row(
+                // The camera lives in the WINDOW now, beside the theory
+                // diagrams, and what the window shows is what the video shows.
+                // So this row is not "preview the camera" — it is the camera.
+                if view.camera_pane_on {
+                    "Hide Camera (W)"
+                } else {
+                    "Show Camera (W)"
+                },
+                MenuAction::ToggleCameraPane,
+            ));
             recorder.push(row("Audio Status...", MenuAction::ShowAudioStatus));
             recorder.push(row("Export...", MenuAction::ShowExportDialog));
             recorder.push(row(
@@ -1029,6 +1052,26 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 })
                 .collect(),
             );
+            // **Where the instruments come from.** Its own category because
+            // "my plugin is not in the list" is the single most common thing
+            // that goes wrong with a plugin host, and the answer to it has to
+            // be somewhere you can find without being told: look again, look
+            // somewhere else as well, or start over.
+            let mut plugins = vec![
+                row("Rescan for Plugins", MenuAction::RescanPlugins),
+                row("Add a Folder...", MenuAction::AddPluginFolder),
+            ];
+            if view.extra_plugin_folders > 0 {
+                plugins.push(row(
+                    &format!(
+                        "Forget {} Added Folder{}",
+                        view.extra_plugin_folders,
+                        if view.extra_plugin_folders == 1 { "" } else { "s" }
+                    ),
+                    MenuAction::ClearPluginFolders,
+                ));
+            }
+            push_category(&mut e, "Plugin folders", plugins);
             // The signature the click, the count-in and the `.mid` all share.
             // A sibling hover for the same reason the count-in is one.
             push_category(
@@ -1140,7 +1183,13 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
 /// Matched by NAME rather than rebuilt, so there is one definition of what the
 /// Recorder's rows are and this cannot drift from it.
 fn move_recorder_to_the_front(e: &mut Vec<Entry>) {
-    const OURS: [&str; 4] = ["Recorder", "Sources", "Time signature", "Count-in"];
+    const OURS: [&str; 5] = [
+        "Recorder",
+        "Sources",
+        "Plugin folders",
+        "Time signature",
+        "Count-in",
+    ];
     let mut moved: Vec<Entry> = Vec::new();
     // Kept in the order OURS lists, which is the order they already appear in —
     // so this is a move, not a re-sort, and adding a fifth category to the
@@ -1697,6 +1746,8 @@ mod tests {
             // a window that grows on its own is the geometry surprise this app
             // has already been bitten by twice.
             recorder_on: false,
+            camera_pane_on: false,
+            extra_plugin_folders: 0,
             recorder_detached: false,
             count_in_beats: 4,
             time_signature: crate::recorder::TimeSignature::default(),
@@ -2514,8 +2565,14 @@ mod tests {
         };
         let names = category_names(v.clone());
         assert_eq!(
-            &names[..4],
-            &["Recorder", "Sources", "Time signature", "Count-in"],
+            &names[..5],
+            &[
+                "Recorder",
+                "Sources",
+                "Plugin folders",
+                "Time signature",
+                "Count-in"
+            ],
             "the recorder block does not lead: {names:?}"
         );
 
@@ -2685,6 +2742,7 @@ mod tests {
                 "Start the Click",
                 "Record the Click Into Takes",
                 "Record the Count-in Into the Take",
+                "Show Camera (W)",
                 "Audio Status...",
                 "Export...",
                 "Hide Elapsed Time",
@@ -2720,6 +2778,7 @@ mod tests {
                 "Capo",
                 "Recorder",
                 "Sources",
+                "Plugin folders",
                 "Time signature",
                 "Count-in",
             ]
@@ -2791,6 +2850,7 @@ mod tests {
                 "Start the Click",
                 "Record the Click Into Takes",
                 "Record the Count-in Into the Take",
+                "Show Camera (W)",
                 "Audio Status...",
                 "Export...",
                 "Hide Elapsed Time"

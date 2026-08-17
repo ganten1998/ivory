@@ -627,14 +627,30 @@ impl DesktopApp {
                 dialog = dialog.set_directory(start);
             }
             if let Some(dir) = dialog.pick_folder() {
-                // The tick is left where the user had it. Choosing a folder is
-                // not a statement about whether to go on choosing it, and
-                // silently ticking "use this by default" because somebody
-                // picked a folder once is how a temporary destination becomes
-                // permanent without anyone deciding it should.
-                let remember = self.app.record_dir_is_default();
-                self.app.set_record_dir(dir, remember);
+                match request.purpose {
+                    // The tick is left where the user had it. Choosing a folder
+                    // is not a statement about whether to go on choosing it,
+                    // and silently ticking "use this by default" because
+                    // somebody picked a folder once is how a temporary
+                    // destination becomes permanent without anyone deciding it
+                    // should.
+                    ivory_ui::ports::DirPurpose::RecordRoot => {
+                        let remember = self.app.record_dir_is_default();
+                        self.app.set_record_dir(dir, remember);
+                    }
+                    ivory_ui::ports::DirPurpose::PluginFolder => {
+                        self.app.add_plugin_folder(dir);
+                    }
+                }
             }
+        }
+        // Scanning reads directories, so it belongs out here with the other
+        // things the UI is not allowed to do — and it runs AFTER the folder
+        // picker above, so a folder added this frame is in the list this frame
+        // rather than one frame later.
+        if self.app.take_plugin_rescan() {
+            let extra = self.app.plugin_folders();
+            self.app.set_plugin_list(ivory_host::discover_in(&extra));
         }
 
         // The take's video, on the EDGES of the session's own state. Placed
@@ -1151,7 +1167,8 @@ impl DesktopApp {
             // even with 112 of them, and no plugin gets the chance to crash the
             // process before the window has appeared. A bundle is opened only
             // when the user picks it.
-            app.set_plugin_list(ivory_host::discover());
+            let extra = app.plugin_folders();
+            app.set_plugin_list(ivory_host::discover_in(&extra));
             Recorder {
                 session: crate::record::Session::new(tap, timebase),
                 audio,

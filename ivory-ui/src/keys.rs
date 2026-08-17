@@ -23,6 +23,7 @@ pub enum KeyAction {
     ToggleKeytoggle,
     ClearNotes,
     ToggleFretboard,
+    ToggleCameraPane,
     CycleTheory,
     ToggleDarkMode,
     ToggleDetection,
@@ -126,6 +127,10 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     (Key::K, "K", KeyAction::ToggleKeytoggle, true),
     (Key::R, "R", KeyAction::ClearNotes, true),
     (Key::G, "G", KeyAction::ToggleFretboard, true),
+    // `W` for webcam. `C` is the chord detector's and `V` is the Recorder
+    // band's, both of them for years — a shortcut that moves is worse than one
+    // that is not the first letter of the thing it does.
+    (Key::W, "W", KeyAction::ToggleCameraPane, true),
     (Key::T, "T", KeyAction::CycleTheory, true),
     (Key::C, "C", KeyAction::ToggleDetection, true),
     (Key::D, "D", KeyAction::ToggleDarkMode, true),
@@ -186,6 +191,7 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ToggleKeytoggle => "keytoggle: click the piano or the neck to place notes",
         KeyAction::ClearNotes => "clear every note you placed",
         KeyAction::ToggleFretboard => "guitar view",
+        KeyAction::ToggleCameraPane => "camera",
         KeyAction::CycleTheory => "cycle the theory band",
         KeyAction::ToggleDarkMode => "dark mode",
         KeyAction::ToggleDetection => "chord detection",
@@ -583,6 +589,7 @@ mod tests {
         for (key, want) in [
             (Key::K, KeyAction::ToggleKeytoggle),
             (Key::G, KeyAction::ToggleFretboard),
+            (Key::W, KeyAction::ToggleCameraPane),
         ] {
             for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
                 assert_eq!(press(key, gates), Some(want), "{key:?} under {gates:?}");

@@ -212,6 +212,33 @@ pub struct Settings {
     /// Anybody who wants it to hold still turns it off, and it stays off —
     /// which is the direction that survives being wrong.
     pub theory_follow_midi: bool,
+    /// The camera preview, as a PANE OF THE WINDOW beside the theory band.
+    ///
+    /// **This is where the camera lives now, and it is why the video is just
+    /// the window.** It used to be a box inside the Recorder band, seen only
+    /// while setting up and never in what was exported; the export then carried
+    /// its own separate model of where the camera went, and that duplication is
+    /// the whole reason a user could pick a layout in a dialog, record, and get
+    /// something else. One camera, one place, one picture.
+    ///
+    /// Off by default because the pane takes real width from the theory band
+    /// and most sessions are not recordings. `V` turns it on.
+    /// Extra folders to look for VST3 bundles in, on top of the standard ones.
+    ///
+    /// **Because the standard ones are not where everybody's plugins are.** A
+    /// portable library on an external drive, a build tree, a shared network
+    /// folder, or simply a machine where an installer put things somewhere its
+    /// own: without this the answer to "my plugin is not in the list" is to
+    /// move the plugin, which is not an answer.
+    ///
+    /// Searched BEFORE the standard paths, so a folder somebody pointed at
+    /// deliberately shadows a copy of the same plugin in a system directory.
+    pub plugin_paths: Vec<String>,
+    pub show_camera_pane: bool,
+    /// Which side of the theory band the pane sits on. Right by default: the
+    /// diagrams are read left to right and the first one is the one people
+    /// look at.
+    pub camera_pane_left: bool,
     /// The Recorder band is showing.
     ///
     /// Off by default and deliberately NOT part of `first_launch()`, for the
@@ -481,6 +508,9 @@ impl Default for Settings {
             theory_tonnetz: false,
             theory_triangles: false,
             theory_follow_midi: true,
+            plugin_paths: Vec::new(),
+            show_camera_pane: false,
+            camera_pane_left: false,
             fretboard_win_w: None,
             fretboard_win_h: None,
             fretboard_win_x: None,
@@ -803,6 +833,15 @@ impl Settings {
         take_bool(&mut map, "theory_tonnetz", &mut s.theory_tonnetz);
         take_bool(&mut map, "theory_triangles", &mut s.theory_triangles);
         take_bool(&mut map, "theory_follow_midi", &mut s.theory_follow_midi);
+        if let Some(Value::Array(v)) = map.remove("plugin_paths") {
+            s.plugin_paths = v
+                .into_iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .filter(|x| !x.trim().is_empty())
+                .collect();
+        }
+        take_bool(&mut map, "show_camera_pane", &mut s.show_camera_pane);
+        take_bool(&mut map, "camera_pane_left", &mut s.camera_pane_left);
         if let Some(v) = map.remove("capo_style") {
             if let Some(t) = v.as_str() {
                 s.capo_style = t.to_owned();
@@ -1117,6 +1156,20 @@ impl Settings {
             "theory_follow_midi".into(),
             Value::Bool(self.theory_follow_midi),
         );
+        map.insert(
+            "plugin_paths".into(),
+            Value::Array(
+                self.plugin_paths
+                    .iter()
+                    .map(|p| Value::String(p.clone()))
+                    .collect(),
+            ),
+        );
+        map.insert(
+            "show_camera_pane".into(),
+            Value::Bool(self.show_camera_pane),
+        );
+        map.insert("camera_pane_left".into(), Value::Bool(self.camera_pane_left));
         map.insert("capo_style".into(), Value::String(self.capo_style.clone()));
         map.insert(
             "fretboard_tuning".into(),
