@@ -928,6 +928,11 @@ impl IvoryApp {
     fn detection_tick(&mut self, force: bool) {
         if !self.settings.chord_detection_enabled {
             self.current_chord = None;
+            // The alternates go with it. They are unreachable while detection
+            // is off — the readout draws nothing without a winner — but state
+            // that outlives the thing it describes is a bug waiting for a
+            // reader.
+            self.chord_alternates.clear();
             return;
         }
         let due = force
