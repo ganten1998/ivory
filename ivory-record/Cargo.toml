@@ -75,8 +75,15 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 # AVCaptureDeviceInput is created, so the prompt happens at Open Camera — the
 # one moment where the user has just asked for a camera and the dialog is not a
 # non-sequitur. See `permission_status` in `camera.rs`.
+#
+# The ENCODER half of this list (`AVAssetWriter`, `AVAssetWriterInput`,
+# `AVVideoSettings`) is what turns camera frames into an `.mp4`. It is a handful
+# of classes rather than the whole of AVFoundation for the same reason as
+# above: the default feature set is ~500 modules and a multi-minute build.
 objc2-av-foundation = { version = "0.3", default-features = false, features = [
     "std",
+    "AVAssetWriter",
+    "AVAssetWriterInput",
     "AVCaptureDevice",
     "AVCaptureInput",
     "AVCaptureOutput",
@@ -84,8 +91,14 @@ objc2-av-foundation = { version = "0.3", default-features = false, features = [
     "AVCaptureSession",
     "AVCaptureVideoDataOutput",
     "AVMediaFormat",
+    "AVVideoSettings",
     "dispatch2",
     "objc2-core-media",
+    # Without this the pixel-buffer adaptor has no `pixelBufferPool` and no
+    # `appendPixelBuffer:withPresentationTime:` — both are gated on the
+    # CoreVideo dep, and their absence reads as "no method named
+    # appendPixelBuffer" rather than as a missing feature.
+    "objc2-core-video",
 ] }
 objc2-core-media = { version = "0.3", default-features = false, features = [
     "std",
@@ -106,6 +119,10 @@ objc2-core-video = { version = "0.3", default-features = false, features = [
     "CVBuffer",
     "CVImageBuffer",
     "CVPixelBuffer",
+    # The encoder's frames come from the adaptor's own pool rather than being
+    # allocated per frame: at 1080p30 that is 250 MB a second of malloc/free
+    # that the pool exists to avoid.
+    "CVPixelBufferPool",
     "CVReturn",
 ] }
 # The delegate must be handed a SERIAL queue or AVFoundation makes no ordering
