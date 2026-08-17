@@ -2928,6 +2928,144 @@ impl IvoryApp {
         self.paint(ui);
     }
 
+    /// Paint the display bands into `rect`, for the video compositor.
+    ///
+    /// **`&self`, and that is the whole safety argument.** It must not be
+    /// [`Self::paint`] called a second time: `paint` drains the MIDI channel,
+    /// runs the voicing and detection ticks, and overwrites `last_pane` and
+    /// `last_drawn` — which dialog placement and `request_natural_size` read.
+    /// A composite pass that did any of that would move the app's own dialogs
+    /// to wherever the video frame is, and would consume MIDI events the window
+    /// then never saw.
+    ///
+    /// So this paints what is ALREADY decided. Whatever the last real frame
+    /// worked out is what goes in the video, which is also what makes the two
+    /// agree: the video shows what the player was looking at.
+    ///
+    /// The Recorder band is deliberately absent. It is the surface you set up a
+    /// take WITH; a recorder's own transport inside the recording is a picture
+    /// of the tool rather than of the performance.
+    /// The width:height ratio of the display bands the video will contain.
+    ///
+    /// The compositor needs this BEFORE it lays out the frame, so the band can
+    /// be given the height its content actually wants — see `Layout::split`.
+    /// Computed from the same `band_sizes_at` the painting uses, so the two
+    /// cannot disagree about how tall a keyboard is.
+    pub fn composite_aspect(&self, shows: recorder::DisplayShows) -> f32 {
+        let s = self.composite_settings(shows);
+        // At a nominal width, because every band's height is a fixed fraction
+        // of the width — so the RATIO is the same at every size and this needs
+        // no knowledge of the frame.
+        const NOMINAL: f32 = 1300.0;
+        let h = band_sizes_at(&s, NOMINAL).total().y;
+        if h <= 0.0 {
+            return 0.0;
+        }
+        NOMINAL / h
+    }
+
+    /// The app's settings with the export's panel selection applied.
+    ///
+    /// One function because the layout and the painting both need it, and a
+    /// second copy of this would be the two of them drawing different videos.
+    fn composite_settings(&self, shows: recorder::DisplayShows) -> Settings {
+        let mut s = self.settings.clone();
+        s.show_recorder = false;
+        s.recorder_detached = false;
+        s.chord_detection_enabled = shows.chord;
+        s.chord_window_detached = false;
+        s.show_fretboard = shows.fretboard;
+        s.fretboard_detached = false;
+        s.theory_detached = false;
+        if !shows.theory {
+            // Every diagram off, which is what makes `theory_views()` empty and
+            // therefore the band's height zero. Set as three flags rather than
+            // one "show theory" bool because there is no such bool: the band
+            // exists exactly when one of its three diagrams is on.
+            s.theory_circle = false;
+            s.theory_tonnetz = false;
+            s.theory_triangles = false;
+        }
+        s
+    }
+
+    pub fn paint_composite(&self, painter: &egui::Painter, rect: Rect, shows: recorder::DisplayShows) {
+        if !rect.is_positive() {
+            return;
+        }
+        // The export's OWN panel selection, applied to a copy. This is how the
+        // dialog's "Display shows" ticks override the live window without
+        // touching it: record a clean piano-and-chord video while keeping the
+        // fretboard on screen for yourself.
+        let s = self.composite_settings(shows);
+
+        // Scaled to FILL the pane's width, then centred vertically. The bands
+        // are a fixed shape, so a pane of a different aspect gets bars rather
+        // than a stretched keyboard — and the bars are the video's own
+        // background, not black, so a stacked layout reads as one picture.
+        let bands = fit_bands(&s, rect.size());
+        let total = bands.total();
+        let origin = Pos2::new(
+            rect.min.x + ((rect.width() - total.x) * 0.5).max(0.0).trunc(),
+            rect.min.y + ((rect.height() - total.y) * 0.5).max(0.0).trunc(),
+        );
+        let w = bands.w;
+        let band_at =
+            |top: f32, h: f32| Rect::from_min_size(Pos2::new(origin.x, origin.y + top), Vec2::new(w, h));
+
+        let display = self.display_notes();
+        if bands.theory_h > 0.0 {
+            theory_panel::draw(
+                painter,
+                band_at(0.0, bands.theory_h),
+                s.theory_views(),
+                self.theory_input(&display),
+                &s,
+            );
+        }
+        if bands.chord_h > 0.0 && shows.chord {
+            chord_strip::draw(
+                painter,
+                band_at(bands.theory_h, bands.chord_h),
+                self.current_chord.as_deref(),
+                s.chord_text_color.to_color32(),
+                // No heart and no transpose arrows in the video. Both are
+                // controls — one is a licence badge and the other is a pair of
+                // buttons — and a control painted into a recording is a thing
+                // the viewer will try to click.
+                None,
+                None,
+                None,
+            );
+        }
+        if shows.piano {
+            piano::draw(
+                painter,
+                band_at(bands.theory_h + bands.chord_h, bands.piano_h),
+                &display,
+                self.notes.sustain_down(),
+                &s,
+            );
+        }
+        if bands.fret_h > 0.0 {
+            let spec = s.fretboard_spec();
+            let r = band_at(
+                bands.theory_h + bands.chord_h + bands.piano_h,
+                bands.fret_h,
+            );
+            fretboard_panel::draw(
+                painter,
+                r,
+                self.voicing.current(),
+                &spec,
+                &s,
+                s.fretboard_wood(),
+                self.barre_to_draw(),
+            );
+            fretboard_panel::draw_top_edge(painter, r, &s);
+        }
+    }
+
     /// The colour behind everything, for hosts that clear the surface
     /// themselves.
     pub const CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];

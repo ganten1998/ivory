@@ -1505,6 +1505,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "egui-wgpu",
  "fd-lock",
  "ivory-core",
  "ivory-host",

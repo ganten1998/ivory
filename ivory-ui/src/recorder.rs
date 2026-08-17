@@ -600,6 +600,150 @@ impl Layout {
     fn from_key(k: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|l| l.key() == k)
     }
+
+    /// Where the camera and the display go inside one video frame.
+    ///
+    /// **The display gets a BAND, not a half.** This is the one decision in the
+    /// whole layout that is worth arguing about, so: the display content is a
+    /// piano keyboard and a chord name, which is a very wide and very short
+    /// thing. Splitting a 16:9 frame down the middle gives it twice the height
+    /// it can use and starves the camera of the room that shows a pianist's
+    /// hands. So in landscape it takes roughly a third, and the camera takes
+    /// the rest.
+    ///
+    /// **Portrait is the exception, and it is why 9:16 is worth offering.**
+    /// A vertical frame has height to spare, so the keyboard can have 40% of it
+    /// and still leave the camera a near-square pane — which is a better crop of
+    /// a person at a piano than 16:9 ever gives. In 9:16 the stack is not a
+    /// compromise, it is the best arrangement available.
+    ///
+    /// Returns `(camera, display)`. Either is `None` when that layer is not in
+    /// the composite; when only one is, it takes the whole frame, because a
+    /// letterbox around the only thing in the video is a bug rather than a
+    /// layout.
+    pub fn split(
+        self,
+        frame: egui::Rect,
+        camera: bool,
+        display: bool,
+        display_aspect: f32,
+    ) -> Panes {
+        let portrait = frame.height() > frame.width();
+        match (camera, display) {
+            (false, false) => Panes::default(),
+            (true, false) => Panes {
+                camera: Some(frame),
+                display: None,
+            },
+            (false, true) => Panes {
+                camera: None,
+                display: Some(frame),
+            },
+            (true, true) => self.both(frame, portrait, display_aspect),
+        }
+    }
+
+    /// How tall the display band should be inside a frame this wide.
+    ///
+    /// **Its content's own height, not a fixed fraction.** The first version
+    /// gave the band a flat 30% of a landscape frame and 40% of a portrait one,
+    /// and the very first composited frame showed why that is wrong: in a
+    /// 360x640 vertical frame the keyboard is 55 points tall and it was handed
+    /// 256, so five sixths of the band was dead black and the camera lost a
+    /// quarter of the picture to hold it.
+    ///
+    /// The cap is still there, because the band grows with every panel switched
+    /// on and a fretboard plus three theory diagrams could otherwise take the
+    /// whole frame.
+    fn band_height(frame: egui::Rect, portrait: bool, display_aspect: f32) -> f32 {
+        let natural = if display_aspect > 0.01 {
+            frame.width() / display_aspect
+        } else {
+            frame.height() * 0.30
+        };
+        let cap = frame.height() * if portrait { 0.45 } else { 0.40 };
+        natural.clamp(0.0, cap)
+    }
+
+    fn both(self, frame: egui::Rect, portrait: bool, display_aspect: f32) -> Panes {
+        let band = Self::band_height(frame, portrait, display_aspect) / frame.height().max(1.0);
+        match self {
+            Layout::CameraAbove => {
+                let cut = frame.bottom() - frame.height() * band;
+                Panes {
+                    camera: Some(above(frame, cut)),
+                    display: Some(below(frame, cut)),
+                }
+            }
+            Layout::DisplayAbove => {
+                let cut = frame.top() + frame.height() * band;
+                Panes {
+                    camera: Some(below(frame, cut)),
+                    display: Some(above(frame, cut)),
+                }
+            }
+            // Overlaid, so the camera keeps the whole frame and the display
+            // floats over the bottom of it. A little shorter than the stacked
+            // band because it is covering the picture rather than sitting
+            // beside it.
+            Layout::CameraFull => {
+                // Overlaid, so it sits a little tighter than the stacked band:
+                // it is covering the picture rather than sitting beside it, and
+                // an overlay is a caption, not a second pane.
+                let h = Self::band_height(frame, portrait, display_aspect * 1.15);
+                Panes {
+                    camera: Some(frame),
+                    display: Some(below(frame, frame.bottom() - h)),
+                }
+            }
+            Layout::SideBySide => {
+                // **In portrait this stacks instead**, and that is deliberate
+                // rather than a limitation. Two halves of a 9:16 frame are two
+                // 9:32 slivers: unusable for a face and unusable for a
+                // keyboard. Silently giving the user the arrangement that works
+                // is better than giving them the one they literally asked for
+                // and letting them find out at the export.
+                if portrait {
+                    return Layout::CameraAbove.both(frame, portrait, display_aspect);
+                }
+                let cut = frame.left() + frame.width() * 0.5;
+                Panes {
+                    camera: Some(egui::Rect::from_min_max(
+                        frame.min,
+                        egui::Pos2::new(cut, frame.bottom()),
+                    )),
+                    display: Some(egui::Rect::from_min_max(
+                        egui::Pos2::new(cut, frame.top()),
+                        frame.max,
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Whether the display is drawn ON TOP of the camera rather than beside it.
+    ///
+    /// The compositor needs to know: an overlaid band is painted after the
+    /// camera and over it, and a stacked one is painted into a region the
+    /// camera never touches.
+    pub fn overlays(self) -> bool {
+        matches!(self, Layout::CameraFull)
+    }
+}
+
+/// Where each layer goes in the composited frame.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Panes {
+    pub camera: Option<egui::Rect>,
+    pub display: Option<egui::Rect>,
+}
+
+fn above(frame: egui::Rect, cut: f32) -> egui::Rect {
+    egui::Rect::from_min_max(frame.min, egui::Pos2::new(frame.right(), cut))
+}
+
+fn below(frame: egui::Rect, cut: f32) -> egui::Rect {
+    egui::Rect::from_min_max(egui::Pos2::new(frame.left(), cut), frame.max)
 }
 
 /// The composited video's frame size.
@@ -608,15 +752,25 @@ pub enum Resolution {
     #[default]
     Hd1080,
     Hd720,
+    /// **9:16, for Reels / Shorts / TikTok.**
+    ///
+    /// Not a crop of the landscape frame — a frame shape of its own, which the
+    /// layouts read and lay out differently. It is the one aspect where the
+    /// stacked layout is not a compromise but the best possible arrangement:
+    /// camera above and keyboard below, both full width, no wasted margin
+    /// anywhere. In 16:9 the same stack has to give the keyboard a band; in
+    /// 9:16 there is height to give it.
+    Vertical1080,
     /// Whatever the camera is giving us. Sharpest, and the one that makes the
     /// file size unpredictable, which is why it is not the default.
     MatchCamera,
 }
 
 impl Resolution {
-    pub const ALL: [Resolution; 3] = [
+    pub const ALL: [Resolution; 4] = [
         Resolution::Hd1080,
         Resolution::Hd720,
+        Resolution::Vertical1080,
         Resolution::MatchCamera,
     ];
 
@@ -624,6 +778,10 @@ impl Resolution {
         match self {
             Resolution::Hd1080 => "1920x1080",
             Resolution::Hd720 => "1280x720",
+            // Named for what it is FOR. "1080x1920" is a number nobody
+            // recognises; "Reels / Shorts" is the reason somebody is choosing
+            // it, and the number is there for the one person who wants it.
+            Resolution::Vertical1080 => "1080x1920  (Reels / Shorts)",
             Resolution::MatchCamera => "Match camera",
         }
     }
@@ -632,6 +790,7 @@ impl Resolution {
         match self {
             Resolution::Hd1080 => "1080",
             Resolution::Hd720 => "720",
+            Resolution::Vertical1080 => "vertical",
             Resolution::MatchCamera => "camera",
         }
     }
@@ -645,7 +804,20 @@ impl Resolution {
         match self {
             Resolution::Hd1080 => Some((1920, 1080)),
             Resolution::Hd720 => Some((1280, 720)),
+            Resolution::Vertical1080 => Some((1080, 1920)),
             Resolution::MatchCamera => None,
+        }
+    }
+
+    /// Whether the frame is taller than it is wide.
+    ///
+    /// The layouts read this rather than measuring the rectangle, so that a
+    /// `MatchCamera` frame from a phone held upright is treated as the portrait
+    /// frame it is.
+    pub fn is_portrait(self, camera: Option<(u32, u32)>) -> bool {
+        match self.pixels().or(camera) {
+            Some((w, h)) => h > w,
+            None => false,
         }
     }
 }
@@ -831,6 +1003,12 @@ impl ExportSpec {
         let per_stream = match self.resolution {
             // 12 Mbit/s and 6 Mbit/s, converted to MB per minute.
             Resolution::Hd1080 | Resolution::MatchCamera => 12.0 * 60.0 / 8.0,
+            // Vertical 1080 is the same pixel count as landscape 1080 turned on
+            // its side, so it costs the same. Listed separately rather than
+            // folded in with Hd1080 because they are not the same frame and a
+            // reader checking this table should see that they were both
+            // considered.
+            Resolution::Vertical1080 => 12.0 * 60.0 / 8.0,
             Resolution::Hd720 => 6.0 * 60.0 / 8.0,
         };
         let streams = match self.video {
@@ -1572,5 +1750,226 @@ mod typing_tests {
         assert!(e.text.len() <= 8, "the box grew to {}", e.text.len());
         // And what is in it is still a tempo rather than an overflow.
         assert_eq!(parse_bpm(&e.text), Some(MAX_BPM));
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use egui::{Pos2, Rect};
+
+    /// The default panel selection — piano and chord name — as a width:height
+    /// ratio. Measured from `band_sizes_at`: at 1300 wide the piano is 150 and
+    /// the chord strip is 50, so the content is 1300:200.
+    const PIANO_AND_CHORD: f32 = 1300.0 / 200.0;
+
+    fn landscape() -> Rect {
+        Rect::from_min_size(Pos2::ZERO, egui::vec2(1920.0, 1080.0))
+    }
+    fn portrait() -> Rect {
+        Rect::from_min_size(Pos2::ZERO, egui::vec2(1080.0, 1920.0))
+    }
+
+    /// Every layer that IS in the composite has somewhere to go, and every
+    /// layer that is not has nowhere. A pane for a layer nobody asked for is a
+    /// black rectangle in the finished video.
+    #[test]
+    fn a_layer_gets_a_pane_exactly_when_it_is_in_the_composite() {
+        for l in Layout::ALL {
+            for frame in [landscape(), portrait()] {
+                for (cam, disp) in [(true, true), (true, false), (false, true), (false, false)] {
+                    let p = l.split(frame, cam, disp, PIANO_AND_CHORD);
+                    assert_eq!(p.camera.is_some(), cam, "{l:?} camera");
+                    assert_eq!(p.display.is_some(), disp, "{l:?} display");
+                }
+            }
+        }
+    }
+
+    /// The only layer in the video gets the WHOLE video. Anything else is a
+    /// letterbox around the one thing the user asked for.
+    #[test]
+    fn one_layer_alone_fills_the_frame() {
+        for l in Layout::ALL {
+            let f = landscape();
+            assert_eq!(l.split(f, true, false, PIANO_AND_CHORD).camera, Some(f), "{l:?}");
+            assert_eq!(l.split(f, false, true, PIANO_AND_CHORD).display, Some(f), "{l:?}");
+        }
+    }
+
+    /// Stacked panes must tile the frame: no gap, no overlap, nothing outside.
+    /// A gap is a black stripe and an overlap is a layer eating another.
+    #[test]
+    fn stacked_panes_tile_the_frame_exactly() {
+        for l in [Layout::CameraAbove, Layout::DisplayAbove, Layout::SideBySide] {
+            for frame in [landscape(), portrait()] {
+                let p = l.split(frame, true, true, PIANO_AND_CHORD);
+                let (c, d) = (p.camera.expect("camera"), p.display.expect("display"));
+                assert!(frame.contains_rect(c) && frame.contains_rect(d), "{l:?} escaped");
+                let covered = c.area() + d.area();
+                assert!(
+                    (covered - frame.area()).abs() < 1.0,
+                    "{l:?} covers {covered} of {}",
+                    frame.area()
+                );
+                assert!(!l.overlays(), "{l:?} should not be an overlay");
+            }
+        }
+    }
+
+    /// **The display band fits its content, and the camera gets everything
+    /// else.**
+    ///
+    /// The first version handed the band a flat fraction — 30% landscape, 40%
+    /// portrait — and the very first composited frame showed the cost: in a
+    /// 360x640 vertical frame the keyboard is 55 points tall and it was given
+    /// 256, so five sixths of the band was black and the camera had lost a
+    /// quarter of the picture to hold it.
+    #[test]
+    fn the_display_band_is_the_height_of_what_goes_in_it() {
+        for frame in [landscape(), portrait()] {
+            let d = Layout::CameraAbove
+                .split(frame, true, true, PIANO_AND_CHORD)
+                .display
+                .expect("display");
+            let natural = frame.width() / PIANO_AND_CHORD;
+            assert!(
+                (d.height() - natural).abs() < 1.0,
+                "the band is {} tall for content that is {natural}",
+                d.height()
+            );
+        }
+    }
+
+    /// And it is still CAPPED, because the band grows with every panel switched
+    /// on. A fretboard and three theory diagrams must not take the whole frame.
+    #[test]
+    fn a_very_tall_display_is_capped_rather_than_swallowing_the_frame() {
+        // Aspect 1.0 is a square display, far taller than any real selection.
+        let f = landscape();
+        let d = Layout::CameraAbove
+            .split(f, true, true, 1.0)
+            .display
+            .expect("display");
+        assert!(
+            d.height() <= f.height() * 0.41,
+            "an outsized display took {} of {}",
+            d.height(),
+            f.height()
+        );
+        assert!(
+            f.contains_rect(d),
+            "and it must still be inside the frame"
+        );
+    }
+
+    /// A vertical frame gives the camera nearly all of itself, which is the
+    /// whole reason 9:16 is worth offering: a near-square camera pane is a far
+    /// better crop of a person at a piano than 16:9 ever gives.
+    #[test]
+    fn the_vertical_camera_gets_the_bulk_of_the_frame() {
+        let f = portrait();
+        let p = Layout::CameraAbove.split(f, true, true, PIANO_AND_CHORD);
+        let cam = p.camera.expect("camera");
+        let share = cam.height() / f.height();
+        assert!(
+            share > 0.80,
+            "the camera got {share} of a vertical frame — the keyboard does not \
+             need the rest"
+        );
+    }
+
+    /// In 9:16 the camera pane must stay a usable shape for a person. This is
+    /// the assertion that justifies offering vertical at all.
+    #[test]
+    fn the_vertical_camera_pane_is_not_a_letterbox_slot() {
+        let cam = Layout::CameraAbove
+            .split(portrait(), true, true, PIANO_AND_CHORD)
+            .camera
+            .expect("camera");
+        let aspect = cam.width() / cam.height();
+        // Portrait-ish, and that is right: a 9:16 frame with a short keyboard
+        // strip under it leaves the camera a tall pane, which frames a seated
+        // player from head to hands. The bound that matters is that it is not a
+        // LETTERBOX SLOT — nothing like the 9:32 sliver a side-by-side split
+        // would give it.
+        assert!(
+            (0.45..=1.6).contains(&aspect),
+            "a {aspect:.2}:1 camera pane is not a crop anybody wants of a person"
+        );
+    }
+
+    /// Side by side in portrait would be two 9:32 slivers, so it stacks.
+    /// Silently giving the arrangement that works beats giving the one that was
+    /// literally asked for and letting the user find out at the export.
+    #[test]
+    fn side_by_side_stacks_when_the_frame_is_vertical() {
+        let p = Layout::SideBySide.split(portrait(), true, true, PIANO_AND_CHORD);
+        let stacked = Layout::CameraAbove.split(portrait(), true, true, PIANO_AND_CHORD);
+        assert_eq!(p, stacked, "side by side should have stacked in 9:16");
+        // And in landscape it is genuinely side by side.
+        let wide = Layout::SideBySide.split(landscape(), true, true, PIANO_AND_CHORD);
+        let (c, d) = (wide.camera.unwrap(), wide.display.unwrap());
+        assert!((c.height() - landscape().height()).abs() < 1.0);
+        assert!(c.right() <= d.left() + 1.0, "they did not sit side by side");
+    }
+
+    /// The overlay keeps the camera whole and floats the display over it, which
+    /// is the one case where the panes are SUPPOSED to intersect.
+    #[test]
+    fn the_overlay_keeps_the_camera_whole_and_sits_on_top_of_it() {
+        let f = landscape();
+        let p = Layout::CameraFull.split(f, true, true, PIANO_AND_CHORD);
+        assert_eq!(p.camera, Some(f), "the camera should still fill the frame");
+        let d = p.display.expect("display");
+        assert!(f.contains_rect(d));
+        assert!(d.intersects(f));
+        assert!(Layout::CameraFull.overlays(), "the compositor must paint it last");
+        assert!(
+            d.height() < f.height() * 0.30,
+            "an overlay covering a third of the picture is not an overlay"
+        );
+    }
+
+    /// A degenerate frame must not produce a pane with negative size, which is
+    /// what a compositor would then try to render into.
+    #[test]
+    fn a_frame_with_no_area_produces_no_impossible_panes() {
+        for w in [0.0_f32, 1.0] {
+            for h in [0.0_f32, 1.0] {
+                let f = Rect::from_min_size(Pos2::ZERO, egui::vec2(w, h));
+                for l in Layout::ALL {
+                    let p = l.split(f, true, true, PIANO_AND_CHORD);
+                    for r in [p.camera, p.display].into_iter().flatten() {
+                        assert!(
+                            r.width() >= 0.0 && r.height() >= 0.0,
+                            "{l:?} produced {r:?} from {f:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_vertical_resolution_is_a_real_portrait_frame() {
+        assert_eq!(Resolution::Vertical1080.pixels(), Some((1080, 1920)));
+        assert!(Resolution::Vertical1080.is_portrait(None));
+        assert!(!Resolution::Hd1080.is_portrait(None));
+        // And a phone held upright, with MatchCamera, is portrait too.
+        assert!(Resolution::MatchCamera.is_portrait(Some((1080, 1920))));
+        assert!(!Resolution::MatchCamera.is_portrait(Some((1920, 1080))));
+    }
+
+    /// Every resolution round-trips through its settings key, or a saved
+    /// vertical export silently becomes 1080p the next time the app starts.
+    #[test]
+    fn every_resolution_survives_the_settings_file() {
+        for r in Resolution::ALL {
+            assert_eq!(Resolution::from_key(r.key()), Some(r), "{r:?}");
+        }
+        for l in Layout::ALL {
+            assert_eq!(Layout::from_key(l.key()), Some(l), "{l:?}");
+        }
     }
 }

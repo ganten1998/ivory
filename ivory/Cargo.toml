@@ -135,6 +135,22 @@ windows-sys = { version = "0.59", features = [
 # what happened the first time. The backend has to be asked for by name.
 eframe = { version = "0.33", default-features = false, features = ["wgpu"] }
 wgpu = { version = "27", default-features = false, features = ["metal"] }
+# The video compositor renders an OFFSCREEN egui pass into a texture it then
+# reads back and encodes. That is this crate's job, not `ivory-ui`'s: the
+# firewall forbids `ivory-ui` from seeing a renderer at all, which is why the
+# seam is `IvoryApp::paint_composite(&self, painter, rect, shows)` — a pure
+# `egui::Painter` on one side, wgpu on the other.
+#
+# Not a new dependency: eframe's `wgpu` feature already puts this exact version
+# in the lock file. Named here because a transitive dependency is not a
+# nameable one.
+#
+# macOS-only because the renderer is. RECORDER-PLAN §6 specified `egui_glow`
+# and borrowing `eframe::Frame::gl()`, which no longer exists on this platform:
+# the plugin-editor flicker fix made Metal the default renderer, and under wgpu
+# `Frame::gl()` returns None. Re-introducing a second GL context to satisfy the
+# old plan would re-introduce the flicker it was written before.
+egui-wgpu = { version = "0.33", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 # `statvfs`, the other half of the same question. Already in the tree via cpal;
