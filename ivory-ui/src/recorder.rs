@@ -232,6 +232,10 @@ pub struct RecorderView<'a> {
     /// The name field has keyboard focus, so it draws a caret and the app's
     /// single-letter shortcuts are suppressed.
     pub name_focused: bool,
+    /// A numeric control being typed into, if any. Draws in place of that
+    /// control's reading, with a caret; suppresses the single-key shortcuts for
+    /// the same reason the name field does.
+    pub editing: Option<&'a NumEdit>,
     /// What the folder will be called, computed by `ivory_record::take`.
     pub folder_preview: &'a str,
     /// The three instrument slots, always all three — an empty one is still
@@ -285,6 +289,7 @@ impl RecorderView<'_> {
             dest: "",
             take_name: "",
             name_focused: false,
+            editing: None,
             folder_preview: "",
             slots: [SlotView::EMPTY; SLOTS],
             gains: Gains::default(),
@@ -387,6 +392,7 @@ impl RecorderState {
         &'a self,
         take_name: &'a str,
         name_focused: bool,
+        editing: Option<&'a NumEdit>,
         knobs: Knobs,
         hide_elapsed: bool,
     ) -> RecorderView<'a> {
@@ -402,6 +408,7 @@ impl RecorderState {
             dest: &self.dest,
             take_name,
             name_focused,
+            editing,
             folder_preview: &self.folder_preview,
             slots: std::array::from_fn(|i| SlotView {
                 name: self.slots[i].name.as_deref(),
@@ -1016,6 +1023,109 @@ pub fn gain_text(gain: f32) -> String {
     format!("{:+.1} dB", 20.0 * gain.log10())
 }
 
+// ── Typing a number in ──────────────────────────────────────────────────────
+//
+// Every control in the band that shows a number can be typed into as well as
+// dragged, because a drag cannot hit 120 BPM on a band fifteen points high and
+// "about 118" is not a tempo anybody wants in a MIDI file. The gesture is a
+// TAP: press and release without moving opens the field, press and move is the
+// drag it always was. Nothing had to be given up for it — the only thing a tap
+// used to do was jump the value to wherever the cursor happened to be, which is
+// the least precise thing either gesture can do.
+
+/// A control in the band that carries a number, and so can be typed into.
+///
+/// Deliberately NOT the `Hit` itself: a `Hit` carries the value the gesture
+/// would set, so two frames of the same drag are two different `Hit`s, and the
+/// identity of the field being edited has to outlive that.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NumField {
+    Slot(usize),
+    Metronome,
+    Input,
+    Tempo,
+}
+
+/// A numeric field mid-edit: which one, and what has been typed so far.
+///
+/// The text is kept as TEXT and not parsed on every keystroke, because a field
+/// passes through "-" and "12." on the way to "-12.5" and neither of those is a
+/// number. Nothing is applied until it is committed.
+#[derive(Clone, Debug)]
+pub struct NumEdit {
+    pub field: NumField,
+    pub text: String,
+}
+
+impl NumEdit {
+    /// Start editing `field`, seeded EMPTY rather than with the current value.
+    ///
+    /// Empty because typing over a selected value is what every DAW does and
+    /// what the fingers expect: the first digit replaces, it does not append.
+    /// Seeding with "+0.0 dB" would mean deleting seven characters before the
+    /// first useful one.
+    pub fn new(field: NumField) -> Self {
+        Self {
+            field,
+            text: String::new(),
+        }
+    }
+
+    /// Accept a typed character, or ignore it.
+    ///
+    /// Silently drops anything that cannot be part of a number so that a
+    /// stray letter — the app's own single-key shortcuts, typed at a field
+    /// that has focus — cannot end up in the box.
+    pub fn push(&mut self, ch: char) {
+        const MAX: usize = 8;
+        let ok = ch.is_ascii_digit()
+            // One dot, and a minus only in front. Neither check is about
+            // rejecting bad input for its own sake: `.parse()` will do that
+            // anyway. They stop the field from showing something it will then
+            // silently refuse to accept.
+            || (ch == '.' && !self.text.contains('.'))
+            || (ch == '-' && self.text.is_empty());
+        if ok && self.text.len() < MAX {
+            self.text.push(ch);
+        }
+    }
+
+    pub fn pop(&mut self) {
+        self.text.pop();
+    }
+}
+
+/// Turn typed text into a LINEAR gain, or `None` if it is not a level.
+///
+/// Reads dB, which is what the field displays. Blank commits nothing.
+pub fn parse_gain(text: &str) -> Option<f32> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let db: f32 = t.parse().ok()?;
+    // Below the bottom of the fader is OFF, not a very quiet signal. This is
+    // the only way to type OFF, and it is the one people reach for: -60 and
+    // "as low as it goes" are the same intention.
+    if db <= GAIN_MIN_DB {
+        return Some(0.0);
+    }
+    Some(10f32.powf(db.min(GAIN_MAX_DB) / 20.0))
+}
+
+/// Turn typed text into a tempo, clamped to what the SMF writer can express.
+pub fn parse_bpm(text: &str) -> Option<f64> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let bpm: f64 = t.parse().ok()?;
+    if !bpm.is_finite() {
+        return None;
+    }
+    Some(bpm.clamp(MIN_BPM, MAX_BPM))
+}
+
 /// Tempo the metronome and the SMF tempo mark share.
 ///
 /// One number, deliberately: a click at 90 against a file that says 120 is a
@@ -1351,5 +1461,116 @@ mod fader_tests {
         );
         assert!(!k.metronome_in_take, "a click in the file is a ruined take");
         assert!(!k.metronome_on, "and it does not start clicking on its own");
+    }
+}
+
+#[cfg(test)]
+mod typing_tests {
+    use super::*;
+
+    /// The two directions have to agree, or a field would show one number and
+    /// accept a different one for it.
+    #[test]
+    fn what_a_fader_shows_is_what_it_will_read_back() {
+        for pos in 0..=100 {
+            let gain = fader_to_gain(pos as f32 / 100.0);
+            if gain <= 0.0 {
+                continue;
+            }
+            let shown = gain_text(gain);
+            // The user retypes what they can see, which includes the unit and
+            // the sign — both have to survive the round trip.
+            let back = parse_gain(shown.trim_end_matches(" dB")).expect("that was a level");
+            let db_in = 20.0 * gain.log10();
+            let db_out = 20.0 * back.log10();
+            assert!(
+                (db_in - db_out).abs() < 0.06,
+                "{shown} read back as {db_out:+.3} dB, not {db_in:+.3}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_level_at_or_below_the_bottom_of_the_fader_is_off() {
+        // The only way to type OFF, and the one people reach for: "-60" and
+        // "as quiet as it goes" are the same intention.
+        assert_eq!(parse_gain("-60"), Some(0.0));
+        assert_eq!(parse_gain("-99"), Some(0.0));
+        assert_eq!(parse_gain("-inf"), Some(0.0));
+    }
+
+    #[test]
+    fn a_level_above_the_top_is_pinned_rather_than_refused() {
+        let g = parse_gain("40").expect("a number is a number");
+        let db = 20.0 * g.log10();
+        assert!(
+            (db - f64::from(GAIN_MAX_DB) as f32).abs() < 1e-3,
+            "{db} should have been pinned to {GAIN_MAX_DB}"
+        );
+    }
+
+    #[test]
+    fn text_that_is_not_a_number_changes_nothing() {
+        // `None` and not a default: committing junk must leave the value the
+        // user was already looking at exactly where it was.
+        for junk in ["", "   ", "loud", "-", ".", "12x"] {
+            assert_eq!(parse_gain(junk), None, "{junk:?} is not a level");
+            assert_eq!(parse_bpm(junk), None, "{junk:?} is not a tempo");
+        }
+    }
+
+    #[test]
+    fn a_tempo_is_clamped_to_what_the_smf_writer_can_say() {
+        assert_eq!(parse_bpm("120"), Some(120.0));
+        assert_eq!(parse_bpm("0"), Some(MIN_BPM));
+        assert_eq!(parse_bpm("100000"), Some(MAX_BPM));
+        assert_eq!(parse_bpm("-4"), Some(MIN_BPM));
+        // NaN and the infinities parse as an f64 and would sail through a
+        // range check, because every comparison against NaN is false — and
+        // `clamp` PANICS when handed one. Refused outright rather than
+        // clamped: neither is reachable from the keyboard (the field drops
+        // letters) and neither is a tempo.
+        assert_eq!(parse_bpm("NaN"), None);
+        assert_eq!(parse_bpm("inf"), None);
+        assert_eq!(parse_bpm("-inf"), None);
+    }
+
+    /// A field with keyboard focus is a field the app's single-key shortcuts
+    /// are typing into. Anything that is not part of a number has to bounce.
+    #[test]
+    fn the_field_refuses_everything_that_is_not_part_of_a_number() {
+        let mut e = NumEdit::new(NumField::Tempo);
+        for ch in "r1e2c3".chars() {
+            e.push(ch);
+        }
+        assert_eq!(e.text, "123", "letters reached the field");
+    }
+
+    #[test]
+    fn one_point_and_a_minus_only_in_front() {
+        let mut e = NumEdit::new(NumField::Input);
+        for ch in "-1.2.3-".chars() {
+            e.push(ch);
+        }
+        assert_eq!(e.text, "-1.23");
+        assert!(parse_gain(&e.text).is_some(), "and it parses");
+    }
+
+    #[test]
+    fn a_field_starts_empty_so_the_first_digit_replaces() {
+        // Seeded with the current reading, "+0.0 dB", somebody wanting -6 would
+        // have to delete seven characters before typing anything.
+        assert_eq!(NumEdit::new(NumField::Slot(0)).text, "");
+    }
+
+    #[test]
+    fn a_field_cannot_be_typed_into_forever() {
+        let mut e = NumEdit::new(NumField::Tempo);
+        for _ in 0..200 {
+            e.push('9');
+        }
+        assert!(e.text.len() <= 8, "the box grew to {}", e.text.len());
+        // And what is in it is still a tempo rather than an overflow.
+        assert_eq!(parse_bpm(&e.text), Some(MAX_BPM));
     }
 }

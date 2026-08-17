@@ -236,6 +236,13 @@ pub struct IvoryApp {
     /// A folder the host has been asked to choose. Drained after the frame so
     /// the native panel's nested run loop never starts inside an egui frame.
     dir_request: Option<crate::ports::DirRequest>,
+    /// A folder the app has asked the host to show in the file manager.
+    ///
+    /// The request pattern again, and for a sharper reason than the picker's:
+    /// showing a folder means starting another process, which a plugin inside
+    /// somebody's DAW has no business doing. A host refuses by never draining
+    /// it, and `Caps` decides whether it is ever set in the first place.
+    reveal_request: Option<std::path::PathBuf>,
     /// An export spec chosen without ticking "use these settings for every
     /// take": it governs every take **for the rest of this session** and is
     /// never written to the settings file.
@@ -263,7 +270,13 @@ pub struct IvoryApp {
     /// a pure function of position with no memory — so the app is what
     /// remembers which control is being held. Without this, dragging a fader
     /// past the edge of its own track hands the next control the value.
-    grabbed: Option<(recorder_panel::Hit, Pos2)>,
+    grabbed: Option<Grab>,
+    /// A numeric field being typed into, if any.
+    ///
+    /// Mutually exclusive with `name_focused` in practice, because a press
+    /// anywhere clears whichever one it is not opening — two focused text
+    /// fields would both eat the same keystroke.
+    num_edit: Option<recorder::NumEdit>,
     /// The take-name field has keyboard focus.
     ///
     /// While this is true every single-letter shortcut is suppressed, or typing
@@ -305,6 +318,26 @@ pub struct IvoryApp {
     detached_shown_at: Option<Instant>,
     detached_wm_managed: bool,
 }
+
+/// A band control the pointer is holding.
+///
+/// `moved` is what separates a DRAG from a TAP, and it latches: once a gesture
+/// has moved it is a drag for the rest of its life, so dragging a fader back to
+/// where it started does not turn into a tap on release and open a text field
+/// over the value you just set.
+#[derive(Clone, Copy)]
+struct Grab {
+    hit: recorder_panel::Hit,
+    from: Pos2,
+    moved: bool,
+}
+
+/// How far the pointer has to travel before a press counts as a drag.
+///
+/// Generous rather than tight. A tap is meant to be easy: on a trackpad a
+/// deliberate click drifts a pixel or two, and a "tap" that needed the pointer
+/// to be perfectly still would open the text field about half the time.
+const TAP_SLOP: f32 = 4.0;
 
 impl IvoryApp {
     /// `ctx` rather than an `eframe::CreationContext`, because eframe is one of
@@ -444,10 +477,12 @@ impl IvoryApp {
             recorder: recorder::RecorderState::default(),
             recorder_request: None,
             dir_request: None,
+            reveal_request: None,
             export_override: None,
             settings_save_at: None,
             picker_slot: 0,
             grabbed: None,
+            num_edit: None,
             plugin_list: Vec::new(),
             name_focused: false,
 
@@ -1072,6 +1107,7 @@ impl IvoryApp {
                         &self.recorder.view(
                             self.settings.record_take_name.as_deref().unwrap_or_default(),
                             self.name_focused,
+                            self.num_edit.as_ref(),
                             self.settings.knobs(),
                             self.settings.record_hide_elapsed,
                         ),
@@ -1080,21 +1116,38 @@ impl IvoryApp {
                     // Remember a dragged control for as long as the button is
                     // held. Only the value-carrying hits are grabbable; a
                     // button does not want a drag.
-                    self.grabbed = hit
-                        .filter(recorder_panel::Hit::is_draggable)
-                        .map(|h| (h, pos));
+                    self.grabbed = hit.filter(recorder_panel::Hit::is_draggable).map(|h| Grab {
+                        hit: h,
+                        from: pos,
+                        moved: false,
+                    });
                     // A press anywhere in the band that is not the name field
                     // takes focus off it, which is what makes clicking away
                     // commit the name the way every other text field does.
                     self.name_focused = matches!(hit, Some(recorder_panel::Hit::NameField));
+                    // The same for a number being typed: pressing anything else
+                    // commits it. Committing rather than discarding, because a
+                    // half-typed tempo that vanishes when you look away is a
+                    // field people learn not to trust.
+                    self.commit_number_unless(hit);
                     if let Some(hit) = hit {
-                        self.apply_recorder_hit(hit);
+                        // A value control is NOT applied on press. It is applied
+                        // once the gesture has moved far enough to be a drag —
+                        // see the drag block — which is what leaves the tap free
+                        // to mean "type into this". Nothing was lost: all a tap
+                        // used to do was jump the value to wherever the pointer
+                        // happened to land, which is the least precise thing
+                        // either gesture can do.
+                        if !recorder_panel::Hit::is_draggable(&hit) {
+                            self.apply_recorder_hit(hit);
+                        }
                     }
                     return;
                 }
                 // Clicking anywhere else also drops the field's focus, or the
                 // next letter typed at the piano would go into the take name.
                 self.name_focused = false;
+                self.commit_number_unless(None);
                 // The supporter heart cycles colour on click. Checked before the
                 // keytoggle hit-test because it sits in the chord strip, not the
                 // keyboard, so the two can never contend.
@@ -1367,6 +1420,16 @@ impl IvoryApp {
         self.dir_request.take()
     }
 
+    /// Take a pending "show me this folder" request. Same contract.
+    pub fn take_reveal_request(&mut self) -> Option<std::path::PathBuf> {
+        self.reveal_request.take()
+    }
+
+    /// Whether a finished take should show itself.
+    pub fn record_open_when_done(&self) -> bool {
+        self.settings.record_open_when_done
+    }
+
     /// Whether the take-name field currently has keyboard focus, so the host
     /// knows a space bar is a space and not a Record press.
     pub fn recorder_name_focused(&self) -> bool {
@@ -1392,6 +1455,11 @@ impl IvoryApp {
                 // using this next time"; clearing the path as well would throw
                 // away the choice the user just made in the act of saying they
                 // did not want it to be permanent.
+                self.save_settings();
+            }
+            Hit::RevealFolder => self.reveal_record_folder(None),
+            Hit::ToggleOpenWhenDone => {
+                self.settings.record_open_when_done = !self.settings.record_open_when_done;
                 self.save_settings();
             }
             Hit::NameField => self.name_focused = true,
@@ -1672,6 +1740,96 @@ impl IvoryApp {
         }
     }
 
+    /// Commit whatever number is being typed, unless the press that triggered
+    /// this landed on the very field being typed into.
+    ///
+    /// The exception is what lets somebody click back into a field they are
+    /// already editing — to fix a typo — without the click committing it out
+    /// from under them.
+    fn commit_number_unless(&mut self, hit: Option<recorder_panel::Hit>) {
+        let Some(edit) = self.num_edit.as_ref() else {
+            return;
+        };
+        if hit.and_then(recorder_panel::num_field) == Some(edit.field) {
+            return;
+        }
+        self.commit_number();
+    }
+
+    /// Apply what has been typed, and close the field.
+    ///
+    /// Text that is not a number simply closes without changing anything.
+    /// Refusing to close would trap the user in a field they cannot satisfy,
+    /// and there is nothing to warn about: the value they were looking at is
+    /// still the value they have.
+    fn commit_number(&mut self) {
+        let Some(edit) = self.num_edit.take() else {
+            return;
+        };
+        use recorder::NumField as F;
+        use recorder_panel::Hit;
+        let hit = match edit.field {
+            F::Tempo => recorder::parse_bpm(&edit.text).map(Hit::SetTempo),
+            // The setters take a FADER POSITION, not a gain, so a typed dB has
+            // to go back through the same curve the drag uses. Doing it here
+            // rather than teaching the setters a second unit keeps one
+            // definition of what a fader position means.
+            F::Slot(i) => recorder::parse_gain(&edit.text)
+                .map(|g| Hit::SetSlotGain(i, recorder::gain_to_fader(g))),
+            F::Metronome => recorder::parse_gain(&edit.text)
+                .map(|g| Hit::SetMetronomeGain(recorder::gain_to_fader(g))),
+            F::Input => recorder::parse_gain(&edit.text)
+                .map(|g| Hit::SetInputGain(recorder::gain_to_fader(g))),
+        };
+        if let Some(hit) = hit {
+            self.apply_recorder_hit(hit);
+            // Committed values are written NOW rather than through the drag
+            // debounce. A drag is followed by more drag; pressing Enter is
+            // somebody saying they are finished.
+            self.save_settings();
+        }
+    }
+
+    /// The numeric field, driven from raw input, exactly as the name field is
+    /// and for the same reason: the band is a pure painter and cannot own a
+    /// `TextEdit`.
+    fn edit_number(&mut self, ctx: &egui::Context) {
+        let events = ctx.input(|i| i.events.clone());
+        for event in events {
+            match event {
+                egui::Event::Text(text) => {
+                    if let Some(edit) = self.num_edit.as_mut() {
+                        for ch in text.chars() {
+                            edit.push(ch);
+                        }
+                    }
+                }
+                egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    pressed: true,
+                    ..
+                } => {
+                    if let Some(edit) = self.num_edit.as_mut() {
+                        edit.pop();
+                    }
+                }
+                egui::Event::Key {
+                    key: egui::Key::Enter | egui::Key::Tab,
+                    pressed: true,
+                    ..
+                } => self.commit_number(),
+                // Escape ABANDONS, which is the one thing that must not go
+                // through `commit_number`.
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    pressed: true,
+                    ..
+                } => self.num_edit = None,
+                _ => {}
+            }
+        }
+    }
+
     fn request_recorder(&mut self, request: recorder::RecorderRequest) {
         // Refused rather than queued where the host cannot honour it. A plugin
         // never drains, so an ungated request would sit here forever and the
@@ -1689,6 +1847,18 @@ impl IvoryApp {
     /// runs a nested run loop, so raising one from inside a frame means
     /// re-entering the frame already on the stack. The host drains this after
     /// `frame()` returns.
+    /// Ask the host to show a folder in the file manager.
+    ///
+    /// `None` means the destination root — the folder the button beside it
+    /// chooses. A take's own folder is passed explicitly, because a take that
+    /// has finished is a more useful thing to be shown than the place takes go.
+    fn reveal_record_folder(&mut self, path: Option<std::path::PathBuf>) {
+        if !self.caps.capture_devices || !self.caps.native_file_dialogs {
+            return;
+        }
+        self.reveal_request = Some(path.unwrap_or_else(|| self.settings.record_root()));
+    }
+
     fn ask_for_a_folder(&mut self) {
         if !self.caps.capture_devices || !self.caps.native_file_dialogs {
             return;
@@ -2875,7 +3045,14 @@ impl IvoryApp {
         // text field there would make Space vanish from the card for as long as
         // somebody was typing, which is a flicker, not a fact. Focus is a
         // "swallow this frame's keys" condition, exactly like an open dialog.
-        if self.dialog.is_none() && self.menu_state.is_none() && !self.name_focused {
+        // A numeric field joins it for the same reason and one of its own: the
+        // transpose arrows are bound to Up and Down, and typing a tempo with
+        // those keys live would transpose the chord behind the field.
+        if self.dialog.is_none()
+            && self.menu_state.is_none()
+            && !self.name_focused
+            && self.num_edit.is_none()
+        {
             if let Some(action) = keys::pressed(&ctx, self.key_gates()) {
                 self.apply_key_action(&ctx, action);
             }
@@ -3015,6 +3192,16 @@ impl IvoryApp {
             (theory_h > 0.0).then(|| band_at(recorder_h, theory_h));
         let recorder_rect_for_hit: Option<Rect> =
             (recorder_h > 0.0).then(|| band_at(0.0, recorder_h));
+        if recorder_rect_for_hit.is_none() {
+            // A band that is not on screen cannot hold a focused field. Without
+            // this, hiding the Recorder with R mid-edit leaves the field open
+            // and invisible, still swallowing every single-key shortcut — an
+            // app that has apparently stopped responding, with nothing on
+            // screen to explain why or to click on to get out of it.
+            self.num_edit = None;
+            self.name_focused = false;
+            self.grabbed = None;
+        }
         if let Some(rect) = recorder_rect_for_hit {
             recorder_panel::draw(
                 ui.painter(),
@@ -3022,6 +3209,7 @@ impl IvoryApp {
                 &self.recorder.view(
                     self.settings.record_take_name.as_deref().unwrap_or_default(),
                     self.name_focused,
+                    self.num_edit.as_ref(),
                     self.settings.knobs(),
                     self.settings.record_hide_elapsed,
                 ),
@@ -3086,23 +3274,45 @@ impl IvoryApp {
         // few pixels of vertical drift on the track instead of dropping the
         // gesture, and the X is clamped into the band so dragging past the end
         // pins the value rather than losing it.
-        if let (Some(rect), Some((held, from))) = (recorder_rect_for_hit, self.grabbed) {
+        if let (Some(rect), Some(grab)) = (recorder_rect_for_hit, self.grabbed) {
             let (down, pos) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos()));
             if !down {
                 self.grabbed = None;
+                // Released without ever moving: a TAP, which opens the control
+                // for typing rather than setting it to wherever the pointer is.
+                if !grab.moved {
+                    if let Some(field) = recorder_panel::num_field(grab.hit) {
+                        self.num_edit = Some(recorder::NumEdit::new(field));
+                        self.name_focused = false;
+                    }
+                }
             } else if let Some(pos) = pos {
-                let probe = Pos2::new(pos.x.clamp(rect.left(), rect.right() - 0.5), from.y);
-                let view = self.recorder.view(
-                    self.settings.record_take_name.as_deref().unwrap_or_default(),
-                    self.name_focused,
-                    self.settings.knobs(),
-                    self.settings.record_hide_elapsed,
-                );
-                if let Some(now) = recorder_panel::hit_test(rect, &view, probe) {
-                    // Same CONTROL, not the same value: the whole point is that
-                    // the value changed.
-                    if now.is_same_control(held) {
-                        self.apply_recorder_hit(now);
+                if (pos - grab.from).length() > TAP_SLOP {
+                    // Latched: this gesture is a drag now and stays one.
+                    if let Some(g) = self.grabbed.as_mut() {
+                        g.moved = true;
+                    }
+                    // A drag beats a half-typed number in the same control —
+                    // you cannot be typing into a fader you are hauling.
+                    self.num_edit = None;
+                }
+                // Only once it IS a drag. A press that has not moved yet sets
+                // nothing, so that letting go of it can mean something else.
+                if self.grabbed.is_some_and(|g| g.moved) {
+                    let probe = Pos2::new(pos.x.clamp(rect.left(), rect.right() - 0.5), grab.from.y);
+                    let view = self.recorder.view(
+                        self.settings.record_take_name.as_deref().unwrap_or_default(),
+                        self.name_focused,
+                        self.num_edit.as_ref(),
+                        self.settings.knobs(),
+                        self.settings.record_hide_elapsed,
+                    );
+                    if let Some(now) = recorder_panel::hit_test(rect, &view, probe) {
+                        // Same CONTROL, not the same value: the whole point is
+                        // that the value changed.
+                        if now.is_same_control(grab.hit) {
+                            self.apply_recorder_hit(now);
+                        }
                     }
                 }
             }
@@ -3116,6 +3326,9 @@ impl IvoryApp {
         // scheme exists to support.
         if self.name_focused {
             self.edit_take_name(&ctx);
+        }
+        if self.num_edit.is_some() {
+            self.edit_number(&ctx);
         }
 
         // Held, not toggled: press to read, release and it slides away. Drawn
@@ -3224,6 +3437,7 @@ impl IvoryApp {
             let view = self.recorder.view(
                 self.settings.record_take_name.as_deref().unwrap_or_default(),
                 self.name_focused,
+                self.num_edit.as_ref(),
                 self.settings.knobs(),
                 self.settings.record_hide_elapsed,
             );
@@ -4143,6 +4357,97 @@ mod tests {
         app.edit_take_name(&ctx);
         let _ = ctx.end_pass();
         assert_eq!(app.settings.record_take_name, None, "not Some(\"\")");
+    }
+
+    /// **A typed level lands where the fader would put it.**
+    ///
+    /// The setters take a FADER POSITION and the field accepts dB, so a commit
+    /// has to go back through the same curve the drag uses. Getting this wrong
+    /// is silent: "-6" would be accepted, stored as a position of -6, clamped
+    /// to zero, and the instrument would go quiet.
+    #[test]
+    fn a_typed_level_is_the_level_that_was_typed() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        for (field, read) in [
+            (
+                recorder::NumField::Slot(1),
+                (|a: &IvoryApp| a.settings.plugin_gains[1]) as fn(&IvoryApp) -> f64,
+            ),
+            (recorder::NumField::Metronome, |a| a.settings.metronome_gain),
+            (recorder::NumField::Input, |a| a.settings.input_gain),
+        ] {
+            app.num_edit = Some(recorder::NumEdit {
+                field,
+                text: "-6".to_owned(),
+            });
+            app.commit_number();
+            assert!(app.num_edit.is_none(), "{field:?} stayed open");
+            let db = 20.0 * (read(&app) as f32).log10();
+            assert!(
+                (db + 6.0).abs() < 0.2,
+                "{field:?} was set to {db:+.2} dB, not -6"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typed_tempo_is_the_tempo_that_was_typed() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.num_edit = Some(recorder::NumEdit {
+            field: recorder::NumField::Tempo,
+            text: "132".to_owned(),
+        });
+        app.commit_number();
+        assert!((app.settings.record_export.tempo_bpm - 132.0).abs() < 1e-9);
+    }
+
+    /// Committing junk closes the field and changes NOTHING.
+    ///
+    /// Refusing to close would trap somebody in a field they cannot satisfy,
+    /// and there is nothing to warn about — the value they were looking at is
+    /// still the value they have.
+    #[test]
+    fn committing_nonsense_leaves_the_value_alone() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let before = app.settings.record_export.tempo_bpm;
+        for junk in ["", "-", "."] {
+            app.num_edit = Some(recorder::NumEdit {
+                field: recorder::NumField::Tempo,
+                text: junk.to_owned(),
+            });
+            app.commit_number();
+            assert!(app.num_edit.is_none(), "{junk:?} left the field open");
+            assert_eq!(
+                app.settings.record_export.tempo_bpm, before,
+                "{junk:?} moved the tempo"
+            );
+        }
+    }
+
+    /// A press elsewhere commits, a press back into the SAME field does not.
+    ///
+    /// The exception is what lets somebody click into a field they are already
+    /// editing to fix a typo, without the click committing it out from under
+    /// them.
+    #[test]
+    fn clicking_away_commits_and_clicking_back_does_not() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let typed = || recorder::NumEdit {
+            field: recorder::NumField::Tempo,
+            text: "144".to_owned(),
+        };
+
+        app.num_edit = Some(typed());
+        app.commit_number_unless(Some(recorder_panel::Hit::SetTempo(90.0)));
+        assert!(app.num_edit.is_some(), "clicking the same field committed it");
+        assert!(
+            (app.settings.record_export.tempo_bpm - 144.0).abs() > 1e-9,
+            "and it must not have applied either"
+        );
+
+        app.commit_number_unless(Some(recorder_panel::Hit::Record));
+        assert!(app.num_edit.is_none(), "clicking away left it open");
+        assert!((app.settings.record_export.tempo_bpm - 144.0).abs() < 1e-9);
     }
 
     /// The session-only spec must not leak into the file, and remembering must

@@ -167,6 +167,12 @@ struct Recorder {
     /// and the answer changes by megabytes, not by pixels.
     disk_checked_at: Option<std::time::Instant>,
     disk_bytes: Option<u64>,
+    /// The last finished take this host has already accounted for.
+    ///
+    /// Updated whether or not "Show when done" is ticked, which is the point:
+    /// without it, ticking the box after a take would immediately open a Finder
+    /// window for a recording made ten minutes ago.
+    seen_take: Option<String>,
     /// `IVORY_OPEN_EDITOR=1` bookkeeping. See `after_frame`.
     dev_editor_at: Option<std::time::Instant>,
     dev_editor_done: bool,
@@ -503,6 +509,30 @@ impl DesktopApp {
                 // permanent without anyone deciding it should.
                 let remember = self.app.record_dir_is_default();
                 self.app.set_record_dir(dir, remember);
+            }
+        }
+
+        if let Some(path) = self.app.take_reveal_request() {
+            reveal(&path);
+        }
+        // The automatic one, at most once per finished take. The marker is
+        // updated whether or not the tick is on, so turning it on after a take
+        // does not immediately open a window for a recording already made.
+        if !self.recorder.session.is_recording() {
+            if let Some(folder) = self
+                .recorder
+                .session
+                .last_summary()
+                .filter(|s| s.problem.is_none())
+                .map(|s| s.folder.clone())
+                .filter(|f| !f.is_empty())
+            {
+                if self.recorder.seen_take.as_deref() != Some(folder.as_str()) {
+                    self.recorder.seen_take = Some(folder.clone());
+                    if self.app.record_open_when_done() {
+                        reveal(&self.app.record_root().join(&folder));
+                    }
+                }
             }
         }
 
@@ -933,6 +963,7 @@ impl DesktopApp {
                 disk_checked_at: None,
                 disk_bytes: None,
                 dev_editor_at: None,
+                seen_take: None,
                 dev_editor_done: false,
             }
         };
@@ -976,4 +1007,42 @@ impl eframe::App for DesktopApp {
         self.recorder.session.stop();
         self.save_plugin_states();
     }
+}
+
+/// Show `path` in the platform's file manager.
+///
+/// Best effort and deliberately silent on failure. There is no useful thing to
+/// tell somebody whose file manager did not open — the take is written either
+/// way, the folder is named on screen, and an error banner over the Recorder
+/// would be reporting a problem with the CONVENIENCE as though it were a
+/// problem with the recording.
+///
+/// `spawn` and not `status`: waiting on Finder or Explorer would block the UI
+/// thread for as long as the window takes to appear.
+fn reveal(path: &std::path::Path) {
+    // A folder that does not exist yet is not an error either. The destination
+    // is created when the first take is written, so pressing SHOW before ever
+    // recording would otherwise open a window onto nothing.
+    if !path.exists() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(path);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("explorer");
+        c.arg(path);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(path);
+        c
+    };
+    let _ = cmd.spawn();
 }

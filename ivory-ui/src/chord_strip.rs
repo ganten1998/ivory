@@ -63,20 +63,43 @@ pub fn transpose_rects(rect: Rect) -> (Rect, Rect) {
     (up, down)
 }
 
-/// Light grey, as asked for: present without competing with the chord name,
-/// which is the thing the strip exists to show.
-const TRANSPOSE_COLOR: Color32 = Color32::from_rgb(0xA8, 0xA8, 0xA8);
+/// Muted grey on the strip's black: present when looked for, quiet when not.
+///
+/// Dimmer than the first version, which was a solid `#A8A8A8` triangle and read
+/// as loud as the chord name next to it. The control is a nudge, not a subject.
+const TRANSPOSE_COLOR: Color32 = Color32::from_rgb(0x70, 0x70, 0x70);
 
-/// Draw one solid triangle pointing up or down inside `r`.
-fn arrow(painter: &Painter, r: Rect, up: bool, color: Color32) {
+/// Draw one chevron pointing up or down inside `r`.
+///
+/// A stroked `^` rather than a filled triangle: a triangle at this size is a
+/// solid grey lozenge, and two of them stacked are the heaviest thing on the
+/// strip. Two thin strokes read as an arrow at the same size while covering a
+/// fraction of the ink.
+///
+/// The glyph is INSET inside `r` and `r` is left alone, so the chevron gets
+/// smaller without the click target following it down — the hit rect is already
+/// only a few points tall at a narrow window, and shrinking that would make the
+/// control hard to hit to buy nothing anybody can see.
+fn chevron(painter: &Painter, r: Rect, up: bool, color: Color32) {
+    let r = r.shrink2(egui::vec2(r.width() * 0.16, r.height() * 0.22));
     let (l, rt, t, b) = (r.left(), r.right(), r.top(), r.bottom());
     let mid = (l + rt) * 0.5;
     let pts = if up {
-        vec![Pos2::new(mid, t), Pos2::new(rt, b), Pos2::new(l, b)]
+        vec![Pos2::new(l, b), Pos2::new(mid, t), Pos2::new(rt, b)]
     } else {
-        vec![Pos2::new(l, t), Pos2::new(rt, t), Pos2::new(mid, b)]
+        vec![Pos2::new(l, t), Pos2::new(mid, b), Pos2::new(rt, t)]
     };
-    painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+    // Thin, and never thinner than a pixel — the strip is 15 points high at a
+    // narrow window and a sub-pixel stroke there fades to nothing.
+    let w = (r.height() * 0.30).clamp(1.0, 2.0);
+    // Dots at the three vertices are what make it SMOOTH: egui tessellates a
+    // polyline with mitred joins and square ends, so the apex comes to a spike
+    // and the tips end in little flat blades. A disc of the stroke's own radius
+    // at each vertex is a round cap and a round join, and costs three circles.
+    painter.add(egui::Shape::line(pts.clone(), Stroke::new(w, color)));
+    for p in pts {
+        painter.circle_filled(p, w * 0.5, color);
+    }
 }
 
 /// Where the heart sits, given the chord rect. Shared by the renderer and the
@@ -205,8 +228,8 @@ pub fn draw(
     }
     if let Some(semitones) = transpose {
         let (up, down) = transpose_rects(rect);
-        arrow(painter, up, true, TRANSPOSE_COLOR);
-        arrow(painter, down, false, TRANSPOSE_COLOR);
+        chevron(painter, up, true, TRANSPOSE_COLOR);
+        chevron(painter, down, false, TRANSPOSE_COLOR);
         if semitones != 0 {
             // The amount, right of the arrows. Only when it is non-zero: a
             // permanent "+0" is noise, and zero is already what two unlit

@@ -90,7 +90,7 @@
 use crate::fonts;
 use crate::recorder::{
     disk_text, gain_text, gain_to_fader, timecode, DeviceLabel, ExportSpec, Level, Meters,
-    RecordState, RecorderView, SlotView, COUNT_IN_CHOICES, MAX_BPM, MIN_BPM, SLOTS,
+    NumField, RecordState, RecorderView, SlotView, COUNT_IN_CHOICES, MAX_BPM, MIN_BPM, SLOTS,
 };
 use crate::settings::Settings;
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
@@ -264,6 +264,13 @@ struct Layout {
 
     // ── destination ──
     dest: Rect,
+    /// The button that shows the folder in the file manager.
+    ///
+    /// Its own target rather than a second affordance inside the FOLDER box:
+    /// that box already carries "Choose...", and a box that opens a picker when
+    /// you click the left of it and a Finder window when you click the right is
+    /// a box nobody can predict.
+    reveal: Rect,
     default_tick: Rect,
     name: Rect,
     /// Live grey text under the name field. Teaches the naming scheme without
@@ -277,6 +284,8 @@ struct Layout {
     count_in: Rect,
     tempo: Rect,
     export: Rect,
+    /// The tick beside Export: show the take's folder as soon as it is done.
+    open_when_done: Rect,
 
     /// One line of status, and the clip warning beside it.
     status: Rect,
@@ -463,6 +472,7 @@ impl Layout {
             click: Rect::NOTHING,
             click_in_take: Rect::NOTHING,
             dest: Rect::NOTHING,
+            reveal: Rect::NOTHING,
             default_tick: Rect::NOTHING,
             name: Rect::NOTHING,
             folder: Rect::NOTHING,
@@ -472,6 +482,7 @@ impl Layout {
             count_in: Rect::NOTHING,
             tempo: Rect::NOTHING,
             export: Rect::NOTHING,
+            open_when_done: Rect::NOTHING,
             status: Rect::NOTHING,
             clip: Rect::NOTHING,
             rules: [Rect::NOTHING; 2],
@@ -633,8 +644,9 @@ impl Layout {
         // is inclusive at both edges, so two rows that merely touch share a
         // line of pixels and the overlap test fails there.
         let folder_row = slice_v(d, 0.000, 0.125);
-        self.dest = slice_h(folder_row, 0.00, 0.68);
-        self.default_tick = slice_h(folder_row, 0.72, 1.00);
+        self.dest = slice_h(folder_row, 0.00, 0.52);
+        self.reveal = slice_h(folder_row, 0.55, 0.70);
+        self.default_tick = slice_h(folder_row, 0.73, 1.00);
         self.name = slice_v(d, 0.150, 0.275);
         // The two answers about where the take is going, side by side and in
         // the faint ink: what it will be called, and whether it will fit.
@@ -646,7 +658,13 @@ impl Layout {
         let take_row = slice_v(d, 0.700, 0.825);
         self.count_in = slice_h(take_row, 0.00, 0.48);
         self.tempo = slice_h(take_row, 0.52, 1.00);
-        self.export = slice_v(d, 0.855, 0.980);
+        // The Export button keeps the left of its row; the tick that says what
+        // to do when a take finishes takes the right. Beside Export rather than
+        // beside the folder because it is a question about the END of a take,
+        // and the folder row is the group set once at the start of a session.
+        let export_row = slice_v(d, 0.855, 0.980);
+        self.export = slice_h(export_row, 0.00, 0.60);
+        self.open_when_done = slice_h(export_row, 0.63, 1.00);
     }
 
     /// Rolling: readable from the bench. The preview collapses to a strip that
@@ -697,7 +715,7 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 26] {
+    fn targets(&self) -> [(Rect, Produces); 28] {
         use Produces::{Along, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
         let s = &self.slots;
@@ -727,7 +745,9 @@ impl Layout {
             (self.click, Fixed(Hit::ToggleMetronome)),
             (self.click_in_take, Fixed(Hit::ToggleMetronomeInTake)),
             (self.dest, Fixed(Hit::ChooseFolder)),
+            (self.reveal, Fixed(Hit::RevealFolder)),
             (self.default_tick, Fixed(Hit::ToggleDefaultDir)),
+            (self.open_when_done, Fixed(Hit::ToggleOpenWhenDone)),
             (self.name, Fixed(Hit::NameField)),
             (self.camera, Fixed(Hit::PickCamera)),
             (self.audio, Fixed(Hit::PickAudio)),
@@ -785,7 +805,11 @@ pub enum Hit {
     Record,
     Stop,
     ChooseFolder,
+    /// Show the destination folder in the file manager.
+    RevealFolder,
     ToggleDefaultDir,
+    /// Show the take's folder as soon as the take is finished.
+    ToggleOpenWhenDone,
     NameField,
     PickCamera,
     PickAudio,
@@ -839,11 +863,13 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 26] = [
+    pub const ALL: [Hit; 28] = [
         Hit::Record,
         Hit::Stop,
         Hit::ChooseFolder,
+        Hit::RevealFolder,
         Hit::ToggleDefaultDir,
+        Hit::ToggleOpenWhenDone,
         Hit::NameField,
         Hit::PickCamera,
         Hit::PickAudio,
@@ -896,7 +922,9 @@ impl Hit {
             Hit::Record => "Record",
             Hit::Stop => "Stop",
             Hit::ChooseFolder => "Choose folder",
+            Hit::RevealFolder => "Show the folder",
             Hit::ToggleDefaultDir => "Use this folder by default",
+            Hit::ToggleOpenWhenDone => "Show the take when it is finished",
             Hit::NameField => "Take name",
             Hit::PickCamera => "Camera",
             Hit::PickAudio => "Audio input",
@@ -957,6 +985,21 @@ impl Hit {
     /// which is the question `==` gets right and a discriminant gets wrong.
     pub fn is_same_control(self, other: Hit) -> bool {
         self.control_key() == other.control_key()
+    }
+}
+
+/// Which typeable field a hit belongs to, if any.
+///
+/// Exactly the draggable hits and no others, which is the point: a control you
+/// can drag to a number is a control you should be able to type the number
+/// into, and there is no third kind.
+pub fn num_field(hit: Hit) -> Option<NumField> {
+    match hit {
+        Hit::SetSlotGain(i, _) => Some(NumField::Slot(i)),
+        Hit::SetMetronomeGain(_) => Some(NumField::Metronome),
+        Hit::SetInputGain(_) => Some(NumField::Input),
+        Hit::SetTempo(_) => Some(NumField::Tempo),
+        _ => None,
     }
 }
 
@@ -1263,13 +1306,19 @@ fn draw_transport(painter: &Painter, l: &Layout, p: &Palette) {
 
 fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palette) {
     for (i, slot) in view.slots.iter().enumerate() {
-        draw_slot(painter, &l.slots[i], i, slot, l.rolling, p);
+        let typing = typing_for(view, NumField::Slot(i));
+        draw_slot(painter, &l.slots[i], i, slot, l.rolling, typing, p);
     }
-    for (row, cap, gain) in [
-        (l.metronome_row, "CLICK", view.gains.metronome),
-        (l.input_row, "INPUT", view.gains.input),
+    for (row, cap, gain, field) in [
+        (
+            l.metronome_row,
+            "CLICK",
+            view.gains.metronome,
+            NumField::Metronome,
+        ),
+        (l.input_row, "INPUT", view.gains.input, NumField::Input),
     ] {
-        draw_fader(painter, row, cap, gain, p);
+        draw_fader(painter, row, cap, gain, typing_for(view, field), p);
     }
     // Two questions that sound like one and are not: whether you HEAR the
     // click, and whether it ends up in the file. The second is off by default
@@ -1297,6 +1346,7 @@ fn draw_slot(
     i: usize,
     v: &SlotView<'_>,
     rolling: bool,
+    typing: Option<&str>,
     p: &Palette,
 ) {
     if !r.row.is_positive() {
@@ -1331,7 +1381,7 @@ fn draw_slot(
     }
 
     draw_track(painter, r.knob, v.gain, p);
-    draw_gain_value(painter, r.value, v.gain, p);
+    draw_gain_value(painter, r.value, v.gain, typing, p);
     draw_open_button(painter, r.open, v.editor_open, p);
     draw_clear_button(painter, r.clear, p);
 }
@@ -1371,6 +1421,23 @@ fn draw_open_button(painter: &Painter, r: Rect, open: bool, p: &Palette) {
     // wherever it fits at full size, which is the main window and any detached
     // window worth detaching.
     let (text, size) = fit_label(r, &["OPEN WINDOW", "WINDOW", "OPEN"], r.height() * 0.46);
+    if size >= MIN_TEXT {
+        painter.text(r.center(), Align2::CENTER_CENTER, text, font(size), p.ink);
+    }
+}
+
+/// A plain word in a button-shaped box.
+///
+/// [`draw_open_button`] with its lit state taken out, for the buttons that are
+/// pressed rather than toggled. Sharing the chrome is what stops the band
+/// growing a second thing that is nearly, but not quite, a button.
+fn draw_word_button(painter: &Painter, r: Rect, choices: &[&str], p: &Palette) {
+    if !r.is_positive() {
+        return;
+    }
+    painter.rect_filled(r, 2.0, p.field);
+    painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
+    let (text, size) = fit_label(r, choices, r.height() * 0.46);
     if size >= MIN_TEXT {
         painter.text(r.center(), Align2::CENTER_CENTER, text, font(size), p.ink);
     }
@@ -1431,7 +1498,7 @@ fn draw_clear_button(painter: &Painter, r: Rect, p: &Palette) {
 /// The dB reading is the part that is easy to leave out and the part that makes
 /// the control usable: a handle two thirds along means nothing on its own, and
 /// `-6.0 dB` means something to everyone who has ever used a mixer.
-fn draw_fader(painter: &Painter, row: Rect, cap: &str, gain: f32, p: &Palette) {
+fn draw_fader(painter: &Painter, row: Rect, cap: &str, gain: f32, typing: Option<&str>, p: &Palette) {
     if !row.is_positive() {
         return;
     }
@@ -1447,8 +1514,19 @@ fn draw_fader(painter: &Painter, row: Rect, cap: &str, gain: f32, p: &Palette) {
             p.faint,
         );
     }
-    draw_gain_value(painter, val_r, gain, p);
+    draw_gain_value(painter, val_r, gain, typing, p);
     draw_track(painter, track, gain, p);
+}
+
+/// What a control is showing while it is being typed into, if it is.
+///
+/// A borrow out of the view rather than a flag, so that the panel draws the
+/// text the app is actually holding — a copy would be a second place for the
+/// caret and the characters to disagree.
+fn typing_for<'a>(view: &RecorderView<'a>, field: NumField) -> Option<&'a str> {
+    view.editing
+        .filter(|e| e.field == field)
+        .map(|e| e.text.as_str())
 }
 
 /// The level in dB, right-aligned in its own box.
@@ -1457,8 +1535,12 @@ fn draw_fader(painter: &Painter, row: Rect, cap: &str, gain: f32, p: &Palette) {
 /// function: a knob small enough to be called tiny needs its number MORE than a
 /// full-width fader does, and two implementations of "what does this control say
 /// it is set to" would drift.
-fn draw_gain_value(painter: &Painter, r: Rect, gain: f32, p: &Palette) {
+fn draw_gain_value(painter: &Painter, r: Rect, gain: f32, typing: Option<&str>, p: &Palette) {
     if !r.is_positive() {
+        return;
+    }
+    if let Some(typed) = typing {
+        draw_typed_value(painter, r, typed, p);
         return;
     }
     let reading = gain_text(gain);
@@ -1475,6 +1557,83 @@ fn draw_gain_value(painter: &Painter, r: Rect, gain: f32, p: &Palette) {
         // will make somebody swear at a silent recording, so it does not
         // get to look like a number.
         if gain <= 0.0 { p.faint } else { p.ink },
+    );
+}
+
+/// What a right-aligned numeric box shows while it is being typed into: the
+/// characters so far, and a caret after them.
+///
+/// The box keeps its size and its alignment, so the row does not move at the
+/// moment somebody starts typing — a control that jumps when you click it is
+/// one you click twice.
+fn draw_typed_value(painter: &Painter, r: Rect, typed: &str, p: &Palette) {
+    // Sized against a full-width reading rather than against `typed`, or the
+    // characters would start enormous and shrink as they were entered.
+    let size = fit_text(r, "-00.0 dB", r.height() * FADER_TEXT);
+    if size < MIN_TEXT {
+        return;
+    }
+    // Room for the caret is taken out of the box BEFORE the text is placed,
+    // which is what keeps the caret inside a right-aligned field instead of
+    // hanging off the end of it.
+    let caret = size * ADV;
+    let end = r.right() - caret;
+    if !typed.is_empty() {
+        painter.text(
+            Pos2::new(end, r.center().y),
+            Align2::RIGHT_CENTER,
+            typed,
+            font(size),
+            p.ink,
+        );
+    }
+    painter.line_segment(
+        [
+            Pos2::new(end + caret * 0.4, r.center().y - size * 0.5),
+            Pos2::new(end + caret * 0.4, r.center().y + size * 0.5),
+        ],
+        Stroke::new(1.5_f32, p.ink),
+    );
+}
+
+/// The caret inside a caption+value box, after `typed_chars` characters of the
+/// value.
+///
+/// Shared by the take name and the tempo. They looked identical when they were
+/// two copies, which is exactly when two copies start to drift.
+fn draw_caption_caret(
+    painter: &Painter,
+    r: Rect,
+    cap: &str,
+    shown: &str,
+    typed_chars: usize,
+    p: &Palette,
+) {
+    if !r.is_positive() {
+        return;
+    }
+    let inset = label_inset(r);
+    let inner = Rect::from_min_max(
+        Pos2::new(r.left() + inset, r.top()),
+        Pos2::new(r.right() - inset, r.bottom()),
+    );
+    if !inner.is_positive() {
+        return;
+    }
+    let size = fit_text(inner, &format!("{cap} {shown}"), inner.height() * 0.52);
+    if size < MIN_TEXT {
+        return;
+    }
+    // The caret goes after what has been TYPED, which is not what is drawn
+    // when the field is empty and showing a placeholder.
+    let before = cap.chars().count() + 1 + typed_chars;
+    let x = inner.left() + size * ADV * before as f32;
+    painter.line_segment(
+        [
+            Pos2::new(x, r.center().y - size * 0.5),
+            Pos2::new(x, r.center().y + size * 0.5),
+        ],
+        Stroke::new(1.5_f32, p.ink),
     );
 }
 
@@ -1740,6 +1899,14 @@ fn draw_destination(
             );
         }
     }
+    // A button, in the same shape as the slots' OPEN WINDOW: a filled box with
+    // a border and a centred word, which in this band is what a pressable thing
+    // looks like and nothing else is. Every other box in this column carries a
+    // caption and a value, and this one has no value to carry.
+    //
+    // It says SHOW rather than OPEN for the reason the tick beside Export does:
+    // nothing is opened, a folder is shown.
+    draw_word_button(painter, l.reveal, &["SHOW FOLDER", "SHOW"], p);
     draw_tick(
         painter,
         l.default_tick,
@@ -1761,26 +1928,15 @@ fn draw_destination(
         if empty { p.faint } else { p.ink },
         p,
     );
-    if view.name_focused && l.name.is_positive() {
-        // The caret goes after what has been TYPED, which is not what is drawn
-        // when the field is empty and showing its placeholder.
-        let inset = label_inset(l.name);
-        let inner = Rect::from_min_max(
-            Pos2::new(l.name.left() + inset, l.name.top()),
-            Pos2::new(l.name.right() - inset, l.name.bottom()),
+    if view.name_focused {
+        draw_caption_caret(
+            painter,
+            l.name,
+            "NAME",
+            shown,
+            view.take_name.chars().count(),
+            p,
         );
-        let size = fit_text(inner, &format!("NAME {shown}"), inner.height() * 0.52);
-        if inner.is_positive() && size >= MIN_TEXT {
-            let typed = 5 + view.take_name.chars().count();
-            let x = inner.left() + size * ADV * typed as f32;
-            painter.line_segment(
-                [
-                    Pos2::new(x, l.name.center().y - size * 0.5),
-                    Pos2::new(x, l.name.center().y + size * 0.5),
-                ],
-                Stroke::new(1.5_f32, p.ink),
-            );
-        }
     }
     text_line(painter, l.folder, view.folder_preview, p.faint, false);
 
@@ -1813,13 +1969,29 @@ fn draw_destination(
         p.ink,
         p,
     );
-    draw_tempo(painter, l.tempo, view.tempo_bpm, p);
+    draw_tempo(
+        painter,
+        l.tempo,
+        view.tempo_bpm,
+        typing_for(view, NumField::Tempo),
+        p,
+    );
     labelled(
         painter,
         l.export,
         "EXPORT",
         &export_summary(&s.record_export),
         p.ink,
+        p,
+    );
+    // "Show when done" and not "Open": the folder is shown in the file manager,
+    // nothing is opened, and somebody who reads "Open" and expects the take to
+    // start playing has been told the wrong thing.
+    draw_tick(
+        painter,
+        l.open_when_done,
+        "Show when done",
+        s.record_open_when_done,
         p,
     );
 }
@@ -1830,8 +2002,15 @@ fn draw_destination(
 /// nothing else in the band is shaped like it, so it has to say so. The bar is
 /// where in `MIN_BPM..=MAX_BPM` the number sits — the same mapping [`tempo_at`]
 /// inverts, which is what makes the picture and the drag agree.
-fn draw_tempo(painter: &Painter, r: Rect, bpm: f64, p: &Palette) {
-    labelled(painter, r, "TEMPO", &tempo_text(bpm), p.ink, p);
+fn draw_tempo(painter: &Painter, r: Rect, bpm: f64, typing: Option<&str>, p: &Palette) {
+    // While it is being typed into, the box shows the characters rather than
+    // the stored tempo — otherwise there is nothing on screen to tell somebody
+    // their keystrokes are going anywhere.
+    let shown = typing.map_or_else(|| tempo_text(bpm), str::to_owned);
+    labelled(painter, r, "TEMPO", &shown, p.ink, p);
+    if let Some(typed) = typing {
+        draw_caption_caret(painter, r, "TEMPO", &shown, typed.chars().count(), p);
+    }
     if !r.is_positive() {
         return;
     }
@@ -2490,6 +2669,8 @@ mod tests {
                         ("record", l.record),
                         ("stop", l.stop),
                         ("folder", l.dest),
+                        ("show button", l.reveal),
+                        ("show-when-done tick", l.open_when_done),
                         ("name field", l.name),
                         ("folder preview", l.folder),
                         ("disk", l.disk),
@@ -3172,6 +3353,42 @@ mod tests {
         assert_eq!(count_in_text(8), "8 beats");
     }
 
+    /// **Draggable and typeable are the same set.**
+    ///
+    /// The gesture is a tap on the control you would otherwise drag, so a
+    /// draggable hit with no field would be a control that swallows a click and
+    /// does nothing, and a field with no drag would be a number you can only
+    /// reach by typing. Asserted over `ALL` so a new control cannot be added on
+    /// one side only.
+    #[test]
+    fn every_control_you_can_drag_is_one_you_can_type_into() {
+        for hit in Hit::ALL {
+            assert_eq!(
+                hit.is_draggable(),
+                num_field(hit).is_some(),
+                "{hit:?} is draggable and typeable in different amounts"
+            );
+        }
+    }
+
+    /// The four fields are four fields, not one used four times.
+    #[test]
+    fn each_control_owns_its_own_field() {
+        let fields: Vec<_> = Hit::ALL.into_iter().filter_map(num_field).collect();
+        let mut seen = fields.clone();
+        seen.sort_by_key(|f| format!("{f:?}"));
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            fields.len(),
+            "two controls share a field, so typing into one would edit the other"
+        );
+        assert!(fields.contains(&NumField::Tempo));
+        for i in 0..SLOTS {
+            assert!(fields.contains(&NumField::Slot(i)), "slot {i} has no field");
+        }
+    }
+
     #[test]
     fn a_tempo_reads_as_a_round_number_unless_it_is_not_one() {
         assert_eq!(tempo_text(120.0), "120");
@@ -3251,7 +3468,11 @@ mod tests {
             for w in [0.0_f32, 60.0, 400.0, 1300.0, 2600.0] {
                 for state in STATES {
                     for preview in [None, Some(pv)] {
-                        for rack in racks() {
+                        // Every control that can be typed into, drawn mid-edit
+                        // at every width — including the degenerate ones, where
+                        // the caret's own rectangle is what would go negative.
+                        for edit in typing_states() {
+                            for rack in racks() {
                             let v = RecorderView {
                                 state,
                                 elapsed_s: 3725.0,
@@ -3268,6 +3489,7 @@ mod tests {
                                 dest: "~/Movies/Tangent",
                                 take_name: "nocturne",
                                 name_focused: true,
+                                editing: edit.as_ref(),
                                 folder_preview: "nocturne-2026-08-16-141203",
                                 slots: rack,
                                 // Every fader at a different, awkward place:
@@ -3300,10 +3522,32 @@ mod tests {
                             // rectangle, at every size, without panicking on the
                             // degenerate ones.
                             let _ = hit_test(r, &v, r.center());
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    /// No edit, plus one per typeable field, plus the two shapes a field passes
+    /// through on the way to a number: empty, and a lone minus sign.
+    fn typing_states() -> Vec<Option<crate::recorder::NumEdit>> {
+        let mut v = vec![None];
+        for field in [
+            NumField::Slot(0),
+            NumField::Slot(SLOTS - 1),
+            NumField::Metronome,
+            NumField::Input,
+            NumField::Tempo,
+        ] {
+            for text in ["", "-", "-12.5"] {
+                v.push(Some(crate::recorder::NumEdit {
+                    field,
+                    text: text.to_owned(),
+                }));
+            }
+        }
+        v
     }
 }

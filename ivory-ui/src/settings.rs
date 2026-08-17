@@ -205,6 +205,12 @@ pub struct Settings {
     /// chosen for this session and the picker will open there next time without
     /// the choice being permanent.
     pub record_dir_is_default: bool,
+    /// Show the take's folder in the file manager as soon as it is finished.
+    ///
+    /// Off by default. Somebody recording take after take does not want a
+    /// Finder window in front of the piano every ninety seconds, and the one
+    /// who does want it is the one who will go and tick the box.
+    pub record_open_when_done: bool,
     /// The take name, kept across takes.
     ///
     /// It persists because the timestamp already guarantees uniqueness, so the
@@ -404,6 +410,7 @@ impl Default for Settings {
             recorder_win_y: None,
             record_dir: None,
             record_dir_is_default: false,
+            record_open_when_done: false,
             record_take_name: None,
             record_camera_uid: None,
             record_audio_device: None,
@@ -708,6 +715,11 @@ impl Settings {
             "record_dir_is_default",
             &mut s.record_dir_is_default,
         );
+        take_bool(
+            &mut map,
+            "record_open_when_done",
+            &mut s.record_open_when_done,
+        );
         take_opt_str(&mut map, "record_take_name", &mut s.record_take_name);
         take_opt_str(&mut map, "record_camera_uid", &mut s.record_camera_uid);
         take_opt_str(&mut map, "record_audio_device", &mut s.record_audio_device);
@@ -946,6 +958,10 @@ impl Settings {
         map.insert(
             "record_dir_is_default".into(),
             Value::Bool(self.record_dir_is_default),
+        );
+        map.insert(
+            "record_open_when_done".into(),
+            Value::Bool(self.record_open_when_done),
         );
         map.insert(
             "record_sources".into(),
