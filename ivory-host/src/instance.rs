@@ -1744,10 +1744,17 @@ impl EventList {
     /// The two 14-bit controllers are folded to 7 bits here. A legacy CC event
     /// has one `value` byte and nowhere to put the rest.
     fn push_legacy_cc(&self, c: Control, offset: i32) -> bool {
+        // `c_char`, NOT `i8`. The VST3 headers declare these fields as `char`,
+        // and `char` is SIGNED on x86 and UNSIGNED on aarch64 — so hard-coding
+        // `i8` compiles on an Intel Mac and on x86_64 Linux, and fails on every
+        // ARM Linux target there is. It builds on Apple Silicon only because
+        // the Darwin ABI keeps `char` signed where Linux's ARM ABI does not,
+        // which is exactly the sort of difference that is invisible until a
+        // Raspberry Pi build fails.
         let value = if c.controller == Control::PITCH_BEND {
-            (c.value >> 7) as i8
+            (c.value >> 7) as std::os::raw::c_char
         } else {
-            (c.value & 0x7F) as i8
+            (c.value & 0x7F) as std::os::raw::c_char
         };
         // SAFETY: `Event` is a plain C struct of integers and a union; zeroed is
         // a valid bit pattern for it and every field that matters is written
@@ -1760,7 +1767,7 @@ impl EventList {
         e.r#type = Event_::EventTypes_::kLegacyMIDICCOutEvent as u16;
         e.__field0.midiCCOut = LegacyMIDICCOutEvent {
             controlNumber: c.controller.clamp(0, 255) as u8,
-            channel: c.channel.clamp(0, 15) as i8,
+            channel: c.channel.clamp(0, 15) as std::os::raw::c_char,
             value,
             value2: 0,
         };
@@ -2439,10 +2446,16 @@ fn read_buses(component: &ComPtr<IComponent>, media: i32, dir: i32) -> Vec<Bus> 
     out
 }
 
+/// A class id, as the SDK wants it.
+///
+/// `TUID` is `[c_char; 16]`, and `c_char` is signed on x86 and unsigned on
+/// aarch64 — so the cast has to be spelled `c_char` rather than `i8` or this
+/// function compiles on exactly half the targets. The BYTES are identical
+/// either way; it is only the type that differs.
 fn bytes_to_tuid(cid: [u8; 16]) -> TUID {
     let mut out: TUID = [0; 16];
     for (o, b) in out.iter_mut().zip(cid.iter()) {
-        *o = *b as i8;
+        *o = *b as std::os::raw::c_char;
     }
     out
 }

@@ -198,6 +198,51 @@ sign_windows_exe() {
   fi
 }
 
+# ensure_alsa_sysroot — the thing that made Linux cross-builds impossible here.
+#
+# midir and cpal both link ALSA, and alsa-sys's build script asks pkg-config for
+# it. On a macOS host there is no ALSA for a Linux target, so every Linux stage
+# of this script failed for the app's whole life and the artifacts were built on
+# a Linux box instead. A sysroot fixes it: headers and a `libasound.so` to link
+# against, which is all the linker wants — the real library comes from the
+# user's own machine at run time.
+#
+# **Debian BULLSEYE, not bookworm, and that is the entire trick.** Bookworm's
+# libasound is built against glibc 2.36 and its .so references `lstat64@2.33`,
+# `dlsym@2.34` and friends; linking it while targeting the 2.32 floor this
+# script sets fails with a page of undefined references that look like a broken
+# toolchain and are actually a version skew. Bullseye is glibc 2.31, below the
+# floor, so nothing it references is newer than what we target.
+#
+# Cached, because it is 400 kB a time and nobody wants a download in a release
+# build. Delete the directory to refresh it.
+ALSA_CACHE="${ALSA_CACHE:-$HOME/.cache/tangent/alsa}"
+ensure_alsa_sysroot() { # $1 = debian arch (amd64|arm64)
+  local darch="$1" root="$ALSA_CACHE/bullseye-$1"
+  if [ -d "$root/usr/include" ]; then echo "$root"; return 0; fi
+  local idx tmp fn base
+  tmp="$(mktemp -d)" || return 1
+  idx="$tmp/Packages.gz"
+  curl -sSL --max-time 180 \
+    "http://deb.debian.org/debian/dists/bullseye/main/binary-$darch/Packages.gz" \
+    -o "$idx" || { rm -rf "$tmp"; return 1; }
+  mkdir -p "$root" || { rm -rf "$tmp"; return 1; }
+  # `libasound2` carries the .so.2, `libasound2-dev` the headers and the
+  # development symlink. Both are needed: the linker follows the symlink and
+  # the build script reads the headers.
+  for pkg in libasound2 libasound2-dev; do
+    fn="$(gunzip -c "$idx" | awk -v p="Package: $pkg" '''$0==p{f=1} f&&/^Filename: /{print $2; exit}''')"
+    [ -n "$fn" ] || { rm -rf "$tmp" "$root"; return 1; }
+    base="$tmp/$(basename "$fn")"
+    curl -sSL --max-time 300 "http://deb.debian.org/debian/$fn" -o "$base" \
+      || { rm -rf "$tmp" "$root"; return 1; }
+    ( cd "$tmp" && ar x "$base" && tar -xf data.tar.* -C "$root" ) \
+      || { rm -rf "$tmp" "$root"; return 1; }
+  done
+  rm -rf "$tmp"
+  echo "$root"
+}
+
 package_linux() { # $1 = rust target, $2 = artifact arch name
   local target="$1" arch="$2"
   local stage="dist/tangent-${VERSION}-linux-${arch}"
@@ -215,7 +260,22 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   # run had simply not produced one. The replacement happens at the end, and
   # only on success.
   rm -rf "$stage"
-  cargo zigbuild --release --target "${target}.${GLIBC}" -p ivory || return 1
+  # The sysroot, and the multiarch directory name inside it — which is the
+  # Debian spelling of the target, not the Rust one.
+  local darch multiarch sysroot
+  case "$target" in
+    x86_64-unknown-linux-gnu)  darch=amd64; multiarch=x86_64-linux-gnu ;;
+    aarch64-unknown-linux-gnu) darch=arm64; multiarch=aarch64-linux-gnu ;;
+    *) echo "!! no ALSA sysroot mapping for $target"; return 1 ;;
+  esac
+  sysroot="$(ensure_alsa_sysroot "$darch")" || {
+    echo "!! could not fetch the ALSA sysroot for $darch"; return 1;
+  }
+  PKG_CONFIG_ALLOW_CROSS=1 \
+  PKG_CONFIG_SYSROOT_DIR="$sysroot" \
+  PKG_CONFIG_PATH="$sysroot/usr/lib/$multiarch/pkgconfig" \
+  RUSTFLAGS="-L $sysroot/usr/lib/$multiarch" \
+    cargo zigbuild --release --target "${target}.${GLIBC}" -p ivory || return 1
   if [ ! -f "target/${target}/release/tangent" ]; then
     echo "!! no binary at target/${target}/release/tangent"
     return 1

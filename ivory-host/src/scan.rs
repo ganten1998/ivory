@@ -265,7 +265,12 @@ impl Module {
             out.push(ClassInfo {
                 name: c_array_to_string(&info.name),
                 category: c_array_to_string(&info.category),
-                cid: unsafe { std::mem::transmute::<[i8; 16], [u8; 16]>(info.cid) },
+                // A plain reinterpretation of sixteen bytes whose only
+                // difference is signedness — and `c_char` rather than `i8`
+                // because that signedness is the thing that varies by target.
+                cid: unsafe {
+                    std::mem::transmute::<[std::os::raw::c_char; 16], [u8; 16]>(info.cid)
+                },
             });
         }
         out
@@ -279,7 +284,12 @@ impl Module {
 
 /// Fixed-size C string fields in the SDK's structs are `char8` (i8) arrays that
 /// are NOT guaranteed to be NUL-terminated when full.
-fn c_array_to_string(raw: &[i8]) -> String {
+/// A NUL-terminated C string out of a fixed-size field.
+///
+/// `&[c_char]` and not `&[i8]`: `char` is signed on x86 and unsigned on
+/// aarch64, so an `i8` signature type-checks on half the targets and fails to
+/// compile on the other half. The bytes are the same either way.
+fn c_array_to_string(raw: &[std::os::raw::c_char]) -> String {
     let bytes: Vec<u8> = raw.iter().map(|c| *c as u8).collect();
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).trim().to_string()
@@ -412,11 +422,14 @@ fn load(c_path: &CString, _binary: &Path) -> Result<*mut c_void, String> {
     #[cfg(not(target_os = "macos"))]
     const RTLD_LOCAL: i32 = 0;
 
+    // `c_char`, not `i8`: these are C's own signatures, and C's `char` is
+    // signed on x86 and unsigned on aarch64. Declaring them `i8` makes the
+    // extern block itself fail to compile on ARM Linux.
     extern "C" {
         #[link_name = "dlopen"]
-        fn libc_dlopen(path: *const i8, flags: i32) -> *mut c_void;
+        fn libc_dlopen(path: *const std::os::raw::c_char, flags: i32) -> *mut c_void;
         #[link_name = "dlerror"]
-        fn libc_dlerror() -> *const i8;
+        fn libc_dlerror() -> *const std::os::raw::c_char;
     }
 
     // SAFETY: `c_path` is a NUL-terminated path that outlives the call.

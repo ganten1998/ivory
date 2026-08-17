@@ -175,6 +175,10 @@ struct Recorder {
     /// Without it a take whose video was REFUSED — no camera, no GPU, a file
     /// that would not open — retries on every window frame, and rewrites the
     /// same error sixty times a second over whatever else the band was saying.
+    ///
+    /// Only read on macOS, because that is the only platform with an encoder.
+    /// Kept unconditionally so the field list does not fork.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     video_tried: bool,
     /// The newest camera frame, kept as RGBA for the compositor.
     ///
