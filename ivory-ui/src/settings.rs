@@ -245,6 +245,15 @@ pub struct Settings {
     pub plugin_gains: [f64; crate::recorder::SLOTS],
     pub metronome_gain: f64,
     pub input_gain: f64,
+    /// Transpose, in semitones, applied to every note the display and the
+    /// chord detector see.
+    ///
+    /// Persisted, because it is a mode you are in rather than a keypress: a
+    /// transpose that reset on relaunch would silently change what the chord
+    /// name means between sessions.
+    pub transpose: i64,
+    /// The transpose arrows are drawn in the chord view. On by default.
+    pub show_transpose: bool,
     /// The click is running.
     pub metronome_on: bool,
     /// The click is mixed into the RECORDING as well as the monitors.
@@ -270,20 +279,37 @@ pub struct Settings {
 
 /// Where `Settings::path()` points during tests.
 ///
-/// One directory per process, so a parallel suite cannot have two tests
-/// clobbering each other, and inside the OS temp dir so nothing survives to
-/// confuse the next run.
+/// One file per THREAD, inside the OS temp dir.
+///
+/// Per thread and not per process, and that distinction is the whole point:
+/// cargo runs tests in parallel threads, so a single per-process file still let
+/// one test's `save_settings` land between another's before-and-after read.
+/// That is exactly how `a_plugin_does_not_write_the_shared_settings_file` kept
+/// failing — not because a plugin wrote anything, but because a DESKTOP test on
+/// another thread did. Per thread, no two tests can see each other's file at
+/// all.
 #[cfg(test)]
 fn test_path() -> PathBuf {
-    use std::sync::OnceLock;
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("tangent-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join("settings.json")
-    })
-    .clone()
+    thread_local! {
+        static PATH: PathBuf = {
+            let dir = std::env::temp_dir().join(format!(
+                "tangent-test-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join("settings.json")
+        };
+    }
+    PATH.with(Clone::clone)
 }
+
+/// How far the transpose control will go, in semitones.
+///
+/// Two octaves each way. Further is arithmetically fine and musically pointless
+/// — and the limit is what stops a held-down arrow key from walking the offset
+/// somewhere a chord can never come back from.
+pub const TRANSPOSE_MAX: i64 = 24;
 
 /// The most a stored gain may be, as a linear multiplier.
 ///
@@ -369,6 +395,8 @@ impl Default for Settings {
             plugin_gains: [1.0; crate::recorder::SLOTS],
             metronome_gain: 0.5,
             input_gain: 1.0,
+            transpose: 0,
+            show_transpose: true,
             metronome_on: false,
             metronome_in_take: false,
             record_hide_elapsed: false,
@@ -721,6 +749,12 @@ impl Settings {
         };
         take_gain(&mut map, "metronome_gain", &mut s.metronome_gain);
         take_gain(&mut map, "input_gain", &mut s.input_gain);
+        if let Some(v) = map.remove("transpose") {
+            if let Some(n) = v.as_i64() {
+                s.transpose = n.clamp(-TRANSPOSE_MAX, TRANSPOSE_MAX);
+            }
+        }
+        take_bool(&mut map, "show_transpose", &mut s.show_transpose);
         take_bool(&mut map, "metronome_on", &mut s.metronome_on);
         take_bool(&mut map, "metronome_in_take", &mut s.metronome_in_take);
         take_bool(&mut map, "record_hide_elapsed", &mut s.record_hide_elapsed);
@@ -934,6 +968,8 @@ impl Settings {
                 map.insert(key.into(), Value::Number(n));
             }
         }
+        map.insert("transpose".into(), Value::Number(self.transpose.into()));
+        map.insert("show_transpose".into(), Value::Bool(self.show_transpose));
         map.insert("metronome_on".into(), Value::Bool(self.metronome_on));
         map.insert(
             "metronome_in_take".into(),

@@ -34,6 +34,51 @@ pub const HEART_COLORS: [Color32; 7] = [
     Color32::from_rgb(0xE8, 0xDC, 0xC0), // ivory
 ];
 
+/// The transpose arrows, top-left: `(up, down)`.
+///
+/// Mirrors [`heart_rect`]'s geometry on the other side of the strip, and is
+/// shared by the renderer and the hit-test for the same reason — two copies of
+/// a rectangle is two chances to click somewhere nothing is drawn.
+///
+/// Stacked rather than side by side: up is above down, which is the only
+/// arrangement nobody has to think about, and it keeps both inside the strip's
+/// height at every window size.
+pub fn transpose_rects(rect: Rect) -> (Rect, Rect) {
+    // Sized from the strip's HEIGHT so the pair always fits inside it.
+    //
+    // The first version scaled a fixed sprite grid the way the heart does, and
+    // the heart gets away with that because it is one row of pixels — two
+    // stacked arrows are more than twice as tall, and at 400 points wide the
+    // strip is only 15 points high, so the lower one hung out of the bottom of
+    // the window. Dividing the height up front cannot do that.
+    let margin = rect.height() * 0.12;
+    let gap = rect.height() * 0.08;
+    let h = ((rect.height() - margin * 2.0 - gap) * 0.5).max(1.0);
+    let w = h * 1.4;
+    let up = Rect::from_min_size(
+        Pos2::new(rect.left() + margin, rect.top() + margin),
+        egui::vec2(w, h),
+    );
+    let down = Rect::from_min_size(Pos2::new(up.left(), up.bottom() + gap), egui::vec2(w, h));
+    (up, down)
+}
+
+/// Light grey, as asked for: present without competing with the chord name,
+/// which is the thing the strip exists to show.
+const TRANSPOSE_COLOR: Color32 = Color32::from_rgb(0xA8, 0xA8, 0xA8);
+
+/// Draw one solid triangle pointing up or down inside `r`.
+fn arrow(painter: &Painter, r: Rect, up: bool, color: Color32) {
+    let (l, rt, t, b) = (r.left(), r.right(), r.top(), r.bottom());
+    let mid = (l + rt) * 0.5;
+    let pts = if up {
+        vec![Pos2::new(mid, t), Pos2::new(rt, b), Pos2::new(l, b)]
+    } else {
+        vec![Pos2::new(l, t), Pos2::new(rt, t), Pos2::new(mid, b)]
+    };
+    painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+}
+
 /// Where the heart sits, given the chord rect. Shared by the renderer and the
 /// hit-test so the two can never disagree about what is clickable.
 pub fn heart_rect(rect: Rect) -> Rect {
@@ -148,11 +193,33 @@ pub fn draw(
     color: Color32,
     heart: Option<Color32>,
     border: Option<Color32>,
+    // `None` hides the transpose control; `Some(n)` draws the arrows and, when
+    // `n` is not zero, the offset beside them — a transpose you cannot see is
+    // one you cannot explain the chord name with.
+    transpose: Option<i32>,
 ) {
     painter.rect_filled(rect, 0.0, Color32::BLACK);
     // Inside, so the outline is never clipped away at the window edge.
     if let Some(bc) = border {
         painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, bc), StrokeKind::Inside);
+    }
+    if let Some(semitones) = transpose {
+        let (up, down) = transpose_rects(rect);
+        arrow(painter, up, true, TRANSPOSE_COLOR);
+        arrow(painter, down, false, TRANSPOSE_COLOR);
+        if semitones != 0 {
+            // The amount, right of the arrows. Only when it is non-zero: a
+            // permanent "+0" is noise, and zero is already what two unlit
+            // arrows mean.
+            let size = (up.height() * 1.6).max(7.0);
+            painter.text(
+                Pos2::new(down.right() + up.width() * 0.5, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                format!("{semitones:+}"),
+                FontId::new(size, fonts::courier()),
+                TRANSPOSE_COLOR,
+            );
+        }
     }
     // Drawn before the early return so it shows even with no chord sounding.
     if let Some(hc) = heart {
@@ -220,6 +287,7 @@ pub fn show_detached_window(
     chord: Option<&str>,
     color: Color32,
     heart: Option<Color32>,
+    transpose: Option<i32>,
 ) -> DetachedOutcome {
     let mut outcome = DetachedOutcome::default();
     let mut builder = ViewportBuilder::default()
@@ -240,7 +308,17 @@ pub fn show_detached_window(
     ctx.show_viewport_immediate(viewport_id(), builder, |vp, _class| {
         crate::shell::viewport_ui(vp, |ui| {
             let rect = ui.max_rect();
-            draw(ui.painter(), rect, chord, color, heart, Some(BORDER_COLOR));
+            // The popped-out chord view is the same instrument as the band, so
+            // it carries the same control.
+            draw(
+                ui.painter(),
+                rect,
+                chord,
+                color,
+                heart,
+                Some(BORDER_COLOR),
+                transpose,
+            );
 
             let (close, inner_rect, outer_rect, pressed, secondary, pointer) = ui.input(|i| {
                 (

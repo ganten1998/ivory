@@ -761,7 +761,7 @@ impl IvoryApp {
         if self.settings.keytoggle_enabled {
             set.extend(self.manual_notes.iter().copied());
         }
-        set
+        transposed(&set, self.settings.transpose)
     }
 
     /// What the theory band draws, from the notes already on screen.
@@ -876,6 +876,40 @@ impl IvoryApp {
             recorder_shown: self.settings.show_recorder,
             recorder_available: self.caps.capture_devices,
         }
+    }
+
+    /// Whether the transpose control is offered at all.
+    fn transpose_view(&self) -> Option<i32> {
+        self.settings
+            .show_transpose
+            .then_some(self.settings.transpose as i32)
+    }
+
+    /// Move the transpose by `step` semitones, if every note can come along.
+    ///
+    /// **All or nothing.** A chord whose top note would leave MIDI's range is
+    /// not transposed at all, rather than transposed with that note dropped —
+    /// dropping one note of a voicing silently changes the chord, and the whole
+    /// point of this control is to ask what the chord becomes.
+    fn transpose_by(&mut self, step: i64) {
+        let want = (self.settings.transpose + step)
+            .clamp(-crate::settings::TRANSPOSE_MAX, crate::settings::TRANSPOSE_MAX);
+        if want == self.settings.transpose {
+            return;
+        }
+        let mut held: HashSet<u8> = self.notes.held().iter().copied().collect();
+        if self.settings.keytoggle_enabled {
+            held.extend(self.manual_notes.iter().copied());
+        }
+        if transposed(&held, want).len() != held.len() {
+            return;
+        }
+        self.settings.transpose = want;
+        self.save_settings();
+        // The neck and the theory band read the same notes, so they have to be
+        // rebuilt from the new ones rather than left showing the old shape.
+        self.rebuild_voicing();
+        self.detection_tick(true);
     }
 
     fn menu_view(&self) -> MenuView {
@@ -1063,6 +1097,22 @@ impl IvoryApp {
                 // The supporter heart cycles colour on click. Checked before the
                 // keytoggle hit-test because it sits in the chord strip, not the
                 // keyboard, so the two can never contend.
+                // The transpose arrows, top-left of the chord view. Checked
+                // before the keytoggle hit-test for the same reason the heart
+                // and the capo are: they sit on top, so they take the click.
+                if self.settings.show_transpose {
+                    if let Some(cr) = chord_rect {
+                        let (up, down) = chord_strip::transpose_rects(cr);
+                        if up.contains(pos) {
+                            self.transpose_by(1);
+                            return;
+                        }
+                        if down.contains(pos) {
+                            self.transpose_by(-1);
+                            return;
+                        }
+                    }
+                }
                 if self.heart_color().is_some() {
                     if let Some(cr) = chord_rect {
                         if chord_strip::heart_rect(cr).contains(pos) {
@@ -1854,6 +1904,8 @@ impl IvoryApp {
             // over the piano with the recorder hidden.
             K::ToggleRecording => self.request_recorder(recorder::RecorderRequest::Toggle),
             K::ToggleRecorder => self.apply_menu_action(ctx, MenuAction::ToggleRecorder),
+            K::TransposeUp => self.transpose_by(1),
+            K::TransposeDown => self.transpose_by(-1),
             K::ToggleDarkMode => self.apply_menu_action(ctx, MenuAction::ToggleDarkMode),
             K::ToggleDetection => self.apply_menu_action(ctx, MenuAction::ToggleChordDetection),
             K::ToggleBorderless => self.apply_menu_action(ctx, MenuAction::ToggleBorderless),
@@ -2637,6 +2689,22 @@ fn fit_bands(settings: &Settings, avail: Vec2) -> Bands {
     band_sizes_at(settings, w)
 }
 
+/// Every note moved by `semitones`, dropping any that leave MIDI's range.
+///
+/// A free function because it is pure arithmetic on a set and both the display
+/// path and the "may we transpose at all?" check need exactly the same answer —
+/// the second asks whether the result is the same SIZE as the input, which only
+/// works if it is the same function.
+fn transposed(notes: &HashSet<u8>, semitones: i64) -> HashSet<u8> {
+    if semitones == 0 {
+        return notes.clone();
+    }
+    notes
+        .iter()
+        .filter_map(|n| u8::try_from(i64::from(*n) + semitones).ok().filter(|m| *m <= 127))
+        .collect()
+}
+
 /// The horizontal bands the window is made of, top to bottom, and its width.
 ///
 /// A struct rather than the tuple this used to be. Adding the theory band made
@@ -2978,6 +3046,7 @@ impl IvoryApp {
                 self.settings.chord_text_color.to_color32(),
                 self.heart_color(),
                 None, // attached: it already has the piano below it as an edge
+                self.transpose_view(),
             );
         }
         piano::draw(
@@ -3204,6 +3273,7 @@ impl IvoryApp {
                 self.current_chord.as_deref(),
                 self.settings.chord_text_color.to_color32(),
                 self.heart_color(),
+                self.transpose_view(),
             );
             // A tiling WM overrules the size we asked for the moment the window
             // appears. Inside the grace period a mismatch is therefore its
@@ -4103,6 +4173,93 @@ mod tests {
             forever,
             "the session copy must not go on shadowing it"
         );
+    }
+
+    /// Transposing moves the notes and the chord name with them.
+    #[test]
+    fn transposing_moves_every_held_note_by_a_semitone() {
+        let c_major: HashSet<u8> = [60, 64, 67].into_iter().collect();
+        assert_eq!(
+            transposed(&c_major, 1),
+            [61, 65, 68].into_iter().collect::<HashSet<u8>>()
+        );
+        assert_eq!(
+            transposed(&c_major, -2),
+            [58, 62, 65].into_iter().collect::<HashSet<u8>>()
+        );
+        assert_eq!(transposed(&c_major, 0), c_major, "zero is the identity");
+    }
+
+    /// **All or nothing.** A chord whose top note would leave MIDI's range is
+    /// not transposed at all — transposing it with that note dropped silently
+    /// changes the chord, and asking what the chord becomes is the whole point
+    /// of the control.
+    #[test]
+    fn a_chord_that_cannot_all_fit_does_not_move_at_all() {
+        let (_ctx, mut app) = recorder_app();
+        app.manual_notes = [120, 124, 127].into_iter().collect();
+        app.settings.keytoggle_enabled = true;
+        app.transpose_by(1);
+        assert_eq!(
+            app.settings.transpose, 0,
+            "127 cannot go up, so nothing did"
+        );
+        // ...and down is still fine.
+        app.transpose_by(-1);
+        assert_eq!(app.settings.transpose, -1);
+        assert_eq!(
+            app.display_notes(),
+            [119, 123, 126].into_iter().collect::<HashSet<u8>>()
+        );
+    }
+
+    /// The offset is bounded, or a held-down arrow key walks it somewhere a
+    /// chord can never come back from.
+    #[test]
+    fn the_transpose_is_bounded_in_both_directions() {
+        let (_ctx, mut app) = recorder_app();
+        for _ in 0..100 {
+            app.transpose_by(1);
+        }
+        assert_eq!(app.settings.transpose, crate::settings::TRANSPOSE_MAX);
+        for _ in 0..200 {
+            app.transpose_by(-1);
+        }
+        assert_eq!(app.settings.transpose, -crate::settings::TRANSPOSE_MAX);
+    }
+
+    /// The arrows are drawn top-LEFT and the heart top-RIGHT, so one can never
+    /// be clicked while aiming at the other.
+    #[test]
+    fn the_transpose_arrows_never_overlap_the_heart() {
+        for w in [400.0_f32, 900.0, 1300.0, 2600.0] {
+            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, (w / 26.0).max(20.0)));
+            let (up, down) = chord_strip::transpose_rects(r);
+            let heart = chord_strip::heart_rect(r);
+            assert!(!up.intersects(heart) && !down.intersects(heart), "at {w}");
+            assert!(!up.intersects(down), "the two arrows overlap at {w}");
+            for a in [up, down, heart] {
+                assert!(r.contains_rect(a), "{a:?} escapes the strip at {w}");
+            }
+        }
+    }
+
+    /// It survives a restart: a transpose is a mode you are in, and one that
+    /// reset on relaunch would silently change what the chord name means
+    /// between sessions.
+    #[test]
+    fn the_transpose_is_remembered() {
+        let mut s = Settings::default();
+        assert_eq!(s.transpose, 0, "and starts at nothing");
+        assert!(s.show_transpose, "the arrows are on by default");
+        s.transpose = -5;
+        s.show_transpose = false;
+        let back = Settings::from_json(&s.to_json());
+        assert_eq!(back.transpose, -5);
+        assert!(!back.show_transpose);
+        // A hand-edited file cannot put the app somewhere the buttons cannot.
+        let wild = Settings::from_json(r#"{"transpose": 9999}"#);
+        assert_eq!(wild.transpose, crate::settings::TRANSPOSE_MAX);
     }
 
     #[test]

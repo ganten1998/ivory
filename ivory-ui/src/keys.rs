@@ -40,6 +40,8 @@ pub enum KeyAction {
     /// The first binding here that is not always live — see [`Gates`].
     ToggleRecording,
     ToggleRecorder,
+    TransposeUp,
+    TransposeDown,
     CloseHelp,
 }
 
@@ -133,6 +135,12 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // the obvious mnemonic and is long since taken by "clear the notes you
     // placed", which is a thing people press by reflex mid-practice; rebinding
     // it to something that opens a 200-point band would be a nasty surprise.
+    // The arrows, and the first bindings in this table that are not a letter
+    // or Space. They move the notes you are holding, which is a thing you do
+    // WHILE holding them — so they had to be keys you can reach without
+    // letting go, and the arrow keys are the only ones that are.
+    (Key::ArrowUp, "Up", KeyAction::TransposeUp, true),
+    (Key::ArrowDown, "Down", KeyAction::TransposeDown, true),
     (Key::V, "V", KeyAction::ToggleRecorder, true),
     (Key::Space, "Space", KeyAction::ToggleRecording, true),
     // Escape only closes the card; it is not worth a row of its own.
@@ -161,6 +169,8 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ToggleNotePreference => "sharps or flats",
         KeyAction::ToggleRecording => "start or stop recording",
         KeyAction::ToggleRecorder => "the recorder",
+        KeyAction::TransposeUp => "transpose up a semitone",
+        KeyAction::TransposeDown => "transpose down a semitone",
         KeyAction::CloseHelp => "close this card",
     }
 }
