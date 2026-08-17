@@ -1476,6 +1476,7 @@ pub fn color_pick_title(target: ColorTarget) -> &'static str {
         ColorTarget::Active => "Choose Active Key Color",
         ColorTarget::Sustain => "Choose Sustain Pedal Color",
         ColorTarget::ChordText => "Choose Chord Color",
+        ColorTarget::RecorderBg => "Choose Recorder Color",
     }
 }
 

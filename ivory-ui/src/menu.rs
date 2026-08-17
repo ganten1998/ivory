@@ -32,6 +32,13 @@ pub enum ColorTarget {
     Sustain,
     /// The chord label. Free to change; the bloom around it is the extra.
     ChordText,
+    /// The Recorder band's own background.
+    ///
+    /// The band used to borrow the piano's, so it read as another band of the
+    /// same window — which is right until you want to tell them apart at a
+    /// glance while playing. Its own colour, and the band's ink follows the
+    /// colour's brightness rather than the theme, so any choice stays readable.
+    RecorderBg,
 }
 
 /// `Clone` but not `Copy`: `SetTuning` carries an owned name, because a custom
@@ -636,6 +643,10 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
             row(
                 "Set Chord Color...",
                 MenuAction::PickColor(ColorTarget::ChordText),
+            ),
+            row(
+                "Set Recorder Color...",
+                MenuAction::PickColor(ColorTarget::RecorderBg),
             ),
         ],
     );

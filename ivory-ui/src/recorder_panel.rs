@@ -143,27 +143,70 @@ struct Palette {
     warn: Color32,
 }
 
+/// The two inks the band can wear.
+const INK_LIGHT: Color32 = Color32::from_rgb(0xE8, 0xDC, 0xC0);
+const INK_DARK: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
+
+/// Relative luminance, sRGB, as WCAG defines it.
+fn luminance(c: Color32) -> f32 {
+    let ch = |v: u8| {
+        let v = f32::from(v) / 255.0;
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+}
+
+/// Contrast ratio between two colours, 1.0 (identical) to 21.0 (black/white).
+fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (x, y) = (luminance(a), luminance(b));
+    let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Whether ink on this background has to be light.
+///
+/// **The band's ink follows its own background, not the theme.** The colour is
+/// the user's to choose, so a rule that read `dark_mode` would put near-black
+/// text on a dark walnut the moment somebody picked one in light mode — and the
+/// band would be unreadable with nothing on screen explaining why.
+///
+/// It MEASURES both candidates rather than testing a brightness threshold, and
+/// the difference is not academic: a mid grey sits below any sensible threshold
+/// and yet takes dark ink far better than light — 5.3 against 2.7. A threshold
+/// picked the ivory and produced the one genuinely unreadable band this whole
+/// mechanism exists to prevent.
+///
+/// The worst case is a background whose luminance falls where the two curves
+/// cross, at about 0.17, where the better of the two still gives 3.57 — above
+/// WCAG's 3.0 for large text and below its 4.5 for body text, which is honest:
+/// somebody who picks that exact colour gets a legible band and not a
+/// comfortable one.
+fn wants_light_ink(c: Color32) -> bool {
+    contrast_ratio(c, INK_LIGHT) > contrast_ratio(c, INK_DARK)
+}
+
 fn palette(s: &Settings) -> Palette {
-    let dark = s.dark_mode;
+    // The BAND's own background, and its own choice. It used to borrow the
+    // piano's, so the recorder read as another band of the same window — which
+    // is right until you want to tell a set of controls apart from an
+    // instrument at a glance while playing.
+    let bg = s.recorder_bg_color.to_color32();
+    // Everything else follows the BACKGROUND, not `dark_mode`. See
+    // `wants_light_ink`.
+    let dark = wants_light_ink(bg);
     Palette {
-        // The piano's own background, so the recorder reads as another band of
-        // the same window rather than as a dialog that landed in it.
-        bg: crate::piano::bg_color(dark),
-        well: if dark {
-            Color32::from_rgb(0x0a, 0x0a, 0x0a)
-        } else {
-            Color32::from_rgb(0xCF, 0xCF, 0xCF)
-        },
-        field: if dark {
-            Color32::from_rgb(0x26, 0x26, 0x26)
-        } else {
-            Color32::from_rgb(0xDC, 0xDC, 0xDC)
-        },
-        ink: if dark {
-            Color32::from_rgb(0xE8, 0xDC, 0xC0)
-        } else {
-            Color32::from_rgb(0x1a, 0x1a, 0x1a)
-        },
+        bg,
+        // Derived FROM the background rather than fixed, so a recessed well
+        // still looks recessed and a control still looks raised whatever the
+        // band is coloured. Multiplying keeps the hue: a well in a walnut band
+        // is a darker walnut, not a grey hole in it.
+        well: shade(bg, if dark { 0.55 } else { 0.88 }),
+        field: shade(bg, if dark { 1.35 } else { 0.94 }),
+        ink: if dark { INK_LIGHT } else { INK_DARK },
         // Secondary text carries the folder preview and the disk line, which
         // are the two things a first-time user actually learns the scheme
         // from, so it is darkened on light and lightened on dark until it
@@ -186,6 +229,15 @@ fn palette(s: &Settings) -> Palette {
             Color32::from_rgb(0xA0, 0x66, 0x00)
         },
     }
+}
+
+/// The background, lightened or darkened, keeping its hue.
+///
+/// `gamma_multiply` would fade it towards transparent; this scales the channels
+/// so a walnut band gets a darker walnut well rather than a grey one.
+fn shade(c: Color32, k: f32) -> Color32 {
+    let f = |v: u8| (f32::from(v) * k).clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
 }
 
 fn font(size: f32) -> FontId {
@@ -1827,7 +1879,13 @@ fn draw_meter(painter: &Painter, r: Rect, m: Meters, p: &Palette) {
 /// front of the person trying to come in on time.
 fn readout_text(state: RecordState, elapsed_s: f64) -> String {
     match state {
-        RecordState::CountIn { beat, of } => format!("{beat} OF {of}"),
+        // Just the number. It said "3 OF 12" when the count was a running
+        // total, and "3 OF 6" once it became a beat within the bar — at which
+        // point the second half stopped carrying anything: the bar's length is
+        // already on screen in the SIG cell, and nobody counting a band in has
+        // ever said "of six". What the player needs is the digit they are
+        // saying out loud, as large as the box will draw it.
+        RecordState::CountIn { beat, .. } => beat.to_string(),
         RecordState::Finishing => "FINISHING".to_owned(),
         RecordState::Rolling | RecordState::Idle => timecode(elapsed_s),
     }
@@ -2641,6 +2699,90 @@ mod tests {
     /// Stop used to be 0.66 of record and then had its glyph shrunk another
     /// 30% inside that, so the square read as less than half the circle — which
     /// makes one look like the real control and the other like a note about it.
+    /// **The band stays readable whatever colour it is given.**
+    ///
+    /// The ink follows the BACKGROUND, not `dark_mode`. A rule that read the
+    /// theme would put near-black text on a dark walnut the moment somebody
+    /// picked one in light mode, and the band would be unreadable with nothing
+    /// on screen explaining why.
+    #[test]
+    fn the_ink_follows_the_background_and_not_the_theme() {
+        use crate::settings::Rgb;
+        // A dark colour chosen while the app is in LIGHT mode.
+        let mut s = Settings {
+            dark_mode: false,
+            ..Settings::default()
+        };
+        s.recorder_bg_color = Rgb {
+            r: 0x2A,
+            g: 0x20,
+            b: 0x18,
+        };
+        let p = palette(&s);
+        assert!(
+            contrast_ratio(p.bg, p.ink) > 4.0,
+            "dark band, light theme: ink {:?} on {:?} is unreadable",
+            p.ink,
+            p.bg
+        );
+
+        // And a light colour chosen while the app is in DARK mode.
+        let mut s = Settings {
+            dark_mode: true,
+            ..Settings::default()
+        };
+        s.recorder_bg_color = Rgb {
+            r: 0xE8,
+            g: 0xDC,
+            b: 0xC0,
+        };
+        let p = palette(&s);
+        assert!(
+            contrast_ratio(p.bg, p.ink) > 4.0,
+            "light band, dark theme: ink {:?} on {:?} is unreadable",
+            p.ink,
+            p.bg
+        );
+    }
+
+    /// Every colour a user could pick leaves legible ink, and a well that is
+    /// still the same hue as the band it is cut into.
+    #[test]
+    fn any_background_gets_readable_ink_and_a_well_of_its_own_hue() {
+        use crate::settings::Rgb;
+        for (r, g, b) in [
+            (0x00, 0x00, 0x00),
+            (0xFF, 0xFF, 0xFF),
+            (0x4A, 0x3B, 0x2C), // the default walnut
+            (0x8B, 0x00, 0x00), // saturated red
+            (0x00, 0x00, 0x8B), // saturated blue: dark despite a high channel
+            (0x00, 0xFF, 0x00), // and green, which is bright despite one channel
+            (0x80, 0x80, 0x80),
+        ] {
+            let mut s = Settings::default();
+            s.recorder_bg_color = Rgb { r, g, b };
+            let p = palette(&s);
+            assert!(
+                contrast_ratio(p.bg, p.ink) > 3.5,
+                "#{r:02X}{g:02X}{b:02X}: ink {:?} on {:?}",
+                p.ink,
+                p.bg
+            );
+            // The well is a shade of the band, not a grey hole in it: the
+            // channel ORDER survives.
+            let order = |c: Color32| {
+                let mut v = [(c.r(), 0u8), (c.g(), 1), (c.b(), 2)];
+                v.sort();
+                [v[0].1, v[1].1, v[2].1]
+            };
+            assert_eq!(
+                order(p.well),
+                order(p.bg),
+                "#{r:02X}{g:02X}{b:02X}: the well lost the band's hue"
+            );
+        }
+    }
+
     #[test]
     fn record_and_stop_are_the_same_size() {
         for w in [320.0_f32, 640.0, 1300.0, 2600.0] {
@@ -3192,13 +3334,14 @@ mod tests {
     /// would be hiding the wrong thing under the right name.
     #[test]
     fn the_count_in_readout_shows_the_beat_and_hide_elapsed_leaves_it_alone() {
+        // Just the number the player is saying out loud. It read "3 OF 4"
+        // while the count was a running total against a total; now that it is
+        // a beat WITHIN THE BAR — 1 2 3 4 5 6, 1 2 3 4 5 6 in 6/8 — the second
+        // half carries nothing the SIG cell does not already say.
+        assert_eq!(readout_text(RecordState::CountIn { beat: 3, of: 4 }, 0.0), "3");
         assert_eq!(
-            readout_text(RecordState::CountIn { beat: 3, of: 4 }, 0.0),
-            "3 OF 4"
-        );
-        assert_eq!(
-            readout_text(RecordState::CountIn { beat: 7, of: 8 }, 91.0),
-            "7 OF 8",
+            readout_text(RecordState::CountIn { beat: 5, of: 6 }, 91.0),
+            "5",
             "the elapsed clock does not leak into the count"
         );
         assert_eq!(readout_text(RecordState::Finishing, 12.0), "FINISHING");

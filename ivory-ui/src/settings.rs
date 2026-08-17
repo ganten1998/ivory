@@ -85,6 +85,14 @@ pub struct Settings {
     pub font_choice: String,
     /// Chord label colour.
     pub chord_text_color: Rgb,
+    /// The Recorder band's background.
+    ///
+    /// A brown by default, and deliberately not the piano's grey: the band is a
+    /// different KIND of surface — a set of controls rather than an instrument
+    /// — and telling them apart at a glance while playing is worth a colour.
+    /// Warm rather than neutral because everything else in this app already is,
+    /// from the ivory ink to the rosewood fretboard.
+    pub recorder_bg_color: Rgb,
     /// Show the welcome/support note at startup. Cleared by its own checkbox.
     pub show_welcome: bool,
     /// Supporter decoration: the pixel heart on the chord view.
@@ -408,6 +416,14 @@ impl Default for Settings {
             keytoggle_enabled: false,
             custom_font_path: None,
             font_choice: crate::fonts::FontChoice::default().key().to_owned(),
+            // A mid walnut. Dark enough that the ivory ink reads on it, warm
+            // enough to be a brown rather than a grey, and desaturated enough
+            // not to fight the accent colour the meters use.
+            recorder_bg_color: Rgb {
+                r: 0x4A,
+                g: 0x3B,
+                b: 0x2C,
+            },
             chord_text_color: Rgb {
                 r: 0xE8,
                 g: 0xDC,
@@ -693,6 +709,11 @@ impl Settings {
             if let Some(f) = v.as_str() {
                 // Stored verbatim; an unknown key resolves to Courier at use.
                 s.font_choice = f.to_owned();
+            }
+        }
+        if let Some(v) = map.remove("recorder_bg_color") {
+            if let Some(c) = v.as_str().and_then(Rgb::parse) {
+                s.recorder_bg_color = c;
             }
         }
         if let Some(v) = map.remove("chord_text_color") {
@@ -985,6 +1006,10 @@ impl Settings {
         map.insert(
             "chord_text_color".into(),
             Value::String(self.chord_text_color.to_hex()),
+        );
+        map.insert(
+            "recorder_bg_color".into(),
+            Value::String(self.recorder_bg_color.to_hex()),
         );
         map.insert("show_welcome".into(), Value::Bool(self.show_welcome));
         map.insert("show_heart".into(), Value::Bool(self.show_heart));

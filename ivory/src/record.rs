@@ -595,7 +595,13 @@ impl Writer {
                     // "dropped" is audio nobody asked to keep.
                     0
                 },
-            first_frame_ns: self.first_frame_ns,
+            // Taken, not copied. It is reset on `Cmd::Start`, and a take that
+            // writes no `.wav` at all never sends one — so without this the
+            // NEXT report would carry the previous take's first frame. Today
+            // `t0.max(first)` makes a stale value harmless, because a stale one
+            // is always in the past and always loses; that is a property of the
+            // consumer, not of this, and it is not one to rely on.
+            first_frame_ns: self.first_frame_ns.take(),
             running: self.sink.stats().device_state().is_running(),
             clipped_samples: m.clipped_samples,
             take_peak: m.loudest_take_peak(),
@@ -1381,9 +1387,20 @@ impl Session {
         }
     }
 
-    /// How long one beat lasts at the take's tempo.
+    /// How long one beat of the take's SIGNATURE lasts, at its tempo.
+    ///
+    /// **Of the signature.** This returned `60 / bpm` — a quarter note, always
+    /// — while the click the player actually hears comes from
+    /// `instrument::period_frames`, which multiplies by `4 / unit`. In 6/8 the
+    /// two disagreed by a factor of two: the clicks came at eighths and the
+    /// number on screen advanced at quarters, so a twelve-beat count-in was
+    /// still showing "6" as the last click sounded.
+    ///
+    /// One function owns the answer now, and it is
+    /// [`TimeSignature::beat_seconds`] — the same one the engine's period is
+    /// derived from.
     fn beat(&self) -> Duration {
-        Duration::from_secs_f64(60.0 / self.spec.tempo_bpm.clamp(20.0, 300.0))
+        Duration::from_secs_f64(self.meter.beat_seconds(self.spec.tempo_bpm).max(1e-6))
     }
 
     /// Advance the count-in. Called once a frame.
@@ -1409,11 +1426,19 @@ impl Session {
             self.begin(root, name);
             return true;
         }
-        // 1-based: the first beat of a four-beat count-in is "1", not "0". The
-        // number shown is the one the player is counting out loud.
+        // **The beat WITHIN THE BAR, and the bar's own length.**
+        //
+        // Two bars of 6/8 is "1 2 3 4 5 6, 1 2 3 4 5 6" — never "1 of 12". A
+        // beat in a measure is a beat in a measure, and nobody counting a band
+        // in has ever said "seven". This used to show the running total against
+        // the total, which is a progress bar wearing a musician's clothes.
+        //
+        // The engine accents the same beat, because it takes the modulo of the
+        // same number — so the "1" on screen is the click that sounds different.
+        let per_bar = u32::from(self.meter.beats.max(1));
         let now = RecordState::CountIn {
-            beat: (done as u32) + 1,
-            of: self.count_in_of,
+            beat: (done as u32) % per_bar + 1,
+            of: per_bar,
         };
         let changed = self.state != now;
         self.state = now;
@@ -1429,6 +1454,16 @@ impl Session {
     /// one that starts a few milliseconds after it.
     pub fn arm_at(&mut self, t0: Nanos) {
         self.arm_override = Some(t0);
+    }
+
+    /// Forget a T0 that was offered and never used.
+    ///
+    /// Belt and braces beside the caller's own edge-detection: an override that
+    /// outlives the count-in it came from is a take timestamped from a downbeat
+    /// that happened minutes ago, and the failure is invisible until somebody
+    /// opens the `.mid` beside the `.wav`.
+    fn forget_arm(&mut self) {
+        self.arm_override = None;
     }
 
     fn begin(&mut self, root: &std::path::Path, name: Option<&str>) {
@@ -1802,6 +1837,7 @@ impl Session {
             note,
         });
         self.started_instant = None;
+        self.forget_arm();
         self.state = RecordState::Idle;
     }
 
@@ -2554,6 +2590,166 @@ mod tests {
         s.toggle(&dir, None, 3, ExportSpec::default());
         assert_eq!(s.state(), RecordState::Idle, "pressing again cancels");
         assert!(!dir.exists());
+    }
+
+    /// **The number on screen advances at the rate of the clicks.**
+    ///
+    /// The countdown is driven by `Session::beat` and the audible click by
+    /// `instrument::period_frames`. They are two clocks and they must agree
+    /// about how long a beat is — and they did not: `beat` returned a QUARTER
+    /// note whatever the signature said, so in 6/8 the clicks came at eighths
+    /// while the screen counted at half that. A twelve-beat count-in was still
+    /// showing "6" as the last click sounded.
+    #[test]
+    fn the_countdown_advances_at_the_same_rate_as_the_click() {
+        use ivory_ui::recorder::TimeSignature;
+        for (sig, bpm, want_secs) in [
+            (TimeSignature { beats: 4, unit: 4 }, 120.0, 0.5),
+            // The one that was wrong: an eighth at 120 is a quarter of a second.
+            (TimeSignature { beats: 6, unit: 8 }, 120.0, 0.25),
+            (TimeSignature { beats: 7, unit: 8 }, 90.0, 60.0 / 90.0 * 0.5),
+            // A half-note beat gets two quarters.
+            (TimeSignature { beats: 2, unit: 2 }, 120.0, 1.0),
+        ] {
+            let mut s = session();
+            s.set_meter(sig);
+            s.spec = ExportSpec {
+                tempo_bpm: bpm,
+                ..ExportSpec::default()
+            };
+            // Through a `Duration`, which is quantised to NANOSECONDS — so the
+            // tolerances below are a nanosecond and not an epsilon. 7/8 at 90
+            // is 0.3333... seconds, which no exact comparison will ever match
+            // after that round trip.
+            let shown = s.beat().as_secs_f64();
+            assert!(
+                (shown - want_secs).abs() < 1e-9,
+                "{} at {bpm}: the screen counts a beat as {shown}s, the click plays {want_secs}s",
+                sig.label()
+            );
+            // And it IS the engine's own answer, not a second derivation that
+            // happens to match today.
+            let engine = sig.beat_seconds(bpm);
+            assert!(
+                (shown - engine).abs() < 1e-9,
+                "{}: the screen and the engine derive a beat differently",
+                sig.label()
+            );
+        }
+    }
+
+    /// **A two-bar count-in in 6/8 counts 1 2 3 4 5 6, 1 2 3 4 5 6.**
+    ///
+    /// Never "1 of 12". A beat in a measure is a beat in a measure, and nobody
+    /// counting a band in has ever said "seven". It used to show the running
+    /// total against the total, which is a progress bar wearing a musician's
+    /// clothes.
+    #[test]
+    fn the_count_in_counts_beats_within_the_bar() {
+        use ivory_ui::recorder::TimeSignature;
+        let dir = std::env::temp_dir().join("tangent-countin-in-bar");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let sig = TimeSignature { beats: 6, unit: 8 };
+        let mut s = session();
+        s.set_meter(sig);
+        // Two bars of 6/8 = twelve beats, at 120 bpm = 0.25s each.
+        s.toggle(&dir, None, sig.beats_in(2), ExportSpec::default());
+
+        let beat_len = sig.beat_seconds(120.0);
+        let mut seen = Vec::new();
+        for n in 0..12 {
+            // Park the start so that exactly `n` beats have elapsed, plus a
+            // sliver so we are inside beat n+1 rather than on its edge.
+            let elapsed = Duration::from_secs_f64(beat_len * (n as f64 + 0.5));
+            s.count_in_from = Some(Instant::now() - elapsed);
+            s.tick(&dir, None);
+            match s.state() {
+                RecordState::CountIn { beat, of } => {
+                    assert_eq!(of, 6, "the bar is six beats long, not twelve");
+                    seen.push(beat);
+                }
+                other => panic!("beat {n} left the count-in: {other:?}"),
+            }
+        }
+        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6]);
+
+        // And it still ENDS after all twelve, which is the half that must not
+        // regress while fixing the numbers.
+        s.count_in_from = Some(Instant::now() - Duration::from_secs(60));
+        assert!(s.tick(&dir, None), "an expiring count-in is a change");
+        assert_eq!(s.state(), RecordState::Rolling);
+        s.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A signature cannot change under a take that is already running.**
+    ///
+    /// The session refuses it, and the ENGINE has to refuse it too — that pair
+    /// is the point. The engine's copy was pushed every frame with no take
+    /// check, so a right-click during a take moved the click and the accent
+    /// while the countdown and the `.mid` kept the old meter: one setting with
+    /// two live values, and a file whose bar lines do not match what was heard.
+    #[test]
+    fn the_signature_is_fixed_once_a_take_is_under_way() {
+        use ivory_ui::recorder::TimeSignature;
+        let dir = std::env::temp_dir().join("tangent-meter-locked");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = session();
+
+        let four = TimeSignature { beats: 4, unit: 4 };
+        let six = TimeSignature { beats: 6, unit: 8 };
+        s.set_meter(four);
+        s.toggle(&dir, Some("locked"), 0, ExportSpec::default());
+        assert_eq!(s.state(), RecordState::Rolling);
+
+        s.set_meter(six);
+        assert_eq!(
+            s.meter, four,
+            "the signature moved under a rolling take"
+        );
+        // The beat length the countdown and the file use is the OLD one too.
+        assert!((s.beat().as_secs_f64() - four.beat_seconds(120.0)).abs() < 1e-9);
+
+        s.stop();
+        // And once it is over, it takes the new one.
+        s.set_meter(six);
+        assert_eq!(s.meter, six, "a stopped session should accept a change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A T0 offered by one take must not be used by the next.**
+    ///
+    /// `arm_at` is how the engine hands over the instant the downbeat was
+    /// HEARD, which is more accurate than the UI frame that noticed it. But
+    /// `count_in_done` is a latch — it stays true until the next count-in
+    /// starts — so the caller offered the same instant on every frame for the
+    /// rest of the session, and a take that began without a count-in took it.
+    /// With "record the count-in into the take" on, every take starts with a
+    /// count-in length of zero, so every take after the first would have been
+    /// stamped from the first one's downbeat.
+    #[test]
+    fn a_stale_downbeat_cannot_time_stamp_the_next_take() {
+        let dir = std::env::temp_dir().join("tangent-stale-arm");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = session();
+
+        // A take that WAS armed from a downbeat.
+        let downbeat = s.timebase.now();
+        s.arm_at(downbeat);
+        s.toggle(&dir, Some("first"), 0, ExportSpec::default());
+        assert_eq!(s.t0, downbeat, "the armed instant is what a take starts at");
+        s.stop();
+
+        // The offer is not renewed, and the next take must not inherit it.
+        let before = s.timebase.now();
+        s.toggle(&dir, Some("second"), 0, ExportSpec::default());
+        assert!(
+            s.t0 >= before,
+            "the second take was stamped from the first take's downbeat"
+        );
+        s.stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The countdown has to actually count. A `tick` that never reaches zero is

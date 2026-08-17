@@ -202,6 +202,11 @@ struct Recorder {
     /// sixty times a second for the rest of the session. The band shows the
     /// error either way.
     engine_retry: Option<(std::time::Instant, u8)>,
+    /// The count-in downbeat the session has already been armed with.
+    ///
+    /// See the use site: `count_in_done` is a latch, so without this the same
+    /// instant is handed over every frame for the rest of the session.
+    armed_downbeat: Option<i64>,
     /// The buffer size both streams were opened with.
     ///
     /// Changing it has to REOPEN them — a running stream cannot be resized —
@@ -591,7 +596,19 @@ impl DesktopApp {
             .filter(|e| e.count_in_done())
             .and_then(|e| e.count_in_downbeat_ns())
         {
-            self.recorder.session.arm_at(downbeat);
+            // **Once per count-in, not once per frame.** `count_in_done` is a
+            // LATCH: it stays true after the count finishes and is only cleared
+            // when the next one starts. So this armed the session with the same
+            // downbeat on every frame for the rest of the session — and the
+            // next take that began WITHOUT a count-in took that stale instant
+            // as its T0. With "record the count-in into the take" on, every
+            // take starts with a count-in length of zero, so every take after
+            // the first would have been timestamped from the first one's
+            // downbeat: minutes of offset between the audio and the `.mid`.
+            if self.recorder.armed_downbeat != Some(downbeat) {
+                self.recorder.armed_downbeat = Some(downbeat);
+                self.recorder.session.arm_at(downbeat);
+            }
         }
         // The count-in, which is the one thing here that animates with no input
         // at all — so it also has to ask for the next frame.
@@ -799,6 +816,12 @@ impl DesktopApp {
     /// nothing — and a change-detection cache here would be a second copy of
     /// the settings to get out of step with the first.
     fn push_monitor_settings(&mut self) {
+        // The SESSION's copy first, and outside the engine gate. It is what the
+        // count-in's on-screen beat and the `.mid`'s tempo map are derived
+        // from, and neither has anything to do with an output device — so a
+        // machine with no monitor (or one another app holds) would have kept
+        // counting and writing 4/4 while the band showed 6/8.
+        self.recorder.session.set_meter(self.app.time_signature());
         let Some(e) = self.recorder.engine.as_ref() else {
             return;
         };
@@ -814,9 +837,15 @@ impl DesktopApp {
         // and how long a beat lasts. In 6/8 those are "every sixth" and "half a
         // quarter" — get the second wrong and the count-in is twice as long as
         // the bar it is counting.
-        let sig = self.app.time_signature();
-        e.set_meter(u32::from(sig.beats), u32::from(sig.unit));
-        self.recorder.session.set_meter(sig);
+        // NOT while a take is running. `Session::set_meter` refuses mid-take —
+        // a `.mid` whose bar lines change halfway through is a file nobody can
+        // edit — and pushing it to the engine anyway would move the click and
+        // the accent while the countdown and the file kept the old meter. One
+        // setting must not have two live values.
+        if !self.recorder.session.is_recording() {
+            let sig = self.app.time_signature();
+            e.set_meter(u32::from(sig.beats), u32::from(sig.unit));
+        }
     }
 
     /// Decide what the next take is made of, from what is actually available.
@@ -1145,6 +1174,7 @@ impl DesktopApp {
                 video_tried: false,
                 camera_rgba: None,
                 engine_retry: None,
+                armed_downbeat: None,
                 buffer_open: None,
                 seen_take: None,
                 dev_editor_done: false,

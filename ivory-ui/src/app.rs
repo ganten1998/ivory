@@ -1601,7 +1601,13 @@ impl IvoryApp {
 
     /// The tempo the click, the count-in and the SMF tempo mark all share.
     pub fn tempo_bpm(&self) -> f64 {
-        self.settings.record_export.tempo_bpm
+        // **The take's tempo, override and all.** This read the SETTINGS while
+        // `export_spec` reads the session-only override, so a tempo set for one
+        // take in the Export dialog moved the `.mid` and the on-screen count
+        // and left the CLICK playing the old one. One number, one source: a
+        // click at 90 against a file that says 120 is the exact failure the
+        // "one tempo" rule in `ExportSpec` exists to prevent.
+        self.export_spec().tempo_bpm
     }
 
     /// The take's time signature: what the click accents and how long a bar of
@@ -2272,6 +2278,7 @@ impl IvoryApp {
                     ColorTarget::Active => self.settings.white_key_active_color,
                     ColorTarget::Sustain => self.settings.sustain_color,
                     ColorTarget::ChordText => self.settings.chord_text_color,
+                    ColorTarget::RecorderBg => self.settings.recorder_bg_color,
                 };
                 self.dialog = Some(Dialog::ColorPick {
                     target,
@@ -2912,6 +2919,7 @@ impl IvoryApp {
                     }
                     ColorTarget::Sustain => self.settings.sustain_color = rgb,
                     ColorTarget::ChordText => self.settings.chord_text_color = rgb,
+                    ColorTarget::RecorderBg => self.settings.recorder_bg_color = rgb,
                 }
                 self.save_settings();
             }
@@ -4818,6 +4826,35 @@ mod tests {
             s.theory_views().count() == 3,
             "a reset hid the theory band"
         );
+    }
+
+    /// **One tempo, one source.**
+    ///
+    /// `export_spec` honours a session-only override and `tempo_bpm` read the
+    /// settings, so a tempo set for ONE take in the Export dialog moved the
+    /// `.mid` and the on-screen count and left the CLICK playing the old one.
+    /// A click at 90 against a file that says 120 is the exact failure the "one
+    /// tempo" rule exists to prevent, and it survived for the whole session
+    /// because nothing clears the override at a take boundary.
+    #[test]
+    fn a_one_off_export_tempo_moves_the_click_too() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.record_export.tempo_bpm = 120.0;
+        assert!((app.tempo_bpm() - 120.0).abs() < 1e-9);
+
+        // Session-only, exactly as the dialog's untick leaves it.
+        app.apply_dialog_action(DialogAction::SetExport(recorder::ExportSpec {
+            tempo_bpm: 90.0,
+            ..app.settings.record_export
+        }));
+        assert!(
+            (app.tempo_bpm() - 90.0).abs() < 1e-9,
+            "the click is still at {} while the take is at 90",
+            app.tempo_bpm()
+        );
+        assert!((app.export_spec().tempo_bpm - 90.0).abs() < 1e-9);
+        // The stored setting is untouched, which is what "session only" means.
+        assert!((app.settings.record_export.tempo_bpm - 120.0).abs() < 1e-9);
     }
 
     /// **A typed level lands where the fader would put it.**
