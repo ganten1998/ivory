@@ -284,6 +284,9 @@ pub struct IvoryApp {
     /// `ivory-ui` cannot see a device and the panel has to stay live while it
     /// is up — a rate that changed under you is exactly what it is for.
     audio_status: recorder::AudioStatus,
+    /// The last right-click landed on the Recorder band, so its category leads
+    /// the menu. Read once when the menu is built and then irrelevant.
+    menu_over_recorder: bool,
     /// A numeric field being typed into, if any.
     ///
     /// Mutually exclusive with `name_focused` in practice, because a press
@@ -496,6 +499,7 @@ impl IvoryApp {
             picker_slot: 0,
             grabbed: None,
             num_edit: None,
+            menu_over_recorder: false,
             audio_status: recorder::AudioStatus::default(),
             fullscreen_sent: None,
             plugin_list: Vec::new(),
@@ -987,6 +991,7 @@ impl IvoryApp {
             time_signature: self.settings.time_signature(),
             count_in_bars: self.settings.count_in_bars(),
             count_in_in_take: self.settings.record_count_in_in_take,
+            recorder_first: self.menu_over_recorder && self.settings.show_recorder,
             record_sources: self.settings.record_sources.clone(),
             metronome_on: self.settings.metronome_on,
             metronome_in_take: self.settings.metronome_in_take,
@@ -1062,6 +1067,13 @@ impl IvoryApp {
         if resp.secondary_clicked() || (resp.clicked() && ctrl_as_context) {
             if let Some(pos) = pointer {
                 let global = self.main_inner_origin + pos.to_vec2();
+                // A right-click ON the Recorder band opens the menu with the
+                // Recorder at the top. The band is where its own settings
+                // belong: it is a surface with fifteen controls on it, and
+                // reaching the sixteenth meant a right-click anywhere else
+                // followed by a hunt down a list of subjects that are mostly
+                // about the piano.
+                self.menu_over_recorder = recorder_rect.is_some_and(|r| r.contains(pos));
                 self.open_menu_at(ctx, global);
             }
             return;
@@ -1740,21 +1752,28 @@ impl IvoryApp {
         // common case — "record what I am looking at" — needs no clicks. The
         // dialog then overrides them FOR THE VIDEO ONLY.
         spec.composite.shows = dialogs::shows_from_settings(&self.settings);
-        // Which of the two dialogs this is depends on whether there is a take
-        // to talk about.
+        // **Always the NEXT take.**
         //
-        // With a finished take on screen, Export means "re-export THAT", and
-        // the post-take dialog is the one that knows what is re-derivable: the
-        // SMF's tempo mark and a display-only video are, and anything
-        // containing the camera is not — those frames were composited live and
-        // nothing kept them. Without one it means "what should the next take
-        // produce".
+        // This used to open the post-take dialog whenever a finished take was
+        // on screen, on the reading that Export then means "re-export THAT".
+        // `last_take_folder` stays set for the rest of the session, so after
+        // one take the layout and the camera were greyed for ever — and the
+        // dialog is the only place either can be chosen, so the one control
+        // that decides what a video LOOKS like became unreachable after the
+        // first recording.
         //
-        // `had_camera: false` unconditionally, and it is not a placeholder: no
-        // take this build can produce contains camera frames, because nothing
-        // encodes video yet. It becomes a real question the day it does.
-        let post_take = self.recorder.last_take_folder.is_some();
-        self.dialog = Some(Dialog::export(spec, post_take, false));
+        // It bought nothing, because nothing re-exports a finished take:
+        // there is no offline pass that repaints a display-only video from a
+        // recorded `.mid`, and the camera frames were encoded live and never
+        // kept. Every setting in this dialog applies to the NEXT take whichever
+        // mode it opened in, so greying half of them only stopped people
+        // configuring the thing the dialog is for.
+        //
+        // `Rederivable` and the post-take wording stay — they are correct, and
+        // they are what the day-one version of a real re-export will need. This
+        // is about which dialog the Export ROW opens, not about deleting the
+        // rule.
+        self.dialog = Some(Dialog::export(spec, false, false));
     }
 
     /// Longest take name the field accepts.
@@ -3171,11 +3190,20 @@ impl IvoryApp {
         s.show_fretboard = shows.fretboard;
         s.fretboard_detached = false;
         s.theory_detached = false;
-        if !shows.theory {
-            // Every diagram off, which is what makes `theory_views()` empty and
-            // therefore the band's height zero. Set as three flags rather than
-            // one "show theory" bool because there is no such bool: the band
-            // exists exactly when one of its three diagrams is on.
+        // The theory band is three flags and no "show theory" bool — it exists
+        // exactly when one of its diagrams is on — so the override has to work
+        // in both directions by hand.
+        if shows.theory {
+            // Asked for and nothing selected: show all three, which is what a
+            // fresh install shows. Forcing it off was symmetric and wrong —
+            // ticking "theory" in the Export dialog and getting no theory is
+            // the tick doing nothing.
+            if !s.theory_views().any() {
+                s.theory_circle = true;
+                s.theory_tonnetz = true;
+                s.theory_triangles = true;
+            }
+        } else {
             s.theory_circle = false;
             s.theory_tonnetz = false;
             s.theory_triangles = false;
@@ -3193,11 +3221,17 @@ impl IvoryApp {
         // fretboard on screen for yourself.
         let s = self.composite_settings(shows);
 
-        // Scaled to FILL the pane's width, then centred vertically. The bands
-        // are a fixed shape, so a pane of a different aspect gets bars rather
-        // than a stretched keyboard — and the bars are the video's own
-        // background, not black, so a stacked layout reads as one picture.
-        let bands = fit_bands(&s, rect.size());
+        // **FILLED, not fitted.** `fit_bands` preserves the stack's aspect and
+        // centres what is left, which is right for a window somebody sized and
+        // wrong here: in the default layout the pane IS the whole video frame,
+        // so fitting left the app as a strip through the middle with black
+        // above and below — the letterbox that made the old default put the
+        // camera first in the first place.
+        //
+        // For the stacked layouts this changes nothing: their pane is already
+        // sized to the content by `Layout::band_height`, so the scale factor
+        // comes out at one.
+        let bands = fill_bands(&s, rect.size());
         let total = bands.total();
         let origin = Pos2::new(
             rect.min.x + ((rect.width() - total.x) * 0.5).max(0.0).trunc(),

@@ -574,9 +574,20 @@ impl VideoMode {
 /// How the camera and the display share one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Layout {
-    /// Camera on top, Tangent's display below. The default because it is the
-    /// shape of every piano tutorial video ever made: hands above, keys below.
+    /// **The display fills the frame; the camera is a small inset over it.**
+    ///
+    /// The default, and the opposite of what it was. `CameraAbove` was the
+    /// default on the reading that this is a tutorial video — hands above,
+    /// keys below — and that is a real shape, but it makes the app the
+    /// SECONDARY thing: a fretboard and three theory diagrams squeezed into a
+    /// band under a webcam are too small to read, which is the whole reason
+    /// anybody would record them.
+    ///
+    /// This app draws the thing worth watching. The camera is the context.
     #[default]
+    DisplayFull,
+    /// Camera on top, the display below. The shape of every piano tutorial
+    /// video ever made.
     CameraAbove,
     DisplayAbove,
     /// Camera fills the frame with the display floated over the bottom of it.
@@ -585,7 +596,8 @@ pub enum Layout {
 }
 
 impl Layout {
-    pub const ALL: [Layout; 4] = [
+    pub const ALL: [Layout; 5] = [
+        Layout::DisplayFull,
         Layout::CameraAbove,
         Layout::DisplayAbove,
         Layout::CameraFull,
@@ -594,6 +606,7 @@ impl Layout {
 
     pub fn label(self) -> &'static str {
         match self {
+            Layout::DisplayFull => "Full app, camera inset",
             Layout::CameraAbove => "Camera above, display below",
             Layout::DisplayAbove => "Display above, camera below",
             Layout::CameraFull => "Camera full frame, display overlaid",
@@ -603,6 +616,7 @@ impl Layout {
 
     pub fn key(self) -> &'static str {
         match self {
+            Layout::DisplayFull => "display_full",
             Layout::CameraAbove => "camera_above",
             Layout::DisplayAbove => "display_above",
             Layout::CameraFull => "camera_full",
@@ -681,6 +695,30 @@ impl Layout {
     fn both(self, frame: egui::Rect, portrait: bool, display_aspect: f32) -> Panes {
         let band = Self::band_height(frame, portrait, display_aspect) / frame.height().max(1.0);
         match self {
+            // The display gets the whole frame and the camera sits in a corner
+            // of it. A QUARTER of the width, which is the size a face has to be
+            // to read as a person and no larger — the point of this layout is
+            // that the app is what you are watching.
+            //
+            // Bottom RIGHT: the app's own bands run full width and the busiest
+            // of them is the keyboard along the bottom, but the right-hand end
+            // of it is the top octaves, which are the least played. Top-right
+            // would sit over the chord name.
+            Layout::DisplayFull => {
+                let w = frame.width() * 0.25;
+                let h = w * 9.0 / 16.0;
+                let margin = frame.width() * 0.015;
+                Panes {
+                    camera: Some(egui::Rect::from_min_max(
+                        egui::Pos2::new(
+                            frame.right() - margin - w,
+                            frame.bottom() - margin - h,
+                        ),
+                        egui::Pos2::new(frame.right() - margin, frame.bottom() - margin),
+                    )),
+                    display: Some(frame),
+                }
+            }
             Layout::CameraAbove => {
                 let cut = frame.bottom() - frame.height() * band;
                 Panes {
@@ -740,7 +778,16 @@ impl Layout {
     /// camera and over it, and a stacked one is painted into a region the
     /// camera never touches.
     pub fn overlays(self) -> bool {
-        matches!(self, Layout::CameraFull)
+        matches!(self, Layout::CameraFull | Layout::DisplayFull)
+    }
+
+    /// Whether the CAMERA is the thing floated on top rather than the display.
+    ///
+    /// The compositor paints the overlaid layer last, and which one that is
+    /// differs: `CameraFull` floats the display over the camera, `DisplayFull`
+    /// floats the camera over the display.
+    pub fn camera_on_top(self) -> bool {
+        matches!(self, Layout::DisplayFull)
     }
 }
 
@@ -2144,6 +2191,55 @@ mod layout_tests {
             d.height() < f.height() * 0.30,
             "an overlay covering a third of the picture is not an overlay"
         );
+    }
+
+    /// **The default puts the APP on screen and the camera in the corner.**
+    ///
+    /// It was the other way round, and that made the thing worth watching the
+    /// secondary one: a fretboard and three theory diagrams squeezed into a
+    /// band under a webcam are too small to read, which is the whole reason
+    /// anybody would record them.
+    #[test]
+    fn the_default_layout_gives_the_display_the_frame() {
+        assert_eq!(Layout::default(), Layout::DisplayFull);
+        for frame in [landscape(), portrait()] {
+            let p = Layout::DisplayFull.split(frame, true, true, PIANO_AND_CHORD);
+            assert_eq!(
+                p.display,
+                Some(frame),
+                "the app should have the whole frame"
+            );
+            let cam = p.camera.expect("camera");
+            assert!(frame.contains_rect(cam), "the inset escaped the frame");
+            // Small enough to be context, big enough to be a person.
+            let share = cam.width() / frame.width();
+            assert!(
+                (0.15..=0.33).contains(&share),
+                "the inset takes {share} of the width"
+            );
+            // 16:9, so a webcam is not squashed into it.
+            let aspect = cam.width() / cam.height();
+            assert!((aspect - 16.0 / 9.0).abs() < 0.01, "the inset is {aspect}:1");
+            // Clear of the edges, and in the bottom right.
+            assert!(cam.right() < frame.right() && cam.bottom() < frame.bottom());
+            assert!(cam.left() > frame.center().x && cam.top() > frame.center().y);
+        }
+    }
+
+    /// The compositor has to know WHICH layer floats. `CameraFull` puts the
+    /// display over the camera; `DisplayFull` puts the camera over the display.
+    /// Painting the camera first regardless buried the inset under the app,
+    /// which is the same as not drawing it.
+    #[test]
+    fn the_overlaid_layer_is_named_and_the_two_full_frames_disagree() {
+        assert!(Layout::CameraFull.overlays());
+        assert!(!Layout::CameraFull.camera_on_top());
+        assert!(Layout::DisplayFull.overlays());
+        assert!(Layout::DisplayFull.camera_on_top());
+        for l in [Layout::CameraAbove, Layout::DisplayAbove, Layout::SideBySide] {
+            assert!(!l.overlays(), "{l:?} is stacked, not overlaid");
+            assert!(!l.camera_on_top(), "{l:?} floats nothing");
+        }
     }
 
     /// A degenerate frame must not produce a pane with negative size, which is

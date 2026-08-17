@@ -761,8 +761,15 @@ impl Layout {
         // does not reshuffle under the eye at the moment the take starts.
         // There is no record button while rolling — pressing it would mean
         // nothing, and a dead control is worse than no control.
-        let dot_d = (top.height() * 0.30).min(top.width() * 0.08);
-        self.dot = Rect::from_center_size(slice_h(top, 0.0, 0.12).center(), Vec2::splat(dot_d));
+        // **The same size as the stop button beside it.** The dot stands where
+        // the record button stood, and at 0.30 of the row against stop's 1.0 it
+        // read as a speck next to a slab — two controls of vastly different
+        // size, which is exactly what they are not: one is the state and the
+        // other is the way out of it, and they belong to the same pair.
+        // 0.16 of the row each, so the pair fits left of the timecode, which
+        // starts at 0.36 and is the biggest thing in the band while a take runs.
+        let dot_d = top.height().min(top.width() * 0.16);
+        self.dot = Rect::from_center_size(slice_h(top, 0.01, 0.17).center(), Vec2::splat(dot_d));
         // As close to its resting size as the row allows. It used to be 0.62
         // of the row height against a resting 1.0, so the one control you reach
         // for while your hands are on the keys shrank the moment the take
@@ -771,8 +778,8 @@ impl Layout {
         // Capped at the slice it has to live in, which is narrower here than
         // at rest: the timecode starts at 0.36 and is the biggest thing in the
         // band while a take runs.
-        let stop_d = top.height().min(top.width() * 0.20);
-        self.stop = Rect::from_center_size(slice_h(top, 0.13, 0.33).center(), Vec2::splat(stop_d));
+        let stop_d = dot_d;
+        self.stop = Rect::from_center_size(slice_h(top, 0.18, 0.34).center(), Vec2::splat(stop_d));
 
         // The one thing `hide_elapsed` suppresses is a CLOCK. The count-in beat
         // is the number the player is counting, and "FINISHING" is the reason
@@ -2780,6 +2787,35 @@ mod tests {
                 order(p.bg),
                 "#{r:02X}{g:02X}{b:02X}: the well lost the band's hue"
             );
+        }
+    }
+
+    /// **And the same size DURING a take, too.**
+    ///
+    /// The rolling layout draws a dot where the record button stood and the
+    /// stop button beside it. The dot was 0.30 of the row against stop's 1.0,
+    /// so it read as a speck next to a slab — two controls of vastly different
+    /// size, which is what they are not: one is the state and the other is the
+    /// way out of it.
+    #[test]
+    fn the_rolling_transport_is_the_same_size_as_itself() {
+        for w in [320.0_f32, 640.0, 1300.0, 2600.0] {
+            let r = band(w);
+            let v = RecorderView {
+                state: RecordState::Rolling,
+                ..idle()
+            };
+            let l = Layout::new(r, &v);
+            if !l.dot.is_positive() || !l.stop.is_positive() {
+                continue;
+            }
+            assert!(
+                (l.dot.width() - l.stop.width()).abs() < 0.51,
+                "at {w}: the dot is {} wide and stop is {}",
+                l.dot.width(),
+                l.stop.width()
+            );
+            assert!(!l.dot.intersects(l.stop), "at {w}: they overlap");
         }
     }
 

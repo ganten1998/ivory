@@ -216,6 +216,15 @@ pub struct MenuView {
     pub count_in_bars: u32,
     /// §5: whether the count-in is written into the take.
     pub count_in_in_take: bool,
+    /// The menu was opened by right-clicking the Recorder band, so the
+    /// Recorder's own category and its choice lists come FIRST.
+    ///
+    /// The rest of the menu is unchanged: this reorders, it does not filter. A
+    /// context menu that showed only the thing under the pointer would be a
+    /// second menu to learn, and the one thing everybody does with a right
+    /// click — dark mode, the fretboard — would stop working depending on
+    /// where they clicked.
+    pub recorder_first: bool,
     /// §5: the live count-in, in beats. Comes from `Settings::count_in_beats()`,
     /// which has already clamped a stray value from a later build's file to
     /// something this menu can mark.
@@ -1110,7 +1119,47 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     e.push(Entry::Separator);
     e.push(item("About", MenuAction::ShowAbout));
     e.push(item("Reset Settings to Default", MenuAction::ResetSettings));
+    if view.recorder_first {
+        move_recorder_to_the_front(&mut e);
+    }
     e
+}
+
+/// Bring the Recorder's categories to the top, in their existing order.
+///
+/// A right-click ON the band opens its own settings first. The band is a
+/// surface with fifteen controls on it, and reaching the sixteenth meant a
+/// right-click anywhere at all followed by a hunt down a list of subjects that
+/// are mostly about the piano.
+///
+/// It REORDERS and does not filter. A context menu showing only what is under
+/// the pointer would be a second menu to learn, and the things everybody does
+/// with a right click — dark mode, the fretboard — would start depending on
+/// where they happened to click.
+///
+/// Matched by NAME rather than rebuilt, so there is one definition of what the
+/// Recorder's rows are and this cannot drift from it.
+fn move_recorder_to_the_front(e: &mut Vec<Entry>) {
+    const OURS: [&str; 4] = ["Recorder", "Sources", "Time signature", "Count-in"];
+    let mut moved: Vec<Entry> = Vec::new();
+    // Kept in the order OURS lists, which is the order they already appear in —
+    // so this is a move, not a re-sort, and adding a fifth category to the
+    // block needs one edit here rather than a guess about position.
+    for want in OURS {
+        if let Some(i) = e.iter().position(|x| {
+            matches!(x, Entry::Submenu { label, .. } if label == want)
+        }) {
+            moved.push(e.remove(i));
+        }
+    }
+    if moved.is_empty() {
+        return;
+    }
+    // A separator under the block, so the rest of the menu still reads as the
+    // list of subjects it was.
+    moved.push(Entry::Separator);
+    moved.extend(e.drain(..));
+    *e = moved;
 }
 
 impl MenuState {
@@ -1653,6 +1702,7 @@ mod tests {
             time_signature: crate::recorder::TimeSignature::default(),
             count_in_bars: 1,
             count_in_in_take: false,
+            recorder_first: false,
             record_sources: "auto".to_owned(),
             metronome_on: false,
             metronome_in_take: false,
@@ -2448,6 +2498,49 @@ mod tests {
         let settled = arrive + SUB_SWITCH_DWELL;
         assert!(!settle_submenu(&mut open, &mut pending, Some(0), false, true, false, settled));
         assert_eq!(open, Some(0), "a deliberate hover must still work");
+    }
+
+    /// **Right-clicking the band puts the Recorder first.**
+    ///
+    /// The band is a surface with fifteen controls on it, and reaching the
+    /// sixteenth meant a right-click anywhere at all followed by a hunt down a
+    /// list of subjects that are mostly about the piano.
+    #[test]
+    fn a_right_click_on_the_band_leads_with_the_recorder() {
+        let v = MenuView {
+            recorder_on: true,
+            recorder_first: true,
+            ..view()
+        };
+        let names = category_names(v.clone());
+        assert_eq!(
+            &names[..4],
+            &["Recorder", "Sources", "Time signature", "Count-in"],
+            "the recorder block does not lead: {names:?}"
+        );
+
+        // **And nothing is lost.** It reorders; it does not filter. A context
+        // menu showing only what is under the pointer would be a second menu to
+        // learn, and dark mode would start depending on where you clicked.
+        let elsewhere = MenuView {
+            recorder_on: true,
+            recorder_first: false,
+            ..view()
+        };
+        let mut a = category_names(v);
+        let mut b = category_names(elsewhere.clone());
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "the two menus hold different categories");
+        assert_eq!(
+            all_rows(elsewhere.clone()).len(),
+            all_rows(MenuView {
+                recorder_first: true,
+                ..elsewhere
+            })
+            .len(),
+            "a row went missing when the block moved"
+        );
     }
 
     /// **A menu that appears under the cursor must not act on what it landed

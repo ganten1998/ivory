@@ -419,10 +419,13 @@ impl Default for Settings {
             // A mid walnut. Dark enough that the ivory ink reads on it, warm
             // enough to be a brown rather than a grey, and desaturated enough
             // not to fight the accent colour the meters use.
+            // Darker than the first walnut, and warmer: the trim on a Tascam
+            // 388 rather than a furniture stain. Dark enough that the ivory ink
+            // is chosen against it with room to spare.
             recorder_bg_color: Rgb {
-                r: 0x4A,
-                g: 0x3B,
-                b: 0x2C,
+                r: 0x33,
+                g: 0x27,
+                b: 0x1B,
             },
             chord_text_color: Rgb {
                 r: 0xE8,

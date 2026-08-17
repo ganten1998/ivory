@@ -197,6 +197,7 @@ impl Compositor {
         );
         let camera_id = self.camera.as_ref().map(|c| (c.id, c.size));
         let overlays = layout.overlays();
+        let camera_on_top = layout.camera_on_top();
 
         let input = egui::RawInput {
             screen_rect: Some(frame_rect),
@@ -212,11 +213,19 @@ impl Compositor {
                 .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
                 .show(ctx, |ui| {
                     let painter = ui.painter();
-                    if let (Some(pane), Some((id, size))) = (panes.camera, camera_id) {
-                        paint_camera(painter, pane, id, size);
+                    // **Which layer is on top depends on the layout.**
+                    // `CameraFull` floats the display over the camera;
+                    // `DisplayFull` floats the camera over the display. Painting
+                    // the camera first unconditionally put the inset UNDER the
+                    // app it is supposed to sit on, which is the same as not
+                    // drawing it at all.
+                    if !camera_on_top {
+                        if let (Some(pane), Some((id, size))) = (panes.camera, camera_id) {
+                            paint_camera(painter, pane, id, size);
+                        }
                     }
                     if let Some(pane) = panes.display {
-                        if overlays {
+                        if overlays && !camera_on_top {
                             // A scrim under an overlaid band, or a white key on
                             // a pale wall is a keyboard nobody can see. Only
                             // when it IS overlaid: a stacked band already has
@@ -228,6 +237,19 @@ impl Compositor {
                             );
                         }
                         app.paint_composite(painter, pane, shows);
+                    }
+                    if camera_on_top {
+                        if let (Some(pane), Some((id, size))) = (panes.camera, camera_id) {
+                            // A hairline round the inset, so a dark webcam does
+                            // not look like a hole cut in the app.
+                            paint_camera(painter, pane, id, size);
+                            painter.rect_stroke(
+                                pane,
+                                0.0,
+                                egui::Stroke::new(2.0, egui::Color32::from_gray(0x20)),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
                     }
                 });
         });
@@ -558,25 +580,25 @@ mod tests {
     /// **The whole pipeline, in one test, producing a file a person can watch.**
     ///
     /// Compositor to encoder to `.mp4`: a moving synthetic camera, the real
-    /// display bands painted over it by the real app, real audio, in the
-    /// VERTICAL frame — because 9:16 is the layout most likely to be wrong and
-    /// least likely to be looked at.
+    /// display bands painted by the real app, real audio, in the layout a take
+    /// actually uses — because the DEFAULT is the one every recording gets and
+    /// the one nobody thinks to check.
     ///
     /// It writes to a named path and prints it, so the output is something to
     /// open rather than only something to assert on.
     #[test]
     #[ignore = "needs a GPU, and writes a real video"]
-    fn the_whole_pipeline_writes_a_vertical_video_with_sound() {
+    fn the_whole_pipeline_writes_a_video_in_the_default_layout() {
         let Some((device, queue)) = headless() else {
             eprintln!("no GPU adapter — the pipeline was not exercised");
             return;
         };
         use ivory_record::encode::{AudioSpec, Encoder, VideoSpec};
 
-        // The Reels / Shorts frame, at a third scale so the test is quick. The
-        // ASPECT is what the layout reads, and it is the same 9:16.
-        const W: u32 = 360;
-        const H: u32 = 640;
+        // Landscape at half 1080p, in the DEFAULT layout, so the frame the
+        // test writes is the one a take actually produces.
+        const W: u32 = 960;
+        const H: u32 = 540;
         const FPS: u32 = 30;
         const RATE: u32 = 48_000;
         const CH: usize = 2;
@@ -585,7 +607,7 @@ mod tests {
         let dir = std::env::temp_dir().join("tangent-pipeline");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let path = dir.join("vertical.mp4");
+        let path = dir.join("default-layout.mp4");
 
         let mut c = Compositor::on(device, queue, W, H).expect("compositor");
         let app = IvoryApp::new(
@@ -627,7 +649,7 @@ mod tests {
             let bgra = c
                 .frame(
                     &app,
-                    Layout::CameraAbove,
+                    Layout::default(),
                     DisplayShows::default(),
                     true,
                     true,
@@ -671,7 +693,7 @@ mod tests {
             "the frame is not {W}x{H}: {probe}"
         );
         // Portrait, which is the point of this test.
-        assert!(H > W);
+        assert!(W > H);
     }
 
     /// A frame with no camera in it is still a frame, and it is black rather
