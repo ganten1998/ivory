@@ -24,6 +24,9 @@ pub enum KeyAction {
     ClearNotes,
     ToggleFretboard,
     ToggleCameraPane,
+    ToggleStaff,
+    CycleClef,
+    ToggleNoteNames,
     CycleTheory,
     ToggleDarkMode,
     ToggleDetection,
@@ -131,6 +134,14 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // band's, both of them for years — a shortcut that moves is worse than one
     // that is not the first letter of the thing it does.
     (Key::W, "W", KeyAction::ToggleCameraPane, true),
+    // **U I O, in that order, are the sheet music.** Not one of them is the
+    // first letter of what it does, and there was no letter left that was:
+    // `S` is the supporter key, `C` the chord detector, `N` the chord namer.
+    // Three keys next to each other under one hand beat three unrelated
+    // letters that each ALMOST stand for something.
+    (Key::U, "U", KeyAction::ToggleNoteNames, true),
+    (Key::I, "I", KeyAction::CycleClef, true),
+    (Key::O, "O", KeyAction::ToggleStaff, true),
     (Key::T, "T", KeyAction::CycleTheory, true),
     (Key::C, "C", KeyAction::ToggleDetection, true),
     (Key::D, "D", KeyAction::ToggleDarkMode, true),
@@ -192,6 +203,9 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ClearNotes => "clear every note you placed",
         KeyAction::ToggleFretboard => "guitar view",
         KeyAction::ToggleCameraPane => "camera",
+        KeyAction::ToggleStaff => "sheet music",
+        KeyAction::CycleClef => "clef",
+        KeyAction::ToggleNoteNames => "note names",
         KeyAction::CycleTheory => "cycle the theory band",
         KeyAction::ToggleDarkMode => "dark mode",
         KeyAction::ToggleDetection => "chord detection",
@@ -590,6 +604,9 @@ mod tests {
             (Key::K, KeyAction::ToggleKeytoggle),
             (Key::G, KeyAction::ToggleFretboard),
             (Key::W, KeyAction::ToggleCameraPane),
+            (Key::U, KeyAction::ToggleNoteNames),
+            (Key::I, KeyAction::CycleClef),
+            (Key::O, KeyAction::ToggleStaff),
         ] {
             for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
                 assert_eq!(press(key, gates), Some(want), "{key:?} under {gates:?}");

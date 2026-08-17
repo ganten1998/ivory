@@ -872,6 +872,7 @@ pub fn shows_from_settings(s: &crate::settings::Settings) -> DisplayShows {
         // Tonnetz showing — hence `Views::any`, which is the same question the
         // band itself asks.
         theory: s.theory_views().any(),
+        staff: s.show_staff,
     }
 }
 
@@ -3398,6 +3399,13 @@ pub fn show(
                                             &mut spec.composite.shows.theory,
                                             "Theory",
                                         );
+                                        export_check(
+                                            ui,
+                                            &t,
+                                            shows_on,
+                                            &mut spec.composite.shows.staff,
+                                            "Sheet music",
+                                        );
                                     });
 
                                     // ── frame size and rate ─────────────────
@@ -4055,6 +4063,7 @@ mod tests {
                         chord: false,
                         fretboard: false,
                         theory: false,
+                        staff: true,
                     },
                     ..Default::default()
                 },

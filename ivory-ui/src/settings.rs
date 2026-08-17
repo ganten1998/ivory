@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 2;
+const SETTINGS_VERSION: u64 = 3;
 
 /// Recorder backgrounds this app shipped as defaults before [`SETTINGS_VERSION`]
 /// 1, and which are therefore not evidence that anybody chose them.
@@ -234,6 +234,25 @@ pub struct Settings {
     /// Searched BEFORE the standard paths, so a folder somebody pointed at
     /// deliberately shadows a copy of the same plugin in a system directory.
     pub plugin_paths: Vec<String>,
+    /// The sheet music band is showing.
+    pub show_staff: bool,
+    /// Which staves it shows, as `StaffSet::key` writes it.
+    ///
+    /// A string rather than an enum because a custom set is a LIST of clefs and
+    /// the settings file is flat — and because an unreadable value has to land
+    /// on the grand staff rather than refuse to load, which is what
+    /// `StaffSet::from_key` does.
+    pub staff_set: String,
+    /// Letter names printed inside the noteheads.
+    pub staff_note_names: bool,
+    /// The user's own stack of clefs, remembered separately from the one that
+    /// is showing.
+    ///
+    /// **Separate on purpose.** `staff_set` is what is on screen and `I` walks
+    /// it through the presets; if the custom stack lived only there, one press
+    /// of `I` would destroy a set somebody had built a clef at a time. This is
+    /// where it is kept, and selecting it in the menu copies it across.
+    pub custom_staff_set: Option<String>,
     pub show_camera_pane: bool,
     /// Which side of the theory band the pane sits on. Right by default: the
     /// diagrams are read left to right and the first one is the one people
@@ -508,6 +527,10 @@ impl Default for Settings {
             theory_tonnetz: false,
             theory_triangles: false,
             theory_follow_midi: true,
+            show_staff: true,
+            staff_set: "grand".to_owned(),
+            staff_note_names: false,
+            custom_staff_set: None,
             plugin_paths: Vec::new(),
             show_camera_pane: false,
             camera_pane_left: false,
@@ -556,6 +579,15 @@ impl Default for Settings {
 }
 
 impl Settings {
+
+    /// Which staves the sheet music band is showing.
+    pub fn staff_set(&self) -> crate::staff::StaffSet {
+        crate::staff::StaffSet::from_key(&self.staff_set)
+    }
+
+    pub fn set_staff_set(&mut self, set: &crate::staff::StaffSet) {
+        self.staff_set = set.key();
+    }
     /// Literal `~/.config/ivory/settings.json` on every platform (parity).
     ///
     /// **Under `cargo test` this is redirected to a temporary directory.** It
@@ -840,6 +872,16 @@ impl Settings {
                 .filter(|x| !x.trim().is_empty())
                 .collect();
         }
+        take_bool(&mut map, "show_staff", &mut s.show_staff);
+        take_bool(&mut map, "staff_note_names", &mut s.staff_note_names);
+        if let Some(v) = map.remove("staff_set") {
+            if let Some(k) = v.as_str() {
+                s.staff_set = k.to_owned();
+            }
+        }
+        if let Some(v) = map.remove("custom_staff_set") {
+            s.custom_staff_set = v.as_str().map(str::to_owned).filter(|k| !k.is_empty());
+        }
         take_bool(&mut map, "show_camera_pane", &mut s.show_camera_pane);
         take_bool(&mut map, "camera_pane_left", &mut s.camera_pane_left);
         if let Some(v) = map.remove("capo_style") {
@@ -1050,6 +1092,12 @@ impl Settings {
                 self.record_export.composite.layout = crate::recorder::Layout::default();
             }
         }
+        if was < 3 {
+            // The sheet music band. New, and on by default — a notation view
+            // nobody can see is the same as one nobody wrote, which is the
+            // failure this whole version stamp exists because of. `O` hides it.
+            self.show_staff = true;
+        }
         if was < 2 {
             // The theory band used to sit still until you clicked something,
             // which meant the first thing a new user learned about it was that
@@ -1155,6 +1203,20 @@ impl Settings {
         map.insert(
             "theory_follow_midi".into(),
             Value::Bool(self.theory_follow_midi),
+        );
+        map.insert("show_staff".into(), Value::Bool(self.show_staff));
+        map.insert("staff_set".into(), Value::String(self.staff_set.clone()));
+        // Absent rather than null when there is none, the same rule the custom
+        // tuning follows, so an older build never meets a key it cannot read.
+        if let Some(custom) = &self.custom_staff_set {
+            map.insert(
+                "custom_staff_set".into(),
+                Value::String(custom.clone()),
+            );
+        }
+        map.insert(
+            "staff_note_names".into(),
+            Value::Bool(self.staff_note_names),
         );
         map.insert(
             "plugin_paths".into(),

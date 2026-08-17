@@ -18,6 +18,7 @@ use crate::ports::{CaptureDevices, MidiPorts};
 use crate::recorder;
 use crate::recorder_panel;
 use crate::settings::{Rgb, Settings};
+use crate::staff;
 use crate::theory_panel;
 use egui::{Pos2, Rect, Vec2, ViewportCommand};
 use ivory_core::voicing::{VoicingSession, Weights};
@@ -991,6 +992,23 @@ impl IvoryApp {
             recorder_on: self.settings.show_recorder,
             camera_pane_on: self.settings.show_camera_pane,
             extra_plugin_folders: self.settings.plugin_paths.len(),
+            staff_on: self.settings.show_staff,
+            staff_note_names: self.settings.staff_note_names,
+            staff_set: self.settings.staff_set.clone(),
+            // Offered only when there IS one — a "Custom" row that does nothing
+            // is worse than no row, and the way to make one is the dialog.
+            staff_custom_label: self
+                .settings
+                .custom_staff_set
+                .as_ref()
+                .map(|k| staff::StaffSet::from_key(k).label()),
+            staff_clefs: self
+                .settings
+                .staff_set()
+                .clefs()
+                .iter()
+                .map(|c| c.key().to_owned())
+                .collect(),
             recorder_detached: self.settings.recorder_detached,
             count_in_beats: self.settings.count_in_beats(),
             time_signature: self.settings.time_signature(),
@@ -2211,6 +2229,9 @@ impl IvoryApp {
             }
             K::ToggleFretboard => self.apply_menu_action(ctx, MenuAction::ToggleFretboard),
             K::ToggleCameraPane => self.apply_menu_action(ctx, MenuAction::ToggleCameraPane),
+            K::ToggleStaff => self.apply_menu_action(ctx, MenuAction::ToggleStaff),
+            K::CycleClef => self.apply_menu_action(ctx, MenuAction::CycleClef),
+            K::ToggleNoteNames => self.apply_menu_action(ctx, MenuAction::ToggleNoteNames),
             // One key, five states, in the order someone discovering the band
             // would want them: nothing, each diagram alone, then all three.
             // Three independent toggles have eight states and no natural
@@ -2438,6 +2459,65 @@ impl IvoryApp {
                 // too — the window has to be asked for a new size or the
                 // diagrams draw into a row that is the wrong shape for them.
                 self.request_natural_size();
+            }
+            MenuAction::ToggleStaff => {
+                self.settings.show_staff = !self.settings.show_staff;
+                self.save_settings();
+                self.request_natural_size();
+            }
+            MenuAction::CycleClef => {
+                // Turning the clef on a band you cannot see is the one thing
+                // this key could do that would look broken, so it opens it.
+                let next = self.settings.staff_set().next();
+                self.settings.set_staff_set(&next);
+                self.settings.show_staff = true;
+                self.save_settings();
+                // The staff count changes with the set — one staff or two — so
+                // the window has to be asked for a new height.
+                self.request_natural_size();
+            }
+            MenuAction::SetStaffSet(key) => {
+                self.settings.staff_set = if key == "__custom__" {
+                    // The stack the user built, brought back out of where it is
+                    // kept. See `Settings::custom_staff_set`.
+                    self.settings
+                        .custom_staff_set
+                        .clone()
+                        .unwrap_or_else(|| "grand".to_owned())
+                } else {
+                    key.to_owned()
+                };
+                self.settings.show_staff = true;
+                self.save_settings();
+                self.request_natural_size();
+            }
+            MenuAction::ToggleCustomClef(key) => {
+                if let Some(clef) = staff::Clef::from_key(key) {
+                    // Toggling from a PRESET starts the custom stack off from
+                    // what is on screen, so ticking "Alto" while the grand
+                    // staff is showing gives you treble, alto and bass — not
+                    // alto alone, which is what starting from nothing would do
+                    // and is never what anybody means.
+                    match self.settings.staff_set().with_clef_toggled(clef) {
+                        Some(set) => {
+                            self.settings.set_staff_set(&set);
+                            self.settings.custom_staff_set = Some(set.key());
+                        }
+                        // The last staff was just removed. A band with nothing
+                        // in it is not a view.
+                        None => {
+                            self.settings.staff_set = "grand".to_owned();
+                            self.settings.custom_staff_set = None;
+                        }
+                    }
+                    self.settings.show_staff = true;
+                    self.save_settings();
+                    self.request_natural_size();
+                }
+            }
+            MenuAction::ToggleNoteNames => {
+                self.settings.staff_note_names = !self.settings.staff_note_names;
+                self.save_settings();
             }
             MenuAction::RescanPlugins => {
                 self.plugin_rescan = true;
@@ -3119,11 +3199,14 @@ fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
     } else {
         0.0
     };
+    let staff_h = staff::visible_set(settings)
+        .map_or(0.0, |set| staff::band_height(w, &set));
     Bands {
         w,
         recorder_h,
         theory_h,
         camera_w,
+        staff_h,
         chord_h,
         piano_h,
         fret_h,
@@ -3191,6 +3274,7 @@ fn fill_bands(settings: &Settings, avail: Vec2) -> Bands {
         w,
         recorder_h: natural.recorder_h * k,
         theory_h: natural.theory_h * k,
+        staff_h: natural.staff_h * k,
         // Scaled by `k` as well, and it has to be. `k` stretches every band's
         // height to fill the screen, so the theory row ends up `h*k` tall — and
         // a pane whose width did NOT follow stops being 16:9 and starts putting
@@ -3244,6 +3328,10 @@ struct Bands {
     theory_h: f32,
     /// How much of that row the camera pane takes. Zero when it is off.
     camera_w: f32,
+    /// The sheet music, between the diagrams and the chord name — which is
+    /// where it belongs in a window that goes from keys at the bottom to the
+    /// most abstract thing at the top.
+    staff_h: f32,
     chord_h: f32,
     piano_h: f32,
     fret_h: f32,
@@ -3287,7 +3375,12 @@ impl Bands {
     fn total(self) -> Vec2 {
         Vec2::new(
             self.w,
-            self.recorder_h + self.theory_h + self.chord_h + self.piano_h + self.fret_h,
+            self.recorder_h
+                + self.theory_h
+                + self.staff_h
+                + self.chord_h
+                + self.piano_h
+                + self.fret_h,
         )
     }
 }
@@ -3362,6 +3455,7 @@ impl IvoryApp {
         s.chord_window_detached = false;
         s.show_fretboard = shows.fretboard;
         s.fretboard_detached = false;
+        s.show_staff = shows.staff;
         s.theory_detached = false;
         // The theory band is three flags and no "show theory" bool — it exists
         // exactly when one of its diagrams is on — so the override has to work
@@ -3452,10 +3546,18 @@ impl IvoryApp {
                 );
             }
         }
+        if bands.staff_h > 0.0 && shows.staff {
+            staff::draw(
+                painter,
+                band_at(bands.theory_h, bands.staff_h),
+                &display,
+                &s,
+            );
+        }
         if bands.chord_h > 0.0 && shows.chord {
             chord_strip::draw(
                 painter,
-                band_at(bands.theory_h, bands.chord_h),
+                band_at(bands.theory_h + bands.staff_h, bands.chord_h),
                 self.current_chord.as_deref(),
                 s.chord_text_color.to_color32(),
                 // No heart and no transpose arrows in the video. Both are
@@ -3470,7 +3572,7 @@ impl IvoryApp {
         if shows.piano {
             piano::draw(
                 painter,
-                band_at(bands.theory_h + bands.chord_h, bands.piano_h),
+                band_at(bands.theory_h + bands.staff_h + bands.chord_h, bands.piano_h),
                 &display,
                 self.notes.sustain_down(),
                 &s,
@@ -3479,7 +3581,7 @@ impl IvoryApp {
         if bands.fret_h > 0.0 {
             let spec = s.fretboard_spec();
             let r = band_at(
-                bands.theory_h + bands.chord_h + bands.piano_h,
+                bands.theory_h + bands.staff_h + bands.chord_h + bands.piano_h,
                 bands.fret_h,
             );
             fretboard_panel::draw(
@@ -3712,6 +3814,7 @@ impl IvoryApp {
             recorder_h,
             theory_h,
             camera_w: _,
+            staff_h,
             chord_h,
             piano_h,
             fret_h,
@@ -3786,10 +3889,10 @@ impl IvoryApp {
         let band_at = |top: f32, h: f32| {
             Rect::from_min_size(Pos2::new(origin.x, origin.y + top), Vec2::new(w, h))
         };
-        let piano_rect = band_at(recorder_h + theory_h + chord_h, piano_h);
+        let piano_rect = band_at(recorder_h + theory_h + staff_h + chord_h, piano_h);
         let mut chord_rect_for_hit: Option<Rect> = None;
         let fret_rect_for_hit: Option<Rect> = (fret_h > 0.0)
-            .then(|| band_at(recorder_h + theory_h + chord_h + piano_h, fret_h));
+            .then(|| band_at(recorder_h + theory_h + staff_h + chord_h + piano_h, fret_h));
         // The row, then the two halves of it. The camera pane is not a hit
         // target — there is nothing to click on a picture of yourself — so only
         // the diagrams' half goes to the hit test.
@@ -3851,8 +3954,16 @@ impl IvoryApp {
                 &self.settings,
             );
         }
+        if staff_h > 0.0 {
+            staff::draw(
+                ui.painter(),
+                band_at(recorder_h + theory_h, staff_h),
+                &display,
+                &self.settings,
+            );
+        }
         if chord_h > 0.0 {
-            let chord_rect = band_at(recorder_h + theory_h, chord_h);
+            let chord_rect = band_at(recorder_h + theory_h + staff_h, chord_h);
             chord_rect_for_hit = Some(chord_rect);
             chord_strip::draw(
                 ui.painter(),
@@ -5761,7 +5872,13 @@ mod tests {
 
     #[test]
     fn size_math_matches_python_int_truncation() {
+        // The piano and the chord strip alone: this test is about the size
+        // ARITHMETIC — the truncation Python did — and every other band is a
+        // separate term added to the same total. Leaving the sheet music on
+        // would be testing that the staff band exists, which its own module
+        // does, while making a failure here unreadable.
         let mut s = Settings::default();
+        s.show_staff = false;
         let table = [
             (50, 650.0, 75.0, 25.0),
             (75, 975.0, 112.0, 37.0),

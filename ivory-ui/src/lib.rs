@@ -19,6 +19,7 @@ pub mod recorder;
 pub mod recorder_panel;
 pub mod settings;
 pub mod splash;
+pub mod staff;
 pub mod shell;
 pub mod theory_panel;
 

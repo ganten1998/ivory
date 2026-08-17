@@ -20,6 +20,7 @@
 use crate::fonts;
 use crate::fretboard_panel;
 use crate::host::Caps;
+use crate::staff::Clef;
 use egui::{Button, Color32, CornerRadius, FontId, Margin, Pos2, Rect, Stroke, Vec2};
 use ivory_core::fretboard;
 use std::time::Instant;
@@ -71,6 +72,16 @@ pub enum MenuAction {
     ToggleFretboard,
     /// Show or hide the camera pane beside the theory band.
     ToggleCameraPane,
+    /// Show or hide the sheet music band.
+    ToggleStaff,
+    /// Step to the next clef preset.
+    CycleClef,
+    /// Set the staves outright, by key.
+    SetStaffSet(&'static str),
+    /// Add or remove one clef from the user's own stack.
+    ToggleCustomClef(&'static str),
+    /// Letter names inside the noteheads.
+    ToggleNoteNames,
     /// Look for VST3 bundles again, now.
     RescanPlugins,
     /// Add another folder to the list of places that are looked in.
@@ -216,6 +227,16 @@ pub struct MenuView {
     pub camera_pane_on: bool,
     /// How many folders the user has added to the plugin search list.
     pub extra_plugin_folders: usize,
+    /// The sheet music band is showing.
+    pub staff_on: bool,
+    /// Letter names are printed inside the noteheads.
+    pub staff_note_names: bool,
+    /// Which staves, as the settings file spells it.
+    pub staff_set: String,
+    /// The user's own stack of clefs, if they have one, ready to be listed.
+    pub staff_custom_label: Option<String>,
+    /// Which clefs are on screen right now, by key, for the Staves list.
+    pub staff_clefs: Vec<String>,
     /// §5: the Recorder band is in its own window.
     ///
     /// Needed for the same reason `theory_detached` is: the Detach row renames
@@ -798,6 +819,80 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     }
     push_category(&mut e, "Theory", theory);
 
+    // ── Sheet music ────────────────────────────────────────────────────────
+    // Its own subject, between Theory and Fretboard, in the order the bands
+    // themselves are stacked — a menu that lists panels in a different order
+    // from the window is a menu you have to translate.
+    let mut staff = vec![row(
+        if view.staff_on {
+            "Hide Sheet Music (O)"
+        } else {
+            "Show Sheet Music (O)"
+        },
+        MenuAction::ToggleStaff,
+    )];
+    if view.staff_on {
+        staff.push(row(
+            if view.staff_note_names {
+                "Hide Note Names (U)"
+            } else {
+                "Show Note Names (U)"
+            },
+            MenuAction::ToggleNoteNames,
+        ));
+    }
+    push_category(&mut e, "Sheet music", staff);
+    if view.staff_on {
+        // Every preset, marked, plus whatever custom stack the user built —
+        // which is listed and marked like the rest rather than hidden behind
+        // the word "custom", because a set you cannot see is one you cannot
+        // trust you are looking at.
+        let mut clefs: Vec<SubItem> = Vec::new();
+        for (key, label) in STAFF_PRESETS {
+            clefs.push(SubItem {
+                label: if *key == view.staff_set {
+                    format!("{label}  \u{2022}")
+                } else {
+                    (*label).to_owned()
+                },
+                action: MenuAction::SetStaffSet(key),
+                enabled: true,
+            });
+        }
+        if let Some(custom) = view.staff_custom_label.clone() {
+            clefs.push(SubItem {
+                label: if view.staff_set.starts_with("custom:") {
+                    format!("{custom}  \u{2022}")
+                } else {
+                    custom
+                },
+                action: MenuAction::SetStaffSet("__custom__"),
+                enabled: true,
+            });
+        }
+        push_category(&mut e, "Clef", clefs);
+        // **A staff each, for a room with more than one instrument in it.**
+        // Ticking a second clef here stacks it under the first and every staff
+        // shows every note — so a violist reads alto while the pianist reads
+        // the grand staff, off the same chord.
+        push_category(
+            &mut e,
+            "Staves",
+            Clef::ALL
+                .into_iter()
+                .map(|c| SubItem {
+                    label: if view.staff_clefs.contains(&c.key().to_owned()) {
+                        format!("{}  \u{2022}", c.label())
+                    } else {
+                        c.label().to_owned()
+                    },
+                    action: MenuAction::ToggleCustomClef(c.key()),
+                    enabled: true,
+                })
+                .collect(),
+        );
+    }
+
     // ── Fretboard ──────────────────────────────────────────────────────────
     // D-UI-15: the guitar view. Its own subject, because it is a second
     // instrument rather than another chord-display option. While it is off the
@@ -1182,6 +1277,21 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
 ///
 /// Matched by NAME rather than rebuilt, so there is one definition of what the
 /// Recorder's rows are and this cannot drift from it.
+/// The clef presets the Clef submenu offers, in the order `I` walks them.
+///
+/// A table rather than a loop over `Clef::ALL`, because the grand staff is not
+/// a clef and belongs first — it is what a pianist wants and what the band
+/// opens with.
+pub const STAFF_PRESETS: &[(&str, &str)] = &[
+    ("grand", "Grand staff"),
+    ("treble", "Treble"),
+    ("bass", "Bass"),
+    ("alto", "Alto"),
+    ("tenor", "Tenor"),
+    ("treble8vb", "Treble 8vb (guitar, tenor)"),
+    ("bass8vb", "Bass 8vb (double bass)"),
+];
+
 fn move_recorder_to_the_front(e: &mut Vec<Entry>) {
     const OURS: [&str; 5] = [
         "Recorder",
@@ -1748,6 +1858,11 @@ mod tests {
             recorder_on: false,
             camera_pane_on: false,
             extra_plugin_folders: 0,
+            staff_on: true,
+            staff_note_names: false,
+            staff_set: "grand".to_owned(),
+            staff_custom_label: None,
+            staff_clefs: Vec::new(),
             recorder_detached: false,
             count_in_beats: 4,
             time_signature: crate::recorder::TimeSignature::default(),
@@ -1993,7 +2108,16 @@ mod tests {
         // Fretboard category is that row rather than a hover onto one item.
         assert_eq!(
             category_names(v.clone()),
-            vec!["Window", "Colors", "Keyboard", "Chords", "Theory"],
+            vec![
+                "Window",
+                "Colors",
+                "Keyboard",
+                "Chords",
+                "Theory",
+                "Sheet music",
+                "Clef",
+                "Staves"
+            ],
             "no fretboard hovers while the fretboard is off"
         );
         assert!(rows(v.clone()).iter().any(|(l, ..)| l == "Show Fretboard"));
@@ -2015,6 +2139,9 @@ mod tests {
                 "Keyboard",
                 "Chords",
                 "Theory",
+                "Sheet music",
+                "Clef",
+                "Staves",
                 "Fretboard",
                 "Wood",
                 "Tuning",
@@ -2181,15 +2308,21 @@ mod tests {
         // rather than sprawl: one subject (Recorder) plus three choice-list
         // siblings — Sources, Time signature and Count-in — which is the exact
         // shape the fretboard already has and the only shape `Entry::Submenu`
-        // allows, since a submenu cannot hold another one. Raise this only for
-        // a reason that can be written down in the same breath.
+        // allows, since a submenu cannot hold another one. The sheet music
+        // costs the same two the fretboard does: the subject and the list of
+        // clefs. Plugin folders is the one place a plugin host has to be able
+        // to say "look again", and it is a sibling of Sources for that reason.
+        // Raise this only for a reason that can be written down in the same
+        // breath.
         assert!(
-            count(fullest()) <= 20,
+            count(fullest()) <= 25,
             "the fullest menu is back to {} top-level rows",
             count(fullest())
         );
+        // The everyday menu gains the two the sheet music costs, and it is
+        // the band the app now opens with.
         assert!(
-            count(view()) <= 11,
+            count(view()) <= 14,
             "the everyday menu is {} top-level rows",
             count(view())
         );
@@ -2410,6 +2543,9 @@ mod tests {
                 "Keyboard",
                 "Chords",
                 "Theory",
+                "Sheet music",
+                "Clef",
+                "Staves",
                 "Fretboard",
                 "Wood",
                 "Tuning",
@@ -2772,6 +2908,9 @@ mod tests {
                 "Keyboard",
                 "Chords",
                 "Theory",
+                "Sheet music",
+                "Clef",
+                "Staves",
                 "Fretboard",
                 "Wood",
                 "Tuning",

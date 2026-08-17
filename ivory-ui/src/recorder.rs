@@ -953,6 +953,8 @@ pub struct DisplayShows {
     pub chord: bool,
     pub fretboard: bool,
     pub theory: bool,
+    /// The sheet music band.
+    pub staff: bool,
 }
 
 impl Default for DisplayShows {
@@ -972,6 +974,7 @@ impl Default for DisplayShows {
             chord: true,
             fretboard: true,
             theory: true,
+            staff: true,
         }
     }
 }
@@ -980,7 +983,7 @@ impl DisplayShows {
     /// Nothing ticked means there is no display layer to composite, which the
     /// dialog has to notice before it offers a layout for it.
     pub fn any(self) -> bool {
-        self.piano || self.chord || self.fretboard || self.theory
+        self.piano || self.chord || self.fretboard || self.theory || self.staff
     }
 }
 
@@ -1214,6 +1217,10 @@ impl ExportSpec {
             Value::Bool(self.composite.shows.theory),
         );
         m.insert(
+            "show_staff".into(),
+            Value::Bool(self.composite.shows.staff),
+        );
+        m.insert(
             "resolution".into(),
             Value::String(self.resolution.key().into()),
         );
@@ -1243,6 +1250,7 @@ impl ExportSpec {
         b("show_chord", &mut s.composite.shows.chord);
         b("show_fretboard", &mut s.composite.shows.fretboard);
         b("show_theory", &mut s.composite.shows.theory);
+        b("show_staff", &mut s.composite.shows.staff);
         if let Some(t) = m.get("tempo_bpm").and_then(Value::as_f64) {
             if (MIN_BPM..=MAX_BPM).contains(&t) {
                 s.tempo_bpm = t;
@@ -1717,6 +1725,7 @@ mod tests {
                     chord: false,
                     fretboard: false,
                     theory: false,
+                    staff: false,
                 },
                 ..Default::default()
             },
@@ -1738,6 +1747,7 @@ mod tests {
                     chord: false,
                     fretboard: false,
                     theory: false,
+                    staff: true,
                 },
                 ..Default::default()
             },
@@ -1763,6 +1773,7 @@ mod tests {
                     chord: true,
                     fretboard: true,
                     theory: true,
+                    staff: true,
                 },
             },
             resolution: Resolution::Hd720,
