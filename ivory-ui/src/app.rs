@@ -182,6 +182,10 @@ pub struct IvoryApp {
     manual_positions: HashMap<u8, (usize, u8)>,
 
     current_chord: Option<String>,
+    /// The detector's next-best distinct names, best first, for the staff
+    /// panel's readout. Empty whenever the staff is not on screen — the ranked
+    /// pass costs a string per scored pattern, and nothing else reads it.
+    chord_alternates: Vec<String>,
     last_detection: Option<Instant>,
 
     /// D-UI-15: the guitar view's solver state. Exactly ONE of these exists,
@@ -488,6 +492,7 @@ impl IvoryApp {
             manual_notes: HashSet::new(),
             manual_positions: HashMap::new(),
             current_chord: None,
+            chord_alternates: Vec::new(),
             last_detection: None,
             voicing,
             last_voicing: None,
@@ -934,11 +939,44 @@ impl IvoryApp {
         }
         self.last_detection = Some(Instant::now());
         let notes = self.display_notes();
-        self.current_chord = if notes.is_empty() {
-            None
+        if notes.is_empty() {
+            self.current_chord = None;
+            self.chord_alternates.clear();
+            return;
+        }
+        // The ranked pass, but only while the staff panel is on screen to
+        // show it. It is the SAME detection — `detect_chord_debug` calls
+        // `detect_chord` and collects what the scorer already computed — so
+        // the winner cannot disagree between the two paths; the only cost is
+        // a string per scored candidate, which nothing else would read.
+        if self
+            .settings
+            .theory_views()
+            .contains(theory_panel::View::Staff)
+        {
+            let (winner, ranked) = self.detector.detect_chord_debug(&notes, 8);
+            self.chord_alternates = ranked
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| Some(name.as_str()) != winner.as_deref())
+                .take(2)
+                .collect();
+            self.current_chord = winner;
         } else {
-            self.detector.detect_chord(&notes)
-        };
+            self.current_chord = self.detector.detect_chord(&notes);
+            self.chord_alternates.clear();
+        }
+    }
+
+    /// The staff panel's chord readout, from whichever settings copy is
+    /// painting — the live ones, or the composite's override. `None` when
+    /// detection is off in that copy, which is what lets the staff take the
+    /// readout strip's height back.
+    fn staff_readout(&self, s: &Settings) -> Option<staff::Readout<'_>> {
+        s.chord_detection_enabled.then_some(staff::Readout {
+            chord: self.current_chord.as_deref(),
+            alternates: &self.chord_alternates,
+        })
     }
 
     /// Which shortcuts are live, for both the handler and the help card.
@@ -3163,7 +3201,15 @@ fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
     } else {
         0.0
     };
-    let chord_visible = settings.chord_detection_enabled && !settings.chord_window_detached;
+    // **The strip yields to the staff.** While the staff element is anywhere
+    // on screen it carries the chord name itself — winner and runners-up — and
+    // one name in two places is two places for them to disagree. The detached
+    // chord window is untouched: that one is an explicit choice.
+    let chord_visible = settings.chord_detection_enabled
+        && !settings.chord_window_detached
+        && !settings
+            .theory_views()
+            .contains(crate::theory_panel::View::Staff);
     let chord_h = if chord_visible {
         (50.0 * w as f64 / 1300.0).trunc() as f32
     } else {
@@ -3544,6 +3590,7 @@ impl IvoryApp {
                     &s.theory_views(),
                     self.theory_input(&display),
                     &display,
+                    self.staff_readout(&s),
                     &s,
                 );
             }
@@ -3958,6 +4005,7 @@ impl IvoryApp {
                 &self.settings.theory_views(),
                 self.theory_input(&display),
                 &display,
+                self.staff_readout(&self.settings),
                 &self.settings,
             );
         }
@@ -4157,6 +4205,7 @@ impl IvoryApp {
                 &self.settings.theory_views(),
                 self.theory_input(&held),
                 &held,
+                self.staff_readout(&self.settings),
                 &self.settings,
             );
             if let Some(g) = self.theory_guard.as_mut() {
@@ -4410,6 +4459,37 @@ mod tests {
                 c.width() / avail.x
             );
         }
+    }
+
+    /// **One chord name on screen, not two.**
+    ///
+    /// The staff panel carries the chord readout, so while it is anywhere in
+    /// the theory band the strip's height goes to zero — and comes back the
+    /// moment the staff leaves, because then the strip is the only place the
+    /// name lives. The detached chord window is a third place and an explicit
+    /// choice; it wins over both.
+    #[test]
+    fn the_chord_strip_yields_to_the_staff_and_returns_when_it_leaves() {
+        // `first_launch`, not `default`: bare defaults leave the band empty
+        // and visibility is exactly what a first launch decides.
+        let mut s = Settings::first_launch();
+        assert!(
+            s.theory_views().contains(theory_panel::View::Staff),
+            "a first launch no longer includes the staff; this test needs rethinking"
+        );
+        assert_eq!(
+            band_sizes_at(&s, 1300.0).chord_h,
+            0.0,
+            "the strip is up while the staff shows the chord"
+        );
+        s.toggle_theory_view(theory_panel::View::Staff);
+        assert!(
+            band_sizes_at(&s, 1300.0).chord_h > 0.0,
+            "the staff left and the strip did not come back"
+        );
+        // Detection off beats everything: no detector, no name anywhere.
+        s.chord_detection_enabled = false;
+        assert_eq!(band_sizes_at(&s, 1300.0).chord_h, 0.0);
     }
 
     /// **The camera pane and the theory band share one row and both fit.**
@@ -5258,9 +5338,14 @@ mod tests {
                 "{screen:?}: filled {total:?}, leaving bars top and bottom"
             );
             // Every band the settings asked for is still there. Filling must
-            // not be a way to lose one.
+            // not be a way to lose one. The chord strip is legitimately absent
+            // here: the default theory band includes the staff, and the staff
+            // carries the chord name itself — see `chord_visible`.
             assert!(filled.piano_h > 0.0, "{screen:?}: no piano");
-            assert!(filled.chord_h > 0.0, "{screen:?}: no chord strip");
+            assert_eq!(
+                filled.chord_h, 0.0,
+                "{screen:?}: the strip is up while the staff already shows the chord"
+            );
             assert!(filled.fret_h > 0.0, "{screen:?}: no fretboard");
             assert!(filled.theory_h > 0.0, "{screen:?}: no theory band");
         }

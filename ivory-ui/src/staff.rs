@@ -474,6 +474,26 @@ impl StaffSet {
     }
 }
 
+/// A notehead's horizontal semi-axis, in staff spaces. One number, because the
+/// ellipse, its outline, and the offset that keeps two seconds apart all have
+/// to agree on how wide a head IS — three copies of 0.72 is how the offset
+/// ends up measured against a head that has quietly grown.
+const HEAD_RX: f32 = 0.72;
+
+/// How far an offset notehead sits to the right of the column, in staff
+/// spaces.
+///
+/// **More than two semi-axes, or the heads overlap.** Engraving convention
+/// lets the two heads of a second touch; the owner's requirement is stricter —
+/// never — so the step is a full head width plus a sliver of daylight. The
+/// test `seconds_are_offset_and_larger_intervals_are_not` holds this
+/// inequality so the daylight cannot be optimised away.
+/// **The outline counts.** Each head wears a hairline of 0.07 spaces centred
+/// on its edge, so the visible width is `2*(HEAD_RX + 0.035)`; a step sized to
+/// the bare ellipse left a third of a pixel of daylight, which at screen size
+/// reads as touching.
+const OFFSET_STEP: f32 = HEAD_RX * 2.0 + 0.26;
+
 /// How many ledger lines a reader will count before an engraver gives up and
 /// writes `8va` instead.
 ///
@@ -490,8 +510,10 @@ struct Placed {
     pos: i32,
     /// -1 for `8vb`, 0 for none, +1 for `8va`, ±2 for the 15ths.
     octave: i32,
-    /// Notes a second apart cannot share a side of the column.
-    offset: bool,
+    /// Which notehead column this note sits in: 0 against the stem line, 1
+    /// one step right, and so on. Almost always 0 or 1 — it takes a chromatic
+    /// cluster to need a third.
+    col: u8,
     /// Which column of accidentals this note's sharp or flat sits in, counted
     /// leftwards from the noteheads. Zero for a note that needs none.
     acc_col: usize,
@@ -537,7 +559,7 @@ impl Column {
                 note: *n,
                 pos: pos - octave * 7,
                 octave,
-                offset: false,
+                col: 0,
                 acc_col: 0,
             })
             .collect();
@@ -550,13 +572,29 @@ impl Column {
         // its neighbour below is a second away AND was not itself offset — so a
         // cluster alternates rather than every note after the first drifting
         // right.
-        // Zero as well as one: an augmented unison -- C natural against C
-        // sharp -- puts two different pitches on the SAME line, and printed on
-        // the same side of the column one of them is simply not on the page.
-        for i in 1..placed.len() {
-            if placed[i].pos - placed[i - 1].pos <= 1 && !placed[i - 1].offset {
-                placed[i].offset = true;
+        // **Noteheads a second — or a unison — apart cannot share a column.**
+        // Two heads one step apart overlap by most of their width, and an
+        // augmented unison puts two different pitches on the SAME line; either
+        // way, one of the two is not on the page.
+        //
+        // Columns, not a boolean, and the difference is a chromatic cluster:
+        // in {C, Db, D} every pair clashes, so alternating sides puts the D
+        // back in the C's column a second above it — which is precisely the
+        // overlap the alternation was for. Greedy colouring on the sorted
+        // notes gives each one the leftmost column where nothing sits within
+        // a step of it, which is minimal and is what an engraver does.
+        for i in 0..placed.len() {
+            let mut col = 0_u8;
+            'find: loop {
+                for j in 0..i {
+                    if placed[j].col == col && (placed[i].pos - placed[j].pos).abs() <= 1 {
+                        col += 1;
+                        continue 'find;
+                    }
+                }
+                break;
             }
+            placed[i].col = col;
         }
 
         // **Accidentals stack into columns, from the top down.** Four flats in
@@ -648,6 +686,9 @@ fn distribute(set: &StaffSet, notes: &[Spelled]) -> Vec<Vec<Spelled>> {
 struct Palette {
     bg: Color32,
     ink: Color32,
+    /// The alternates and other second-rank text — the same values the theory
+    /// band uses for its legends, because this panel lives inside that band.
+    faint: Color32,
     lit: Color32,
     lit_text: Color32,
 }
@@ -660,6 +701,7 @@ fn palette(s: &Settings) -> Palette {
         Palette {
             bg: Color32::from_rgb(0x0a, 0x0a, 0x0a),
             ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
+            faint: Color32::from_rgb(0x9a, 0x92, 0x80),
             lit: s.white_key_active_color.to_color32(),
             lit_text: Color32::BLACK,
         }
@@ -667,6 +709,7 @@ fn palette(s: &Settings) -> Palette {
         Palette {
             bg: Color32::from_rgb(0xE8, 0xDC, 0xC0),
             ink: Color32::from_rgb(0x1a, 0x1a, 0x1a),
+            faint: Color32::from_rgb(0x6b, 0x60, 0x4a),
             lit: s.white_key_active_color.to_color32(),
             lit_text: Color32::BLACK,
         }
@@ -693,13 +736,58 @@ impl Geometry {
     }
 }
 
-/// Draw the band.
-pub fn draw(painter: &Painter, rect: Rect, notes: &HashSet<u8>, s: &Settings) {
+/// The chord readout the staff carries: what the detector calls the notes, and
+/// the runners-up it nearly called them.
+///
+/// **This panel is the chord view now.** The chord strip band auto-hides while
+/// the staff is on screen — one name in two places is two places for them to
+/// disagree — so what used to be a band of its own is a strip at the top of
+/// this panel, with up to two next-best readings under the winner. The
+/// alternates are the teaching feature: a chord that is C6 and Am7 at once is
+/// a fact about harmony, and the strip could never say it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Readout<'a> {
+    /// The winning name, or nothing while nothing is sounding.
+    pub chord: Option<&'a str>,
+    /// The next-best distinct names, best first. At most two are drawn.
+    pub alternates: &'a [String],
+}
+
+/// The readout strip's height as a fraction of the panel, and its bounds.
+///
+/// **Reserved whenever a readout is passed at all**, sounding or silent: a
+/// strip that appeared on the first chord would drop the staves a quarter of
+/// an inch mid-performance, and a staff that jumps when you play is worse than
+/// any amount of idle headroom.
+const READOUT_FRACTION: f32 = 0.20;
+
+/// Draw the band. `readout` is `None` when chord detection is off entirely —
+/// only then does the staff take the whole rect.
+pub fn draw(
+    painter: &Painter,
+    rect: Rect,
+    notes: &HashSet<u8>,
+    readout: Option<Readout<'_>>,
+    s: &Settings,
+) {
     if !rect.is_positive() {
         return;
     }
     let p = palette(s);
     painter.rect_filled(rect, 0.0, p.bg);
+
+    let rect = match readout {
+        Some(r) => {
+            let h = (rect.height() * READOUT_FRACTION).clamp(24.0, 64.0);
+            let strip = Rect::from_min_size(rect.min, egui::vec2(rect.width(), h));
+            draw_readout(painter, strip, r, &p);
+            Rect::from_min_max(Pos2::new(rect.min.x, strip.max.y), rect.max)
+        }
+        None => rect,
+    };
+    if !rect.is_positive() {
+        return;
+    }
 
     let set = s.staff_set();
     let clefs = set.clefs();
@@ -782,6 +870,51 @@ fn draw_brace(painter: &Painter, x: f32, top: f32, bottom: f32, space: f32, p: &
     }
 }
 
+/// The winner, large, and up to two runners-up under it.
+fn draw_readout(painter: &Painter, strip: Rect, r: Readout<'_>, p: &Palette) {
+    // Sized to fit: chord names run from "C" to "C7(b9,#11)/E", and a name
+    // that clipped would be worse than a small one. 0.62 is the bundled
+    // monospace advance, the same number every other band uses.
+    let fit = |text: &str, nominal: f32| -> f32 {
+        let n = text.chars().count().max(1) as f32;
+        nominal.min(strip.width() * 0.94 / (n * 0.62))
+    };
+    let Some(chord) = r.chord else {
+        return;
+    };
+    let main_size = fit(chord, strip.height() * 0.52);
+    if main_size < 5.0 {
+        return;
+    }
+    let two_lines = !r.alternates.is_empty();
+    let main_y = if two_lines {
+        strip.min.y + strip.height() * 0.34
+    } else {
+        strip.center().y
+    };
+    painter.text(
+        Pos2::new(strip.center().x, main_y),
+        Align2::CENTER_CENTER,
+        chord,
+        FontId::new(main_size, fonts::courier_bold()),
+        p.ink,
+    );
+    if two_lines {
+        // "or", because that is what an alternate reading IS — not a second
+        // answer, a second way of hearing the first one.
+        let names: Vec<&str> = r.alternates.iter().take(2).map(String::as_str).collect();
+        let line = format!("or  {}", names.join("   "));
+        let size = fit(&line, main_size * 0.52).max(5.0);
+        painter.text(
+            Pos2::new(strip.center().x, strip.min.y + strip.height() * 0.78),
+            Align2::CENTER_CENTER,
+            &line,
+            FontId::new(size, fonts::courier()),
+            p.faint,
+        );
+    }
+}
+
 /// One staff: its lines, its clef, and whatever is on it.
 fn draw_staff(
     painter: &Painter,
@@ -843,7 +976,7 @@ fn draw_column(
 
     for placed in &column.notes {
         let y = g.y(placed.pos);
-        let cx = if placed.offset { x + head_w } else { x };
+        let cx = x + g.space * OFFSET_STEP * f32::from(placed.col);
 
         // Ledger lines first, so a notehead sits ON them rather than under
         // them — a ledger line drawn over a hollow head fills it in.
@@ -889,7 +1022,7 @@ fn draw_column(
 /// polygon in the background colour rather than a stroke, so the head keeps its
 /// thick-thin weight — which is the whole visual signature of a notehead.
 fn draw_notehead(painter: &Painter, c: Pos2, space: f32, fill: Color32, named: bool, p: &Palette) {
-    let outer = ellipse(c, space * 0.72, space * 0.5, -0.35);
+    let outer = ellipse(c, space * HEAD_RX, space * 0.5, -0.35);
     painter.add(egui::Shape::convex_polygon(outer, fill, Stroke::NONE));
     // **No counter when the head is carrying a letter.** A semibreve's hole is
     // a narrow slot — three or four points across at the size this band draws —
@@ -902,7 +1035,7 @@ fn draw_notehead(painter: &Painter, c: Pos2, space: f32, fill: Color32, named: b
     }
     // A hairline round the outside, so a lit notehead in the accent colour
     // still reads as a note on a page rather than as a coloured blob.
-    let edge = ellipse(c, space * 0.72, space * 0.5, -0.35);
+    let edge = ellipse(c, space * HEAD_RX, space * 0.5, -0.35);
     painter.add(egui::Shape::closed_line(
         edge,
         Stroke::new((space * 0.07).max(0.8), p.ink),
@@ -1553,24 +1686,79 @@ mod tests {
         );
     }
 
-    /// Notes a second apart must not share a side of the column, or a chord is
-    /// an inkblot.
+    /// **No two noteheads may overlap, in any chord whatsoever.**
+    ///
+    /// The rule is geometric and this asserts the geometry: any two notes in
+    /// the same column must be more than a second apart, and the step between
+    /// columns must clear a full head width. The boolean version of this rule
+    /// shipped a chromatic cluster — {C, Db, D} — with the D "alternated" back
+    /// into the C's column, one step above it, overlapping.
     #[test]
     fn seconds_are_offset_and_larger_intervals_are_not() {
-        // C D E: the D is a second above the C and moves; the E is a second
-        // above the D but the D already moved, so the E comes back.
+        // C D E: the middle note moves right, the outer two stay.
         let notes: Vec<Spelled> = [60_u8, 62, 64].iter().map(|n| spell(*n, false)).collect();
         let col = Column::place(Clef::Treble, &notes);
-        let offsets: Vec<bool> = col.notes.iter().map(|p| p.offset).collect();
-        assert_eq!(offsets, vec![false, true, false], "a cluster did not alternate");
+        let cols: Vec<u8> = col.notes.iter().map(|p| p.col).collect();
+        assert_eq!(cols, vec![0, 1, 0], "a cluster did not alternate");
+
+        // **The offset clears the head.** Two semi-axes is where the ellipses
+        // touch; anything less is the overlap this rule exists to prevent, and
+        // it shipped once at 1.18 spaces against a 1.44-space head.
+        assert!(
+            OFFSET_STEP > (HEAD_RX + 0.035) * 2.0 + 0.15,
+            "an offset second has no daylight: step {OFFSET_STEP} vs outlined width {}",
+            (HEAD_RX + 0.035) * 2.0
+        );
 
         // A triad has nothing a second apart in it and stays in one column.
         let triad: Vec<Spelled> = [60_u8, 64, 67].iter().map(|n| spell(*n, false)).collect();
         let col = Column::place(Clef::Treble, &triad);
         assert!(
-            col.notes.iter().all(|p| !p.offset),
+            col.notes.iter().all(|p| p.col == 0),
             "a plain triad was split across the stem"
         );
+
+        // The case the boolean shipped wrong: a chromatic cluster needs a
+        // THIRD column, because its outer notes are themselves a second apart
+        // (C and D share a staff position with a sharp between them, or sit
+        // one step apart as here with Db between).
+        let cluster: Vec<Spelled> = [60_u8, 61, 62].iter().map(|n| spell(*n, true)).collect();
+        let col = Column::place(Clef::Treble, &cluster);
+        for i in 0..col.notes.len() {
+            for j in (i + 1)..col.notes.len() {
+                let (a, b) = (col.notes[i], col.notes[j]);
+                assert!(
+                    a.col != b.col || (a.pos - b.pos).abs() > 1,
+                    "{} and {} share column {} only {} apart",
+                    a.note.midi,
+                    b.note.midi,
+                    a.col,
+                    (a.pos - b.pos).abs()
+                );
+            }
+        }
+
+        // And exhaustively: every chromatic run up to five notes, at several
+        // roots, obeys the rule. Five simultaneous semitones is beyond what a
+        // hand plays as a chord; past that the drawing may do what it likes.
+        for root in [36_u8, 59, 60, 71] {
+            for len in 2..=5_u8 {
+                let ns: Vec<Spelled> =
+                    (0..len).map(|k| spell(root + k, false)).collect();
+                let col = Column::place(Clef::Bass, &ns);
+                for i in 0..col.notes.len() {
+                    for j in (i + 1)..col.notes.len() {
+                        let (a, b) = (col.notes[i], col.notes[j]);
+                        assert!(
+                            a.col != b.col || (a.pos - b.pos).abs() > 1,
+                            "run at {root} len {len}: {} and {} clash",
+                            a.note.midi,
+                            b.note.midi
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// **Accidentals stack into columns rather than on top of each other.**
@@ -1666,7 +1854,7 @@ mod tests {
                     for j in (i + 1)..col.notes.len() {
                         let (a, b) = (col.notes[i], col.notes[j]);
                         assert!(
-                            a.pos != b.pos || a.offset != b.offset,
+                            a.pos != b.pos || a.col != b.col,
                             "{clef:?} {chord:?}: {} and {} print in the same place",
                             a.note.midi,
                             b.note.midi

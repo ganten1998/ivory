@@ -1520,7 +1520,8 @@ impl DesktopApp {
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(splash.since);
 
-        // What is still being waited on, and what to say about it.
+        // What is still being waited on. The splash no longer SAYS it — the
+        // lattice is the whole picture — but readiness still depends on it.
         #[cfg(feature = "recorder")]
         let (instrument, camera) = (
             self.recorder.plugin_opening.is_some(),
@@ -1554,12 +1555,7 @@ impl DesktopApp {
             egui::Id::new("tangent-splash"),
         ));
         let rect = ctx.screen_rect();
-        ivory_ui::splash::draw(
-            &painter,
-            rect,
-            ivory_ui::splash::status(instrument, camera),
-            fade,
-        );
+        ivory_ui::splash::draw(&painter, rect, fade);
         // While it is up, the window must keep repainting — nothing else is
         // asking it to, and a splash that freezes mid-fade because no input
         // arrived is worse than none.

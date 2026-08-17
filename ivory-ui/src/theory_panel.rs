@@ -508,6 +508,7 @@ pub fn draw(
     views: &Views,
     input: Input,
     notes: &std::collections::HashSet<u8>,
+    readout: Option<crate::staff::Readout<'_>>,
     s: &Settings,
 ) {
     let p = palette(s);
@@ -548,7 +549,7 @@ pub fn draw(
                     crate::staff::key_label(s.staff_key)
                 );
                 let body = title(painter, inner, "SHEET MUSIC", &legend, &p);
-                crate::staff::draw(painter, body, notes, s);
+                crate::staff::draw(painter, body, notes, readout, s);
             }
         }
     }
@@ -1354,10 +1355,11 @@ fn draw_detached(
     views: &Views,
     input: Input,
     notes: &std::collections::HashSet<u8>,
+    readout: Option<crate::staff::Readout<'_>>,
     s: &Settings,
 ) {
     if views.any() {
-        draw(painter, rect, views, input, notes, s);
+        draw(painter, rect, views, input, notes, readout, s);
     } else {
         let p = palette(s);
         painter.rect_filled(rect, 0.0, p.bg);
@@ -1406,6 +1408,7 @@ pub fn show_detached_window(
     views: &Views,
     input: Input,
     notes: &std::collections::HashSet<u8>,
+    readout: Option<crate::staff::Readout<'_>>,
     s: &Settings,
 ) -> DetachedOutcome {
     let mut outcome = DetachedOutcome::default();
@@ -1434,7 +1437,7 @@ pub fn show_detached_window(
             // see and did not point at. Nothing here may reach for a band
             // rect, which is why none is passed in.
             let rect = ui.max_rect();
-            draw_detached(ui.painter(), rect, views, input, notes, s);
+            draw_detached(ui.painter(), rect, views, input, notes, readout, s);
             painter_border(ui.painter(), rect);
 
             let (close, inner_rect, outer_rect, pressed, secondary, pointer, ctrl) =
@@ -1980,6 +1983,7 @@ mod tests {
                             minor: false,
                         },
                         &notes,
+                        None,
                         &s,
                     );
                 });
@@ -2487,7 +2491,7 @@ mod tests {
                     };
                     let _ = ctx.run(Default::default(), |ctx| {
                         let painter = ctx.layer_painter(egui::LayerId::background());
-                        draw(&painter, rect, &views, input, &HashSet::new(), &s);
+                        draw(&painter, rect, &views, input, &HashSet::new(), None, &s);
                     });
                 }
             }
@@ -2800,6 +2804,7 @@ mod tests {
                     &views,
                     input,
                     &HashSet::new(),
+                    None,
                     s,
                 );
         });

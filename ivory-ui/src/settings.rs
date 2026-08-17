@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 4;
+const SETTINGS_VERSION: u64 = 5;
 
 /// Recorder backgrounds this app shipped as defaults before [`SETTINGS_VERSION`]
 /// 1, and which are therefore not evidence that anybody chose them.
@@ -544,7 +544,7 @@ impl Default for Settings {
             theory_order: String::new(),
             theory_follow_midi: true,
             staff_set: "grand".to_owned(),
-            staff_note_names: false,
+            staff_note_names: true,
             staff_key: 0,
             show_piano: true,
             custom_staff_set: None,
@@ -1165,6 +1165,13 @@ impl Settings {
         }
         if was >= SETTINGS_VERSION {
             return;
+        }
+        if was < 5 {
+            // Letter names inside the noteheads, on. The band is a teaching
+            // surface before it is anything else, and the labels are the whole
+            // reason a beginner can read it; `U` turns them off, and from a
+            // stamped v5 file they stay off.
+            self.staff_note_names = true;
         }
         if was < 1 {
             if V0_RECORDER_BG.contains(&self.recorder_bg_color.to_hex().as_str()) {
