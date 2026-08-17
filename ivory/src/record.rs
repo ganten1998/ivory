@@ -176,14 +176,32 @@ impl TakeSource {
         }
     }
 
-    /// Forgiving, and it resolves the one case the UI cannot: "plugin" with no
-    /// plugin loaded records the input rather than recording silence, because a
-    /// take of nothing is never what anybody meant.
+    /// Forgiving, and it resolves the cases the setting cannot know about.
+    ///
+    /// **An absent setting means "record whatever there is".** That is the fix
+    /// for the first thing anybody hit: load a piano, press record, and get a
+    /// file with only the microphone in it — the instrument you could plainly
+    /// hear was monitored but never recorded, because the stored setting said
+    /// `input` and nothing had ever offered to change it. A loaded instrument
+    /// is one the user went and chose; leaving it out of the take is never what
+    /// they meant.
+    ///
+    /// An EXPLICIT setting is still obeyed, which is what makes
+    /// instrument-only and microphone-only reachable.
     pub fn resolve(setting: &str, plugin_loaded: bool, input_open: bool) -> Self {
         let want = match setting {
             "plugin" => TakeSource::Plugin,
             "both" => TakeSource::Both,
-            _ => TakeSource::Input,
+            "input" => TakeSource::Input,
+            // Anything else, including the absent default, is "everything
+            // there is".
+            _ => {
+                if plugin_loaded {
+                    TakeSource::Both
+                } else {
+                    TakeSource::Input
+                }
+            }
         };
         match (want, plugin_loaded, input_open) {
             (TakeSource::Plugin, false, _) => TakeSource::Input,
@@ -299,9 +317,19 @@ impl Writer {
                 // they share a crystal and this is exact. On two separate
                 // devices they drift, which is why `take.json` records which
                 // source was the master.
+                let frames = self.buf.len() / self.tracker.channels().max(1);
                 if self.source.uses_plugin() {
-                    let frames = self.buf.len() / self.tracker.channels().max(1);
                     self.mix_plugin(frames);
+                } else {
+                    // Drained and thrown away, NOT left alone.
+                    //
+                    // Leaving it filled a ring that nothing was reading, and
+                    // every frame it then refused counted as a take loss: a
+                    // 37-second take reported "1,608,192 frames were lost to
+                    // the system and padded with silence" — 33 seconds of a
+                    // 37-second recording — when in truth nothing was lost at
+                    // all. The instrument simply was not part of the take.
+                    self.discard_plugin(frames);
                 }
                 self.tracker.absorb(&self.buf);
                 // The ring can hold fewer frames than the mark promised — the
@@ -418,6 +446,19 @@ impl Writer {
         }
     }
 
+    /// Move `frames` of instrument audio out of the ring and drop it.
+    ///
+    /// The same amount `mix_plugin` would have taken, so the ring keeps pace
+    /// with the take instead of backing up.
+    fn discard_plugin(&mut self, frames: usize) {
+        let Some(tap) = self.plugin.as_mut() else {
+            return;
+        };
+        self.plugin_buf.clear();
+        tap.drain_frames(frames, &mut self.plugin_buf);
+        self.plugin_buf.clear();
+    }
+
     fn write_samples(&mut self, samples: &[f32]) {
         let Some(wav) = self.wav.as_mut() else {
             return;
@@ -476,16 +517,26 @@ impl Writer {
             // crystal is the same one, so a longer fit is strictly a better
             // measurement of it. It is the counters that would lie, not the fit.
             unstamped: self.clock.unstamped().saturating_sub(self.unstamped_at_arm),
+            // The instrument ring's losses count ONLY when the instrument is
+            // part of the take. Counting them regardless is what produced the
+            // false "1,608,192 frames were lost" on a take that lost nothing:
+            // the ring was not being read because the instrument was not being
+            // recorded, which is not a dropout, it is a decision.
             frames_dropped: self
                 .sink
                 .stats()
                 .frames_dropped()
                 .saturating_sub(self.dropped_at_arm)
                 + self.short_frames
-                + self
-                    .plugin
-                    .as_ref()
-                    .map_or(0, |t| t.dropped().saturating_sub(self.plugin_dropped_at_arm)),
+                + if self.source.uses_plugin() {
+                    let armed = self.plugin_dropped_at_arm;
+                    self.plugin.as_ref().map_or(0, |t| t.dropped().saturating_sub(armed))
+                } else {
+                    // An instrument that is not in the take cannot cost the take
+                    // anything. Its ring is drained and discarded, so whatever it
+                    // "dropped" is audio nobody asked to keep.
+                    0
+                },
             first_frame_ns: self.first_frame_ns,
             running: self.sink.stats().device_state().is_running(),
             clipped_samples: m.clipped_samples,
@@ -1725,6 +1776,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **The instrument's ring must be drained even when it is not recorded.**
+    ///
+    /// It was not, so it filled, and every frame it then refused was counted as
+    /// a take loss: a 37-second take reported "1,608,192 frames were lost to
+    /// the system and padded with silence" — 33 seconds of a 37-second
+    /// recording — when nothing had been lost at all. The instrument simply was
+    /// not part of that take.
+    #[test]
+    fn an_instrument_left_out_of_the_take_reports_no_losses() {
+        let dir = std::env::temp_dir().join("tangent-writer-nodrain");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        const CH: usize = 2;
+        const BLOCK: usize = 256;
+        let (mut source, mut writer) = writer_with_ring(CH);
+        writer.source = TakeSource::Input;
+        // A REAL tap, deliberately tiny, and one the test keeps filling. The
+        // first version of this test had `plugin: None` and passed with the fix
+        // removed, which is no test at all: with nothing to drain there is
+        // nothing to leave undrained.
+        let (tap, mut tap_tx, note_overflow) = crate::instrument::RecorderTap::for_test(1024, 2);
+        writer.plugin = Some(tap);
+        let spec = WavSpec {
+            sample_rate: 48_000,
+            channels: CH as u16,
+            format: TAKE_FORMAT,
+        };
+        let at = WallTime::from_unix(1_786_804_327, 0);
+        writer.wav = Some(
+            WavWriter::create(&dir.join("t.wav"), spec, &Bext::new(at, spec)).expect("create"),
+        );
+
+        let block = vec![0.25f32; BLOCK * CH];
+        let mut host_ns: Nanos = 1_000_000;
+        for _ in 0..40 {
+            source.accept(&block, Some(host_ns), host_ns);
+            host_ns += (BLOCK as Nanos * 1_000_000_000) / 48_000;
+            // Push more instrument audio than a 1024-slot ring can hold, every
+            // block, so a writer that does not drain it WILL overflow and count
+            // losses.
+            for _ in 0..(BLOCK * 2) {
+                if tap_tx.push(0.5).is_err() {
+                    note_overflow(1);
+                }
+            }
+            writer.pump();
+        }
+        let report = writer.stop();
+        assert_eq!(
+            report.frames_dropped, 0,
+            "an instrument that is not being recorded cannot lose a take any              frames"
+        );
+        assert_eq!(report.frames, (BLOCK * 40) as u64);
+
+        // And the other half: the ring was actually kept MOVING. Reporting zero
+        // losses is easy to get right by accident — the conditional above does
+        // it — while still leaving the ring to fill up and stay full, which is
+        // the state the user's 1,608,192 phantom losses came from.
+        //
+        // Measured through the tap's own overflow counter rather than by
+        // draining what is left over. Draining was the first thing tried and it
+        // proves nothing: an empty result reads the same whether the ring was
+        // kept empty or merely could not be read.
+        let overflowed = writer
+            .plugin
+            .as_ref()
+            .expect("the tap is still installed")
+            .dropped();
+        assert_eq!(
+            overflowed, 0,
+            "the instrument's ring overflowed {overflowed} times during a take \
+             that does not record it — it is not being drained, so it backs up \
+             and every later take inherits the loss"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The dropout path, which is what the doubling bug was hiding behind:
     /// when the two pads DIFFER the old code was accidentally correct.
     #[test]
@@ -2057,6 +2186,31 @@ mod source_tests {
             TakeSource::Plugin
         );
         assert_eq!(TakeSource::resolve("both", true, false), TakeSource::Plugin);
+    }
+
+    /// **The bug a user hit within minutes.** Load a piano, press record, and
+    /// the file had only the microphone in it — the instrument was monitored,
+    /// plainly audible, and absent from the take, because the stored default
+    /// said `input` and no control had ever existed to say otherwise.
+    #[test]
+    fn a_loaded_instrument_is_in_the_take_unless_somebody_says_otherwise() {
+        assert_eq!(
+            TakeSource::resolve("auto", true, true),
+            TakeSource::Both,
+            "an instrument you went and loaded belongs in the recording"
+        );
+        assert_eq!(
+            TakeSource::resolve("auto", false, true),
+            TakeSource::Input,
+            "and with none loaded there is nothing extra to add"
+        );
+        // An EXPLICIT choice still wins, which is what makes the other three
+        // menu rows mean anything.
+        assert_eq!(TakeSource::resolve("input", true, true), TakeSource::Input);
+        assert_eq!(
+            TakeSource::resolve("plugin", true, true),
+            TakeSource::Plugin
+        );
     }
 
     #[test]

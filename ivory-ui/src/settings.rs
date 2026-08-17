@@ -216,9 +216,27 @@ pub struct Settings {
     pub record_camera_uid: Option<String>,
     /// The audio input's stable UID. Same reasoning.
     pub record_audio_device: Option<String>,
-    /// `input`, `plugin` or `both`. Stored verbatim; an unknown value resolves
-    /// to `input` at the point of use, like `font_choice`.
-    pub record_audio_source: String,
+    /// What a take is made of: `auto`, `input`, `plugin` or `both`.
+    ///
+    /// **A NEW key, and the old `record_audio_source` is deliberately left
+    /// unread in `extra`.** That key defaulted to `"input"` and no control ever
+    /// existed to change it, so every value it holds was written by the app
+    /// rather than chosen by anybody — and the result was the first thing a
+    /// user hit: load a piano, press record, get a file with only the
+    /// microphone in it. Migrating it would mean guessing which `"input"`s were
+    /// decisions; a new key has no such history.
+    ///
+    /// `auto` means "record whatever there is", which with an instrument loaded
+    /// is the instrument and the input together.
+    pub record_sources: String,
+    /// The user picked "None — record MIDI only" in the audio-input picker.
+    ///
+    /// Its own key, because `record_audio_source` used to carry BOTH this and
+    /// what a take is made of, and the two are unrelated questions: "no
+    /// microphone" and "record the instrument too" can each be true or false
+    /// independently. Overloading them is how choosing no input and choosing
+    /// what to record could not both be expressed.
+    pub record_input_off: bool,
     /// Count-in length in BEATS, at the take's tempo. Clamped to
     /// [`recorder::COUNT_IN_CHOICES`](crate::recorder::COUNT_IN_CHOICES) on
     /// read.
@@ -389,7 +407,8 @@ impl Default for Settings {
             record_take_name: None,
             record_camera_uid: None,
             record_audio_device: None,
-            record_audio_source: "input".to_owned(),
+            record_sources: "auto".to_owned(),
+            record_input_off: false,
             record_count_in_beats: 4,
             plugin_slots: [None, None, None],
             plugin_gains: [1.0; crate::recorder::SLOTS],
@@ -692,9 +711,10 @@ impl Settings {
         take_opt_str(&mut map, "record_take_name", &mut s.record_take_name);
         take_opt_str(&mut map, "record_camera_uid", &mut s.record_camera_uid);
         take_opt_str(&mut map, "record_audio_device", &mut s.record_audio_device);
-        if let Some(v) = map.remove("record_audio_source") {
+        take_bool(&mut map, "record_input_off", &mut s.record_input_off);
+        if let Some(v) = map.remove("record_sources") {
             if let Some(t) = v.as_str() {
-                s.record_audio_source = t.to_owned();
+                s.record_sources = t.to_owned();
             }
         }
         if let Some(v) = map.remove("record_count_in_beats") {
@@ -928,8 +948,12 @@ impl Settings {
             Value::Bool(self.record_dir_is_default),
         );
         map.insert(
-            "record_audio_source".into(),
-            Value::String(self.record_audio_source.clone()),
+            "record_sources".into(),
+            Value::String(self.record_sources.clone()),
+        );
+        map.insert(
+            "record_input_off".into(),
+            Value::Bool(self.record_input_off),
         );
         map.insert(
             "record_count_in_beats".into(),

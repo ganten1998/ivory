@@ -933,6 +933,7 @@ impl IvoryApp {
             recorder_on: self.settings.show_recorder,
             recorder_detached: self.settings.recorder_detached,
             count_in_beats: self.settings.count_in_beats(),
+            record_sources: self.settings.record_sources.clone(),
             metronome_on: self.settings.metronome_on,
             metronome_in_take: self.settings.metronome_in_take,
             hide_elapsed: self.settings.record_hide_elapsed,
@@ -1486,9 +1487,9 @@ impl IvoryApp {
         self.settings.record_export.tempo_bpm
     }
 
-    /// `input` / `plugin` / `both`, verbatim from the file.
+    /// `auto` / `input` / `plugin` / `both`, verbatim from the file.
     pub fn audio_source_setting(&self) -> &str {
-        &self.settings.record_audio_source
+        &self.settings.record_sources
     }
 
     pub fn metronome_on(&self) -> bool {
@@ -1516,7 +1517,7 @@ impl IvoryApp {
     /// behaviour at startup: a default input so the meter is live, or no input
     /// at all.
     pub fn audio_explicitly_off(&self) -> bool {
-        self.settings.record_audio_source == "none"
+        self.settings.record_input_off
     }
 
     pub fn chosen_camera_uid(&self) -> Option<&str> {
@@ -2109,6 +2110,10 @@ impl IvoryApp {
             MenuAction::DetachRecorder => self.detach_recorder(),
             MenuAction::AttachRecorder => self.reattach_recorder(),
             MenuAction::ShowExportDialog => self.open_export_dialog(),
+            MenuAction::SetRecordSources(kind) => {
+                self.settings.record_sources = kind.to_owned();
+                self.save_settings();
+            }
             MenuAction::SetCountIn(beats) => {
                 self.settings.record_count_in_beats = i64::from(beats);
                 self.save_settings();
@@ -2450,16 +2455,12 @@ impl IvoryApp {
                         }
                     }
                     dialogs::DeviceKind::AudioInput => {
-                        // `record_audio_source` carries the None choice across
-                        // a restart. Without it, `record_audio_device: null` is
+                        // This flag carries the None choice across a restart.
+                        // Without it, `record_audio_device: null` is
                         // indistinguishable from "never chose", and the next
                         // launch helpfully opens the system microphone for
                         // somebody who explicitly asked for MIDI only.
-                        self.settings.record_audio_source = if uid.is_some() {
-                            "input".to_owned()
-                        } else {
-                            "none".to_owned()
-                        };
+                        self.settings.record_input_off = uid.is_none();
                         self.settings.record_audio_device = uid.clone();
                         if let Some(d) = self.audio_devices.as_mut() {
                             let _ = d.open(uid.as_deref().unwrap_or(""));

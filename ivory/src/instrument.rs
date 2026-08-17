@@ -1552,6 +1552,37 @@ pub struct RecorderTap {
 }
 
 impl RecorderTap {
+    /// Build a tap over a ring the caller owns the other end of.
+    ///
+    /// For tests in sibling modules — `record.rs`'s writer holds a `RecorderTap`
+    /// and its behaviour around one (draining it even when the instrument is
+    /// not being recorded, counting its losses only when it is) cannot be
+    /// tested against a `None`. Ask me how I know: the first version of that
+    /// test passed with the fix removed, because there was no tap in it.
+    /// Returns the tap, the write end, and a closure that counts a frame the
+    /// ring could not take — the three things the engine wires together.
+    ///
+    /// The closure rather than the counter itself, so `Shared` stays private:
+    /// a test in a sibling module needs to BUMP the count, not to see the type
+    /// that holds it.
+    #[cfg(test)]
+    pub(crate) fn for_test(slots: usize, channels: usize) -> (Self, Producer<f32>, impl Fn(u64)) {
+        let shared = Arc::new(Shared::new());
+        let counter = Arc::clone(&shared);
+        let (tx, rx) = RingBuffer::<f32>::new(slots);
+        (
+            Self {
+                rx,
+                channels,
+                sample_rate: 48_000,
+                dropped: shared,
+            },
+            tx,
+            move |frames: u64| {
+                counter.tap_dropped.fetch_add(frames, Ordering::Relaxed);
+            },
+        )
+    }
     /// Append everything available. Interleaved; returns frames moved.
     pub fn drain(&mut self, out: &mut Vec<f32>) -> usize {
         let available = self.rx.slots();

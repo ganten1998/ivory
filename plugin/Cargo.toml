@@ -19,7 +19,7 @@
 # `nih_export_vst3!` are GPLv3, so the .vst3 binary inherits it; ivory-core,
 # ivory-ui and the standalone stay MIT. See LICENSING.md.
 name = "tangent-vst3"
-version = "3.1.0"
+version = "3.1.1"
 edition = "2021"
 rust-version = "1.92"
 license = "GPL-3.0-or-later"

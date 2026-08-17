@@ -122,6 +122,8 @@ pub enum MenuAction {
     /// §5: pre-roll countdown in seconds; one of `recorder::PREROLL_CHOICES`.
     /// Count-in length in beats (0 / 4 / 8).
     SetCountIn(u32),
+    /// What a take is made of: `auto` / `input` / `plugin` / `both`.
+    SetRecordSources(&'static str),
     /// The click.
     ToggleMetronome,
     /// Whether the click is mixed into the FILE as well as the monitors.
@@ -197,6 +199,8 @@ pub struct MenuView {
     /// which has already clamped a stray value from a later build's file to
     /// something this menu can mark.
     pub count_in_beats: u32,
+    /// What a take is made of, verbatim from the settings.
+    pub record_sources: String,
     /// The click is running.
     pub metronome_on: bool,
     /// The click is mixed into the recording as well as the monitors.
@@ -833,6 +837,38 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         }
         push_category(&mut e, "Recorder", recorder);
         if view.recorder_on {
+            // What a take is made of. A sibling hover for the same reason the
+            // count-in is one: it is a list of choices.
+            //
+            // It exists at all because its absence was a bug people hit: with
+            // no control, the stored default decided, and the default recorded
+            // the microphone and left the instrument you could plainly hear out
+            // of the file.
+            //
+            // "Sources" and not "Record": this sits directly under "Recorder",
+            // and two rows reading "Recorder" and "Record" are one glance apart
+            // from being the same word.
+            push_category(
+                &mut e,
+                "Sources",
+                [
+                    ("auto", "Everything there is"),
+                    ("plugin", "Instruments only"),
+                    ("input", "Audio input only"),
+                    ("both", "Instruments + input"),
+                ]
+                .into_iter()
+                .map(|(key, label)| SubItem {
+                    label: if key == view.record_sources {
+                        format!("{label}  \u{2022}")
+                    } else {
+                        label.to_owned()
+                    },
+                    action: MenuAction::SetRecordSources(key),
+                    enabled: true,
+                })
+                .collect(),
+            );
             // A SIBLING hover, for exactly the reason Wood/Tuning/Capo are:
             // the count-in is a list of choices, so it is already a submenu, and a
             // submenu cannot hold another one (see `Entry::Submenu`). Offered
@@ -1392,6 +1428,7 @@ mod tests {
             recorder_on: false,
             recorder_detached: false,
             count_in_beats: 4,
+            record_sources: "auto".to_owned(),
             metronome_on: false,
             metronome_in_take: false,
             hide_elapsed: false,
@@ -1994,6 +2031,7 @@ mod tests {
         // choice cannot be added to `COUNT_IN_CHOICES` and quietly arrive in a
         // plugin unlisted here.
         forbidden.extend(crate::recorder::COUNT_IN_CHOICES.map(MenuAction::SetCountIn));
+        forbidden.extend(["auto", "plugin", "input", "both"].map(MenuAction::SetRecordSources));
         for (label, action, _) in all_rows(v.clone()) {
             assert!(
                 !forbidden.contains(&action),
@@ -2237,6 +2275,7 @@ mod tests {
                 "Tuning",
                 "Capo",
                 "Recorder",
+                "Sources",
                 "Count-in",
             ]
         );
