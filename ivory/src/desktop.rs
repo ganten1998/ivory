@@ -188,6 +188,14 @@ struct Recorder {
     /// Without this the video would only ever contain frames that happened to
     /// land on the same window frame as a tick.
     camera_rgba: Option<(Vec<u8>, u32, u32)>,
+    /// The buffer size both streams were opened with.
+    ///
+    /// Changing it has to REOPEN them — a running stream cannot be resized —
+    /// and reopening the output means reloading every instrument, which is
+    /// five seconds each. So it is done on the edge, and never while a take is
+    /// rolling: a take whose buffer changed halfway through is a take with a
+    /// hole in it.
+    buffer_open: Option<u32>,
     /// The last finished take this host has already accounted for.
     ///
     /// Updated whether or not "Show when done" is ticked, which is the point:
@@ -286,6 +294,38 @@ impl DesktopApp {
             // Drop the stale picture when there is no camera behind it, or the
             // last frame of an unplugged webcam stays on screen looking live.
             self.recorder.preview = None;
+        }
+
+        // What both sides are doing, for the Audio Status panel. Pushed every
+        // frame rather than fetched when the panel opens: a rate that changed
+        // under you is exactly what it is there to show.
+        self.app.set_audio_status(ivory_ui::recorder::AudioStatus {
+            input: self.recorder.session.input_stats(),
+            output: self.recorder.engine.as_ref().map(|e| {
+                let o = e.output();
+                (
+                    o.device.clone(),
+                    ivory_ui::recorder::StreamStats {
+                        sample_rate: o.sample_rate,
+                        channels: o.channels,
+                        buffer_frames: o.buffer_frames,
+                    },
+                )
+            }),
+        });
+
+        // The buffer size, on the edge. Reopening both streams is expensive —
+        // the output takes every instrument with it — so it happens when the
+        // choice CHANGES and not while a take is rolling.
+        let want_buffer = self.app.buffer_frames();
+        if self.recorder.buffer_open != want_buffer && !self.recorder.session.is_recording() {
+            self.recorder.buffer_open = want_buffer;
+            // Dropping the engine stops the output stream; the next frame
+            // starts a new one at the new size and reloads the slots, exactly
+            // as it does when the band is reopened.
+            self.recorder.engine = None;
+            self.recorder.plugin_loaded = std::array::from_fn(|_| None);
+            self.reconcile_audio(true);
         }
 
         let audio_uid = self.app.chosen_audio_uid().map(str::to_owned);
@@ -596,7 +636,11 @@ impl DesktopApp {
                     // sample clock. Started here, at the press, so the first
                     // beat lands immediately rather than a frame later.
                     let beats = self.app.count_in_beats();
+                    let in_take = self.app.count_in_in_take();
                     if let Some(e) = self.recorder.engine.as_ref() {
+                        // The click's own switch for the count, which is not
+                        // `metronome_in_take` — see `Shared::count_in_in_take`.
+                        e.set_count_in_in_take(in_take);
                         if !self.recorder.session.is_recording() && beats > 0 {
                             e.start_count_in(beats, self.app.tempo_bpm());
                         } else {
@@ -611,12 +655,15 @@ impl DesktopApp {
                         e.clear_clip();
                     }
                     let spec = self.app.export_spec();
-                    self.recorder.session.toggle(
-                        &root,
-                        name.as_deref(),
-                        self.app.count_in_beats(),
-                        spec,
-                    );
+                    // **Zero when the count-in goes INSIDE the take.** The
+                    // session's count-in is a delay before the file opens; the
+                    // engine's is the click. Passing zero here starts writing
+                    // at the press while the click counts on regardless, which
+                    // is exactly "start instantly with the count-in in the
+                    // export" — the count is at the head of the file to trim to
+                    // or to keep.
+                    let wait = if in_take { 0 } else { beats };
+                    self.recorder.session.toggle(&root, name.as_deref(), wait, spec);
                 }
                 R::Stop => self.recorder.session.stop(),
                 R::OpenPluginEditor(slot) => {
@@ -674,7 +721,11 @@ impl DesktopApp {
         if self.recorder.engine.is_some() {
             return;
         }
-        match crate::instrument::Engine::start_with(None, self.recorder.session.timebase()) {
+        match crate::instrument::Engine::start_sized(
+            None,
+            self.recorder.session.timebase(),
+            self.app.buffer_frames(),
+        ) {
             Ok(e) => {
                 self.recorder.engine = Some(e);
                 self.recorder.engine_error = None;
@@ -709,6 +760,13 @@ impl DesktopApp {
         e.set_metronome_enabled(self.app.metronome_on());
         e.set_metronome_in_take(self.app.metronome_in_take());
         e.set_tempo(self.app.tempo_bpm());
+        // The signature drives both halves of the click: which beat is accented
+        // and how long a beat lasts. In 6/8 those are "every sixth" and "half a
+        // quarter" — get the second wrong and the count-in is twice as long as
+        // the bar it is counting.
+        let sig = self.app.time_signature();
+        e.set_meter(u32::from(sig.beats), u32::from(sig.unit));
+        self.recorder.session.set_meter(sig);
     }
 
     /// Decide what the next take is made of, from what is actually available.
@@ -854,7 +912,10 @@ impl DesktopApp {
             return;
         }
         match crate::devices::audio_selection(&self.recorder.audio) {
-            Some(selection) => self.recorder.session.open_input(&selection),
+            Some(selection) => self
+                .recorder
+                .session
+                .open_input(&selection, self.app.buffer_frames()),
             // The user picked "None — record MIDI only". Mapping that to the
             // system default (which is what happened before `explicit` existed)
             // opened the built-in microphone and put its name in the band.
@@ -1020,6 +1081,7 @@ impl DesktopApp {
                 video: None,
                 video_tried: false,
                 camera_rgba: None,
+                buffer_open: None,
                 seen_take: None,
                 dev_editor_done: false,
             }

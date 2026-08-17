@@ -618,6 +618,9 @@ struct Audio {
     device_name: String,
     channels: u16,
     sample_rate: u32,
+    /// Frames per callback, when the device accepted a fixed size. `None` is
+    /// cpal's `BufferSize::Default`: the device chose and did not say what.
+    buffer_frames: Option<u32>,
     cmds: mpsc::Sender<Cmd>,
     reports: mpsc::Receiver<AudioReport>,
     meters: Arc<Mutex<AudioMeters>>,
@@ -630,8 +633,16 @@ impl Audio {
         selection: &InputSelection,
         timebase: Timebase,
         tap_home: mpsc::Sender<Box<crate::instrument::RecorderTap>>,
+        buffer_frames: Option<u32>,
     ) -> Result<Self, String> {
-        let wish = audio::ConfigWish::default();
+        // The user's buffer choice, or the device's own. Both streams get the
+        // same one: they are two halves of one path, and a round-trip figure
+        // made of a 64-frame input and a 1024-frame output is a number nobody
+        // can act on.
+        let wish = audio::ConfigWish {
+            buffer_frames,
+            ..audio::ConfigWish::default()
+        };
         // Three seconds of ring. The writer thread wakes every 4 ms, so this is
         // absurd headroom — and that is the point: the one thing that must
         // never happen is the ring filling because the machine hiccuped while
@@ -756,6 +767,10 @@ impl Audio {
             device_name: config.device.clone(),
             channels: config.channels,
             sample_rate: config.sample_rate,
+            buffer_frames: match config.buffer_size {
+                cpal::BufferSize::Fixed(n) => Some(n),
+                cpal::BufferSize::Default => None,
+            },
             cmds: cmd_tx,
             reports: report_rx,
             meters,
@@ -913,6 +928,8 @@ pub struct Session {
     /// Latched across the take, because the meter's own latch is reset when the
     /// next one is armed and the user may not have looked yet.
     clipped: bool,
+    /// The take's time signature, for the `.mid`'s tempo map.
+    meter: ivory_ui::recorder::TimeSignature,
     /// Where a writer thread puts the instrument tap when it shuts down.
     ///
     /// **The tap is a single object that has to move between two writers.** It
@@ -956,6 +973,7 @@ impl Session {
             midi_clock: SourceClock::new(MIDIR_SCALE_NS, MIDI_SETTLE_NS),
             midi: MidiTake::new(),
             state: RecordState::Idle,
+            meter: ivory_ui::recorder::TimeSignature::default(),
             tap_tx,
             tap_rx,
             plugin_audio: None,
@@ -1000,6 +1018,19 @@ impl Session {
 
     pub fn clipped(&self) -> bool {
         self.clipped
+    }
+
+    /// What the INPUT stream is running at, for the status panel.
+    pub fn input_stats(&self) -> Option<(String, ivory_ui::recorder::StreamStats)> {
+        let a = self.audio.as_ref()?;
+        Some((
+            a.device_name.clone(),
+            ivory_ui::recorder::StreamStats {
+                sample_rate: a.sample_rate,
+                channels: a.channels,
+                buffer_frames: a.buffer_frames,
+            },
+        ))
     }
 
     pub fn audio_device_name(&self) -> Option<&str> {
@@ -1050,7 +1081,7 @@ impl Session {
     /// changes — never at Record. RECORDER-PLAN §3: a device opened at Record
     /// costs warm-up time inside the take, and a meter that only comes alive
     /// once recording has begun cannot prevent the mistake it exists to prevent.
-    pub fn open_input(&mut self, selection: &InputSelection) {
+    pub fn open_input(&mut self, selection: &InputSelection, buffer_frames: Option<u32>) {
         if self.state.is_active() {
             return; // never swap the device out from under a running take
         }
@@ -1061,7 +1092,7 @@ impl Session {
         // the channel rather than lost with the thread.
         self.plugin_audio = None;
         let tap = self.recover_tap();
-        match Audio::open(selection, self.timebase, self.tap_tx.clone()) {
+        match Audio::open(selection, self.timebase, self.tap_tx.clone(), buffer_frames) {
             Ok(a) => {
                 if let Some(t) = tap {
                     let _ = a.cmds.send(Cmd::Plugin(Some(Box::new(t))));
@@ -1137,6 +1168,14 @@ impl Session {
     /// Which sources the next take is made of. Ignored mid-take: a take that
     /// changed what it was recording halfway through would produce a file
     /// matching neither answer.
+    /// The take's time signature. Ignored mid-take, like the source: a `.mid`
+    /// whose bar lines changed halfway through is a file nobody can edit.
+    pub fn set_meter(&mut self, meter: ivory_ui::recorder::TimeSignature) {
+        if !self.state.is_active() {
+            self.meter = meter;
+        }
+    }
+
     pub fn set_source(&mut self, source: TakeSource) {
         if self.state.is_active() {
             return;
@@ -1629,7 +1668,18 @@ impl Session {
         // ── MIDI ────────────────────────────────────────────────────────────
         let mut wrote_midi = false;
         if spec.midi && !self.midi.is_empty() {
-            match self.midi.write(&timeline, spec.tempo_bpm, &take.midi()) {
+            // With the take's signature, so a DAW's bar lines land where the
+            // click did. `Meter` carries the unit as a POWER of two, because
+            // that is what the file stores and converting in two places is how
+            // the two come to disagree.
+            let meter = ivory_record::smf::Meter {
+                beats: self.meter.beats,
+                unit_power: self.meter.unit_power(),
+            };
+            match self
+                .midi
+                .write_with_meter(&timeline, spec.tempo_bpm, &take.midi(), meter)
+            {
                 Ok(()) => wrote_midi = true,
                 Err(e) => {
                     problem.get_or_insert_with(|| format!("could not write the MIDI file: {e}"));
@@ -1881,7 +1931,7 @@ pub fn record_test(seconds: Option<String>) {
     let timebase = Timebase::new();
     let tap = Arc::new(RawMidiTap::new(60_000));
     let mut session = Session::new(Arc::clone(&tap), timebase);
-    session.open_input(&InputSelection::Default);
+    session.open_input(&InputSelection::Default, None);
     match (session.audio_device_name(), session.audio_error()) {
         (Some(name), _) => println!("\nopen: {name}"),
         (None, Some(e)) => {

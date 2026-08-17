@@ -79,6 +79,17 @@ pub enum Dialog {
         message: String,
     },
     About,
+    /// What the audio path is actually doing, and the one knob that changes it.
+    ///
+    /// It exists because every number in it was invisible: somebody whose
+    /// interface quietly came up at 44.1 while the monitor ran at 48 had no way
+    /// to find out, and the symptom — an instrument ring overflowing and
+    /// reporting the losses against the take — points nowhere near the cause.
+    AudioStatus {
+        status: crate::recorder::AudioStatus,
+        /// Frames per callback, or `None` for the device's own default.
+        buffer: Option<u32>,
+    },
     /// Shown at startup until dismissed with its checkbox. Tangent is free; this
     /// asks for support without gating anything, so it must never feel like a
     /// paywall prompt.
@@ -205,6 +216,9 @@ pub enum DialogAction {
     ConnectPort(String),
     /// Persist the welcome dialog's "don't show again" choice.
     SetShowWelcome(bool),
+    /// Frames per audio callback, or `None` for the device's own default.
+    /// Applies to both streams and reopens them.
+    SetBufferFrames(Option<u32>),
     /// Try to install a pasted supporter key. The app reports the outcome by
     /// updating or closing the dialog.
     InstallLicense {
@@ -689,6 +703,11 @@ const WELCOME_LINES: [&str; 13] = [
     "",
     "Press and hold  H  for every keyboard shortcut.",
 ];
+
+/// The Audio Status window. Two device blocks, a round-trip line, and a row of
+/// buffer sizes — measured by `the_audio_status_card_fits_its_own_text`.
+const AUDIO_W: f32 = 430.0;
+const AUDIO_H: f32 = 400.0;
 
 /// The Welcome card's window, and the size it opens at.
 ///
@@ -2050,6 +2069,140 @@ pub fn show(
                             ui.add_space((ui.available_height() - 30.0).max(0.0));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui.button("OK").clicked() {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
+        Dialog::AudioStatus { status, buffer } => {
+            let t = theme(dark_mode);
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Audio Status",
+                Vec2::new(AUDIO_W, AUDIO_H),
+                Vec2::new(AUDIO_W - 60.0, AUDIO_H - 40.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.visuals_mut().extreme_bg_color = t.bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    let plain = |size: f32| FontId::new(size, fonts::courier());
+                    // Derived from the theme's own ink rather than added to
+                    // `DialogTheme`: two shades used by one dialog are not a
+                    // theme, and a field nothing else reads is a field the next
+                    // theme has to remember to set.
+                    let dim = t.text.gamma_multiply(0.62);
+                    let warn = Color32::from_rgb(0xE0, 0x9A, 0x3C);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(14))
+                        .show(ui, |ui| {
+                            for (title, side) in
+                                [("INPUT", &status.input), ("OUTPUT", &status.output)]
+                            {
+                                ui.label(RichText::new(title).font(bold(11.0)).color(t.text));
+                                match side {
+                                    Some((name, s)) => {
+                                        ui.label(
+                                            RichText::new(name).font(plain(11.0)).color(t.text),
+                                        );
+                                        let buf = match (s.buffer_frames, s.buffer_ms()) {
+                                            (Some(f), Some(ms)) => {
+                                                format!("{f} frames  ({ms:.1} ms)")
+                                            }
+                                            // The device chose and did not say
+                                            // what it chose — which is what
+                                            // cpal's `BufferSize::Default`
+                                            // means, and pretending otherwise
+                                            // would be inventing a number.
+                                            _ => "device default".to_owned(),
+                                        };
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} Hz   {} ch   {buf}",
+                                                s.sample_rate, s.channels
+                                            ))
+                                            .font(plain(11.0))
+                                            .color(t.text),
+                                        );
+                                    }
+                                    None => {
+                                        ui.label(
+                                            RichText::new("not open")
+                                                .font(plain(11.0))
+                                                .color(dim),
+                                        );
+                                    }
+                                }
+                                ui.add_space(6.0);
+                            }
+
+                            if status.rates_disagree() {
+                                // Not cosmetic: the writer drains the
+                                // instrument's ring at the input's rate while
+                                // the engine fills it at the output's.
+                                // Two lines. One was 549 points wide against a
+                                // 430-point panel — see
+                                // `the_audio_status_card_fits_its_own_text`,
+                                // which measures it rather than trusting it.
+                                for line in [
+                                    "The two sides run at different rates.",
+                                    "The instrument's audio will drift.",
+                                ] {
+                                    ui.label(
+                                        RichText::new(line).font(bold(11.0)).color(warn),
+                                    );
+                                }
+                                ui.add_space(6.0);
+                            }
+
+                            ui.label(
+                                RichText::new(match status.round_trip_ms() {
+                                    Some(ms) => format!("Round trip, at least  {ms:.1} ms"),
+                                    None => "Round trip  —".to_owned(),
+                                })
+                                .font(bold(11.0))
+                                .color(t.text),
+                            );
+                            // Said out loud, because a latency figure people
+                            // trust and should not is worse than none.
+                            ui.label(
+                                RichText::new(
+                                    "buffers only; converters and the driver add more",
+                                )
+                                .font(plain(10.0))
+                                .color(dim),
+                            );
+                            ui.add_space(10.0);
+
+                            ui.label(
+                                RichText::new("BUFFER SIZE").font(bold(11.0)).color(t.text),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                let mut pick = |ui: &mut egui::Ui, label: String, val: Option<u32>| {
+                                    if ui.selectable_label(*buffer == val, label).clicked() {
+                                        *buffer = val;
+                                        action = Some(DialogAction::SetBufferFrames(val));
+                                    }
+                                };
+                                pick(ui, "Device".to_owned(), None);
+                                for f in crate::recorder::BUFFER_CHOICES {
+                                    pick(ui, f.to_string(), Some(f));
+                                }
+                            });
+                            ui.label(
+                                RichText::new("both streams reopen; not while a take is rolling")
+                                    .font(plain(10.0))
+                                    .color(dim),
+                            );
+
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.add(Button::new(RichText::new("Close").color(t.text))).clicked()
+                                {
                                     result.close = true;
                                 }
                             });
@@ -4194,6 +4347,59 @@ mod tests {
         assert!(
             WELCOME_LINES.iter().any(|l| l.contains(" H ")),
             "the welcome card no longer tells anybody about the help key"
+        );
+    }
+
+    /// **The Audio Status panel fits the longest line it can produce.**
+    ///
+    /// Its content is generated, not fixed — device names, rates, a warning —
+    /// so the thing to measure is the widest line it could ever draw. A panel
+    /// whose rate line runs under the buffer buttons is one nobody can read the
+    /// number off, which is its entire job.
+    #[test]
+    fn the_audio_status_card_fits_its_own_text() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+
+        // The longest of each kind, including a device name longer than any
+        // real one — interfaces have names like "Scarlett 18i20 USB" and a
+        // Continuity camera's is longer still.
+        let lines = [
+            "Scarlett 18i20 USB (2nd Generation) Digital".to_owned(),
+            format!("{} Hz   {} ch   {} frames  ({:.1} ms)", 192_000, 32, 2048, 10.7),
+            "The two sides run at different rates.".to_owned(),
+            "The instrument's audio will drift.".to_owned(),
+            "Round trip, at least  21.3 ms".to_owned(),
+            "buffers only; converters and the driver add more".to_owned(),
+            "both streams reopen; not while a take is rolling".to_owned(),
+        ];
+        let mut widest = 0.0_f32;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for (i, line) in lines.iter().enumerate() {
+                    // The warning and the headings are bold; the readings are
+                    // not. Measured at the size each is actually drawn.
+                    let (size, family) = match i {
+                        2 | 3 | 4 => (11.0, fonts::courier_bold()),
+                        5 | 6 => (10.0, fonts::courier()),
+                        _ => (11.0, fonts::courier()),
+                    };
+                    let g = ui.painter().layout_no_wrap(
+                        line.clone(),
+                        FontId::new(size, family),
+                        Color32::WHITE,
+                    );
+                    widest = widest.max(g.rect.width());
+                }
+            });
+        });
+
+        const MARGIN: f32 = 14.0 * 2.0;
+        let needed = widest + MARGIN;
+        assert!(
+            needed <= AUDIO_W,
+            "the audio panel needs {needed:.0} points of width and has {AUDIO_W:.0}"
         );
     }
 

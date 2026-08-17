@@ -119,9 +119,16 @@ pub enum MenuAction {
     /// configures a take that a plugin may not capture or write in the first
     /// place — the whole category goes, not this row.
     ShowExportDialog,
+    /// What the audio path is doing: both rates, both buffers, the round trip.
+    ShowAudioStatus,
     /// §5: pre-roll countdown in seconds; one of `recorder::PREROLL_CHOICES`.
     /// Count-in length in beats (0 / 4 / 8).
     SetCountIn(u32),
+    /// The take's time signature. Drives the click's accent, how long a bar of
+    /// count-in is, and the `.mid`'s meta event.
+    SetTimeSignature(crate::recorder::TimeSignature),
+    /// Write the count-in into the take rather than before it.
+    ToggleCountInInTake,
     /// What a take is made of: `auto` / `input` / `plugin` / `both`.
     SetRecordSources(&'static str),
     /// The click.
@@ -195,6 +202,13 @@ pub struct MenuView {
     /// Needed for the same reason `theory_detached` is: the Detach row renames
     /// itself to Attach, so the label IS the state readout.
     pub recorder_detached: bool,
+    /// §5: the take's time signature, so the count-in submenu can say what a
+    /// bar is worth.
+    pub time_signature: crate::recorder::TimeSignature,
+    /// §5: the count-in length in BARS.
+    pub count_in_bars: u32,
+    /// §5: whether the count-in is written into the take.
+    pub count_in_in_take: bool,
     /// §5: the live count-in, in beats. Comes from `Settings::count_in_beats()`,
     /// which has already clamped a stray value from a later build's file to
     /// something this menu can mark.
@@ -904,6 +918,18 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 },
                 MenuAction::ToggleMetronomeInTake,
             ));
+            recorder.push(row(
+                // Worded as what it does, like the click row above it. The
+                // consequence is the whole point: with it on, Record starts
+                // writing IMMEDIATELY and the count is at the head of the file.
+                if view.count_in_in_take {
+                    "Count In Before the Take Starts"
+                } else {
+                    "Record the Count-in Into the Take"
+                },
+                MenuAction::ToggleCountInInTake,
+            ));
+            recorder.push(row("Audio Status...", MenuAction::ShowAudioStatus));
             recorder.push(row("Export...", MenuAction::ShowExportDialog));
             recorder.push(row(
                 if view.hide_elapsed {
@@ -948,6 +974,24 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 })
                 .collect(),
             );
+            // The signature the click, the count-in and the `.mid` all share.
+            // A sibling hover for the same reason the count-in is one.
+            push_category(
+                &mut e,
+                "Time signature",
+                crate::recorder::TIME_SIGNATURES
+                    .into_iter()
+                    .map(|sig| SubItem {
+                        label: if sig == view.time_signature {
+                            format!("{}  \u{2022}", sig.label())
+                        } else {
+                            sig.label()
+                        },
+                        action: MenuAction::SetTimeSignature(sig),
+                        enabled: true,
+                    })
+                    .collect(),
+            );
             // A SIBLING hover, for exactly the reason Wood/Tuning/Capo are:
             // the count-in is a list of choices, so it is already a submenu, and a
             // submenu cannot hold another one (see `Entry::Submenu`). Offered
@@ -958,27 +1002,31 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 "Count-in",
                 crate::recorder::COUNT_IN_CHOICES
                     .into_iter()
-                    .map(|s| {
-                        // Bars in brackets because "8 beats" is what the click
-                        // plays and "two bars" is what a musician asks for, and
-                        // saying only one of them makes the other a sum you do
-                        // in your head. 4/4 is assumed and stated, because the
-                        // app has no time signature to consult.
-                        let label = if s == 0 {
+                    .map(|bars| {
+                        // Bars, with the beat count in brackets — the signature
+                        // decides it now, so "2 bars" alone leaves you doing
+                        // the multiplication and "12 beats" alone leaves you
+                        // doing the division.
+                        let label = if bars == 0 {
                             "No count-in".to_owned()
                         } else {
-                            format!("{s} beats  ({} bars of 4)", s / 4)
+                            let beats = view.time_signature.beats_in(bars);
+                            let word = if bars == 1 { "bar" } else { "bars" };
+                            format!(
+                                "{bars} {word}  ({beats} beats of {})",
+                                view.time_signature.label()
+                            )
                         };
                         SubItem {
                             // Marked rather than hidden, like Tuning and Capo: a
                             // submenu that never says what is selected makes you
                             // close it again to find out.
-                            label: if s == view.count_in_beats {
+                            label: if bars == view.count_in_bars {
                                 format!("{label}  \u{2022}")
                             } else {
                                 label
                             },
-                            action: MenuAction::SetCountIn(s),
+                            action: MenuAction::SetCountIn(bars),
                             enabled: true,
                         }
                     })
@@ -1527,6 +1575,9 @@ mod tests {
             recorder_on: false,
             recorder_detached: false,
             count_in_beats: 4,
+            time_signature: crate::recorder::TimeSignature::default(),
+            count_in_bars: 1,
+            count_in_in_take: false,
             record_sources: "auto".to_owned(),
             metronome_on: false,
             metronome_in_take: false,
@@ -1950,13 +2001,14 @@ mod tests {
                 .filter(|e| !matches!(e, Entry::Separator))
                 .count()
         };
-        // Was 16. The recorder costs two, and both are structural rather than
-        // sprawl: one subject (Recorder) plus one choice-list sibling
-        // (Pre-roll), which is the exact shape the fretboard already has and
-        // the only shape `Entry::Submenu` allows. Raise this only for a reason
-        // that can be written down in the same breath.
+        // Was 16, then 18. The recorder costs FOUR, and each is structural
+        // rather than sprawl: one subject (Recorder) plus three choice-list
+        // siblings — Sources, Time signature and Count-in — which is the exact
+        // shape the fretboard already has and the only shape `Entry::Submenu`
+        // allows, since a submenu cannot hold another one. Raise this only for
+        // a reason that can be written down in the same breath.
         assert!(
-            count(fullest()) <= 18,
+            count(fullest()) <= 20,
             "the fullest menu is back to {} top-level rows",
             count(fullest())
         );
@@ -2407,6 +2459,8 @@ mod tests {
                 "Detach Recorder",
                 "Start the Click",
                 "Record the Click Into Takes",
+                "Record the Count-in Into the Take",
+                "Audio Status...",
                 "Export...",
                 "Hide Elapsed Time",
             ]
@@ -2441,6 +2495,7 @@ mod tests {
                 "Capo",
                 "Recorder",
                 "Sources",
+                "Time signature",
                 "Count-in",
             ]
         );
@@ -2510,6 +2565,8 @@ mod tests {
                 "Hide Recorder",
                 "Start the Click",
                 "Record the Click Into Takes",
+                "Record the Count-in Into the Take",
+                "Audio Status...",
                 "Export...",
                 "Hide Elapsed Time"
             ],
@@ -2526,7 +2583,7 @@ mod tests {
         for &want in &crate::recorder::COUNT_IN_CHOICES {
             let v = MenuView {
                 recorder_on: true,
-                count_in_beats: want,
+                count_in_bars: want,
                 ..view()
             };
             let (labels, actions) = {
@@ -2536,11 +2593,14 @@ mod tests {
             assert_eq!(labels.len(), crate::recorder::COUNT_IN_CHOICES.len());
             let marked: Vec<&String> =
                 labels.iter().filter(|l| l.ends_with('\u{2022}')).collect();
-            assert_eq!(marked.len(), 1, "{want} beats marked {marked:?}");
-            let expect = if want == 0 {
-                "No count-in".to_owned()
-            } else {
-                format!("{want} beats")
+            assert_eq!(marked.len(), 1, "{want} bars marked {marked:?}");
+            // Bars, with the beat count in brackets — the signature decides
+            // it, so "2 bars" alone leaves the reader multiplying and
+            // "12 beats" alone leaves them dividing.
+            let expect = match want {
+                0 => "No count-in".to_owned(),
+                1 => "1 bar".to_owned(),
+                n => format!("{n} bars"),
             };
             assert!(marked[0].starts_with(&expect), "{marked:?} is not {expect}");
             assert_eq!(
@@ -2556,11 +2616,32 @@ mod tests {
             ..view()
         };
         assert_eq!(
-            sub(v, "Count-in").1,
+            sub(v.clone(), "Count-in").1,
             vec![
                 "No count-in",
-                "4 beats  (1 bars of 4)  \u{2022}",
-                "8 beats  (2 bars of 4)"
+                "1 bar  (4 beats of 4/4)  \u{2022}",
+                "2 bars  (8 beats of 4/4)",
+                "4 bars  (16 beats of 4/4)",
+            ]
+        );
+
+        // **And the same list in 6/8 counts twelve, not eight.** This is the
+        // whole reason the count-in is bars: no number of beats is the right
+        // answer at every signature, and the old label said "of 4" because
+        // there was nothing else it could say.
+        let six_eight = MenuView {
+            recorder_on: true,
+            time_signature: crate::recorder::TimeSignature { beats: 6, unit: 8 },
+            count_in_bars: 2,
+            ..view()
+        };
+        assert_eq!(
+            sub(six_eight, "Count-in").1,
+            vec![
+                "No count-in",
+                "1 bar  (6 beats of 6/8)",
+                "2 bars  (12 beats of 6/8)  \u{2022}",
+                "4 bars  (24 beats of 6/8)",
             ]
         );
     }

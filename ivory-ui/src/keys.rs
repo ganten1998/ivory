@@ -35,10 +35,18 @@ pub enum KeyAction {
     ManageTaughtChords,
     ToggleChordLearning,
     ToggleNotePreference,
-    /// §5: start or stop a take.
+    /// §5: START a take.
+    ///
+    /// Separate from stopping, which is the owner's call and the right one: one
+    /// key that does both means the key that begins a performance is the same
+    /// one that ends it, and the difference between the two is a state you
+    /// cannot see from the bench. Enter starts, Space stops.
     ///
     /// The first binding here that is not always live — see [`Gates`].
-    ToggleRecording,
+    StartRecording,
+    /// §5: STOP a take. Space, because that is what every transport in every
+    /// DAW the user already owns is bound to.
+    StopRecording,
     ToggleRecorder,
     /// Fill the screen, and come back.
     ///
@@ -99,7 +107,7 @@ pub struct Gates {
 /// card cannot advertise a dead key and a live key cannot go unlisted.
 fn available(action: KeyAction, gates: Gates) -> bool {
     match action {
-        KeyAction::ToggleRecording => gates.recorder_shown,
+        KeyAction::StartRecording | KeyAction::StopRecording => gates.recorder_shown,
         KeyAction::ToggleRecorder => gates.recorder_available,
         KeyAction::ToggleFullscreen => gates.window_sizing,
         _ => true,
@@ -164,7 +172,8 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     (Key::ArrowUp, "Up", KeyAction::TransposeUp, true),
     (Key::ArrowDown, "Down", KeyAction::TransposeDown, true),
     (Key::V, "V", KeyAction::ToggleRecorder, true),
-    (Key::Space, "Space", KeyAction::ToggleRecording, true),
+    (Key::Enter, "Enter", KeyAction::StartRecording, true),
+    (Key::Space, "Space", KeyAction::StopRecording, true),
     // Escape only closes the card; it is not worth a row of its own.
     (Key::Escape, "Esc", KeyAction::CloseHelp, false),
 ];
@@ -189,7 +198,8 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ManageTaughtChords => "chords you have taught",
         KeyAction::ToggleChordLearning => "chord learning",
         KeyAction::ToggleNotePreference => "sharps or flats",
-        KeyAction::ToggleRecording => "start or stop recording",
+        KeyAction::StartRecording => "start recording",
+        KeyAction::StopRecording => "stop recording",
         KeyAction::ToggleRecorder => "the recorder",
         KeyAction::ToggleFullscreen => "fill the screen",
         KeyAction::TransposeUp => "transpose up a semitone",
@@ -558,7 +568,16 @@ mod tests {
         );
         assert_eq!(
             press(Key::Space, Gates { recorder_shown: true, recorder_available: true, window_sizing: true }),
-            Some(KeyAction::ToggleRecording)
+            Some(KeyAction::StopRecording)
+        );
+        // And Enter, which is the other half of the same gate. **Two keys, not
+        // one that toggles**: the key that begins a performance must not be the
+        // key that ends it, because the difference between the two is a state
+        // you cannot read from the bench.
+        assert_eq!(press(Key::Enter, Gates::default()), None);
+        assert_eq!(
+            press(Key::Enter, Gates { recorder_shown: true, recorder_available: true, window_sizing: true }),
+            Some(KeyAction::StartRecording)
         );
         // The gate is Space's alone: nothing else changes with it.
         for (key, want) in [
@@ -584,22 +603,26 @@ mod tests {
             window_sizing: true,
         };
         let hidden = card_rows(can_record);
-        assert!(
-            !hidden.iter().any(|(label, _)| *label == "Space"),
-            "the card offers a shortcut the app would ignore"
-        );
+        for gone in ["Space", "Enter"] {
+            assert!(
+                !hidden.iter().any(|(label, _)| *label == gone),
+                "the card offers {gone}, a shortcut the app would ignore"
+            );
+        }
         let shown = card_rows(Gates {
             recorder_shown: true,
             ..can_record
         });
+        // TWO rows now, not one: starting and stopping are separate keys, so
+        // that the key which begins a performance is not the key that ends it.
         assert_eq!(
             shown.len(),
-            hidden.len() + 1,
-            "opening the band added something other than Space"
+            hidden.len() + 2,
+            "opening the band added something other than Enter and Space"
         );
         assert_eq!(
             shown.last().map(|(l, d)| (*l, *d)),
-            Some(("Space", describe(KeyAction::ToggleRecording))),
+            Some(("Space", describe(KeyAction::StopRecording))),
             "Space is last, so appearing does not reflow every row above it"
         );
         // And every listed row is a live binding, in both states.

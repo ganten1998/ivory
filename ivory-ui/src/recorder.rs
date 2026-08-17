@@ -1162,13 +1162,15 @@ pub const MAX_BPM: f64 = 300.0;
 /// passages ask for, and everything else is a support question.
 pub const FPS_CHOICES: [u32; 3] = [24, 30, 60];
 
-/// Count-in choices, in BEATS.
+/// Count-in choices, in BARS.
 ///
-/// Nothing, one bar, two bars — at 4/4, which is what "4" and "8" mean here.
-/// Expressed in beats rather than bars because the app has no time signature
-/// and inventing one to describe a click would be a bigger lie than counting
-/// beats.
-pub const COUNT_IN_CHOICES: [u32; 3] = [0, 4, 8];
+/// Bars now that there IS a time signature to count them in. It used to be
+/// beats — 0, 4, 8 — with "(2 bars of 4)" in brackets and 4/4 assumed and
+/// stated, because inventing a signature to describe a click would have been a
+/// bigger lie than counting beats. In 6/8 that assumption stops being a
+/// simplification and starts being wrong: two bars is twelve clicks, and no
+/// number of beats is the right answer at every signature.
+pub const COUNT_IN_CHOICES: [u32; 4] = [0, 1, 2, 4];
 
 /// Gain range for every fader in the band, in dB, plus what 1.0 means.
 ///
@@ -1311,6 +1313,186 @@ pub fn parse_bpm(text: &str) -> Option<f64> {
     }
     Some(bpm.clamp(MIN_BPM, MAX_BPM))
 }
+
+/// A time signature, as a musician writes it: `beats`/`unit`.
+///
+/// # What the tempo means, and why it is not negotiable
+///
+/// **`tempo_bpm` counts QUARTER notes**, always, whatever the unit is. That is
+/// not a preference — an SMF tempo meta event is microseconds per quarter note
+/// and nothing else, so any other reading would make the `.mid` disagree with
+/// the click in every bar. In 6/8 at 120 a quarter is half a second, so an
+/// eighth is a quarter of a second and a bar of six is a second and a half.
+///
+/// It is worth being loud about because the other convention is common: many
+/// musicians set 6/8 by its dotted-quarter pulse and would expect 120 to mean
+/// two of those per bar. Under this reading that is 6/8 at 360, which the range
+/// allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeSignature {
+    /// Beats in a bar — the top number. 1..=32.
+    pub beats: u8,
+    /// What gets the beat — the bottom number. A power of two, 1..=32.
+    pub unit: u8,
+}
+
+impl Default for TimeSignature {
+    fn default() -> Self {
+        Self { beats: 4, unit: 4 }
+    }
+}
+
+/// The ones worth putting in a menu, in the order a musician would look for
+/// them. Anything else can still be typed — see [`TimeSignature::parse`].
+pub const TIME_SIGNATURES: [TimeSignature; 8] = [
+    TimeSignature { beats: 4, unit: 4 },
+    TimeSignature { beats: 3, unit: 4 },
+    TimeSignature { beats: 2, unit: 4 },
+    TimeSignature { beats: 6, unit: 8 },
+    TimeSignature { beats: 9, unit: 8 },
+    TimeSignature { beats: 12, unit: 8 },
+    TimeSignature { beats: 5, unit: 4 },
+    TimeSignature { beats: 7, unit: 8 },
+];
+
+impl TimeSignature {
+    /// Whether this is a signature anything can play or write.
+    ///
+    /// The unit has to be a power of two because that is what a note value IS,
+    /// and because the SMF meta event stores it as a power: 8 is written as 3.
+    pub fn is_valid(self) -> bool {
+        (1..=32).contains(&self.beats) && matches!(self.unit, 1 | 2 | 4 | 8 | 16 | 32)
+    }
+
+    /// How long one beat of THIS signature lasts, in seconds.
+    ///
+    /// `4.0 / unit` is the whole of it: the tempo counts quarters, so an eighth
+    /// is half a quarter and a half-note is two of them.
+    pub fn beat_seconds(self, tempo_bpm: f64) -> f64 {
+        let bpm = if tempo_bpm.is_finite() {
+            tempo_bpm.clamp(MIN_BPM, MAX_BPM)
+        } else {
+            DEFAULT_BPM
+        };
+        (4.0 / f64::from(self.unit.max(1))) * (60.0 / bpm)
+    }
+
+    /// Beats in `bars` bars of this signature.
+    pub fn beats_in(self, bars: u32) -> u32 {
+        u32::from(self.beats.max(1)) * bars
+    }
+
+    /// The SMF meta event's second byte: the unit as a POWER of two.
+    ///
+    /// 4 is written as 2, 8 as 3. Getting this wrong writes a file every DAW
+    /// reads as a different signature, which is the sort of thing nobody
+    /// notices until a bar line is in the wrong place.
+    pub fn unit_power(self) -> u8 {
+        match self.unit {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            16 => 4,
+            32 => 5,
+            // Unreachable through `is_valid`; 4/4 is the answer that cannot
+            // make a file unreadable.
+            _ => 2,
+        }
+    }
+
+    /// `"6/8"`, for a menu and for the settings file alike.
+    pub fn label(self) -> String {
+        format!("{}/{}", self.beats, self.unit)
+    }
+
+    /// The inverse. Anything that is not two numbers around a slash, or is not
+    /// a signature, is `None` rather than a guess.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (a, b) = text.trim().split_once('/')?;
+        let sig = Self {
+            beats: a.trim().parse().ok()?,
+            unit: b.trim().parse().ok()?,
+        };
+        sig.is_valid().then_some(sig)
+    }
+}
+
+/// One audio device, as the status panel reports it.
+///
+/// Plain data, filled by the binary: `ivory-ui` cannot see a device and must
+/// not learn how. `None` throughout means "no device open", which is a real
+/// state now that an input is never opened until one is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StreamStats {
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// Frames per callback, when the device is running one it will admit to.
+    /// `None` is cpal's `BufferSize::Default` — the device chose, and did not
+    /// say what it chose.
+    pub buffer_frames: Option<u32>,
+}
+
+impl StreamStats {
+    /// One buffer's worth of time, in milliseconds.
+    pub fn buffer_ms(self) -> Option<f64> {
+        let frames = self.buffer_frames?;
+        (self.sample_rate > 0).then(|| f64::from(frames) * 1000.0 / f64::from(self.sample_rate))
+    }
+}
+
+/// What the status panel shows: both sides of the audio path.
+#[derive(Debug, Clone, Default)]
+pub struct AudioStatus {
+    /// The input, when one is open.
+    pub input: Option<(String, StreamStats)>,
+    /// The monitor output, when the engine is running.
+    pub output: Option<(String, StreamStats)>,
+}
+
+impl AudioStatus {
+    /// **An ESTIMATE of round-trip latency, and labelled as one everywhere it
+    /// is shown.**
+    ///
+    /// It is one buffer in plus one buffer out, which is the part anybody can
+    /// compute. It is not the whole truth: a converter's own analogue-to-digital
+    /// and digital-to-analogue stages, the USB frame, and whatever the driver
+    /// does in between are all real and none of them are reported by cpal on
+    /// any platform. So this is a floor, not a measurement — the true figure is
+    /// always larger, typically by a few milliseconds.
+    ///
+    /// Measuring it properly means a loopback: play a click, record it, count
+    /// the samples between. That is worth doing and it is not this.
+    pub fn round_trip_ms(&self) -> Option<f64> {
+        let a = self.input.as_ref()?.1.buffer_ms()?;
+        let b = self.output.as_ref()?.1.buffer_ms()?;
+        Some(a + b)
+    }
+
+    /// Whether the two sides disagree about the sample rate.
+    ///
+    /// Worth its own question because it is not cosmetic: the writer drains the
+    /// instrument's ring at the INPUT's rate while the engine fills it at the
+    /// OUTPUT's, so a mismatch overflows that ring and reports the losses
+    /// against the take. Every device on the owner's machine is at 48k, which
+    /// is exactly why this needs to be visible rather than discovered.
+    pub fn rates_disagree(&self) -> bool {
+        match (&self.input, &self.output) {
+            (Some((_, a)), Some((_, b))) => {
+                a.sample_rate > 0 && b.sample_rate > 0 && a.sample_rate != b.sample_rate
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Buffer sizes the status panel offers, in frames.
+///
+/// Powers of two, because that is what every driver actually honours, and
+/// stopping at 2048 because beyond it the latency is worse than the dropout it
+/// was bought to prevent. `None` — the device's own default — is offered
+/// alongside these and is what the app has always used.
+pub const BUFFER_CHOICES: [u32; 6] = [64, 128, 256, 512, 1024, 2048];
 
 /// Tempo the metronome and the SMF tempo mark share.
 ///
@@ -1979,5 +2161,188 @@ mod layout_tests {
         for l in Layout::ALL {
             assert_eq!(Layout::from_key(l.key()), Some(l), "{l:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod meter_tests {
+    use super::*;
+
+    /// **The tempo counts quarters, whatever the unit is.**
+    ///
+    /// Forced by the file format: an SMF tempo meta event is microseconds per
+    /// quarter note and nothing else, so any other reading makes the `.mid`
+    /// disagree with the click in every bar.
+    #[test]
+    fn a_beat_is_measured_against_the_quarter_note() {
+        let bpm = 120.0;
+        // A quarter at 120 is half a second, and 4/4 is four of them.
+        let four_four = TimeSignature { beats: 4, unit: 4 };
+        assert!((four_four.beat_seconds(bpm) - 0.5).abs() < 1e-12);
+
+        // An eighth is half of that, so a bar of 6/8 is a second and a half.
+        let six_eight = TimeSignature { beats: 6, unit: 8 };
+        assert!((six_eight.beat_seconds(bpm) - 0.25).abs() < 1e-12);
+        let bar = six_eight.beat_seconds(bpm) * f64::from(six_eight.beats);
+        assert!((bar - 1.5).abs() < 1e-12, "a 6/8 bar at 120 is 1.5s, got {bar}");
+
+        // And a half-note gets two quarters.
+        let cut = TimeSignature { beats: 2, unit: 2 };
+        assert!((cut.beat_seconds(bpm) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_signature_is_two_numbers_and_a_note_value() {
+        assert!(TimeSignature { beats: 4, unit: 4 }.is_valid());
+        assert!(TimeSignature { beats: 7, unit: 8 }.is_valid());
+        assert!(TimeSignature { beats: 1, unit: 32 }.is_valid());
+        // The unit has to be a power of two, because that is what a note value
+        // IS — and because the SMF meta stores it as a power.
+        assert!(!TimeSignature { beats: 4, unit: 6 }.is_valid());
+        assert!(!TimeSignature { beats: 4, unit: 0 }.is_valid());
+        assert!(!TimeSignature { beats: 0, unit: 4 }.is_valid());
+        assert!(!TimeSignature { beats: 33, unit: 4 }.is_valid());
+    }
+
+    /// The SMF writes the unit as a POWER of two: 4 is 2, 8 is 3. Getting it
+    /// wrong writes a file every DAW reads as a different signature, and a bar
+    /// line in the wrong place is not something anybody notices until later.
+    #[test]
+    fn the_smf_meta_stores_the_unit_as_a_power_of_two() {
+        for (unit, power) in [(1, 0), (2, 1), (4, 2), (8, 3), (16, 4), (32, 5)] {
+            let sig = TimeSignature { beats: 4, unit };
+            assert_eq!(sig.unit_power(), power, "{unit} should write as {power}");
+        }
+    }
+
+    /// Every offered signature is playable, and round-trips through the text
+    /// the settings file and the menu both use.
+    #[test]
+    fn every_offered_signature_survives_the_settings_file() {
+        for sig in TIME_SIGNATURES {
+            assert!(sig.is_valid(), "{} is offered and unplayable", sig.label());
+            assert_eq!(TimeSignature::parse(&sig.label()), Some(sig));
+        }
+        // And a custom one the menu never offered.
+        assert_eq!(
+            TimeSignature::parse("11/16"),
+            Some(TimeSignature { beats: 11, unit: 16 })
+        );
+        assert_eq!(TimeSignature::parse(" 3 / 4 "), Some(TimeSignature { beats: 3, unit: 4 }));
+        // Nonsense is None rather than a guess.
+        for bad in ["", "4", "4/", "/4", "4/6", "0/4", "x/y", "4/4/4"] {
+            assert_eq!(TimeSignature::parse(bad), None, "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_count_in_is_bars_times_the_top_number() {
+        assert_eq!(TimeSignature { beats: 4, unit: 4 }.beats_in(2), 8);
+        assert_eq!(TimeSignature { beats: 6, unit: 8 }.beats_in(1), 6);
+        assert_eq!(TimeSignature { beats: 7, unit: 8 }.beats_in(2), 14);
+        assert_eq!(TimeSignature { beats: 4, unit: 4 }.beats_in(0), 0);
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    fn side(rate: u32, frames: Option<u32>) -> (String, StreamStats) {
+        (
+            "device".to_owned(),
+            StreamStats {
+                sample_rate: rate,
+                channels: 2,
+                buffer_frames: frames,
+            },
+        )
+    }
+
+    #[test]
+    fn a_buffer_is_reported_in_milliseconds_of_its_own_rate() {
+        // 256 frames at 48k is 5.333 ms; at 44.1k it is longer, which is the
+        // whole reason the rate is part of the sum.
+        let at48 = StreamStats {
+            sample_rate: 48_000,
+            channels: 2,
+            buffer_frames: Some(256),
+        };
+        assert!((at48.buffer_ms().unwrap() - 5.3333).abs() < 1e-3);
+        let at44 = StreamStats {
+            sample_rate: 44_100,
+            channels: 2,
+            buffer_frames: Some(256),
+        };
+        assert!(at44.buffer_ms().unwrap() > at48.buffer_ms().unwrap());
+
+        // A device that chose its own size did not say what it chose, and
+        // inventing a number here would be inventing a latency figure.
+        assert_eq!(
+            StreamStats {
+                sample_rate: 48_000,
+                channels: 2,
+                buffer_frames: None,
+            }
+            .buffer_ms(),
+            None
+        );
+    }
+
+    /// The round trip is BOTH sides, and absent when either is.
+    #[test]
+    fn the_round_trip_needs_both_halves() {
+        let both = AudioStatus {
+            input: Some(side(48_000, Some(256))),
+            output: Some(side(48_000, Some(512))),
+        };
+        assert!((both.round_trip_ms().unwrap() - 16.0).abs() < 1e-3);
+
+        for one in [
+            AudioStatus {
+                input: Some(side(48_000, Some(256))),
+                output: None,
+            },
+            AudioStatus {
+                input: None,
+                output: Some(side(48_000, Some(256))),
+            },
+            // And a side that will not say its buffer size cannot contribute
+            // half a figure.
+            AudioStatus {
+                input: Some(side(48_000, None)),
+                output: Some(side(48_000, Some(256))),
+            },
+        ] {
+            assert_eq!(one.round_trip_ms(), None);
+        }
+    }
+
+    /// **A rate mismatch is a fault, not a curiosity.**
+    ///
+    /// The writer drains the instrument's ring at the INPUT's rate while the
+    /// engine fills it at the OUTPUT's, so a mismatch overflows that ring and
+    /// reports the losses against the take — a symptom that points nowhere near
+    /// its cause, which is exactly why the panel says it out loud.
+    #[test]
+    fn a_rate_mismatch_is_noticed() {
+        assert!(AudioStatus {
+            input: Some(side(44_100, Some(256))),
+            output: Some(side(48_000, Some(256))),
+        }
+        .rates_disagree());
+
+        assert!(!AudioStatus {
+            input: Some(side(48_000, Some(256))),
+            output: Some(side(48_000, Some(512))),
+        }
+        .rates_disagree());
+
+        // One side alone cannot disagree with anything.
+        assert!(!AudioStatus {
+            input: Some(side(44_100, Some(256))),
+            output: None,
+        }
+        .rates_disagree());
     }
 }

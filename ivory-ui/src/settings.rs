@@ -271,6 +271,32 @@ pub struct Settings {
     /// preserved but unread: three seconds does not convert into a number of
     /// beats without knowing a tempo it was never measured against.)
     pub record_count_in_beats: i64,
+    /// Count-in length in BARS, at the take's time signature.
+    ///
+    /// **Bars, not beats.** A count-in is "two bars" to everybody who has ever
+    /// been counted in, and in 6/8 two bars is twelve clicks — a number nobody
+    /// wants to set by hand and which changes the moment the signature does.
+    /// The old `record_count_in_beats` is migrated once and then left alone.
+    pub record_count_in_bars: i64,
+    /// The take's time signature, as `"6/8"`.
+    ///
+    /// Text rather than two numbers, because that is how it is written, how it
+    /// is read back, and how a file from a later build with `13/16` in it
+    /// survives being loaded by a build that only offers eight of them.
+    pub record_time_signature: String,
+    /// Start writing at the button press, with the count-in inside the take.
+    ///
+    /// Off means the count-in happens BEFORE the file starts, which is the
+    /// usual thing to want: the bars before the downbeat are not part of the
+    /// performance. On means the recording starts instantly and the count is at
+    /// the head of the file, to trim to or to keep.
+    pub record_count_in_in_take: bool,
+    /// Frames per audio callback, or 0 for the device's own default.
+    ///
+    /// Applies to BOTH streams: they are two halves of one path, and a
+    /// round-trip figure made of a 64-frame input and a 1024-frame output is a
+    /// number nobody can act on.
+    pub record_buffer_frames: i64,
     /// The VST3 bundle in each instrument slot. `None` is an empty slot.
     ///
     /// Paths and not names: a plugin's display name is not unique, changes
@@ -436,6 +462,10 @@ impl Default for Settings {
             record_sources: "auto".to_owned(),
             record_input_off: false,
             record_count_in_beats: 4,
+            record_count_in_bars: 1,
+            record_time_signature: "4/4".to_owned(),
+            record_count_in_in_take: false,
+            record_buffer_frames: 0,
             plugin_slots: [None, None, None],
             plugin_gains: [1.0; crate::recorder::SLOTS],
             metronome_gain: 0.5,
@@ -802,6 +832,30 @@ impl Settings {
                 s.record_sources = t.to_owned();
             }
         }
+        // Whether the FILE carried a bars key. A local rather than a field on
+        // `Settings`, because it is a fact about the file and not about the
+        // user: a field would have to round-trip, and two settings that differ
+        // only in how they were loaded are not different settings.
+        let mut saw_bars = false;
+        if let Some(v) = map.remove("record_count_in_bars") {
+            if let Some(n) = v.as_i64() {
+                s.record_count_in_bars = n;
+                saw_bars = true;
+            }
+        }
+        if let Some(Value::String(t)) = map.remove("record_time_signature") {
+            s.record_time_signature = t;
+        }
+        take_bool(
+            &mut map,
+            "record_count_in_in_take",
+            &mut s.record_count_in_in_take,
+        );
+        if let Some(v) = map.remove("record_buffer_frames") {
+            if let Some(n) = v.as_i64() {
+                s.record_buffer_frames = n;
+            }
+        }
         if let Some(v) = map.remove("record_count_in_beats") {
             if let Some(n) = v.as_i64() {
                 s.record_count_in_beats = n;
@@ -868,6 +922,9 @@ impl Settings {
         }
 
         s.extra = map; // whatever is left, preserved in file order
+        if !saw_bars {
+            s.convert_count_in_to_bars();
+        }
         s
     }
 
@@ -1055,6 +1112,22 @@ impl Settings {
         map.insert(
             "record_count_in_beats".into(),
             Value::Number(self.record_count_in_beats.into()),
+        );
+        map.insert(
+            "record_count_in_bars".into(),
+            Value::Number(self.record_count_in_bars.into()),
+        );
+        map.insert(
+            "record_time_signature".into(),
+            Value::String(self.record_time_signature.clone()),
+        );
+        map.insert(
+            "record_count_in_in_take".into(),
+            Value::Bool(self.record_count_in_in_take),
+        );
+        map.insert(
+            "record_buffer_frames".into(),
+            Value::Number(self.record_buffer_frames.into()),
         );
         // Written as full-length arrays including the empty slots, so slot 2
         // stays slot 2 when slot 1 is empty. A compacted list would silently
@@ -1287,11 +1360,53 @@ impl Settings {
     /// a later build with a 12-beat count-in keeps its 12 in the file and
     /// counts in with the nearest thing this build has.
     pub fn count_in_beats(&self) -> u32 {
-        let want = self.record_count_in_beats.clamp(0, i64::from(u32::MAX)) as u32;
-        crate::recorder::COUNT_IN_CHOICES
+        self.time_signature().beats_in(self.count_in_bars())
+    }
+
+    /// Count-in length in BARS.
+    pub fn count_in_bars(&self) -> u32 {
+        self.record_count_in_bars.clamp(0, 8) as u32
+    }
+
+    /// Frames per callback, or `None` for the device's own default.
+    ///
+    /// Sanitised at the point of use like every other stored choice: a file
+    /// with 999 in it keeps its 999 and runs at the nearest size that exists.
+    pub fn buffer_frames(&self) -> Option<u32> {
+        let want = self.record_buffer_frames;
+        if want <= 0 {
+            return None;
+        }
+        let want = want.clamp(0, i64::from(u32::MAX)) as u32;
+        crate::recorder::BUFFER_CHOICES
             .into_iter()
             .min_by_key(|c| c.abs_diff(want))
-            .unwrap_or(4)
+    }
+
+    /// The take's time signature, sanitised at the point of use.
+    ///
+    /// Like the tuning and the capo: a file from a later build with `13/16` in
+    /// it keeps its 13/16 in the file and plays in the nearest thing this build
+    /// understands — which, since anything valid is understood, is itself.
+    pub fn time_signature(&self) -> crate::recorder::TimeSignature {
+        crate::recorder::TimeSignature::parse(&self.record_time_signature).unwrap_or_default()
+    }
+
+    /// Convert a pre-bars count-in once.
+    ///
+    /// The old key was BEATS and the offered values were 0, 4 and 8 — which in
+    /// 4/4, the only signature that existed, are 0, 1 and 2 bars. Anything else
+    /// divides and rounds, and a count-in somebody had set to a non-zero number
+    /// of beats never becomes zero bars: silently removing somebody's count-in
+    /// is worse than rounding it up.
+    fn convert_count_in_to_bars(&mut self) {
+        let beats = self.record_count_in_beats.max(0);
+        let per_bar = i64::from(self.time_signature().beats.max(1));
+        self.record_count_in_bars = if beats == 0 {
+            0
+        } else {
+            (beats / per_bar).max(1)
+        };
     }
 
     /// Everything the band renders but does not own, in one value.

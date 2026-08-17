@@ -194,6 +194,11 @@ impl MidiTake {
     /// played to a 72 BPM click and types 72 gets a file that drops into their
     /// 72 BPM project sample-accurately *and* whose bar lines land right.
     pub fn build(&self, timeline: &Timeline, tempo_bpm: f64) -> Smf<'_> {
+        self.build_with_meter(timeline, tempo_bpm, Meter::default())
+    }
+
+    /// The same, with a time signature to write into the tempo map.
+    pub fn build_with_meter(&self, timeline: &Timeline, tempo_bpm: f64, meter: Meter) -> Smf<'_> {
         let tempo_us = ((60.0 / tempo_bpm) * 1_000_000.0).round() as u32;
         let ticks_per_sec = PPQ as f64 * 1_000_000.0 / tempo_us as f64;
 
@@ -219,9 +224,21 @@ impl MidiTake {
         let track0 = vec![
             meta(0, MetaMessage::TrackName(b"Tangent take")),
             meta(0, MetaMessage::Tempo(u24::new(tempo_us))),
-            // numerator, denominator as a power of two, MIDI clocks per click,
-            // 32nds per quarter. 4/4.
-            meta(0, MetaMessage::TimeSignature(4, 2, 24, 8)),
+            // Numerator, denominator as a POWER OF TWO, MIDI clocks per
+            // metronome click, 32nds per quarter.
+            //
+            // The power of two is the part that is easy to get wrong: 4 is
+            // written as 2 and 8 as 3, and a file that says 8 where it means
+            // 2^8 is read by every DAW as a signature nobody chose — which
+            // shows up as bar lines in the wrong place, long after the take.
+            //
+            // Clocks-per-click follows the UNIT so the DAW's own metronome
+            // agrees with the one that was playing: 24 MIDI clocks is a quarter
+            // note, so an eighth-note beat is 12.
+            meta(
+                0,
+                MetaMessage::TimeSignature(meter.beats, meter.unit_power, meter.clocks_per_click(), 8),
+            ),
             meta(0, MetaMessage::EndOfTrack),
         ];
 
@@ -391,6 +408,17 @@ impl MidiTake {
     }
 
     /// Build and write in one step.
+    /// The same, with a time signature.
+    pub fn write_with_meter(
+        &self,
+        timeline: &Timeline,
+        tempo_bpm: f64,
+        path: &std::path::Path,
+        meter: Meter,
+    ) -> std::io::Result<()> {
+        self.build_with_meter(timeline, tempo_bpm, meter).save(path)
+    }
+
     pub fn write(
         &self,
         timeline: &Timeline,
@@ -398,6 +426,44 @@ impl MidiTake {
         path: &Path,
     ) -> std::io::Result<()> {
         self.build(timeline, tempo_bpm).save(path)
+    }
+}
+
+/// A time signature, as the SMF tempo map needs it.
+///
+/// `unit_power` rather than the unit itself, because that is what the file
+/// stores and converting in two places is how the two disagree. `ivory-ui`
+/// owns the musical type and hands the numbers over — this crate never learns
+/// what a `TimeSignature` is, which is the same firewall every other type in
+/// here respects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Meter {
+    pub beats: u8,
+    /// The denominator as a power of two: 4 is 2, 8 is 3.
+    pub unit_power: u8,
+}
+
+impl Default for Meter {
+    /// 4/4.
+    fn default() -> Self {
+        Self {
+            beats: 4,
+            unit_power: 2,
+        }
+    }
+}
+
+impl Meter {
+    /// MIDI clocks per metronome click, which is 24 per QUARTER note.
+    ///
+    /// So a quarter-note beat is 24 and an eighth is 12. Without this a 6/8
+    /// file makes the DAW's own click play quarters against a take counted in
+    /// eighths.
+    pub fn clocks_per_click(self) -> u8 {
+        // 24 * 4 / unit, where unit = 2^power. Saturating, because a 1/32 beat
+        // is 3 clocks and anything smaller would round to nothing.
+        let unit = 1u32 << u32::from(self.unit_power.min(5));
+        ((24 * 4) / unit.max(1)).clamp(1, 255) as u8
     }
 }
 
@@ -477,6 +543,50 @@ fn raw_to_kind(b: &[u8]) -> Option<TrackEventKind<'_>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The unit is a POWER of two and the click follows it.**
+    ///
+    /// A file that says 8 where it means 2^8 is read by every DAW as a
+    /// signature nobody chose, and bar lines in the wrong place is not
+    /// something anybody notices until long after the take.
+    #[test]
+    fn a_meter_writes_the_unit_as_a_power_and_the_click_to_match() {
+        // 4/4: quarter-note beat, 24 MIDI clocks each.
+        let four = Meter { beats: 4, unit_power: 2 };
+        assert_eq!(four, Meter::default());
+        assert_eq!(four.clocks_per_click(), 24);
+
+        // 6/8: eighth-note beat, so twelve. Without this the DAW's own click
+        // plays quarters against a take counted in eighths.
+        let six_eight = Meter { beats: 6, unit_power: 3 };
+        assert_eq!(six_eight.clocks_per_click(), 12);
+
+        // 2/2: half-note beat, so forty-eight.
+        assert_eq!(Meter { beats: 2, unit_power: 1 }.clocks_per_click(), 48);
+        // And nothing rounds to zero at the small end, which would be a click
+        // every no time at all.
+        for power in 0..=5u8 {
+            let m = Meter { beats: 4, unit_power: power };
+            assert!(m.clocks_per_click() >= 1, "2^{power} gave no clocks");
+        }
+    }
+
+    /// The signature reaches the FILE, which is the only place it matters.
+    #[test]
+    fn the_tempo_map_carries_the_signature_it_was_given() {
+        let take = MidiTake::new();
+        let timeline = Timeline::synthetic(0, 1_000_000_000, 48_000.0);
+        let smf = take.build_with_meter(&timeline, 120.0, Meter { beats: 6, unit_power: 3 });
+        let found = smf.tracks[0].iter().find_map(|e| match e.kind {
+            TrackEventKind::Meta(MetaMessage::TimeSignature(n, d, c, t)) => Some((n, d, c, t)),
+            _ => None,
+        });
+        assert_eq!(
+            found,
+            Some((6, 3, 12, 8)),
+            "the tempo map does not say 6/8"
+        );
+    }
     use super::*;
     use crate::clock::Timeline;
 

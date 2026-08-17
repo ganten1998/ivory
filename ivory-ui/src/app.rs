@@ -278,6 +278,12 @@ pub struct IvoryApp {
     /// to be lifted on the way in and re-applied on the way out, once each
     /// rather than every frame.
     fullscreen_sent: Option<bool>,
+    /// What both audio streams are doing, filled by the host each frame.
+    ///
+    /// Kept on the app rather than fetched when the panel opens, because
+    /// `ivory-ui` cannot see a device and the panel has to stay live while it
+    /// is up — a rate that changed under you is exactly what it is for.
+    audio_status: recorder::AudioStatus,
     /// A numeric field being typed into, if any.
     ///
     /// Mutually exclusive with `name_focused` in practice, because a press
@@ -490,6 +496,7 @@ impl IvoryApp {
             picker_slot: 0,
             grabbed: None,
             num_edit: None,
+            audio_status: recorder::AudioStatus::default(),
             fullscreen_sent: None,
             plugin_list: Vec::new(),
             name_focused: false,
@@ -977,6 +984,9 @@ impl IvoryApp {
             recorder_on: self.settings.show_recorder,
             recorder_detached: self.settings.recorder_detached,
             count_in_beats: self.settings.count_in_beats(),
+            time_signature: self.settings.time_signature(),
+            count_in_bars: self.settings.count_in_bars(),
+            count_in_in_take: self.settings.record_count_in_in_take,
             record_sources: self.settings.record_sources.clone(),
             metronome_on: self.settings.metronome_on,
             metronome_in_take: self.settings.metronome_in_take,
@@ -1429,6 +1439,25 @@ impl IvoryApp {
         self.dir_request.take()
     }
 
+    /// What the audio path is doing, from the host that owns the devices.
+    ///
+    /// Pushed every frame rather than pulled, for the same reason the recorder
+    /// view is: this crate must not be able to ask a device anything.
+    pub fn set_audio_status(&mut self, status: recorder::AudioStatus) {
+        // Also refreshed into an OPEN panel, or it would show whatever was true
+        // at the moment it was opened and never change.
+        if let Some(dialogs::Dialog::AudioStatus { status: live, .. }) = self.dialog.as_mut() {
+            live.clone_from(&status);
+        }
+        self.audio_status = status;
+    }
+
+    /// Frames per audio callback the user has chosen, or `None` for the
+    /// device's own default. The host reopens its streams to match.
+    pub fn buffer_frames(&self) -> Option<u32> {
+        self.settings.buffer_frames()
+    }
+
     /// Take a pending "show me this folder" request. Same contract.
     pub fn take_reveal_request(&mut self) -> Option<std::path::PathBuf> {
         self.reveal_request.take()
@@ -1562,6 +1591,22 @@ impl IvoryApp {
     /// The tempo the click, the count-in and the SMF tempo mark all share.
     pub fn tempo_bpm(&self) -> f64 {
         self.settings.record_export.tempo_bpm
+    }
+
+    /// The take's time signature: what the click accents and how long a bar of
+    /// count-in is.
+    pub fn time_signature(&self) -> recorder::TimeSignature {
+        self.settings.time_signature()
+    }
+
+    /// Count-in length in bars.
+    pub fn count_in_bars(&self) -> u32 {
+        self.settings.count_in_bars()
+    }
+
+    /// Whether the count-in belongs INSIDE the take.
+    pub fn count_in_in_take(&self) -> bool {
+        self.settings.record_count_in_in_take
     }
 
     /// `auto` / `input` / `plugin` / `both`, verbatim from the file.
@@ -2091,7 +2136,17 @@ impl IvoryApp {
             // menu row for it: pressing Record is what the BAND is for, and a
             // menu row that starts a take would be reachable from a right-click
             // over the piano with the recorder hidden.
-            K::ToggleRecording => self.request_recorder(recorder::RecorderRequest::Toggle),
+            // Toggle, not "start": pressing Enter during a count-in has to
+            // cancel it, which is what anybody who has just realised they came
+            // in wrong will try — and `Toggle` is where that already lives.
+            // Pressing it while a take is ROLLING does nothing, because Space
+            // is the key that ends a performance.
+            K::StartRecording => {
+                if !self.recorder.state.is_writing() {
+                    self.request_recorder(recorder::RecorderRequest::Toggle);
+                }
+            }
+            K::StopRecording => self.request_recorder(recorder::RecorderRequest::Stop),
             K::ToggleRecorder => self.apply_menu_action(ctx, MenuAction::ToggleRecorder),
             K::TransposeUp => self.transpose_by(1),
             K::TransposeDown => self.transpose_by(-1),
@@ -2298,12 +2353,39 @@ impl IvoryApp {
             MenuAction::DetachRecorder => self.detach_recorder(),
             MenuAction::AttachRecorder => self.reattach_recorder(),
             MenuAction::ShowExportDialog => self.open_export_dialog(),
+            MenuAction::ShowAudioStatus => {
+                self.dialog = Some(dialogs::Dialog::AudioStatus {
+                    // A SNAPSHOT, taken when the panel opens. It is refreshed
+                    // each frame by the host — see `set_audio_status` — because
+                    // a status panel that froze the moment it opened would be
+                    // the least useful version of itself.
+                    status: self.audio_status.clone(),
+                    buffer: self.settings.buffer_frames(),
+                });
+            }
             MenuAction::SetRecordSources(kind) => {
                 self.settings.record_sources = kind.to_owned();
                 self.save_settings();
             }
-            MenuAction::SetCountIn(beats) => {
-                self.settings.record_count_in_beats = i64::from(beats);
+            MenuAction::SetCountIn(bars) => {
+                self.settings.record_count_in_bars = i64::from(bars);
+                // The old key is kept in step so a downgrade to a build that
+                // reads beats still counts in for roughly as long.
+                self.settings.record_count_in_beats =
+                    i64::from(self.settings.time_signature().beats_in(bars));
+                self.save_settings();
+            }
+            MenuAction::SetTimeSignature(sig) => {
+                self.settings.record_time_signature = sig.label();
+                // A count-in is a number of BARS, so changing the signature
+                // changes how many beats that is — and the legacy beats key has
+                // to follow, or a downgrade would count in for the old meter.
+                self.settings.record_count_in_beats =
+                    i64::from(sig.beats_in(self.settings.count_in_bars()));
+                self.save_settings();
+            }
+            MenuAction::ToggleCountInInTake => {
+                self.settings.record_count_in_in_take = !self.settings.record_count_in_in_take;
                 self.save_settings();
             }
             MenuAction::ToggleMetronome => {
@@ -2616,6 +2698,12 @@ impl IvoryApp {
 
     fn apply_dialog_action(&mut self, action: DialogAction) {
         match action {
+            DialogAction::SetBufferFrames(frames) => {
+                self.settings.record_buffer_frames = i64::from(frames.unwrap_or(0));
+                self.save_settings();
+                // The host reopens both streams when it notices; it cannot be
+                // done from here, and it must not be done mid-take.
+            }
             DialogAction::SetShowWelcome(show) => {
                 self.settings.show_welcome = show;
                 self.save_settings();
@@ -4524,16 +4612,18 @@ mod tests {
         );
     }
 
-    /// Space is the transport, and the band owns a text field. Typing a space
-    /// into a take name must not also start a take.
+    /// The transport keys are Enter and Space, and the band owns a text field.
+    /// Typing into a take name must not also drive the transport — and Enter
+    /// is now one of them, which makes this sharper than it was: Enter is also
+    /// how you finish typing a name.
     #[test]
     fn a_focused_take_name_swallows_the_transport_key() {
         let (ctx, mut app) = recorder_app();
         app.settings.show_recorder = true;
         assert_eq!(
             space(&ctx, &mut app),
-            Some(recorder::RecorderRequest::Toggle),
-            "with the band open and nothing focused, Space is the transport"
+            Some(recorder::RecorderRequest::Stop),
+            "with the band open and nothing focused, Space stops"
         );
 
         app.name_focused = true;
@@ -4561,7 +4651,7 @@ mod tests {
         app.settings.show_recorder = true;
         assert_eq!(
             space(&ctx, &mut app),
-            Some(recorder::RecorderRequest::Toggle)
+            Some(recorder::RecorderRequest::Stop)
         );
     }
 

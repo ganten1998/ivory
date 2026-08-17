@@ -721,7 +721,7 @@ struct Beats {
 impl Beats {
     fn new(rate: f64, bpm: f64) -> Self {
         Self {
-            period: period_frames(rate, bpm),
+            period: period_frames(rate, bpm, 4),
             to_next: 0.0,
             index: 0,
             count_in_left: 0,
@@ -814,7 +814,14 @@ impl Beats {
 
 /// Frames per beat, with the tempo clamped to something the frame counter can
 /// represent.
-fn period_frames(rate: f64, bpm: f64) -> f64 {
+///
+/// `unit` is the time signature's bottom number, and it is what makes 6/8 count
+/// eighths rather than quarters. **The tempo always counts QUARTER notes** —
+/// forced by the file format, since an SMF tempo meta event is microseconds per
+/// quarter and nothing else — so a beat of `1/unit` lasts `4/unit` quarters.
+/// At 120 in 6/8 that is a quarter of a second, and a bar of six is a second
+/// and a half.
+fn period_frames(rate: f64, bpm: f64, unit: u32) -> f64 {
     let bpm = if bpm.is_finite() {
         bpm.clamp(MIN_BPM, MAX_BPM)
     } else {
@@ -825,7 +832,13 @@ fn period_frames(rate: f64, bpm: f64) -> f64 {
     } else {
         48_000.0
     };
-    (rate * 60.0 / bpm).max(1.0)
+    // Clamped to the note values that exist. A zero here would divide by
+    // nothing on the audio thread, which is the one place that must not happen.
+    let unit = match unit {
+        1 | 2 | 4 | 8 | 16 | 32 => unit,
+        _ => 4,
+    };
+    (rate * 60.0 / bpm * (4.0 / f64::from(unit))).max(1.0)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -847,8 +860,20 @@ struct Shared {
     metro_gain: AtomicU32,
     metro_on: AtomicBool,
     metro_in_take: AtomicBool,
+    /// The COUNT-IN's clicks belong in the take, whatever `metro_in_take` says.
+    ///
+    /// Two flags rather than one because they answer different questions.
+    /// `metro_in_take` is about the performance: a click bleeding through a
+    /// take is a ruined take, which is why it is off by default. This one is
+    /// about the count that comes first — and if it were not recorded, "record
+    /// the count-in into the take" would produce a silence at the head of the
+    /// file with nothing to line anything up against, which is the whole
+    /// reason somebody asked for it.
+    count_in_in_take: AtomicBool,
     bpm: AtomicU64,
     beats_per_bar: AtomicU32,
+    /// The time signature's bottom number: what gets the beat.
+    beat_unit: AtomicU32,
 
     /// Bumped by `start_count_in`/`cancel_count_in`. The callback restarts its
     /// beat clock when this changes, which is how a request crosses without a
@@ -900,8 +925,10 @@ impl Shared {
             // THE default the owner called out: the click is a monitor signal,
             // not a take signal.
             metro_in_take: AtomicBool::new(false),
+            count_in_in_take: AtomicBool::new(false),
             bpm: AtomicU64::new(120.0f64.to_bits()),
             beats_per_bar: AtomicU32::new(4),
+            beat_unit: AtomicU32::new(4),
             count_in_req: AtomicU64::new(0),
             count_in_beats: AtomicU32::new(0),
             beat_now: AtomicU32::new(0),
@@ -1130,6 +1157,15 @@ struct Renderer {
     click: Click,
     voice: Voice,
     beats: Beats,
+    /// Frames left during which a count-in click is still SOUNDING.
+    ///
+    /// `Beats::counting_in` goes false the moment the last count-in beat is
+    /// consumed, and the click is a decaying sample — so a take that recorded
+    /// the count-in by that flag alone would cut the last click off mid-decay,
+    /// and the downbeat, which is the one everybody listens for, not at all.
+    /// Reset to a beat's worth of frames every time a count-in beat or the
+    /// downbeat fires.
+    count_in_tail: u64,
 
     /// `process` calls made since the stream opened. Not a statistic: it is how
     /// the chunking test observes that a 4096-frame callback became eight
@@ -1288,10 +1324,12 @@ impl Renderer {
         let metro_target = Shared::f32_of(&self.shared.metro_gain).clamp(0.0, 8.0);
         let metro_on = self.shared.metro_on.load(Ordering::Relaxed);
         let in_take = self.shared.metro_in_take.load(Ordering::Relaxed);
+        let count_in_recorded = self.shared.count_in_in_take.load(Ordering::Relaxed);
         let bpb = self.shared.beats_per_bar.load(Ordering::Relaxed);
         self.beats.period = period_frames(
             self.rate,
             f64::from_bits(self.shared.bpm.load(Ordering::Relaxed)),
+            self.shared.beat_unit.load(Ordering::Relaxed),
         );
         let req = self.shared.count_in_req.load(Ordering::Relaxed);
         if req != self.beats.seen_req {
@@ -1331,8 +1369,17 @@ impl Renderer {
             for i in 0..n {
                 let frame_index = done + i;
 
+                let counting_in = self.count_in_tail > 0;
+                self.count_in_tail = self.count_in_tail.saturating_sub(1);
                 if let Some(beat) = self.beats.tick(metro_on, bpb) {
                     self.voice.trigger(beat.accent);
+                    if beat.count_in > 0 || beat.downbeat {
+                        // A whole beat, so the sample has room to decay, and
+                        // reset on the downbeat too — that click is the "go"
+                        // and the one anybody trimming to the count will look
+                        // for.
+                        self.count_in_tail = self.beats.period.max(1.0) as u64;
+                    }
                     self.shared
                         .beat_now
                         .store(beat.count_in, Ordering::Relaxed);
@@ -1356,8 +1403,15 @@ impl Renderer {
                 // ── the tap mix: instruments only, unless asked otherwise ──
                 map_frame(src, &mut self.frame[..TAP_CHANNELS]);
                 let tap_at = tap_frames * TAP_CHANNELS;
+                // The click reaches the FILE when the performance is meant to
+                // carry it, or while a count-in that was asked to be in the
+                // take is still sounding. `counting_in` rather than a beat
+                // number, because the click is a decaying sample: the sound of
+                // beat four is still going during beat five and has to be
+                // recorded for as long as it lasts.
+                let click_recorded = in_take || (count_in_recorded && counting_in);
                 for c in 0..TAP_CHANNELS {
-                    let s = self.frame[c] + if in_take { click } else { 0.0 };
+                    let s = self.frame[c] + if click_recorded { click } else { 0.0 };
                     self.tap_scratch[tap_at + c] = s;
                 }
                 tap_frames += 1;
@@ -1766,6 +1820,15 @@ impl Engine {
         Self::start_with(out_device, Timebase::new())
     }
 
+    /// As [`Engine::start`], with a buffer size the user chose.
+    pub fn start_sized(
+        out_device: Option<&str>,
+        timebase: Timebase,
+        buffer_frames: Option<u32>,
+    ) -> Result<Self, String> {
+        Self::start_inner(out_device, timebase, buffer_frames)
+    }
+
     /// As [`Engine::start`], sharing the recorder's timebase.
     ///
     /// Worth doing: it is what makes [`Engine::count_in_downbeat_ns`] comparable
@@ -1773,6 +1836,14 @@ impl Engine {
     /// on the downbeat the player actually heard rather than on the UI frame
     /// that noticed.
     pub fn start_with(out_device: Option<&str>, timebase: Timebase) -> Result<Self, String> {
+        Self::start_inner(out_device, timebase, None)
+    }
+
+    fn start_inner(
+        out_device: Option<&str>,
+        timebase: Timebase,
+        asked_buffer: Option<u32>,
+    ) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = resolve_output(&host, out_device)?;
         let name = device
@@ -1787,7 +1858,7 @@ impl Engine {
         if channels == 0 || rate == 0 {
             return Err(format!("{name} reports {channels} channels at {rate} Hz"));
         }
-        let (buffer_size, buffer_frames) = pick_buffer(supported.buffer_size());
+        let (buffer_size, buffer_frames) = pick_buffer(supported.buffer_size(), asked_buffer);
 
         let shared = Arc::new(Shared::new());
         let fault = Arc::new(Mutex::new(None));
@@ -1845,6 +1916,7 @@ impl Engine {
             click,
             voice: Voice::default(),
             beats: Beats::new(f64::from(rate), 120.0),
+            count_in_tail: 0,
             chunks: 0,
             metro_gain: 0.7,
             gain_coeff: gain_coefficient(f64::from(rate)),
@@ -2541,14 +2613,40 @@ impl Engine {
         self.shared.metro_in_take.store(on, Ordering::Relaxed);
     }
 
+    /// Whether the COUNT-IN's clicks go into the take. See
+    /// [`Shared::count_in_in_take`] for why this is not the same switch.
+    pub fn set_count_in_in_take(&self, on: bool) {
+        self.shared.count_in_in_take.store(on, Ordering::Relaxed);
+    }
+
 
     pub fn set_tempo(&self, bpm: f64) {
         self.shared.bpm.store(bpm.to_bits(), Ordering::Relaxed);
     }
 
 
-    /// Beats per bar, which decides only which beat is accented.
+    /// Beats per bar, which decides which beat is accented.
     pub fn set_beats_per_bar(&self, beats: u32) {
+        self.shared
+            .beats_per_bar
+            .store(beats.max(1), Ordering::Relaxed);
+    }
+
+    /// The time signature, both halves at once.
+    ///
+    /// One call rather than two setters, because the two are read on the audio
+    /// thread on different frames: setting 6 then 8 leaves one callback seeing
+    /// 6/4, which is a bar and a half of clicks at the wrong speed. They are
+    /// still two atomics — a callback can still catch them mid-change — but the
+    /// window is one store apart rather than a whole UI frame.
+    pub fn set_meter(&self, beats: u32, unit: u32) {
+        self.shared.beat_unit.store(
+            match unit {
+                1 | 2 | 4 | 8 | 16 | 32 => unit,
+                _ => 4,
+            },
+            Ordering::Relaxed,
+        );
         self.shared
             .beats_per_bar
             .store(beats.max(1), Ordering::Relaxed);
@@ -2702,10 +2800,20 @@ fn resolve_output(host: &cpal::Host, want: Option<&str>) -> Result<cpal::Device,
 /// A `Fixed` size outside the supported range is a build error rather than a
 /// clamp, so the range is read first. `SupportedBufferSize::Unknown` means the
 /// backend will not say, and there the only safe answer is `Default`.
-fn pick_buffer(supported: &cpal::SupportedBufferSize) -> (cpal::BufferSize, Option<u32>) {
-    let want = std::env::var("IVORY_OUT_BUFFER")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
+fn pick_buffer(
+    supported: &cpal::SupportedBufferSize,
+    asked: Option<u32>,
+) -> (cpal::BufferSize, Option<u32>) {
+    // The user's choice first, then the dev override, then the default. The
+    // env var stays ahead of the built-in so a debugging session does not have
+    // to go through the settings file, and behind the SETTING so that what the
+    // Audio Status panel says is what the panel was told.
+    let want = asked
+        .or_else(|| {
+            std::env::var("IVORY_OUT_BUFFER")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+        })
         .unwrap_or(WANT_BUFFER_FRAMES);
     match supported {
         cpal::SupportedBufferSize::Range { min, max } if *min <= *max => {
@@ -3671,10 +3779,10 @@ mod tests {
     #[test]
     fn an_absurd_tempo_cannot_make_the_beat_clock_fire_forever_inside_one_block() {
         // A period below one frame would never let the countdown run down.
-        assert!(period_frames(48_000.0, 1e9) >= 1.0);
-        assert!(period_frames(48_000.0, 0.0) >= 1.0);
-        assert!(period_frames(48_000.0, f64::NAN) >= 1.0);
-        assert!(period_frames(0.0, 120.0) >= 1.0);
+        assert!(period_frames(48_000.0, 1e9, 4) >= 1.0);
+        assert!(period_frames(48_000.0, 0.0, 4) >= 1.0);
+        assert!(period_frames(48_000.0, f64::NAN, 4) >= 1.0);
+        assert!(period_frames(0.0, 120.0, 4) >= 1.0);
         let mut b = Beats::new(48_000.0, f64::INFINITY);
         b.restart(0);
         b.was_on = true;
@@ -3984,6 +4092,7 @@ mod tests {
             },
             voice: Voice::default(),
             beats: Beats::new(RATE, 120.0),
+            count_in_tail: 0,
             chunks: 0,
             metro_gain: 1.0,
             gain_coeff: 1.0,
@@ -4418,13 +4527,13 @@ mod tests {
     fn a_device_that_will_not_say_what_buffer_sizes_it_takes_gets_its_own_choice() {
         // `BufferSize::Fixed` outside the supported range is a build error, not
         // a clamp, so guessing is worse than deferring.
-        let (size, frames) = pick_buffer(&cpal::SupportedBufferSize::Unknown);
+        let (size, frames) = pick_buffer(&cpal::SupportedBufferSize::Unknown, None);
         assert!(matches!(size, cpal::BufferSize::Default));
         assert_eq!(frames, None);
-        let (size, frames) = pick_buffer(&cpal::SupportedBufferSize::Range { min: 512, max: 4096 });
+        let (size, frames) = pick_buffer(&cpal::SupportedBufferSize::Range { min: 512, max: 4096 }, None);
         assert!(matches!(size, cpal::BufferSize::Fixed(512)));
         assert_eq!(frames, Some(512), "the request is clamped up to the minimum");
-        let (_, frames) = pick_buffer(&cpal::SupportedBufferSize::Range { min: 16, max: 64 });
+        let (_, frames) = pick_buffer(&cpal::SupportedBufferSize::Range { min: 16, max: 64 }, None);
         assert_eq!(frames, Some(64), "and down to the maximum");
     }
 

@@ -582,12 +582,19 @@ impl Layout {
             return;
         }
         let top = slice_v(t, 0.0, 0.52);
-        // Each button is capped at the width of its own slice, which is what
-        // keeps the two from colliding at any aspect ratio the window can take.
-        let rec_d = top.height().min(top.width() * 0.42);
-        self.record = Rect::from_center_size(slice_h(top, 0.0, 0.42).center(), Vec2::splat(rec_d));
-        self.stop =
-            Rect::from_center_size(slice_h(top, 0.46, 0.80).center(), Vec2::splat(rec_d * 0.66));
+        // **The same size, both of them.** Stop used to be 0.66 of record, and
+        // then its glyph was shrunk another 30% inside that — so the square
+        // read as less than half the circle. Two transport buttons of different
+        // sizes look like one is the real control and the other is a note about
+        // it.
+        //
+        // Capped at the width of its own slice, which is what keeps the two
+        // from colliding at any aspect the window can take. 0.38 rather than
+        // 0.42 because they are now the same width: the centres are 42% of the
+        // row apart, so two half-widths have to come to less than that.
+        let d = top.height().min(top.width() * 0.38);
+        self.record = Rect::from_center_size(slice_h(top, 0.0, 0.42).center(), Vec2::splat(d));
+        self.stop = Rect::from_center_size(slice_h(top, 0.46, 0.88).center(), Vec2::splat(d));
         self.meter = slice_v(t, 0.56, 0.74);
         self.timecode = slice_v(t, 0.78, 1.00);
     }
@@ -1293,11 +1300,23 @@ fn draw_transport(painter: &Painter, l: &Layout, p: &Palette) {
         // Present in BOTH layouts, in the same place. A stop button that only
         // appears once the take has started is one you have to find while your
         // hands are on the keys.
-        control(painter, l.stop, p);
-        painter.rect_filled(
-            l.stop.shrink(l.stop.width() * 0.30),
+        //
+        // Drawn like the record button and not like a menu row: a filled shape
+        // with a hairline round it, at the same size. It used to sit inside a
+        // `control` box, which is the chrome every LABELLED row in this band
+        // wears — so the two transport buttons were not merely different sizes
+        // but different KINDS of thing.
+        //
+        // The square is inset a little because an inscribed square is 27%
+        // more ink than the circle it shares a diameter with, and equal
+        // measurements are not equal weight.
+        let stop = l.stop.shrink(l.stop.width() * 0.09);
+        painter.rect_filled(stop, 1.0, if l.rolling { p.ink } else { p.faint });
+        painter.rect_stroke(
+            stop,
             1.0,
-            if l.rolling { p.ink } else { p.faint },
+            Stroke::new(1.5_f32, p.line),
+            StrokeKind::Inside,
         );
     }
 }
@@ -2571,6 +2590,40 @@ mod tests {
     /// insides change shape with what is in it: an empty slot's name box takes
     /// the whole row, and a row whose neighbour grew into it is precisely the
     /// bug this catches.
+    /// **The two transport buttons are the same size.**
+    ///
+    /// Stop used to be 0.66 of record and then had its glyph shrunk another
+    /// 30% inside that, so the square read as less than half the circle — which
+    /// makes one look like the real control and the other like a note about it.
+    #[test]
+    fn record_and_stop_are_the_same_size() {
+        for w in [320.0_f32, 640.0, 1300.0, 2600.0] {
+            let r = band(w);
+            let l = Layout::new(r, &idle());
+            if !l.record.is_positive() || !l.stop.is_positive() {
+                continue;
+            }
+            assert!(
+                (l.record.width() - l.stop.width()).abs() < 0.51,
+                "at {w}: record is {} wide and stop is {}",
+                l.record.width(),
+                l.stop.width()
+            );
+            assert!(
+                (l.record.height() - l.stop.height()).abs() < 0.51,
+                "at {w}: record is {} tall and stop is {}",
+                l.record.height(),
+                l.stop.height()
+            );
+            // And they still do not touch, which is the constraint that made
+            // them different sizes in the first place.
+            assert!(
+                !l.record.intersects(l.stop),
+                "at {w}: the transport buttons overlap"
+            );
+        }
+    }
+
     #[test]
     fn no_two_hit_regions_overlap() {
         for w in [500.0_f32, 900.0, 1300.0, 2600.0] {
