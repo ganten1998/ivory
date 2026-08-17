@@ -277,8 +277,36 @@ fn main() {
         Err(err) => eprintln!("could not decode assets/ivory.png as the app icon: {err}"),
     }
 
+    // Which renderer draws the window.
+    //
+    // **macOS defaults to wgpu (Metal), and that is a bug fix rather than a
+    // preference.** With a VST3 editor open the main window flickered rapidly
+    // and recovered the instant the plugin's window was closed. eframe draws
+    // with glow — OpenGL — and a plugin editor on macOS commonly makes its own
+    // GL context current on this very thread; two GL contexts on one thread is
+    // the classic way a host ends up drawing into the wrong drawable.
+    //
+    // Confirmed by switching renderers with nothing else changed: under Metal
+    // the flicker is gone. Metal shares nothing with the plugin's GL.
+    //
+    // `IVORY_RENDERER=glow` goes back, because this is the renderer every
+    // shipped build until now has used and an escape hatch costs one line.
+    //
+    // Windows and Linux stay on glow: their plugin editors are not implemented
+    // (`EditorError::Unsupported`), so no foreign GL context is ever created in
+    // this process, and wgpu is a large dependency tree to add for a problem
+    // those platforms do not have yet. When their editors land, they inherit
+    // this question.
+    #[cfg(target_os = "macos")]
+    let renderer = match std::env::var("IVORY_RENDERER").as_deref() {
+        Ok("glow") => eframe::Renderer::Glow,
+        _ => eframe::Renderer::Wgpu,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let renderer = eframe::Renderer::Glow;
     let options = eframe::NativeOptions {
         viewport,
+        renderer,
         ..Default::default()
     };
 

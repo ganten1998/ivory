@@ -371,6 +371,10 @@ pub struct RecorderState {
     pub disk_minutes: Option<f64>,
     pub message: Option<String>,
     pub clip_warning: bool,
+    /// The folder the last finished take went to, while it is still the thing
+    /// on screen. `Some` is what makes Export mean "re-export that take"
+    /// rather than "set up the next one".
+    pub last_take_folder: Option<String>,
 }
 
 impl RecorderState {

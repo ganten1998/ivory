@@ -133,18 +133,27 @@
 //! `start` — and it happens on the UI thread, in the same call that spends five
 //! seconds warming the instrument up.
 //!
-//! There is **one exception and it is not this file's to remove**:
-//! `Instance::process` allocates internally on every call — a `Vec` of channel
+//! There used to be **one exception, and it was not this file's to remove**:
+//! `Instance::process` allocated internally on every call — a `Vec` of channel
 //! pointers, an `AudioBusBuffers` vector, one scratch buffer per channel of
-//! every output bus past the first, and a `ComWrapper`ed event list. On
-//! Pianoteq, which exposes eight stereo buses, that is fourteen same-sized
-//! allocations per block, every block. **Three loaded slots is three times
-//! that**, which is the one place layering made an existing landmine bigger
-//! rather than adding a new one. They are identical in size every time, so a
-//! general-purpose allocator serves them from a free list and it has never been
-//! heard here; the fix is still a `process_into` on `Instance` that keeps its
-//! scratch between calls. Recorded rather than hidden because someone will
-//! eventually hit it under memory pressure and start looking in the wrong file.
+//! every output bus past the first, and a `ComWrapper`ed event list. Measured
+//! on Pianoteq's eight-stereo-bus layout by putting the old code under a
+//! counting allocator: **42 allocator calls for one block**, 21 allocations and
+//! 21 frees, and **three loaded slots was three times that** — 126 a block,
+//! about 12,000 a second. It is the one place layering made an existing
+//! landmine bigger rather than adding a new one. They were identical in size
+//! every time, so a general-purpose allocator served them from a free list and
+//! it was never heard here, which is exactly why it survived so long.
+//!
+//! **It is fixed, in `ivory-host`'s `instance.rs`, where it always had to be**:
+//! the scratch now lives on the `Instance`, sized once in `Instance::create`
+//! from `Setup::max_block` and the bus layout. Nothing changed on this side —
+//! the call is still `process_with_controls` — but the pre-grown `bufs` below
+//! are now load-bearing rather than merely tidy: `process` resizes them to the
+//! block length, and a `Vec` that has never held a block would grow **here**,
+//! on the audio thread, which is the one allocation the host cannot make go
+//! away on the caller's behalf. Measured: a hundred blocks of Pianoteq through
+//! this path now touch Rust's allocator zero times.
 //!
 //! **Never lock.** `rtrb` SPSC rings — one for MIDI, one for the tap, and a
 //! pair per slot for the handoff — and a handful of relaxed atomics. The only
@@ -1693,6 +1702,24 @@ pub struct Engine {
     /// thread — see [`Engine::open_editor`], where that is the whole trick.
     /// `None` for a slot with nothing loaded.
     editor_handles: [Option<ivory_host::EditorHandle>; SLOTS],
+    /// A reference to each loaded plugin's **processor**, taken in the same
+    /// moment and for the same reason, so that [`Engine::save_slot_state`] can
+    /// ask an instrument what it sounds like after it has left for the audio
+    /// callback. `None` for a slot with nothing loaded.
+    ///
+    /// Cleared before the slot's instance is retired, exactly like
+    /// `editor_handles`: a handle that outlives the instance is a live pointer
+    /// into a terminated object.
+    state_handles: [Option<ivory_host::StateHandle>; SLOTS],
+    /// Why a slot's saved state was not restored, if it was not.
+    ///
+    /// A stale or hand-edited blob in the settings file must not stop the
+    /// instrument loading — the user wants their piano more than they want
+    /// their preset — so the load continues with the plugin's defaults and the
+    /// reason lands here, where [`Engine::state_error`] can put it in front of
+    /// someone. Silently ignoring it is how "my preset keeps resetting" becomes
+    /// unreportable.
+    state_errors: [Option<String>; SLOTS],
 
     /// Meter hold, decayed on the UI thread because that is where it is read.
     hold: Cell<(f32, f32)>,
@@ -1833,6 +1860,8 @@ impl Engine {
             fault,
             editors: std::array::from_fn(|_| None),
             editor_handles: std::array::from_fn(|_| None),
+            state_handles: std::array::from_fn(|_| None),
+            state_errors: std::array::from_fn(|_| None),
             hold: Cell::new((0.0, 0.0)),
             hold_at: Cell::new(Instant::now()),
         })
@@ -1870,6 +1899,42 @@ impl Engine {
         slot: usize,
         bundle: &Path,
         class_name: Option<&str>,
+    ) -> Result<Loaded, String> {
+        self.load_plugin_with_state(slot, bundle, class_name, None)
+    }
+
+    /// As [`Engine::load_plugin`], and restore `state` into the instrument
+    /// before it is warmed up or handed over.
+    ///
+    /// `state` is whatever [`Engine::save_slot_state`] returned in an earlier
+    /// session. Anything else — a truncated file, another plugin's blob, a
+    /// hand-edited one — is refused by `ivory_host::state` before it can reach
+    /// the plugin, and refusing it is **not** a failed load: the instrument
+    /// comes up with its defaults and [`Engine::state_error`] says why.
+    ///
+    /// # Create, restore, warm up, and the order is the whole point
+    ///
+    /// The restore happens between `Instance::create` and the warm-up, and both
+    /// of those neighbours matter:
+    ///
+    /// * **After create**, because there is nothing to restore into before it;
+    /// * **Before the warm-up**, because a preset change makes an instrument
+    ///   reload its samples. State that arrives afterwards starts a NEW load
+    ///   immediately after `ivory_host::ready` finished waiting for the old
+    ///   one, so the gate says Ready and the instrument then goes quiet — the
+    ///   exact failure that module exists to prevent, reintroduced by ordering.
+    ///   It also means the first thing the warm-up probe renders is the default
+    ///   piano rather than the user's.
+    ///
+    /// `Instance::load_state` refuses a restore after the instance has rendered
+    /// anything, so this ordering is enforced by the host rather than by
+    /// convention.
+    pub fn load_plugin_with_state(
+        &mut self,
+        slot: usize,
+        bundle: &Path,
+        class_name: Option<&str>,
+        state: Option<&[u8]>,
     ) -> Result<Loaded, String> {
         // Checked FIRST, before five seconds of work that would have nowhere to
         // go, and returned as an error rather than an index because this is
@@ -1924,6 +1989,14 @@ impl Engine {
             return Err(format!("{} has no audio output channels", class.name));
         }
 
+        // BEFORE the warm-up. See this function's docs: a preset change makes a
+        // sampled instrument reload, so state that arrives after the gate has
+        // closed means the gate waited for the wrong load.
+        let state_error = match state {
+            Some(bytes) => inst.load_state(bytes).err(),
+            None => None,
+        };
+
         let gate = ivory_host::ready::warm_up(&mut inst, ivory_host::Policy::default());
         if gate.state() == ivory_host::ReadyState::Failed {
             return Err(gate
@@ -1964,6 +2037,11 @@ impl Engine {
         // main-thread object and every call this file makes on it is on this
         // thread.
         let editor_handle = inst.editor_handle();
+        // The same trick, one line later and for the same reason: after the
+        // handoff there is no `&Instance` here to ask for its state either.
+        // `IComponent` is reference-counted, the handle is `!Send`, and
+        // `getState` is a main-thread call — which is this thread.
+        let state_handle = inst.state_handle();
 
         let loaded = Loaded {
             bundle: bundle.to_path_buf(),
@@ -1990,12 +2068,21 @@ impl Engine {
         if let Some(h) = self.editor_handles.get_mut(slot) {
             *h = None;
         }
+        if let Some(h) = self.state_handles.get_mut(slot) {
+            *h = None;
+        }
         self.hand_off(slot, PluginBox(Some(Box::new(hosted))));
         // Written through `get_mut` rather than indexed even though `slot` was
         // bounded at the top: the bound and the write are forty lines apart, and
         // the next edit to this function is the one that separates them further.
         if let Some(h) = self.editor_handles.get_mut(slot) {
             *h = editor_handle;
+        }
+        if let Some(h) = self.state_handles.get_mut(slot) {
+            *h = Some(state_handle);
+        }
+        if let Some(e) = self.state_errors.get_mut(slot) {
+            *e = state_error;
         }
         if let Some(l) = self.loaded.get_mut(slot) {
             *l = Some(loaded.clone());
@@ -2024,6 +2111,14 @@ impl Engine {
         self.close_editor(slot);
         if let Some(h) = self.editor_handles.get_mut(slot) {
             *h = None;
+        }
+        // Before the instance goes, and for the same reason the editor handle
+        // does: `Instance::drop` calls `IComponent::terminate`.
+        if let Some(h) = self.state_handles.get_mut(slot) {
+            *h = None;
+        }
+        if let Some(e) = self.state_errors.get_mut(slot) {
+            *e = None;
         }
         if self.loaded.get(slot).is_none_or(Option::is_none) {
             return;
@@ -2183,6 +2278,53 @@ impl Engine {
     /// never made a sound and was declared ready by timeout.
     pub fn warm_up(&self, slot: usize) -> Option<&WarmUp> {
         self.warm.get(slot).and_then(Option::as_ref)
+    }
+
+    // ── the instruments' state ──────────────────────────────────────────────
+
+    /// What the instrument in `slot` sounds like right now, as opaque bytes to
+    /// be written somewhere and handed back to
+    /// [`Engine::load_plugin_with_state`] next session.
+    ///
+    /// `None` for an empty slot, for a slot that does not exist, and for a
+    /// plugin that refused — the three are deliberately not distinguished,
+    /// because the only thing a caller can do with any of them is write nothing
+    /// for that slot.
+    ///
+    /// **Main thread, and it does not interrupt the audio.** The instance is
+    /// inside the callback; this goes through a second reference to its
+    /// processor taken at load time, exactly as the editor does. `getState`
+    /// while `process` runs on another thread is the arrangement VST3 specifies
+    /// and the one every DAW uses to save a project mid-playback — the
+    /// alternative, retiring the instrument across the handoff to borrow it
+    /// back, would cost a block of silence and every note in flight each time
+    /// the settings file is written. See `ivory_host::StateHandle`.
+    ///
+    /// **Size**: measured on Pianoteq 9, one slot is about 40 KB (41,233 bytes,
+    /// of which 41,215 are the processor's and none the controller's). Three
+    /// full slots is around 120 KB, or 165 KB base64'd into a JSON settings
+    /// file — large for a settings file and small for a disk. A sampler that
+    /// embeds its content could be far larger; `ivory_host::MAX_STATE_BYTES` is
+    /// the ceiling either way.
+    pub fn save_slot_state(&self, slot: usize) -> Option<Vec<u8>> {
+        self.state_handles
+            .get(slot)
+            .and_then(Option::as_ref)
+            .and_then(|h| h.save().ok())
+    }
+
+    /// Why the state handed to [`Engine::load_plugin_with_state`] was not
+    /// restored into `slot`.
+    ///
+    /// `None` is the normal answer: nothing was offered, or it was restored.
+    /// `Some` means the instrument came up with its defaults and the user's
+    /// preset did not survive — worth saying out loud, because the symptom is
+    /// "it keeps forgetting my piano" and nothing else in the app would know.
+    pub fn state_error(&self, slot: usize) -> Option<&str> {
+        self.state_errors
+            .get(slot)
+            .and_then(Option::as_ref)
+            .map(String::as_str)
     }
 
     pub fn output(&self) -> &OutputInfo {
@@ -2775,6 +2917,18 @@ pub fn plugin_test(filter: Option<String>) {
         );
     }
 
+    // ── the state, which is what makes a preset survive a restart ───────────
+    //
+    // Read here rather than at the end, because the other two slots are loaded
+    // WITH it: the layering measurement below rests on the three instruments
+    // being identical, and "restored from slot 1's own bytes" is a stronger
+    // claim than "the same plugin file".
+    let preset = engine.save_slot_state(0);
+    match &preset {
+        Some(b) => println!("state:    {} bytes from slot 1", b.len()),
+        None => println!("state:    this instrument handed over none"),
+    }
+
     for slot in 0..SLOTS {
         engine.set_slot_gain(slot, LAYER_GAIN);
     }
@@ -2905,9 +3059,17 @@ pub fn plugin_test(filter: Option<String>) {
     for slot in 0..SLOTS {
         if slot > 0 {
             println!("  loading slot {} with the same instrument...", slot + 1);
-            if let Err(why) = engine.load_plugin(slot, &bundle, None) {
+            if let Err(why) =
+                engine.load_plugin_with_state(slot, &bundle, None, preset.as_deref())
+            {
                 println!("  slot {} would not load: {why}", slot + 1);
                 break;
+            }
+            if let Some(why) = engine.state_error(slot) {
+                // Not fatal — the slot is loaded, on its defaults — but it
+                // means the three instruments are no longer known to match,
+                // which is exactly what the dB column below assumes.
+                println!("  slot {}: the saved state was refused: {why}", slot + 1);
             }
         }
         let (peak, in_tap, cores) = measure(
@@ -3020,6 +3182,22 @@ pub fn plugin_test(filter: Option<String>) {
             engine.callbacks() - before
         );
         peak = peak.max(after_peak);
+    }
+
+    // Did anything the user did in the editor reach the bytes? This is the one
+    // end of the persistence feature no test can check: pick a different piano
+    // in Pianoteq's own UI, close the window, and watch the state change.
+    match (preset.as_deref(), engine.save_slot_state(0)) {
+        (Some(before), Some(after)) if before == after.as_slice() => {
+            println!("state:           unchanged, {} bytes", after.len());
+        }
+        (Some(before), Some(after)) => println!(
+            "state:           CHANGED, {} bytes -> {} bytes. That is the preset the \
+             next launch would restore.",
+            before.len(),
+            after.len()
+        ),
+        (_, after) => println!("state:           {:?} bytes now", after.map(|b| b.len())),
     }
 
     // ── unloading, one slot at a time ───────────────────────────────────────
@@ -4287,6 +4465,67 @@ mod tests {
             "a four-beat count-in at 120 bpm took {total:.2} s"
         );
         assert!(engine.count_in_downbeat_ns().is_some());
+    }
+
+    #[test]
+    #[ignore = "needs an audio output device and a real VST3 instrument; run with \
+                `cargo test -p ivory -- --ignored a_slots_state --nocapture`"]
+    fn a_slots_state_can_be_saved_while_it_plays_and_handed_back_to_the_next_load() {
+        // The engine's half of the persistence story: the instance is inside
+        // the audio callback the whole time, so this exercises the second
+        // reference to its processor rather than any path that stops the audio.
+        // That the RESTORED SOUND is right is proved in `ivory-host`'s
+        // `instance.rs`, where a rendered probe can be measured; here the claim
+        // is that the bytes can be got at all while the stream runs, and that a
+        // bad blob costs the preset rather than the piano.
+        let bundle = pianoteq();
+        let mut engine = Engine::start(None).expect("an audio output");
+        engine.load_plugin(0, &bundle, None).expect("load");
+        assert!(engine.state_error(0).is_none());
+
+        let now = engine.timebase().now();
+        engine.send_midi(now, &[0x90, 60, 100]);
+        let bytes = engine
+            .save_slot_state(0)
+            .expect("a loaded slot has state to save");
+        engine.send_midi(engine.timebase().now(), &[0x80, 60, 64]);
+        println!("slot 0 state: {} bytes", bytes.len());
+        assert!(bytes.len() > 18, "only the container came back");
+        assert!(engine.is_running(), "saving state stopped the stream");
+        assert!(engine.fault().is_none(), "{:?}", engine.fault());
+
+        // An empty slot has nothing to save, and neither has a slot that does
+        // not exist. Both are `None` rather than an error, because the caller's
+        // only move either way is to write nothing.
+        assert!(engine.save_slot_state(1).is_none());
+        assert!(engine.save_slot_state(SLOTS).is_none());
+
+        engine
+            .load_plugin_with_state(0, &bundle, None, Some(&bytes))
+            .expect("reload with state");
+        assert!(
+            engine.state_error(0).is_none(),
+            "a blob this engine just wrote was refused: {:?}",
+            engine.state_error(0)
+        );
+
+        // And the case that will actually happen: a settings file that has been
+        // truncated, edited, or written by a different plugin. The instrument
+        // must still load.
+        let mut broken = bytes.clone();
+        broken.truncate(broken.len() / 2);
+        engine
+            .load_plugin_with_state(0, &bundle, None, Some(&broken))
+            .expect("a corrupt blob must not stop the instrument loading");
+        assert!(
+            engine.state_error(0).is_some(),
+            "a truncated blob was silently accepted, which is how 'it keeps \
+             forgetting my piano' becomes unreportable"
+        );
+        assert!(engine.plugin(0).is_some(), "the instrument did not load");
+        // ...and the error does not outlive the slot.
+        engine.unload_plugin(0);
+        assert!(engine.state_error(0).is_none());
     }
 
     #[test]

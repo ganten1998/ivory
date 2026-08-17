@@ -1276,6 +1276,27 @@ impl Session {
             .as_ref()
             .and_then(|r| r.first_frame_ns)
             .map_or(self.t0, |first| self.t0.max(first));
+        // And T1 stretches to cover the audio that is actually in the file.
+        //
+        // The writer does one last pass after Stop, so the `.wav` runs a poll
+        // interval or so past the instant the button was pressed — measured at
+        // about 11 ms. Left alone, `duration_seconds` and the SMF's end-of-track
+        // describe a take slightly shorter than the file beside them, and the
+        // three deliverables disagree about where the take ends.
+        //
+        // **Extended, never shortened.** `max` is the whole point: audio that
+        // ran LONG is the writer's tail and the timeline should cover it, while
+        // audio that ran SHORT is a device that stopped — and pulling T1 back to
+        // meet it would silently truncate the MIDI to match a fault instead of
+        // reporting one. The short case is already reported through `running`
+        // and the frame count.
+        let t1 = match &report {
+            Some(r) if r.frames > 0 => {
+                let secs = r.frames as f64 / nominal;
+                t1.max(t0 + (secs * 1_000_000_000.0) as Nanos)
+            }
+            _ => t1,
+        };
         let timeline = match &report {
             Some(r) => Timeline::from_fit(t0, t1, nominal, &r.fit),
             None => Timeline::synthetic(t0, t1, nominal),

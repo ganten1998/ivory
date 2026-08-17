@@ -167,7 +167,15 @@ struct Recorder {
     /// and the answer changes by megabytes, not by pixels.
     disk_checked_at: Option<std::time::Instant>,
     disk_bytes: Option<u64>,
+    /// `IVORY_OPEN_EDITOR=1` bookkeeping. See `after_frame`.
+    dev_editor_at: Option<std::time::Instant>,
+    dev_editor_done: bool,
 }
+
+/// How long `IVORY_OPEN_EDITOR` waits before opening, so the plugin has
+/// finished loading and the window has drawn at least one ordinary frame.
+#[cfg(feature = "recorder")]
+const DEV_EDITOR_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The standalone app: `IvoryApp`, plus the eframe trait impl it cannot carry.
 pub struct DesktopApp {
@@ -358,6 +366,17 @@ impl DesktopApp {
         state.slots = slots;
         state.message = message;
         state.clip_warning = self.recorder.session.clipped();
+        // Cleared the moment a new take starts: "re-export the last take" stops
+        // being a sensible offer once there is a take in progress.
+        state.last_take_folder = (!self.recorder.session.is_recording())
+            .then(|| {
+                self.recorder
+                    .session
+                    .last_summary()
+                    .filter(|s| s.problem.is_none())
+                    .map(|s| s.folder.clone())
+            })
+            .flatten();
     }
 
     /// Everything that must happen OUTSIDE a frame: opening devices, raising
@@ -365,11 +384,44 @@ impl DesktopApp {
     fn after_frame(&mut self, ctx: &egui::Context) {
         use ivory_ui::recorder::RecorderRequest as R;
 
+        // Dev hook, alongside IVORY_INLINE and IVORY_DEMO_NOTES: open slot 0's
+        // editor once, a second in, without anybody clicking. It is how a
+        // window-interaction bug gets reproduced and bisected from a script;
+        // driving it by hand makes every measurement a different measurement.
+        //   IVORY_OPEN_EDITOR=1 dist/Tangent.app/Contents/MacOS/tangent
+        if !self.recorder.dev_editor_done
+            && std::env::var("IVORY_OPEN_EDITOR").as_deref() == Ok("1")
+        {
+            let due = self
+                .recorder
+                .dev_editor_at
+                .get_or_insert_with(|| std::time::Instant::now() + DEV_EDITOR_DELAY);
+            if std::time::Instant::now() >= *due {
+                self.recorder.dev_editor_done = true;
+                if let Some(e) = self.recorder.engine.as_mut() {
+                    match e.open_editor(0) {
+                        Ok(()) => eprintln!("IVORY_OPEN_EDITOR: slot 1 editor opened"),
+                        Err(err) => eprintln!("IVORY_OPEN_EDITOR: {err}"),
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }
+
         // The instrument's own window, if it has one open. Polled rather than
         // notified because the user closes it with the OS's close button, which
         // the plugin's view knows about and we only find out by asking.
         if let Some(e) = self.recorder.engine.as_mut() {
+            let was: Vec<bool> = (0..ivory_ui::recorder::SLOTS).map(|i| e.editor_open(i)).collect();
             e.poll_editor();
+            // An editor that has just closed is a preset that has just been
+            // chosen. Save then, rather than only at quit, because the gap
+            // between the two is where a force-quit loses the sound.
+            let closed = (0..ivory_ui::recorder::SLOTS)
+                .any(|i| was[i] && !self.recorder.engine.as_ref().is_some_and(|e| e.editor_open(i)));
+            if closed {
+                self.save_plugin_states();
+            }
         }
 
         // The always-on MIDI tap, drained whether or not a take is running, and
@@ -507,6 +559,28 @@ impl DesktopApp {
         }
     }
 
+    /// Write every loaded slot's plugin state beside the settings.
+    ///
+    /// Called on quit and whenever an editor closes — the second matters more
+    /// than the first, because closing the editor is the moment right after
+    /// somebody chose a preset, and it is also the moment they are most likely
+    /// to then force-quit or unplug something.
+    fn save_plugin_states(&mut self) {
+        for slot in 0..ivory_ui::recorder::SLOTS {
+            let Some(bundle) = self.app.chosen_plugin(slot).map(str::to_owned) else {
+                continue;
+            };
+            if let Some(state) = self
+                .recorder
+                .engine
+                .as_ref()
+                .and_then(|e| e.save_slot_state(slot))
+            {
+                write_state(slot, &bundle, &state);
+            }
+        }
+    }
+
     /// Start the monitor output, once, when the band opens.
     ///
     /// A failure here is not fatal and must not be: a machine with no output
@@ -610,7 +684,12 @@ impl DesktopApp {
                 e.unload_plugin(slot);
                 self.recorder.engine_error = None;
             }
-            Some(path) => match e.load_plugin(slot, std::path::Path::new(path), None) {
+            Some(path) => match e.load_plugin_with_state(
+                slot,
+                std::path::Path::new(path),
+                None,
+                saved_state(slot, path).as_deref(),
+            ) {
                 Ok(_) => {
                     self.recorder.engine_error = None;
                     // The take has to be able to RECORD what it can now hear.
@@ -706,6 +785,46 @@ impl DesktopApp {
             self.recorder.session.audio_error().map(str::to_owned),
         );
     }
+}
+
+/// Where one slot's plugin state lives.
+///
+/// A sidecar file rather than a key in `settings.json`: Pianoteq's state is
+/// **41,233 bytes**, so three slots would put ~165 KB of base64 into a file a
+/// human is expected to be able to open and read. It sits beside the settings
+/// so it travels with them.
+#[cfg(feature = "recorder")]
+fn state_path(slot: usize) -> std::path::PathBuf {
+    let dir = ivory_ui::settings::Settings::path()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    dir.join(format!("plugin-state-{slot}.bin"))
+}
+
+/// The saved state for `slot`, but only if it belongs to `bundle`.
+///
+/// The bundle path is written into the file and checked on the way back,
+/// because handing Pianoteq's state to Piano V3 is not a preset, it is
+/// arbitrary bytes to a `setState` that will believe them. `ivory-host`'s
+/// container catches corruption; nothing but this catches *the wrong plugin*.
+#[cfg(feature = "recorder")]
+fn saved_state(slot: usize, bundle: &str) -> Option<Vec<u8>> {
+    let raw = std::fs::read(state_path(slot)).ok()?;
+    let split = raw.iter().position(|b| *b == 0)?;
+    let owner = std::str::from_utf8(&raw[..split]).ok()?;
+    (owner == bundle).then(|| raw[split + 1..].to_vec())
+}
+
+#[cfg(feature = "recorder")]
+fn write_state(slot: usize, bundle: &str, state: &[u8]) {
+    let mut out = Vec::with_capacity(bundle.len() + 1 + state.len());
+    out.extend_from_slice(bundle.as_bytes());
+    out.push(0);
+    out.extend_from_slice(state);
+    // Best effort. A preset that could not be saved is a preset to choose
+    // again, and refusing to quit over it would be worse.
+    let _ = std::fs::write(state_path(slot), out);
 }
 
 /// `/Users/x/Movies/Tangent` reads as `~/Movies/Tangent`.
@@ -813,6 +932,8 @@ impl DesktopApp {
                 band_was_open: false,
                 disk_checked_at: None,
                 disk_bytes: None,
+                dev_editor_at: None,
+                dev_editor_done: false,
             }
         };
 
@@ -853,5 +974,6 @@ impl eframe::App for DesktopApp {
     #[cfg(feature = "recorder")]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.recorder.session.stop();
+        self.save_plugin_states();
     }
 }

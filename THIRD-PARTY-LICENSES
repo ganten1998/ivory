@@ -209,6 +209,11 @@ bitflags 2.13.1
     authors: The Rust Project Developers
     repository: https://github.com/bitflags/bitflags
 
+block 0.1.6
+    license: MIT
+    authors: Steven Sheldon
+    repository: http://github.com/SSheldon/rust-block
+
 block2 0.5.1
     license: MIT
     authors: Steven Sheldon, Mads Marquart <mads@marquart.dk>
@@ -340,6 +345,11 @@ core-graphics 0.23.2
     repository: https://github.com/servo/core-foundation-rs
 
 core-graphics-types 0.1.3
+    license: MIT OR Apache-2.0
+    authors: The Servo Project Developers
+    repository: https://github.com/servo/core-foundation-rs
+
+core-graphics-types 0.2.0
     license: MIT OR Apache-2.0
     authors: The Servo Project Developers
     repository: https://github.com/servo/core-foundation-rs
@@ -879,6 +889,11 @@ mach2 0.4.3
     authors: unknown
     repository: https://github.com/JohnTitor/mach2
 
+malloc_buf 0.0.6
+    license: MIT
+    authors: Steven Sheldon
+    repository: https://github.com/SSheldon/malloc_buf
+
 memchr 2.8.3
     license: Unlicense OR MIT
     authors: Andrew Gallant <jamslam@gmail.com>, bluss
@@ -893,6 +908,11 @@ memoffset 0.9.1
     license: MIT
     authors: Gilad Naaman <gilad.naaman@gmail.com>
     repository: https://github.com/Gilnaa/memoffset
+
+metal 0.32.0
+    license: MIT OR Apache-2.0
+    authors: gfx-rs developers
+    repository: https://github.com/gfx-rs/metal-rs
 
 midir 0.11.0
     license: MIT
@@ -958,6 +978,11 @@ num_enum_derive 0.7.6
     license: BSD-3-Clause OR MIT OR Apache-2.0
     authors: Daniel Wagner-Hall <dawagner@gmail.com>, Daniel Henry-Mantilla <daniel.henry.mantilla@gmail.com>, Vincent Esche <regexident@gmail.com>
     repository: https://github.com/illicitonion/num_enum
+
+objc 0.2.7
+    license: MIT
+    authors: Steven Sheldon
+    repository: http://github.com/SSheldon/rust-objc
 
 objc-sys 0.3.5
     license: MIT
@@ -1143,6 +1168,11 @@ parking_lot_core 0.9.12
     license: MIT OR Apache-2.0
     authors: Amanieu d'Antras <amanieu@gmail.com>
     repository: https://github.com/Amanieu/parking_lot
+
+paste 1.0.15
+    license: MIT OR Apache-2.0
+    authors: David Tolnay <dtolnay@gmail.com>
+    repository: https://github.com/dtolnay/paste
 
 percent-encoding 2.3.2
     license: MIT OR Apache-2.0
@@ -1724,6 +1754,11 @@ wgpu-core 27.0.3
     authors: gfx-rs developers
     repository: https://github.com/gfx-rs/wgpu
 
+wgpu-core-deps-apple 27.0.0
+    license: MIT OR Apache-2.0
+    authors: gfx-rs developers
+    repository: https://github.com/gfx-rs/wgpu
+
 wgpu-core-deps-windows-linux-android 27.0.0
     license: MIT OR Apache-2.0
     authors: gfx-rs developers
@@ -2129,4 +2164,4 @@ zvariant_utils 3.5.0
     authors: Zeeshan Ali Khan <zeeshanak@gnome.org>, turbocooler <turbocooler@cocaine.ninja>
     repository: https://github.com/z-galaxy/zbus/
 
-(416 crates)
+(423 crates)

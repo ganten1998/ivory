@@ -1550,11 +1550,21 @@ impl IvoryApp {
         // common case — "record what I am looking at" — needs no clicks. The
         // dialog then overrides them FOR THE VIDEO ONLY.
         spec.composite.shows = dialogs::shows_from_settings(&self.settings);
-        // `false, false`: this is the before-a-take dialog. The after-a-take
-        // one greys the camera controls because those frames were composited
-        // live and nothing kept them, and it is opened from the result strip,
-        // which does not exist until there is a result to strip.
-        self.dialog = Some(Dialog::export(spec, false, false));
+        // Which of the two dialogs this is depends on whether there is a take
+        // to talk about.
+        //
+        // With a finished take on screen, Export means "re-export THAT", and
+        // the post-take dialog is the one that knows what is re-derivable: the
+        // SMF's tempo mark and a display-only video are, and anything
+        // containing the camera is not — those frames were composited live and
+        // nothing kept them. Without one it means "what should the next take
+        // produce".
+        //
+        // `had_camera: false` unconditionally, and it is not a placeholder: no
+        // take this build can produce contains camera frames, because nothing
+        // encodes video yet. It becomes a real question the day it does.
+        let post_take = self.recorder.last_take_folder.is_some();
+        self.dialog = Some(Dialog::export(spec, post_take, false));
     }
 
     /// Longest take name the field accepts.

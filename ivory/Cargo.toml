@@ -111,6 +111,31 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
 ] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# THE macOS RENDERER, and a bug fix rather than a preference.
+#
+# With a VST3 editor open the main window flickered rapidly, recovering the
+# instant the plugin's window closed. eframe draws with glow — OpenGL — and a
+# plugin editor on macOS commonly makes its own GL context current on the very
+# thread eframe draws from; two GL contexts on one thread is the classic way a
+# host ends up drawing into the wrong drawable. Confirmed by switching
+# renderers with nothing else changed: under Metal the flicker is gone.
+#
+# `glow` is still compiled in and `IVORY_RENDERER=glow` selects it, because it
+# is what every shipped build until now has used.
+#
+# macOS-only deliberately: Windows and Linux have no plugin editor yet, so no
+# foreign GL context is ever created there, and wgpu is a large tree to put in
+# those artifacts for a problem they do not have.
+#
+# The explicit `wgpu` line is not redundant. eframe is taken with
+# `default-features = false`, so enabling its `wgpu` feature alone compiles
+# wgpu with NO BACKEND — the app then panics at startup with "No wgpu backend
+# feature that is implemented for the target platform was enabled", which is
+# what happened the first time. The backend has to be asked for by name.
+eframe = { version = "0.33", default-features = false, features = ["wgpu"] }
+wgpu = { version = "27", default-features = false, features = ["metal"] }
+
 [target.'cfg(unix)'.dependencies]
 # `statvfs`, the other half of the same question. Already in the tree via cpal;
 # named here because a transitive dependency is not a nameable one.

@@ -10,17 +10,19 @@
 //! pre-generated bindings and therefore needs no libclang, no SDK download and
 //! no C toolchain — so the existing `cargo xwin` cross-build survives.
 //!
-//! Three parts: [`scan`] finds modules and reads what they claim to be,
-//! [`instance`] turns one of those claims into a running instrument, and
+//! Four parts: [`scan`] finds modules and reads what they claim to be,
+//! [`instance`] turns one of those claims into a running instrument,
 //! [`editor`] opens that instrument's own UI in a window so its sound can be
-//! changed.
+//! changed, and [`state`] is how the change survives quitting the app.
 
 pub mod editor;
 pub mod instance;
 pub mod ready;
 pub mod scan;
+pub mod state;
 
 pub use editor::{Editor, EditorError, EditorHandle};
 pub use instance::{Bus, Control, Instance, Note, Rendered, Setup};
 pub use ready::{Policy, Readiness, State as ReadyState};
 pub use scan::{discover, ClassInfo, Module};
+pub use state::{StateHandle, MAX_STATE_BYTES};
