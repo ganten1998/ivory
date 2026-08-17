@@ -283,6 +283,9 @@ struct Layout {
     audio: Rect,
     count_in: Rect,
     tempo: Rect,
+    /// The time signature, typed rather than dragged. NOT `meter` — that name
+    /// is the level meter's, twenty lines up.
+    time_sig: Rect,
     export: Rect,
     /// The tick beside Export: show the take's folder as soon as it is done.
     open_when_done: Rect,
@@ -481,6 +484,7 @@ impl Layout {
             audio: Rect::NOTHING,
             count_in: Rect::NOTHING,
             tempo: Rect::NOTHING,
+            time_sig: Rect::NOTHING,
             export: Rect::NOTHING,
             open_when_done: Rect::NOTHING,
             status: Rect::NOTHING,
@@ -663,8 +667,12 @@ impl Layout {
         self.camera = slice_v(d, 0.400, 0.525);
         self.audio = slice_v(d, 0.545, 0.670);
         let take_row = slice_v(d, 0.700, 0.825);
-        self.count_in = slice_h(take_row, 0.00, 0.48);
-        self.tempo = slice_h(take_row, 0.52, 1.00);
+        // Three cells now, not two. The signature belongs beside the count-in
+        // and the tempo because the three describe one thing between them —
+        // how long a bar is, how many of them you get, and how fast.
+        self.count_in = slice_h(take_row, 0.00, 0.34);
+        self.time_sig = slice_h(take_row, 0.37, 0.62);
+        self.tempo = slice_h(take_row, 0.65, 1.00);
         // The Export button keeps the left of its row; the tick that says what
         // to do when a take finishes takes the right. Beside Export rather than
         // beside the folder because it is a question about the END of a take,
@@ -703,8 +711,16 @@ impl Layout {
         // nothing, and a dead control is worse than no control.
         let dot_d = (top.height() * 0.30).min(top.width() * 0.08);
         self.dot = Rect::from_center_size(slice_h(top, 0.0, 0.12).center(), Vec2::splat(dot_d));
-        let stop_d = (top.height() * 0.62).min(top.width() * 0.14);
-        self.stop = Rect::from_center_size(slice_h(top, 0.14, 0.32).center(), Vec2::splat(stop_d));
+        // As close to its resting size as the row allows. It used to be 0.62
+        // of the row height against a resting 1.0, so the one control you reach
+        // for while your hands are on the keys shrank the moment the take
+        // started. It cannot be identical — the timecode is enormous here and
+        // has to start somewhere — but it no longer halves.
+        // Capped at the slice it has to live in, which is narrower here than
+        // at rest: the timecode starts at 0.36 and is the biggest thing in the
+        // band while a take runs.
+        let stop_d = top.height().min(top.width() * 0.20);
+        self.stop = Rect::from_center_size(slice_h(top, 0.13, 0.33).center(), Vec2::splat(stop_d));
 
         // The one thing `hide_elapsed` suppresses is a CLOCK. The count-in beat
         // is the number the player is counting, and "FINISHING" is the reason
@@ -722,7 +738,7 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 28] {
+    fn targets(&self) -> [(Rect, Produces); 29] {
         use Produces::{Along, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
         let s = &self.slots;
@@ -760,6 +776,7 @@ impl Layout {
             (self.audio, Fixed(Hit::PickAudio)),
             (self.count_in, Fixed(Hit::CycleCountIn)),
             (self.tempo, Along(tempo_at)),
+            (self.time_sig, Fixed(Hit::EditTimeSignature)),
             (self.export, Fixed(Hit::Export)),
         ]
     }
@@ -853,6 +870,10 @@ pub enum Hit {
     SetInputGain(f32),
     /// Tempo dragged, already clamped to `MIN_BPM..=MAX_BPM`.
     SetTempo(f64),
+    /// Type a time signature into the band. A CLICK opens it, because unlike
+    /// every other numeric cell there is nothing to drag: "6/8" is two numbers
+    /// and a slash, not a point on a continuum.
+    EditTimeSignature,
 }
 
 impl Hit {
@@ -870,7 +891,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 28] = [
+    pub const ALL: [Hit; 29] = [
         Hit::Record,
         Hit::Stop,
         Hit::ChooseFolder,
@@ -899,6 +920,7 @@ impl Hit {
         Hit::SetMetronomeGain(Hit::MIDWAY),
         Hit::SetInputGain(Hit::MIDWAY),
         Hit::SetTempo((MIN_BPM + MAX_BPM) * 0.5),
+        Hit::EditTimeSignature,
     ];
 
     pub fn label(self) -> &'static str {
@@ -946,6 +968,7 @@ impl Hit {
             Hit::SetMetronomeGain(_) => "Click level",
             Hit::SetInputGain(_) => "Input level",
             Hit::SetTempo(_) => "Tempo",
+            Hit::EditTimeSignature => "Time signature",
         }
     }
 
@@ -1002,6 +1025,7 @@ impl Hit {
 /// into, and there is no third kind.
 pub fn num_field(hit: Hit) -> Option<NumField> {
     match hit {
+        Hit::EditTimeSignature => Some(NumField::Meter),
         Hit::SetSlotGain(i, _) => Some(NumField::Slot(i)),
         Hit::SetMetronomeGain(_) => Some(NumField::Metronome),
         Hit::SetInputGain(_) => Some(NumField::Input),
@@ -1293,6 +1317,14 @@ fn draw_transport(painter: &Painter, l: &Layout, p: &Palette) {
         painter.circle_filled(c, rad, p.rec);
         painter.circle_stroke(c, rad, Stroke::new(1.5_f32, p.line));
     }
+    // The two glyphs sit in rects of the SAME size — and that alone did not
+    // make them look the same size, which is the part the first attempt got
+    // wrong. The circle fills its rect; the square was inset another 9%, so it
+    // was 82% of the circle's diameter and read as the smaller control.
+    //
+    // A square of side D beside a circle of diameter D looks BIGGER, because it
+    // is 27% more ink. Equal AREA is the honest match: side = D * sqrt(pi)/2 =
+    // 0.886 D, which is the inset used below.
     if l.dot.is_positive() {
         painter.circle_filled(l.dot.center(), l.dot.width() * 0.5, p.rec);
     }
@@ -1310,7 +1342,8 @@ fn draw_transport(painter: &Painter, l: &Layout, p: &Palette) {
         // The square is inset a little because an inscribed square is 27%
         // more ink than the circle it shares a diameter with, and equal
         // measurements are not equal weight.
-        let stop = l.stop.shrink(l.stop.width() * 0.09);
+        const STOP_INSET: f32 = (1.0 - 0.886) * 0.5;
+        let stop = l.stop.shrink(l.stop.width() * STOP_INSET);
         painter.rect_filled(stop, 1.0, if l.rolling { p.ink } else { p.faint });
         painter.rect_stroke(
             stop,
@@ -1877,11 +1910,14 @@ fn export_summary(spec: &ExportSpec) -> String {
 ///
 /// Beats rather than bars, matching the menu: "8 beats" is what the click
 /// plays, and the app has no time signature to turn that into bars with.
-fn count_in_text(beats: u32) -> String {
-    if beats == 0 {
-        "off".to_owned()
-    } else {
-        format!("{beats} beats")
+/// The count-in, in BARS — which is what a click cycles and what the menu
+/// offers. It read beats, and beats stopped being the setting when the time
+/// signature arrived: the cell showed a number the control no longer changed.
+fn count_in_text(bars: u32) -> String {
+    match bars {
+        0 => "off".to_owned(),
+        1 => "1 bar".to_owned(),
+        n => format!("{n} bars"),
     }
 }
 
@@ -1984,10 +2020,20 @@ fn draw_destination(
         painter,
         l.count_in,
         "COUNT-IN",
-        &count_in_text(view.count_in_beats),
+        &count_in_text(view.count_in_bars),
         p.ink,
         p,
     );
+    // The signature, typed rather than dragged. `labelled` with a caret when it
+    // is being edited, exactly like the take name.
+    {
+        let typing = typing_for(view, NumField::Meter);
+        let shown = typing.map_or_else(|| view.time_signature.label(), str::to_owned);
+        labelled(painter, l.time_sig, "SIG", &shown, p.ink, p);
+        if let Some(typed) = typing {
+            draw_caption_caret(painter, l.time_sig, "SIG", &shown, typed.chars().count(), p);
+        }
+    }
     draw_tempo(
         painter,
         l.tempo,
@@ -3401,27 +3447,40 @@ mod tests {
         // A value a hand-edited settings file could hold lands somewhere real
         // rather than sticking.
         assert_eq!(next_count_in(97), COUNT_IN_CHOICES[0]);
-        // And the label says beats, because that is what the click plays.
+        // And the label says BARS, because that is what the choices are now
+        // that there is a time signature to count them in. It said beats, and
+        // went on saying beats after the setting became bars — so the cell
+        // showed a number the control no longer changed.
         assert_eq!(count_in_text(0), "off");
-        assert_eq!(count_in_text(8), "8 beats");
+        assert_eq!(count_in_text(1), "1 bar");
+        assert_eq!(count_in_text(2), "2 bars");
     }
 
-    /// **Draggable and typeable are the same set.**
+    /// **Everything draggable is typeable; not everything typeable is
+    /// draggable.**
     ///
-    /// The gesture is a tap on the control you would otherwise drag, so a
-    /// draggable hit with no field would be a control that swallows a click and
-    /// does nothing, and a field with no drag would be a number you can only
-    /// reach by typing. Asserted over `ALL` so a new control cannot be added on
-    /// one side only.
+    /// It used to be an equality, and that was right while every numeric cell
+    /// was a fader: a draggable hit with no field would swallow a tap and do
+    /// nothing. The time signature broke the symmetry honestly rather than
+    /// accidentally — "6/8" is two numbers and a slash, and there is no
+    /// continuum between 4/4 and 7/8 to drag along, so it is typed and only
+    /// typed.
     #[test]
     fn every_control_you_can_drag_is_one_you_can_type_into() {
         for hit in Hit::ALL {
-            assert_eq!(
-                hit.is_draggable(),
-                num_field(hit).is_some(),
-                "{hit:?} is draggable and typeable in different amounts"
-            );
+            if hit.is_draggable() {
+                assert!(
+                    num_field(hit).is_some(),
+                    "{hit:?} can be dragged and not typed into"
+                );
+            }
         }
+        // And the one that goes the other way is the one it is supposed to be.
+        let typed_only: Vec<Hit> = Hit::ALL
+            .into_iter()
+            .filter(|h| num_field(*h).is_some() && !h.is_draggable())
+            .collect();
+        assert_eq!(typed_only, vec![Hit::EditTimeSignature]);
     }
 
     /// The four fields are four fields, not one used four times.
@@ -3556,6 +3615,8 @@ mod tests {
                                 metronome_in_take: dark,
                                 tempo_bpm: 92.5,
                                 count_in_beats: 8,
+                                count_in_bars: 2,
+                                time_signature: crate::recorder::TimeSignature { beats: 6, unit: 8 },
                                 camera: DeviceLabel::Missing("FaceTime HD Camera"),
                                 audio: DeviceLabel::Open("Scarlett 2i2 USB"),
                                 preview,

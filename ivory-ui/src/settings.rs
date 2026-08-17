@@ -1111,7 +1111,12 @@ impl Settings {
         );
         map.insert(
             "record_count_in_beats".into(),
-            Value::Number(self.record_count_in_beats.into()),
+            // The DERIVED value, not the stored one. This key is legacy — bars
+            // and the signature are the setting now — and writing it back
+            // unchanged let the two disagree: the owner's file said 0 beats
+            // beside 1 bar of 4/4, which is 4. A build old enough to read this
+            // key would have counted them in for no bars at all.
+            Value::Number(i64::from(self.count_in_beats()).into()),
         );
         map.insert(
             "record_count_in_bars".into(),
@@ -1423,6 +1428,8 @@ impl Settings {
             // against a file that says 120 is a take nobody can edit later.
             tempo_bpm: self.record_export.tempo_bpm,
             count_in_beats: self.count_in_beats(),
+            count_in_bars: self.count_in_bars(),
+            time_signature: self.time_signature(),
         }
     }
 
@@ -1595,6 +1602,32 @@ mod tests {
         let back = Settings::from_json(&s.to_json());
         assert_eq!(back.fretboard_spec().tuning.name, "DADGAD");
         assert!(back.custom_tuning().is_some(), "the custom tuning was lost");
+    }
+
+    /// **The legacy beats key cannot disagree with the bars that produced it.**
+    ///
+    /// Bars and the signature are the setting; `record_count_in_beats` is left
+    /// in the file so a downgrade still counts something in. Writing it back
+    /// unchanged let the two drift — the owner's file said 0 beats beside 1 bar
+    /// of 4/4, which is 4 — so an older build would have counted them in for no
+    /// bars at all. It is derived on the way out.
+    #[test]
+    fn the_legacy_count_in_key_is_derived_and_not_remembered() {
+        let mut s = Settings::default();
+        s.record_time_signature = "6/8".to_owned();
+        s.record_count_in_bars = 2;
+        // Stale, exactly as the broken cycle left it.
+        s.record_count_in_beats = 0;
+
+        let back = Settings::from_map(s.to_map());
+        assert_eq!(back.record_count_in_bars, 2);
+        assert_eq!(back.record_time_signature, "6/8");
+        assert_eq!(
+            back.record_count_in_beats, 12,
+            "2 bars of 6/8 is 12 beats, whatever the stale key said"
+        );
+        // And the live accessor agrees with the file, which is the point.
+        assert_eq!(back.count_in_beats(), 12);
     }
 
     #[test]

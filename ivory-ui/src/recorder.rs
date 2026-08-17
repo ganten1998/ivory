@@ -257,6 +257,11 @@ pub struct RecorderView<'a> {
     /// mark — one number, because a click at 90 against a file that says 120
     /// is a take nobody can edit afterwards.
     pub tempo_bpm: f64,
+    /// The take's time signature, shown beside the tempo and the count-in
+    /// because the three describe one thing between them.
+    pub time_signature: TimeSignature,
+    /// Count-in length in BARS — what the cell shows and what a click cycles.
+    pub count_in_bars: u32,
     pub count_in_beats: u32,
     pub camera: DeviceLabel<'a>,
     pub audio: DeviceLabel<'a>,
@@ -296,6 +301,8 @@ impl RecorderView<'_> {
             metronome_on: false,
             metronome_in_take: false,
             tempo_bpm: DEFAULT_BPM,
+            time_signature: TimeSignature::default(),
+            count_in_bars: 1,
             count_in_beats: 4,
             camera: DeviceLabel::None,
             audio: DeviceLabel::None,
@@ -422,6 +429,8 @@ impl RecorderState {
             metronome_in_take: knobs.metronome_in_take,
             tempo_bpm: knobs.tempo_bpm,
             count_in_beats: knobs.count_in_beats,
+            count_in_bars: knobs.count_in_bars,
+            time_signature: knobs.time_signature,
             camera: label(&self.camera_name, self.camera_missing),
             audio: label(&self.audio_name, self.audio_missing),
             preview: self.preview,
@@ -445,6 +454,8 @@ pub struct Knobs {
     pub metronome_in_take: bool,
     pub tempo_bpm: f64,
     pub count_in_beats: u32,
+    pub count_in_bars: u32,
+    pub time_signature: TimeSignature,
 }
 
 impl Default for Knobs {
@@ -455,6 +466,8 @@ impl Default for Knobs {
             metronome_in_take: false,
             tempo_bpm: DEFAULT_BPM,
             count_in_beats: 4,
+            count_in_bars: 1,
+            time_signature: TimeSignature::default(),
         }
     }
 }
@@ -1232,6 +1245,9 @@ pub enum NumField {
     Metronome,
     Input,
     Tempo,
+    /// The time signature. Typed rather than dragged — "6/8" is two numbers and
+    /// a slash, and there is no continuum between 4/4 and 7/8 to drag along.
+    Meter,
 }
 
 /// A numeric field mid-edit: which one, and what has been typed so far.
@@ -1266,6 +1282,15 @@ impl NumEdit {
     /// that has focus — cannot end up in the box.
     pub fn push(&mut self, ch: char) {
         const MAX: usize = 8;
+        // A signature is two numbers and a slash, and nothing else: no minus,
+        // no decimal point. Handled first so those two cannot creep in.
+        if self.field == NumField::Meter {
+            let ok = ch.is_ascii_digit() || (ch == '/' && !self.text.contains('/'));
+            if ok && self.text.len() < MAX {
+                self.text.push(ch);
+            }
+            return;
+        }
         let ok = ch.is_ascii_digit()
             // One dot, and a minus only in front. Neither check is about
             // rejecting bad input for its own sake: `.parse()` will do that

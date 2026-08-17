@@ -1503,15 +1503,26 @@ impl IvoryApp {
             Hit::NameField => self.name_focused = true,
             Hit::PickCamera => self.open_device_picker(dialogs::DeviceKind::Camera),
             Hit::PickAudio => self.open_device_picker(dialogs::DeviceKind::AudioInput),
+            // A click OPENS it for typing — there is nothing to drag, so the
+            // tap-versus-drag gesture the faders use does not apply.
+            Hit::EditTimeSignature => {
+                self.num_edit = Some(recorder::NumEdit::new(recorder::NumField::Meter));
+                self.name_focused = false;
+            }
             Hit::CycleCountIn => {
+                // **BARS.** `COUNT_IN_CHOICES` became bars when the time
+                // signature arrived, and this went on comparing them against
+                // `count_in_beats()` and writing the legacy beats key — which
+                // the band no longer reads. So the control cycled a number
+                // nothing displayed, and the band appeared not to react to
+                // clicks at all.
                 let choices = recorder::COUNT_IN_CHOICES;
-                let now = self.settings.count_in_beats();
+                let now = self.settings.count_in_bars();
                 let next = choices
                     .iter()
                     .position(|c| *c == now)
                     .map_or(choices[0], |i| choices[(i + 1) % choices.len()]);
-                self.settings.record_count_in_beats = i64::from(next);
-                self.save_settings();
+                self.set_count_in_bars(next);
             }
             Hit::Export => self.open_export_dialog(),
             Hit::PickSlot(slot) => self.open_plugin_picker(slot),
@@ -1822,7 +1833,16 @@ impl IvoryApp {
         };
         use recorder::NumField as F;
         use recorder_panel::Hit;
+        // The signature is not a `Hit` — there is no value to carry along a
+        // control — so it is committed here and returns nothing to apply.
+        if edit.field == F::Meter {
+            if let Some(sig) = recorder::TimeSignature::parse(&edit.text) {
+                self.set_time_signature(sig);
+            }
+            return;
+        }
         let hit = match edit.field {
+            F::Meter => None,
             F::Tempo => recorder::parse_bpm(&edit.text).map(Hit::SetTempo),
             // The setters take a FADER POSITION, not a gain, so a typed dB has
             // to go back through the same curve the drag uses. Doing it here
@@ -1882,6 +1902,30 @@ impl IvoryApp {
                 _ => {}
             }
         }
+    }
+
+    /// Set the count-in, in bars, from wherever asked.
+    ///
+    /// One place, because there are two — the band's cell and the menu — and
+    /// they disagreed: the band cycled the legacy BEATS key while the display
+    /// read bars, so clicking it changed a number nothing showed.
+    /// Set the time signature from wherever asked, keeping the count-in's
+    /// beat count in step: a count-in is a number of BARS, so changing the
+    /// signature changes how many beats that is.
+    fn set_time_signature(&mut self, sig: recorder::TimeSignature) {
+        self.settings.record_time_signature = sig.label();
+        self.settings.record_count_in_beats =
+            i64::from(sig.beats_in(self.settings.count_in_bars()));
+        self.save_settings();
+    }
+
+    fn set_count_in_bars(&mut self, bars: u32) {
+        self.settings.record_count_in_bars = i64::from(bars);
+        // The legacy key is kept in step so a downgrade to a build that reads
+        // beats still counts in for roughly as long.
+        self.settings.record_count_in_beats =
+            i64::from(self.settings.time_signature().beats_in(bars));
+        self.save_settings();
     }
 
     fn request_recorder(&mut self, request: recorder::RecorderRequest) {
@@ -2367,23 +2411,8 @@ impl IvoryApp {
                 self.settings.record_sources = kind.to_owned();
                 self.save_settings();
             }
-            MenuAction::SetCountIn(bars) => {
-                self.settings.record_count_in_bars = i64::from(bars);
-                // The old key is kept in step so a downgrade to a build that
-                // reads beats still counts in for roughly as long.
-                self.settings.record_count_in_beats =
-                    i64::from(self.settings.time_signature().beats_in(bars));
-                self.save_settings();
-            }
-            MenuAction::SetTimeSignature(sig) => {
-                self.settings.record_time_signature = sig.label();
-                // A count-in is a number of BARS, so changing the signature
-                // changes how many beats that is — and the legacy beats key has
-                // to follow, or a downgrade would count in for the old meter.
-                self.settings.record_count_in_beats =
-                    i64::from(sig.beats_in(self.settings.count_in_bars()));
-                self.save_settings();
-            }
+            MenuAction::SetCountIn(bars) => self.set_count_in_bars(bars),
+            MenuAction::SetTimeSignature(sig) => self.set_time_signature(sig),
             MenuAction::ToggleCountInInTake => {
                 self.settings.record_count_in_in_take = !self.settings.record_count_in_in_take;
                 self.save_settings();
