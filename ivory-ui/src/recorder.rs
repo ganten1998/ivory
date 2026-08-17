@@ -705,14 +705,22 @@ impl Layout {
             // of it is the top octaves, which are the least played. Top-right
             // would sit over the chord name.
             Layout::DisplayFull => {
-                let w = frame.width() * 0.25;
-                let h = w * 9.0 / 16.0;
-                let margin = frame.width() * 0.015;
+                // **A SQUARE, off the short edge.** It was a quarter of the
+                // frame's width at 16:9, which is a slab: 25% of the width and
+                // 25% of the height, sitting on a sixth of the picture the
+                // layout exists to show. A square is the crop a face wants —
+                // `paint_camera` centre-crops rather than letterboxing, so a
+                // 16:9 sensor loses its empty sides rather than gaining bars —
+                // and taking the side off the SHORT edge is what keeps it the
+                // same apparent size in a 9:16 frame, where a fraction of the
+                // width would be a postage stamp.
+                let side = frame.width().min(frame.height()) * 0.26;
+                let margin = frame.width().min(frame.height()) * 0.025;
                 Panes {
                     camera: Some(egui::Rect::from_min_max(
                         egui::Pos2::new(
-                            frame.right() - margin - w,
-                            frame.bottom() - margin - h,
+                            frame.right() - margin - side,
+                            frame.bottom() - margin - side,
                         ),
                         egui::Pos2::new(frame.right() - margin, frame.bottom() - margin),
                     )),
@@ -2211,15 +2219,24 @@ mod layout_tests {
             );
             let cam = p.camera.expect("camera");
             assert!(frame.contains_rect(cam), "the inset escaped the frame");
-            // Small enough to be context, big enough to be a person.
-            let share = cam.width() / frame.width();
+            // **Square**, and `paint_camera` centre-crops to it, so a 16:9
+            // sensor loses its empty sides rather than gaining bars.
             assert!(
-                (0.15..=0.33).contains(&share),
-                "the inset takes {share} of the width"
+                (cam.width() - cam.height()).abs() < 0.01,
+                "the inset is {}x{} and should be square",
+                cam.width(),
+                cam.height()
             );
-            // 16:9, so a webcam is not squashed into it.
-            let aspect = cam.width() / cam.height();
-            assert!((aspect - 16.0 / 9.0).abs() < 0.01, "the inset is {aspect}:1");
+            // Small enough to be context, big enough to be a person — and the
+            // SAME apparent size in both frames, which is the whole reason the
+            // side comes off the short edge. A fraction of the width would be a
+            // quarter of a 16:9 frame and a fifteenth of a 9:16 one.
+            let short = frame.width().min(frame.height());
+            let share = cam.width() / short;
+            assert!(
+                (0.20..=0.30).contains(&share),
+                "the inset takes {share} of the short edge"
+            );
             // Clear of the edges, and in the bottom right.
             assert!(cam.right() < frame.right() && cam.bottom() < frame.bottom());
             assert!(cam.left() > frame.center().x && cam.top() > frame.center().y);
