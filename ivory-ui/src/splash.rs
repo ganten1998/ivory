@@ -16,9 +16,13 @@ use crate::fonts;
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke};
 
 /// The wordmark, at a size proportional to the window.
-const TITLE_FRACTION: f32 = 0.085;
+///
+/// Deliberately modest. The first version took 8.5% of the window height and
+/// capped at 64 points, which on a large display was a title card rather than a
+/// loading screen — a splash is a courtesy, not an announcement.
+const TITLE_FRACTION: f32 = 0.045;
 /// The status line, relative to the wordmark.
-const STATUS_FRACTION: f32 = 0.30;
+const STATUS_FRACTION: f32 = 0.42;
 /// Ink, on the app's own black. Not the theme's: the splash is up before
 /// anybody has seen the theme, and a light-mode splash that flashes white for
 /// half a second at midnight is worse than one that is always dark.
@@ -40,7 +44,7 @@ pub fn draw(painter: &Painter, rect: Rect, status: &str, fade: f32) {
     // how a loading screen ends up looking like a rendering fault.
     painter.rect_filled(rect, 0.0, alpha(Color32::BLACK));
 
-    let title_size = (rect.height() * TITLE_FRACTION).clamp(14.0, 64.0);
+    let title_size = (rect.height() * TITLE_FRACTION).clamp(12.0, 30.0);
     let centre = rect.center();
     painter.text(
         Pos2::new(centre.x, centre.y - title_size * 0.4),
@@ -80,13 +84,18 @@ pub fn draw(painter: &Painter, rect: Rect, status: &str, fade: f32) {
 /// One place, so the status line cannot contradict the band underneath it once
 /// the splash lifts. `None` when there is nothing specific to report, which is
 /// the ordinary case — most of the wait is the window and the fonts.
-pub fn status(instrument: Option<&str>, camera: bool) -> String {
+pub fn status(instrument: bool, camera: bool) -> &'static str {
     match (instrument, camera) {
-        // The instrument first: it is the longer wait by far, and naming it is
+        // The instrument first: it is the longer wait by far, and saying so is
         // what turns five silent seconds into five explained ones.
-        (Some(name), _) => format!("loading {name}"),
-        (None, true) => "starting the camera".to_owned(),
-        (None, false) => "starting up".to_owned(),
+        //
+        // It is NOT named. The first version put the plugin's file name on the
+        // splash, which is somebody else's product on your loading screen —
+        // and on a shared screen it is a piece of your setup you did not choose
+        // to publish. What is waited on matters; whose it is does not.
+        (true, _) => "loading your instrument",
+        (false, true) => "starting the camera",
+        (false, false) => "starting up",
     }
 }
 
@@ -95,14 +104,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_status_names_the_instrument_because_that_is_the_long_wait() {
-        assert_eq!(status(Some("Pianoteq 9"), false), "loading Pianoteq 9");
+    fn the_status_says_what_is_waited_on_and_never_whose_it_is() {
         // The instrument wins even when the camera is also starting: five
         // seconds beats four, and two subjects in one line is a line nobody
         // reads.
-        assert_eq!(status(Some("Pianoteq 9"), true), "loading Pianoteq 9");
-        assert_eq!(status(None, true), "starting the camera");
-        assert_eq!(status(None, false), "starting up");
+        assert_eq!(status(true, false), "loading your instrument");
+        assert_eq!(status(true, true), "loading your instrument");
+        assert_eq!(status(false, true), "starting the camera");
+        assert_eq!(status(false, false), "starting up");
+        // No plugin's file name reaches the screen. It is somebody else's
+        // product on your loading screen, and on a shared screen it is a piece
+        // of a setup nobody chose to publish.
+        for s in [
+            status(true, false),
+            status(true, true),
+            status(false, true),
+            status(false, false),
+        ] {
+            assert!(
+                !s.contains('.') && !s.contains('/'),
+                "{s:?} looks like it is quoting a file"
+            );
+        }
     }
 
     /// It must draw at every size a window can be, including the degenerate

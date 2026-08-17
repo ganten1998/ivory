@@ -2425,6 +2425,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **During a count-in there is no take folder, and nothing may assume
+    /// there is.**
+    ///
+    /// This pair is what the video lifecycle keys off, and getting it wrong
+    /// cost every user with a count-in their video, silently: the host asked
+    /// `is_recording()`, which is TRUE through the count-in, went looking for a
+    /// folder to write an `.mp4` into, found none, and set the flag that stops
+    /// it trying again. By the time the take actually started there was a
+    /// folder and nothing left that would look at it.
+    ///
+    /// `is_writing()` is the honest question, and it is also right on its own
+    /// terms: the bars before the downbeat are deliberately not in the audio,
+    /// so they have no business being in the video.
+    #[test]
+    fn a_count_in_is_not_a_take_and_has_no_folder_yet() {
+        let dir = std::env::temp_dir().join("tangent-countin-nofolder");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = session();
+        s.toggle(&dir, Some("counted"), 4, ExportSpec::default());
+
+        assert!(
+            matches!(s.state(), RecordState::CountIn { .. }),
+            "a count-in was asked for and not entered"
+        );
+        assert!(
+            s.is_recording(),
+            "a count-in IS active — this is the half that misleads"
+        );
+        assert!(
+            !s.state().is_writing(),
+            "a count-in is not writing, and that is the half to ask"
+        );
+        assert!(
+            s.take_dir().is_none(),
+            "there is no folder until the downbeat, so nothing may look for one"
+        );
+        s.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn a_session_with_no_device_still_starts_and_stops_a_take() {
         let dir = std::env::temp_dir().join("tangent-session-test-basic");
         let _ = std::fs::remove_dir_all(&dir);

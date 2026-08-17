@@ -546,8 +546,15 @@ impl DesktopApp {
         // window frame late at both ends.
         #[cfg(target_os = "macos")]
         {
-            let recording = self.recorder.session.is_recording();
-            if recording {
+            // **`is_writing`, not `is_recording`.** The latter is true through
+            // the COUNT-IN, and during a count-in there is no take folder yet —
+            // so `begin_video` found nothing to write to, gave up, and set the
+            // flag that stops it trying again. Anybody with a count-in got no
+            // video at all, every time, silently. It is also the right rule on
+            // its own terms: the bars before the downbeat are deliberately not
+            // in the audio, and they have no business being in the video.
+            let writing = self.recorder.session.state().is_writing();
+            if writing {
                 self.begin_video(frame);
                 self.pump_video();
             } else {
@@ -1144,10 +1151,13 @@ impl DesktopApp {
         if !spec.video.wants_video() || self.recorder.video.is_some() || self.recorder.video_tried {
             return;
         }
-        self.recorder.video_tried = true;
+        // The folder FIRST, and the flag only after it. Setting the flag before
+        // this check is what turned "the take is not ready yet" into "this take
+        // will never have video" — a one-frame condition becoming permanent.
         let Some(dir) = self.recorder.session.take_dir().map(|d| d.to_path_buf()) else {
             return;
         };
+        self.recorder.video_tried = true;
         // The camera's own size, for `MatchCamera` and for nothing else.
         let cam = self
             .recorder
@@ -1340,16 +1350,13 @@ impl DesktopApp {
         // What is still being waited on, and what to say about it.
         #[cfg(feature = "recorder")]
         let (instrument, camera) = (
-            self.recorder
-                .plugin_opening
-                .and_then(|slot| self.app.chosen_plugin(slot))
-                .map(short_plugin_name),
+            self.recorder.plugin_opening.is_some(),
             self.recorder.camera_opening,
         );
         #[cfg(not(feature = "recorder"))]
-        let (instrument, camera): (Option<String>, bool) = (None, false);
+        let (instrument, camera) = (false, false);
 
-        let busy = instrument.is_some() || camera;
+        let busy = instrument || camera;
         // "Ready" is a minimum time AND nothing outstanding — or the cap.
         if !busy && elapsed >= SPLASH_MIN && splash.done_at.is_none() {
             splash.done_at = Some(now);
@@ -1374,8 +1381,12 @@ impl DesktopApp {
             egui::Id::new("tangent-splash"),
         ));
         let rect = ctx.screen_rect();
-        let status = ivory_ui::splash::status(instrument.as_deref(), camera);
-        ivory_ui::splash::draw(&painter, rect, &status, fade);
+        ivory_ui::splash::draw(
+            &painter,
+            rect,
+            ivory_ui::splash::status(instrument, camera),
+            fade,
+        );
         // While it is up, the window must keep repainting — nothing else is
         // asking it to, and a splash that freezes mid-fade because no input
         // arrived is worse than none.
@@ -1383,11 +1394,3 @@ impl DesktopApp {
     }
 }
 
-/// A plugin path as a name worth putting on screen.
-#[cfg(feature = "recorder")]
-fn short_plugin_name(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_owned())
-}
