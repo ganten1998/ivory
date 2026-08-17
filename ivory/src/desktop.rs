@@ -167,6 +167,23 @@ struct Recorder {
     /// and the answer changes by megabytes, not by pixels.
     disk_checked_at: Option<std::time::Instant>,
     disk_bytes: Option<u64>,
+    /// The take's video, while one is being filmed.
+    #[cfg(target_os = "macos")]
+    video: Option<TakeVideo>,
+    /// Whether this take has already tried to start filming.
+    ///
+    /// Without it a take whose video was REFUSED — no camera, no GPU, a file
+    /// that would not open — retries on every window frame, and rewrites the
+    /// same error sixty times a second over whatever else the band was saying.
+    video_tried: bool,
+    /// The newest camera frame, kept as RGBA for the compositor.
+    ///
+    /// A copy, and a deliberate one: the preview uploads its own texture and
+    /// then drops the frame, but a video tick happens on the take's clock and
+    /// not the window's, so the pixels have to still be here when it does.
+    /// Without this the video would only ever contain frames that happened to
+    /// land on the same window frame as a tick.
+    camera_rgba: Option<(Vec<u8>, u32, u32)>,
     /// The last finished take this host has already accounted for.
     ///
     /// Updated whether or not "Show when done" is ticked, which is the point:
@@ -226,6 +243,10 @@ impl DesktopApp {
             // premultiplied would be a claim about the data that happens to be
             // true, and it stops being true the moment anything composites.
             let image = egui::ColorImage::from_rgba_unmultiplied(size, &frame.pixels);
+            // Kept for the compositor, which ticks on the take's clock rather
+            // than this one and will want a frame on a window frame that has
+            // none of its own.
+            self.recorder.camera_rgba = Some((frame.pixels.clone(), frame.width, frame.height));
             self.recorder.preview_px = egui::Vec2::new(frame.width as f32, frame.height as f32);
             match self.recorder.preview.as_mut() {
                 // `set` reuses the GPU allocation; `load_texture` makes a new
@@ -387,7 +408,7 @@ impl DesktopApp {
 
     /// Everything that must happen OUTSIDE a frame: opening devices, raising
     /// native panels, creating directories.
-    fn after_frame(&mut self, ctx: &egui::Context) {
+    fn after_frame(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         use ivory_ui::recorder::RecorderRequest as R;
 
         // Dev hook, alongside IVORY_INLINE and IVORY_DEMO_NOTES: open slot 0's
@@ -511,6 +532,25 @@ impl DesktopApp {
                 self.app.set_record_dir(dir, remember);
             }
         }
+
+        // The take's video, on the EDGES of the session's own state. Placed
+        // after the request loop so that a Record pressed this frame is already
+        // rolling by the time this asks, and a Stop pressed this frame is
+        // already stopped — the alternative is a video that starts and ends one
+        // window frame late at both ends.
+        #[cfg(target_os = "macos")]
+        {
+            let recording = self.recorder.session.is_recording();
+            if recording {
+                self.begin_video(frame);
+                self.pump_video();
+            } else {
+                self.end_video();
+                self.recorder.video_tried = false;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = frame;
 
         if let Some(path) = self.app.take_reveal_request() {
             reveal(&path);
@@ -963,6 +1003,10 @@ impl DesktopApp {
                 disk_checked_at: None,
                 disk_bytes: None,
                 dev_editor_at: None,
+                #[cfg(target_os = "macos")]
+                video: None,
+                video_tried: false,
+                camera_rgba: None,
                 seen_take: None,
                 dev_editor_done: false,
             }
@@ -983,12 +1027,12 @@ impl eframe::App for DesktopApp {
     /// The recorder brackets it: state in before, requests out after. Nothing
     /// that opens a device, raises a native panel or creates a directory
     /// happens between those two lines.
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         #[cfg(feature = "recorder")]
         self.fill_recorder_state(ctx);
         self.app.frame(ctx);
         #[cfg(feature = "recorder")]
-        self.after_frame(ctx);
+        self.after_frame(ctx, frame);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -1045,4 +1089,197 @@ fn reveal(path: &std::path::Path) {
         c
     };
     let _ = cmd.spawn();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// The take's video
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The compositor and the encoder for a take that is being filmed.
+///
+/// Both live on the UI thread, and that is the whole thread design: the
+/// compositor must be here because it paints the app, and the encoder is here
+/// because moving IT here costs 384 kB a second of audio crossing a channel,
+/// where moving the compositor to the writer thread would cost 250 MB a second
+/// of composited frames going the other way.
+#[cfg(all(feature = "recorder", target_os = "macos"))]
+struct TakeVideo {
+    compositor: crate::composite::Compositor,
+    encoder: ivory_record::encode::Encoder,
+    /// The next frame index to produce. The video's clock is the TAKE's clock:
+    /// frame `n` is presented at `n / fps` seconds after the take started,
+    /// whatever the camera has managed to deliver by then.
+    next: u64,
+    fps: u32,
+    layout: ivory_ui::recorder::Layout,
+    shows: ivory_ui::recorder::DisplayShows,
+    camera: bool,
+    display: bool,
+    path: std::path::PathBuf,
+    /// Frames the compositor or the encoder refused, so the summary can say so
+    /// rather than the user counting them in the finished file.
+    failed: u64,
+}
+
+#[cfg(all(feature = "recorder", target_os = "macos"))]
+impl DesktopApp {
+    /// Start filming, if this take is meant to be filmed.
+    ///
+    /// Every refusal is a message rather than a silent skip: a take that was
+    /// supposed to produce an `.mp4` and did not is exactly the failure that
+    /// wastes a performance.
+    fn begin_video(&mut self, frame: &eframe::Frame) {
+        let spec = self.app.export_spec();
+        if !spec.video.wants_video() || self.recorder.video.is_some() || self.recorder.video_tried {
+            return;
+        }
+        self.recorder.video_tried = true;
+        let Some(dir) = self.recorder.session.take_dir().map(|d| d.to_path_buf()) else {
+            return;
+        };
+        // The camera's own size, for `MatchCamera` and for nothing else.
+        let cam = self
+            .recorder
+            .session
+            .camera_format()
+            .map(|f| (f.width, f.height));
+        let (w, h) = spec.resolution.pixels().or(cam).unwrap_or((1920, 1080));
+        let want_camera = spec.composite.camera && self.recorder.session.camera_running();
+        let want_display = spec.composite.display && spec.composite.shows.any();
+        if !want_camera && !want_display {
+            self.recorder.engine_error =
+                Some("the video has neither the camera nor the display in it".to_owned());
+            return;
+        }
+        let path = dir.join("take.mp4");
+        let video = ivory_record::encode::VideoSpec {
+            width: w,
+            height: h,
+            fps: spec.fps.max(1),
+        };
+        // The audio track exists only when the writer is actually sending
+        // samples — a take with the `.wav` unticked has no audio to mux, and a
+        // silent video is a legitimate request in its own right.
+        let audio = spec
+            .composite
+            .audio
+            .then(|| self.recorder.session.video_audio_spec())
+            .flatten()
+            .map(|(rate, channels)| ivory_record::encode::AudioSpec {
+                sample_rate: rate,
+                channels,
+            });
+        let compositor =
+            match crate::composite::Compositor::new(frame.wgpu_render_state(), video.width, video.height) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.recorder.engine_error = Some(format!("no video this take: {e}"));
+                    return;
+                }
+            };
+        // The offscreen context needs the app's fonts or every chord name in
+        // the video renders in egui's default face.
+        self.app.install_fonts(compositor.context());
+        let encoder = match ivory_record::encode::Encoder::create(&path, video, audio) {
+            Ok(e) => e,
+            Err(e) => {
+                self.recorder.engine_error = Some(format!("no video this take: {e}"));
+                return;
+            }
+        };
+        self.recorder.video = Some(TakeVideo {
+            compositor,
+            encoder,
+            next: 0,
+            fps: video.fps,
+            layout: spec.composite.layout,
+            shows: spec.composite.shows,
+            camera: want_camera,
+            display: want_display,
+            path,
+            failed: 0,
+        });
+    }
+
+    /// Produce every video frame that is due, and drain the audio behind it.
+    ///
+    /// **Ticked from the take's own elapsed time**, not from the window's frame
+    /// rate. The window may be drawing at 60, or at 8 while a plugin editor is
+    /// dragging; neither may change how many frames a second the video has.
+    fn pump_video(&mut self) {
+        // Taken OUT for the duration, not borrowed. `&mut self.recorder.video`
+        // and `&self.recorder.session` are both borrows of `self.recorder`, and
+        // this function needs the encoder mutably while reading the session and
+        // the app.
+        let Some(mut v) = self.recorder.video.take() else {
+            return;
+        };
+        // The audio first, so a long video stall cannot leave the encoder's two
+        // inputs far apart in time — AVAssetWriter buffers the gap in memory.
+        if let Some(rx) = self.recorder.session.video_audio() {
+            while let Ok(chunk) = rx.try_recv() {
+                if let Err(e) = v.encoder.push_audio(&chunk.samples, chunk.first_frame) {
+                    self.recorder.engine_error = Some(e);
+                    break;
+                }
+            }
+        }
+        let elapsed = self.recorder.session.elapsed();
+        // A cap per window frame. Without it, a machine that stalls for two
+        // seconds tries to composite sixty frames in one go and stalls for two
+        // more — the classic spiral of death.
+        const MAX_PER_FRAME: u32 = 3;
+        let mut made = 0;
+        while made < MAX_PER_FRAME && (v.next as f64) < elapsed * f64::from(v.fps) {
+            let pts = (v.next as i64 * 1_000_000_000) / i64::from(v.fps);
+            let frame = self.recorder.camera_rgba.as_ref().map(|(px, w, h)| (px.as_slice(), *w, *h));
+            match v
+                .compositor
+                .frame(&self.app, v.layout, v.shows, v.camera, v.display, frame)
+            {
+                Ok(bgra) => {
+                    if v.encoder.push(bgra, pts).is_err() {
+                        v.failed += 1;
+                    }
+                }
+                Err(_) => v.failed += 1,
+            }
+            v.next += 1;
+            made += 1;
+        }
+        self.recorder.video = Some(v);
+    }
+
+    /// Close the video file. Must happen, or the container has no index.
+    fn end_video(&mut self) {
+        let Some(mut v) = self.recorder.video.take() else {
+            return;
+        };
+        // One last drain, for the samples the writer flushed at Stop. Without
+        // it the video's audio is a poll interval shorter than the `.wav`.
+        if let Some(rx) = self.recorder.session.video_audio() {
+            while let Ok(chunk) = rx.try_recv() {
+                let _ = v.encoder.push_audio(&chunk.samples, chunk.first_frame);
+            }
+        }
+        let dropped = v.encoder.dropped_not_ready() + v.failed;
+        let path = v.path.clone();
+        match v.encoder.finish() {
+            Ok(()) => {
+                if dropped > 0 {
+                    self.recorder.engine_error = Some(format!(
+                        "the video is complete, but {dropped} frames were dropped — \
+                         this machine could not composite and encode in real time"
+                    ));
+                }
+            }
+            Err(e) => {
+                self.recorder.engine_error = Some(format!("the video could not be finished: {e}"));
+                // A half-written mp4 has no index and no player will open it.
+                // Removing it is kinder than leaving a file that looks like a
+                // take and is not one.
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
 }

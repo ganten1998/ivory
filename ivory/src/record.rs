@@ -111,6 +111,28 @@ struct StartArgs {
     path: PathBuf,
     spec: WavSpec,
     bext: Bext,
+    /// Where to copy every sample that reaches the `.wav`, for the video's
+    /// audio track. `None` for a take with no video in it.
+    ///
+    /// **This is the sync guarantee, and it is a copy rather than a second
+    /// read of the device on purpose.** Anything that re-derived the samples —
+    /// a second tap, a second cursor, a re-read of the file — would be a second
+    /// chance to disagree with the `.wav` about which frame is which. Sending
+    /// what was just written, with the index it was written at, cannot.
+    audio_tx: Option<mpsc::Sender<AudioChunk>>,
+}
+
+/// Samples on their way to the video's audio track.
+///
+/// Sent to the UI thread, where the encoder lives. That direction is
+/// deliberate and it is a 600-fold difference in traffic: audio is 384 kB a
+/// second, and composited 1080p frames are 250 MB a second — so the audio
+/// crosses the thread boundary and the video never has to.
+pub(crate) struct AudioChunk {
+    /// Index of the first frame here, counted from the start of the take —
+    /// which is exactly its index in the `.wav`.
+    pub first_frame: u64,
+    pub samples: Vec<f32>,
 }
 
 /// Everything the UI needs from the writer once a take has stopped.
@@ -258,6 +280,9 @@ struct Writer {
     /// `dropped_at_arm`, and it needs its own baseline because the two rings
     /// fill for completely different reasons.
     plugin_dropped_at_arm: u64,
+    /// See [`StartArgs::audio_tx`]. Cleared at Stop, so a take with no video
+    /// does not go on copying samples to a receiver nobody is draining.
+    audio_tx: Option<mpsc::Sender<AudioChunk>>,
 }
 
 impl Writer {
@@ -463,10 +488,35 @@ impl Writer {
         let Some(wav) = self.wav.as_mut() else {
             return;
         };
+        // The index BEFORE the write, which is the index of the first frame in
+        // `samples`. Read here rather than tracked separately so that the
+        // encoder's idea of "frame N" is the wav's own, not a parallel count
+        // that could drift from it.
+        let first_frame = wav.frames();
         if let Err(e) = wav.write_interleaved(samples) {
             if self.error.is_none() {
                 self.error = Some(format!("could not write the audio file: {e}"));
             }
+        }
+        // **Every sample the file gets, the video gets, at the same index** —
+        // including the silence a dropout is padded with, because this is the
+        // single funnel both go through. That is the entire reason the video's
+        // audio cannot drift from the `.wav`: there is no second path for it to
+        // drift along.
+        if let Some(tx) = self.audio_tx.as_ref() {
+            // A fresh Vec per block, and measured rather than assumed: a block
+            // is a poll interval of audio, so this is one small allocation
+            // every few milliseconds on a thread that is already writing to a
+            // file. Recycling buffers through a return channel was written and
+            // then removed — it was more machinery than the thing it saved.
+            let buf = samples.to_vec();
+            // A send that fails means the UI thread has stopped listening,
+            // which happens at Stop and on the frame a video take is abandoned.
+            // Not an error: the `.wav` is unaffected and it is the master.
+            let _ = tx.send(AudioChunk {
+                first_frame,
+                samples: buf,
+            });
         }
     }
 
@@ -608,6 +658,7 @@ impl Audio {
             dropped_at_arm: 0,
             unstamped_at_arm: 0,
             plugin_dropped_at_arm: 0,
+            audio_tx: None,
             buf: Vec::with_capacity(channels * 4096),
             // One block of zeros, reused. Allocating a pad the size of the
             // dropout would allocate megabytes on the worst possible thread at
@@ -648,6 +699,7 @@ impl Audio {
                                 writer.plugin.as_ref().map_or(0, |t| t.dropped());
                             writer.unstamped_at_arm = writer.clock.unstamped();
                             writer.tracker.arm();
+                            writer.audio_tx = args.audio_tx;
                             match WavWriter::create(&args.path, args.spec, &args.bext) {
                                 Ok(w) => writer.wav = Some(w),
                                 Err(e) => {
@@ -658,6 +710,11 @@ impl Audio {
                         }
                         Ok(Cmd::Stop) => {
                             let report = writer.stop();
+                            // Dropped AFTER the final pump, so the last block —
+                            // the one `stop` flushes — reaches the video too.
+                            // Dropping it before would leave the video's audio
+                            // a poll interval short of the `.wav`'s.
+                            writer.audio_tx = None;
                             let _ = report_tx.send(report);
                         }
                         Ok(Cmd::Plugin(tap)) => writer.plugin = tap.map(|t| *t),
@@ -829,6 +886,13 @@ pub struct Session {
     /// Latched across the take, because the meter's own latch is reset when the
     /// next one is armed and the user may not have looked yet.
     clipped: bool,
+    /// The take's audio on its way to the video encoder. See
+    /// [`StartArgs::audio_tx`] for why it goes THIS way across the threads.
+    audio_for_video: Option<mpsc::Receiver<AudioChunk>>,
+    /// The rate and channel count the writer is actually using, which the
+    /// encoder needs to describe its input and which the UI thread cannot
+    /// assume — the device decides it, not the settings.
+    video_audio_spec: Option<(u32, u16)>,
 }
 
 impl Session {
@@ -847,6 +911,8 @@ impl Session {
             midi_clock: SourceClock::new(MIDIR_SCALE_NS, MIDI_SETTLE_NS),
             midi: MidiTake::new(),
             state: RecordState::Idle,
+            audio_for_video: None,
+            video_audio_spec: None,
             t0: 0,
             started_at: WallTime::now_utc(),
             started_instant: None,
@@ -903,6 +969,17 @@ impl Session {
     }
 
     /// Seconds since the take started writing.
+    /// Where the take being recorded is being written, while one is.
+    ///
+    /// The video file goes beside the `.wav` and the `.mid`, so the compositor
+    /// needs the folder — and it has to be the folder of the take that is
+    /// ACTUALLY running, not one recomputed from the settings, or a take
+    /// started before somebody changed the destination would write its video
+    /// somewhere else.
+    pub fn take_dir(&self) -> Option<&std::path::Path> {
+        self.take.as_ref().map(|t| t.dir())
+    }
+
     pub fn elapsed(&self) -> f64 {
         match (self.state.is_writing(), self.started_instant) {
             (true, Some(at)) => at.elapsed().as_secs_f64(),
@@ -999,6 +1076,23 @@ impl Session {
             self.camera = None;
             self.camera_error = None;
         }
+    }
+
+    /// The take's audio, on its way to the video encoder.
+    ///
+    /// Drained by the UI thread every frame while a video take is rolling. See
+    /// [`StartArgs::audio_tx`] for why the samples travel in this direction.
+    pub(crate) fn video_audio(&self) -> Option<&mpsc::Receiver<AudioChunk>> {
+        self.audio_for_video.as_ref()
+    }
+
+    /// The rate and channel count the input device settled on.
+    ///
+    /// The encoder needs this to describe what it is being handed, and it
+    /// cannot be taken from the settings: the device decides it. A take at
+    /// 44.1 kHz described as 48 would play back a semitone and a bit sharp.
+    pub fn video_audio_spec(&self) -> Option<(u32, u16)> {
+        self.video_audio_spec
     }
 
     pub fn camera_error(&self) -> Option<&str> {
@@ -1216,10 +1310,22 @@ impl Session {
         }
         if let (Some(audio), true) = (&self.audio, self.spec.audio) {
             let spec = audio.spec();
+            // The video's audio track, when the take has video. A channel per
+            // take rather than one for the session's life: a receiver left over
+            // from the last take would deliver its tail into this one.
+            let (audio_tx, audio_rx) = if self.spec.video.wants_video() {
+                let (tx, rx) = mpsc::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            self.audio_for_video = audio_rx;
+            self.video_audio_spec = Some((spec.sample_rate, spec.channels));
             let args = StartArgs {
                 path: take.wav(),
                 spec,
                 bext: Bext::new(at, spec),
+                audio_tx,
             };
             let _ = audio.cmds.send(Cmd::Start(Box::new(args)));
         }
@@ -1707,6 +1813,7 @@ mod tests {
             dropped_at_arm: 0,
             unstamped_at_arm: 0,
             plugin_dropped_at_arm: 0,
+            audio_tx: None,
             buf: Vec::new(),
             silence: vec![0.0; channels * 1024],
         };
@@ -1884,6 +1991,7 @@ mod tests {
             dropped_at_arm: 0,
             unstamped_at_arm: 0,
             plugin_dropped_at_arm: 0,
+            audio_tx: None,
             buf: Vec::new(),
             silence: vec![0.0; CH * 1024],
         };

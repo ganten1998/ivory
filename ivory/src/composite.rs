@@ -160,11 +160,17 @@ impl Compositor {
 
     /// Composite one frame and return it as tightly-packed BGRA.
     ///
-    /// `camera` is the latest frame from the device, as BGRA with its own size,
-    /// or `None` when the camera has not produced one yet — which is the normal
-    /// state for the first seconds of a take and is drawn as an empty pane
-    /// rather than skipped. See `encode`'s note on why the video ticks from
-    /// take start regardless.
+    /// `camera` is the latest frame from the device, as **RGBA** with its own
+    /// size — which is what `ivory_record::camera::Frame` carries, the backend
+    /// having already converted from the device's BGRA. What this RETURNS is
+    /// BGRA, because that is what the encoder wants. The two differ, the
+    /// texture formats below are what convert between them, and assuming they
+    /// were the same would swap red and blue in every recording.
+    ///
+    /// `None` means the camera has not produced a frame yet — the normal state
+    /// for the first seconds of a take, and drawn as an empty pane rather than
+    /// skipped. See `encode`'s note on why the video ticks from take start
+    /// regardless of what the camera is doing.
     pub fn frame(
         &mut self,
         app: &IvoryApp,
@@ -346,7 +352,16 @@ impl Compositor {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Bgra8Unorm,
+                // RGBA, matching what the camera actually hands over — the
+                // backend has already converted from the device's BGRA, and
+                // `Frame::pixels` is RGBA by the time it reaches anything here.
+                //
+                // The render target is BGRA, and the difference is the point:
+                // naming each texture's TRUE format is what makes the GPU do
+                // the swizzle for nothing. Declaring this one BGRA so it
+                // "matches" the target would exchange red and blue in every
+                // recording anybody ever made.
+                format: wgpu::TextureFormat::Rgba8Unorm,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
@@ -501,8 +516,12 @@ mod tests {
         const H: u32 = 240;
         let mut c = Compositor::on(device, queue, W, H).expect("compositor");
 
-        // Opaque orange, in BGRA byte order: B=0x20, G=0x80, R=0xF0.
-        let cam: Vec<u8> = std::iter::repeat([0x20, 0x80, 0xF0, 0xFF])
+        // Opaque orange, in the RGBA byte order the camera delivers: R=0xF0,
+        // G=0x80, B=0x20. It must come back as BGRA — the bytes REVERSED — and
+        // that conversion is the whole point of the test. An earlier version
+        // fed BGRA in and expected BGRA out, which round-tripped through
+        // matching texture formats and so proved nothing at all.
+        let cam: Vec<u8> = std::iter::repeat([0xF0, 0x80, 0x20, 0xFF])
             .take((W * H) as usize)
             .flatten()
             .collect();
@@ -531,7 +550,7 @@ mod tests {
         let close = |a: u8, b: u8| a.abs_diff(b) <= 2;
         assert!(
             close(px[0], 0x20) && close(px[1], 0x80) && close(px[2], 0xF0),
-            "the middle pixel came back {px:02X?}, not [20, 80, F0, FF] —              the channels are swapped somewhere"
+            "RGBA F0,80,20 came back as {px:02X?} rather than BGRA 20,80,F0 — red and blue are swapped"
         );
         assert!(close(px[3], 0xFF), "the frame is not opaque: {px:02X?}");
     }

@@ -647,16 +647,25 @@ fn confirm(name: &str, strings: &[TuningString]) -> Result<Tuning, Problem> {
 
 /// Whether the video encoder exists yet.
 ///
-/// **It does not** (plan steps 6-7; today only the WAV and the SMF are
-/// written). The whole video section is still drawn, because the layout is the
-/// specified design and it has to be right — but every video mode other than
-/// `None` is greyed and the dialog says so in plain words, because a dialog
-/// that silently promises an `.mp4` nobody will ever find is worse than a
-/// dialog that admits what it can do.
+/// **It does, on macOS.** The compositor renders an offscreen egui pass into a
+/// wgpu texture and AVAssetWriter turns it into H.264 with AAC beside it; the
+/// whole path is covered by `the_whole_pipeline_writes_a_vertical_video_with_
+/// sound`, which produces a file and has `ffprobe` check it.
 ///
-/// **Flip this to `true` when the encoder lands** and the section comes alive:
-/// it is the only edit, which is the point of it being a constant rather than
-/// eleven scattered conditions that can be half-remembered.
+/// It was a constant so that turning the section on would be ONE edit rather
+/// than eleven scattered conditions, and that is how it turned out — this line
+/// is the edit.
+///
+/// Windows and Linux have no encoder (`ivory_record::encode::stub`) and no
+/// compositor, and they refuse at the moment a take starts with a message
+/// saying so. That refusal is not the same as this flag: this decides whether
+/// the DIALOG offers video at all, and on those platforms it still does,
+/// because the alternative is a dialog that silently loses the settings a user
+/// carried over from a Mac. A take says what it cannot do; a dialog should not
+/// forget what was asked for.
+#[cfg(target_os = "macos")]
+pub const VIDEO_EXPORT_READY: bool = true;
+#[cfg(not(target_os = "macos"))]
 pub const VIDEO_EXPORT_READY: bool = false;
 
 /// The dialog as a window. Wide enough for the left column and the longest
