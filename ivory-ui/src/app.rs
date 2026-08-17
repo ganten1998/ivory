@@ -271,6 +271,13 @@ pub struct IvoryApp {
     /// remembers which control is being held. Without this, dragging a fader
     /// past the edge of its own track hands the next control the value.
     grabbed: Option<Grab>,
+    /// Whether the window has been told it may be fullscreen.
+    ///
+    /// The size pin is Min == Max, and a window whose minimum equals its
+    /// maximum cannot become the size of the screen — so the constraints have
+    /// to be lifted on the way in and re-applied on the way out, once each
+    /// rather than every frame.
+    fullscreen_sent: Option<bool>,
     /// A numeric field being typed into, if any.
     ///
     /// Mutually exclusive with `name_focused` in practice, because a press
@@ -483,6 +490,7 @@ impl IvoryApp {
             picker_slot: 0,
             grabbed: None,
             num_edit: None,
+            fullscreen_sent: None,
             plugin_list: Vec::new(),
             name_focused: false,
 
@@ -2891,6 +2899,36 @@ fn fit_bands(settings: &Settings, avail: Vec2) -> Bands {
     band_sizes_at(settings, w)
 }
 
+/// The layout for a screen the app has been given ALL of.
+///
+/// **Both edges, always.** `fit_bands` preserves every band's natural aspect,
+/// which means one dimension runs out first and the other gets bars — correct
+/// in a window the user sized, and useless in fullscreen, where bars down both
+/// sides are the whole screen you asked for and did not get.
+///
+/// So: take the full width, then scale every band's height by one factor to
+/// make the stack exactly as tall as the screen. ONE factor for all of them, so
+/// the bands keep their proportions relative to each other and only their own
+/// aspect changes — a slightly taller or shorter keyboard, which is a keyboard,
+/// rather than a keyboard next to a fretboard that grew at a different rate.
+fn fill_bands(settings: &Settings, avail: Vec2) -> Bands {
+    let w = avail.x.max(1.0).trunc();
+    let natural = band_sizes_at(settings, w);
+    let total = natural.total().y;
+    if total <= 0.0 || avail.y <= 0.0 {
+        return natural;
+    }
+    let k = avail.y / total;
+    Bands {
+        w,
+        recorder_h: natural.recorder_h * k,
+        theory_h: natural.theory_h * k,
+        chord_h: natural.chord_h * k,
+        piano_h: natural.piano_h * k,
+        fret_h: natural.fret_h * k,
+    }
+}
+
 /// Every note moved by `semitones`, dropping any that leave MIDI's range.
 ///
 /// A free function because it is pure arithmetic on a set and both the display
@@ -3294,7 +3332,14 @@ impl IvoryApp {
         // has to lay out inside it — `main_width` would otherwise put a
         // 1300-point layout into whatever the host opened, and the piano would
         // run off the right-hand edge.
-        let bands = if self.caps.window_sizing {
+        // Fullscreen is its own layout, and it has to be: `layout_sizes` asks
+        // for a WINDOW SIZE and gets it, which is meaningless when the window
+        // is already the screen. Filling is the point — see `fill_bands`.
+        let fullscreen = self.caps.window_sizing
+            && ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let bands = if fullscreen {
+            fill_bands(&self.settings, ui.max_rect().size())
+        } else if self.caps.window_sizing {
             self.layout_sizes()
         } else {
             // The PANE, not the context: inside a host's resizable wrapper the
@@ -3316,11 +3361,38 @@ impl IvoryApp {
         // ungated triple would reach into the DAW and resize the editor behind
         // the host's back on frame one. Min/Max are swallowed there, which
         // would leave exactly the half of the mechanism that does damage.
-        if self.caps.window_sizing && self.last_sent_size != Some(target) {
-            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(target));
-            ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(target));
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
-            self.last_sent_size = Some(target);
+        //
+        // AND NOT WHILE FULLSCREEN, which is the other half. This app pins the
+        // window by setting Min and Max to the SAME size — that is what makes
+        // it un-resizable — and a window whose minimum equals its maximum
+        // cannot be made the size of the screen. Fullscreen was fighting the
+        // window manager every frame; it is not a mode you can bolt onto a
+        // fixed-size window without saying so here.
+        if self.caps.window_sizing && fullscreen {
+            if self.fullscreen_sent != Some(true) {
+                // Let it grow. Sent once on the way in rather than every frame,
+                // because these are the constraints the OS is trying to honour
+                // while it animates into fullscreen.
+                ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(Vec2::new(1.0, 1.0)));
+                ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(Vec2::new(
+                    f32::INFINITY,
+                    f32::INFINITY,
+                )));
+                self.fullscreen_sent = Some(true);
+                // So the pin is re-applied on the way back out.
+                self.last_sent_size = None;
+            }
+        } else if self.caps.window_sizing {
+            if self.fullscreen_sent == Some(true) {
+                self.fullscreen_sent = Some(false);
+                self.last_sent_size = None;
+            }
+            if self.last_sent_size != Some(target) {
+                ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(target));
+                ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(target));
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
+                self.last_sent_size = Some(target);
+            }
         }
         // Borderless enforcement; Qt re-sets the title after flag changes.
         let decorations = !self.settings.borderless_mode;
@@ -4526,6 +4598,98 @@ mod tests {
         app.edit_take_name(&ctx);
         let _ = ctx.end_pass();
         assert_eq!(app.settings.record_take_name, None, "not Some(\"\")");
+    }
+
+    /// **Fullscreen uses both edges, or it is a nuisance.**
+    ///
+    /// `fit_bands` preserves each band's natural aspect, so one dimension runs
+    /// out first and the other gets bars. That is right in a window somebody
+    /// sized and useless when they asked for the whole screen — bars down both
+    /// sides are the real estate they asked for and did not get.
+    #[test]
+    fn filling_the_screen_uses_all_of_it() {
+        let s = crate::settings::Settings::first_launch();
+        for screen in [
+            Vec2::new(1920.0, 1080.0),
+            Vec2::new(3440.0, 1440.0),
+            Vec2::new(2560.0, 1600.0),
+            // Portrait, and a near-square, because a monitor on its side is a
+            // real thing and the arithmetic must not care.
+            Vec2::new(1080.0, 1920.0),
+            Vec2::new(1400.0, 1400.0),
+        ] {
+            let filled = fill_bands(&s, screen);
+            let total = filled.total();
+            assert!(
+                (total.x - screen.x).abs() < 1.5,
+                "{screen:?}: filled {total:?}, leaving bars down the sides"
+            );
+            assert!(
+                (total.y - screen.y).abs() < 1.5,
+                "{screen:?}: filled {total:?}, leaving bars top and bottom"
+            );
+            // Every band the settings asked for is still there. Filling must
+            // not be a way to lose one.
+            assert!(filled.piano_h > 0.0, "{screen:?}: no piano");
+            assert!(filled.chord_h > 0.0, "{screen:?}: no chord strip");
+            assert!(filled.fret_h > 0.0, "{screen:?}: no fretboard");
+            assert!(filled.theory_h > 0.0, "{screen:?}: no theory band");
+        }
+    }
+
+    /// The bands keep their proportions relative to EACH OTHER.
+    ///
+    /// One scale factor for all of them, so filling changes each band's own
+    /// aspect a little and never the balance between them — a keyboard that
+    /// grew while the fretboard beside it did not would read as a bug.
+    #[test]
+    fn filling_scales_every_band_by_the_same_amount() {
+        let s = crate::settings::Settings::first_launch();
+        let screen = Vec2::new(2560.0, 1440.0);
+        let natural = band_sizes_at(&s, screen.x);
+        let filled = fill_bands(&s, screen);
+        let k = filled.total().y / natural.total().y;
+        for (name, a, b) in [
+            ("piano", natural.piano_h, filled.piano_h),
+            ("chord", natural.chord_h, filled.chord_h),
+            ("fretboard", natural.fret_h, filled.fret_h),
+            ("theory", natural.theory_h, filled.theory_h),
+            ("recorder", natural.recorder_h, filled.recorder_h),
+        ] {
+            if a <= 0.0 {
+                continue;
+            }
+            assert!(
+                (b / a - k).abs() < 1e-3,
+                "{name} scaled by {} while the stack scaled by {k}",
+                b / a
+            );
+        }
+    }
+
+    /// A reset must land where a fresh install lands.
+    ///
+    /// They were two different states, and the gap was a trap: a new install
+    /// shows every band and "Reset Settings to Default" showed two. Somebody
+    /// pressing it to get back to how the app came got LESS, which reads as
+    /// settings that are not being saved.
+    #[test]
+    fn resetting_lands_where_a_fresh_install_lands() {
+        let mut s = crate::settings::Settings::default();
+        s.show_fretboard = false;
+        s.theory_circle = false;
+        s.dark_mode = true;
+        s.reset_to_defaults();
+
+        let fresh = crate::settings::Settings::first_launch();
+        assert_eq!(s.show_fretboard, fresh.show_fretboard);
+        assert_eq!(s.theory_views().count(), fresh.theory_views().count());
+        assert_eq!(s.show_recorder, fresh.show_recorder);
+        assert!(s.show_fretboard, "a reset hid the guitar view");
+        assert!(
+            s.theory_views().count() == 3,
+            "a reset hid the theory band"
+        );
     }
 
     /// **A typed level lands where the fader would put it.**

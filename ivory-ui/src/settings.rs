@@ -1146,10 +1146,28 @@ impl Settings {
 
     /// "Reset Settings to Default" (D-UI-8): resets the 13 parity keys and
     /// `custom_font_path`, keeps unknown keys.
+    /// **Resets to what a FRESH INSTALL gets, not to `Settings::default()`.**
+    ///
+    /// Those were two different things, and the gap was a real trap: a new
+    /// install opens with every band showing, and "Reset Settings to Default"
+    /// took you to keyboard-and-chord. So the app's own reset produced a state
+    /// the app never starts in — and somebody who pressed it expecting to get
+    /// back to how it came, got less, three launches running, and reasonably
+    /// concluded their settings were not being saved.
+    ///
+    /// One meaning of "default" now. `Settings::default()` remains the
+    /// mechanical one — every field's zero value, and what a corrupt file falls
+    /// back to, where rearranging somebody's window on top of a parse failure
+    /// would be the wrong kindness.
     pub fn reset_to_defaults(&mut self) {
         let extra = std::mem::take(&mut self.extra);
-        *self = Self::default();
+        *self = Self::first_launch();
         self.extra = extra;
+        // A reset is not a first launch: the migrations have already run, and
+        // re-running them would put video back on for somebody who has just
+        // asked for everything to go back to how it was.
+        self.video_default_applied = true;
+        self.shows_default_applied = true;
     }
 
     /// Height for the detached chord window (D-UI-1: <= 0 falls back to 50).
