@@ -128,6 +128,49 @@ impl Meters {
     }
 }
 
+/// How many instruments can be layered at once.
+///
+/// Three, because that is what the owner asked for and because it is the number
+/// that covers the real cases: a piano, a pad under it, and something on top.
+/// It is a constant rather than a `Vec` so the band can lay out a fixed number
+/// of slots — a variable count would make the band's height depend on how many
+/// instruments are loaded, and every band's height in this app is a function of
+/// width alone.
+pub const SLOTS: usize = 3;
+
+/// One instrument slot, as the band draws it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlotView<'a> {
+    /// What is loaded. `None` is an empty slot, which is still drawn — three
+    /// visible slots means three, not "as many as are full".
+    pub name: Option<&'a str>,
+    /// Named in settings but would not load this time. Distinct from empty:
+    /// a licence server that was unreachable this morning is not the same as a
+    /// slot nobody has filled.
+    pub missing: bool,
+    /// Linear gain for this slot.
+    pub gain: f32,
+    /// This instrument offers an editor. A plugin without one is legal VST3.
+    pub has_editor: bool,
+    /// Its window is on screen.
+    pub editor_open: bool,
+}
+
+impl SlotView<'_> {
+    pub const EMPTY: SlotView<'static> = SlotView {
+        name: None,
+        missing: false,
+        gain: 1.0,
+        has_editor: false,
+        editor_open: false,
+    };
+
+    /// Whether there is an instrument here at all — loaded or merely named.
+    pub fn filled(&self) -> bool {
+        self.name.is_some()
+    }
+}
+
 /// A camera frame that has already been uploaded to the GPU by the host.
 ///
 /// `ivory-ui` never touches a camera: the binary owns the device, converts the
@@ -191,9 +234,10 @@ pub struct RecorderView<'a> {
     pub name_focused: bool,
     /// What the folder will be called, computed by `ivory_record::take`.
     pub folder_preview: &'a str,
-    /// The hosted instrument, if one is loaded. `Missing` means a plugin the
-    /// settings file names that would not load this time.
-    pub plugin: DeviceLabel<'a>,
+    /// The three instrument slots, always all three — an empty one is still
+    /// drawn, because "three visible slots" is what makes layering discoverable
+    /// rather than a thing you have to know about.
+    pub slots: [SlotView<'a>; SLOTS],
     /// The four faders, as LINEAR gains (not fader positions). See
     /// [`gain_to_fader`] for turning one into a knob angle.
     pub gains: Gains,
@@ -242,7 +286,7 @@ impl RecorderView<'_> {
             take_name: "",
             name_focused: false,
             folder_preview: "",
-            plugin: DeviceLabel::None,
+            slots: [SlotView::EMPTY; SLOTS],
             gains: Gains::default(),
             metronome_on: false,
             metronome_in_take: false,
@@ -267,8 +311,12 @@ impl RecorderView<'_> {
 /// five call sites.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Gains {
-    /// The hosted instrument.
-    pub plugin: f32,
+    /// One per instrument slot, so a layered sound can be balanced.
+    ///
+    /// An array rather than three fields: every consumer wants to iterate them,
+    /// and a fourth slot should be a constant change rather than a fourth
+    /// field, a fourth fader and a fourth settings key.
+    pub slots: [f32; SLOTS],
     /// The click. Applies to what you hear; whether it reaches the FILE is
     /// `metronome_in_take`, which is a separate question with a separate
     /// answer.
@@ -285,7 +333,7 @@ impl Default for Gains {
     /// hand within a minute otherwise.
     fn default() -> Self {
         Self {
-            plugin: 1.0,
+            slots: [1.0; SLOTS],
             metronome: 0.5,
             input: 1.0,
         }
@@ -315,15 +363,8 @@ pub struct RecorderState {
     /// The camera named in settings is not present right now.
     pub camera_missing: bool,
     /// The loaded instrument's display name.
-    pub plugin_name: Option<String>,
-    /// Named in settings but did not load this time.
-    pub plugin_missing: bool,
-    /// The loaded instrument offers an editor of its own. Not all do — a
-    /// parameter-only plugin is legal VST3 — and offering a window that cannot
-    /// open is worse than not offering one.
-    pub plugin_has_editor: bool,
-    /// Its window is on screen.
-    pub plugin_editor_open: bool,
+    /// One per slot, filled by the host each frame.
+    pub slots: [SlotState; SLOTS],
     pub audio_name: Option<String>,
     pub audio_missing: bool,
     pub preview: Option<Preview>,
@@ -358,7 +399,13 @@ impl RecorderState {
             take_name,
             name_focused,
             folder_preview: &self.folder_preview,
-            plugin: label(&self.plugin_name, self.plugin_missing),
+            slots: std::array::from_fn(|i| SlotView {
+                name: self.slots[i].name.as_deref(),
+                missing: self.slots[i].missing,
+                gain: knobs.gains.slots[i],
+                has_editor: self.slots[i].has_editor,
+                editor_open: self.slots[i].editor_open,
+            }),
             gains: knobs.gains,
             metronome_on: knobs.metronome_on,
             metronome_in_take: knobs.metronome_in_take,
@@ -401,6 +448,15 @@ impl Default for Knobs {
     }
 }
 
+/// The owned half of [`SlotView`].
+#[derive(Debug, Clone, Default)]
+pub struct SlotState {
+    pub name: Option<String>,
+    pub missing: bool,
+    pub has_editor: bool,
+    pub editor_open: bool,
+}
+
 /// Something the band asked the host to do, drained after the frame.
 ///
 /// The **request pattern**, for the same reason the directory picker uses it:
@@ -422,15 +478,15 @@ pub enum RecorderRequest {
     /// distinct Stop control and "the button that stops it" must not also be
     /// able to start one.
     Stop,
-    /// Open the instrument's OWN editor — the plugin's window, with its presets
-    /// and its knobs.
+    /// Open slot `n`'s OWN editor — the plugin's window, with its presets and
+    /// its knobs.
     ///
     /// A request rather than a dialog, because the window is not ours: the
     /// plugin draws into a native window the host creates after the frame. VST3
     /// requires it on the main thread, and creating an AppKit window with an
     /// egui frame still on the stack is the same re-entrancy the folder picker
     /// avoids.
-    OpenPluginEditor,
+    OpenPluginEditor(usize),
 }
 
 // ── The export contract ─────────────────────────────────────────────────────
@@ -1285,7 +1341,10 @@ mod fader_tests {
     #[test]
     fn the_click_starts_under_the_music_and_out_of_the_file() {
         let k = Knobs::default();
-        assert!(k.gains.metronome < k.gains.plugin);
+        assert!(
+            k.gains.slots.iter().all(|g| k.gains.metronome < *g),
+            "the click starts under EVERY instrument, not just the first"
+        );
         assert!(!k.metronome_in_take, "a click in the file is a ruined take");
         assert!(!k.metronome_on, "and it does not start clicking on its own");
     }

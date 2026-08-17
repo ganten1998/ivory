@@ -121,10 +121,10 @@ struct Recorder {
     engine: Option<crate::instrument::Engine>,
     /// Why the output device would not open, if it would not.
     engine_error: Option<String>,
-    /// The bundle path the engine currently has loaded, so a change in settings
-    /// can be noticed on the edge rather than re-decided every frame.
-    plugin_loaded: Option<String>,
-    /// A plugin load that has been announced but not yet performed.
+    /// What the engine has in each slot, so a change in settings is noticed on
+    /// the edge rather than re-decided every frame.
+    plugin_loaded: [Option<String>; ivory_ui::recorder::SLOTS],
+    /// The slot whose load has been announced but not yet performed.
     ///
     /// `load_plugin` blocks for **about five seconds** — the module's own
     /// initialiser, then a warm-up, because four of six instruments on this
@@ -133,7 +133,7 @@ struct Recorder {
     /// seconds with the previous frame still painted and nothing on screen
     /// saying why. Same two-phase treatment the camera already gets: announce
     /// on one frame, block on the next.
-    plugin_opening: bool,
+    plugin_opening: Option<usize>,
     audio: crate::devices::Shared,
     camera: crate::devices::Shared,
     /// Why enumeration failed last time, so the band can say "permission" and
@@ -258,19 +258,19 @@ impl DesktopApp {
         let message = self
             .recorder
             .plugin_opening
-            .then(|| {
+            .and_then(|slot| {
                 // Named, because "loading…" with no subject is the least
                 // informative thing a status line can say.
-                match self.app.chosen_plugin() {
-                    Some(p) => format!(
+                match self.app.chosen_plugin(slot) {
+                    Some(p) => Some(format!(
                         "loading {} — instruments warm up for a few seconds so \
                          the first take is not silent",
                         std::path::Path::new(p)
                             .file_stem()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| p.to_owned())
-                    ),
-                    None => "loading the instrument…".to_owned(),
+                    )),
+                    None => None,
                 }
             })
             .or_else(|| self.recorder.camera_opening
@@ -310,28 +310,27 @@ impl DesktopApp {
         });
         // Computed BEFORE the mutable borrow of the app: `chosen_plugin()`
         // borrows it immutably and `recorder_state_mut()` holds it mutably.
-        let plugin_name = self
-            .recorder
-            .engine
-            .as_ref()
-            .and_then(|e| e.plugin())
-            .map(|p| p.class.clone())
-            .or_else(|| {
-                // Chosen but not loaded: show the bundle's file name so the
-                // band says WHICH instrument is missing.
-                self.app.chosen_plugin().map(|p| {
-                    std::path::Path::new(p)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| p.to_owned())
-                })
+        let engine = self.recorder.engine.as_ref();
+        let slots: [ivory_ui::recorder::SlotState; ivory_ui::recorder::SLOTS] =
+            std::array::from_fn(|i| {
+                let loaded = engine.and_then(|e| e.plugin(i));
+                ivory_ui::recorder::SlotState {
+                    // The instrument's own name when it loaded; the bundle's
+                    // file name when it did not, so the band can say WHICH
+                    // instrument is missing rather than just that one is.
+                    name: loaded.map(|p| p.class.clone()).or_else(|| {
+                        self.app.chosen_plugin(i).map(|p| {
+                            std::path::Path::new(p)
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| p.to_owned())
+                        })
+                    }),
+                    missing: loaded.is_none() && self.app.chosen_plugin(i).is_some(),
+                    has_editor: engine.is_some_and(|e| e.has_editor(i)),
+                    editor_open: engine.is_some_and(|e| e.editor_open(i)),
+                }
             });
-        let plugin_missing = plugin_name.is_some()
-            && self
-                .recorder
-                .engine
-                .as_ref()
-                .is_none_or(|e| e.plugin().is_none());
 
         let state = self.app.recorder_state_mut();
         state.preview = preview;
@@ -356,18 +355,7 @@ impl DesktopApp {
             .recorder
             .disk_bytes
             .and_then(|b| ivory_ui::recorder::minutes_on_disk(b, &spec));
-        state.plugin_name = plugin_name;
-        state.plugin_missing = plugin_missing;
-        state.plugin_has_editor = self
-            .recorder
-            .engine
-            .as_ref()
-            .is_some_and(crate::instrument::Engine::has_editor);
-        state.plugin_editor_open = self
-            .recorder
-            .engine
-            .as_ref()
-            .is_some_and(crate::instrument::Engine::editor_open);
+        state.slots = slots;
         state.message = message;
         state.clip_warning = self.recorder.session.clipped();
     }
@@ -413,7 +401,7 @@ impl DesktopApp {
                 // which is what "the band is closed" should mean: no device
                 // held, no third-party code resident.
                 self.recorder.engine = None;
-                self.recorder.plugin_loaded = None;
+                self.recorder.plugin_loaded = [const { None }; ivory_ui::recorder::SLOTS];
             }
         } else if open {
             self.reconcile_audio(false);
@@ -496,7 +484,7 @@ impl DesktopApp {
                     );
                 }
                 R::Stop => self.recorder.session.stop(),
-                R::OpenPluginEditor => {
+                R::OpenPluginEditor(slot) => {
                     // The plugin's own window, created here rather than in the
                     // frame: VST3 requires the main thread and AppKit will not
                     // have a window built while an egui frame is on the stack.
@@ -506,9 +494,9 @@ impl DesktopApp {
                         // One row, two names, one action: open it, or close the
                         // one that is open. A second menu row for closing a
                         // window that has its own close button is clutter.
-                        if e.editor_open() {
-                            e.close_editor();
-                        } else if let Err(err) = e.open_editor() {
+                        if e.editor_open(slot) {
+                            e.close_editor(slot);
+                        } else if let Err(err) = e.open_editor(slot) {
                             self.recorder.engine_error =
                                 Some(format!("could not open the instrument window: {err}"));
                         }
@@ -533,7 +521,7 @@ impl DesktopApp {
             Ok(e) => {
                 self.recorder.engine = Some(e);
                 self.recorder.engine_error = None;
-                self.recorder.plugin_loaded = None;
+                self.recorder.plugin_loaded = [const { None }; ivory_ui::recorder::SLOTS];
                 self.push_monitor_settings();
                 // Announces rather than loads on this frame: the band has just
                 // appeared and a remembered instrument would otherwise freeze
@@ -557,7 +545,9 @@ impl DesktopApp {
             return;
         };
         let gains = self.app.gains();
-        e.set_plugin_gain(gains.plugin);
+        for (slot, g) in gains.slots.iter().enumerate() {
+            e.set_slot_gain(slot, *g);
+        }
         e.set_metronome_gain(gains.metronome);
         e.set_metronome_enabled(self.app.metronome_on());
         e.set_metronome_in_take(self.app.metronome_in_take());
@@ -570,7 +560,7 @@ impl DesktopApp {
             .recorder
             .engine
             .as_ref()
-            .is_some_and(|e| e.plugin().is_some());
+            .is_some_and(crate::instrument::Engine::any_plugin_loaded);
         let input = self.recorder.session.audio_device_name().is_some();
         let want = crate::record::TakeSource::resolve(
             self.app.audio_source_setting(),
@@ -588,45 +578,52 @@ impl DesktopApp {
     /// library's initialiser and `Instance::create` can take seconds on a
     /// sampler. Hence after the frame, never inside one.
     fn reconcile_plugin(&mut self, ctx: &egui::Context) {
-        let wanted = self.app.chosen_plugin().map(str::to_owned);
-        if wanted == self.recorder.plugin_loaded {
+        // ONE slot per call. Loading blocks for about five seconds, so three
+        // stale slots would freeze the window for fifteen; taking them one
+        // frame at a time keeps the band alive and lets the status line name
+        // each instrument as it arrives.
+        let Some(slot) = (0..ivory_ui::recorder::SLOTS).find(|i| {
+            self.app.chosen_plugin(*i).map(str::to_owned) != self.recorder.plugin_loaded[*i]
+        }) else {
             return;
-        }
+        };
+        let wanted = self.app.chosen_plugin(slot).map(str::to_owned);
+
         // Announce first, act next frame — but only when there is a wait to
         // explain. Unloading is instant, so making the user watch a frame of
         // "loading…" in order to REMOVE an instrument would be silly.
-        if wanted.is_some() && !self.recorder.plugin_opening {
-            self.recorder.plugin_opening = true;
+        if wanted.is_some() && self.recorder.plugin_opening != Some(slot) {
+            self.recorder.plugin_opening = Some(slot);
             ctx.request_repaint();
             return;
         }
-        self.recorder.plugin_opening = false;
+        self.recorder.plugin_opening = None;
         let Some(e) = self.recorder.engine.as_mut() else {
             return;
         };
+        // The editor FIRST, in both branches: it is a view onto THIS
+        // instrument, and a window still attached to a plugin that has been
+        // terminated is a use-after-free with a title bar.
+        e.close_editor(slot);
         match &wanted {
             None => {
-                // The editor FIRST: it is a view onto this instrument, and a
-                // window still attached to a plugin that has been terminated is
-                // a use-after-free with a title bar.
-                e.close_editor();
-                e.unload_plugin();
+                e.unload_plugin(slot);
                 self.recorder.engine_error = None;
             }
-            Some(path) => match {
-                e.close_editor();
-                e.load_plugin(std::path::Path::new(path), None)
-            } {
+            Some(path) => match e.load_plugin(slot, std::path::Path::new(path), None) {
                 Ok(_) => {
-                self.recorder.engine_error = None;
-                // The take has to be able to RECORD what it can now hear.
-                // Handed over on load rather than at Record, because the tap is
-                // moved once and the writer thread keeps it for the session.
-                if let Some(tap) = self.recorder.engine.as_mut().and_then(|e| e.take_recorder_tap())
-                {
-                    self.recorder.session.set_plugin_tap(Some(tap));
+                    self.recorder.engine_error = None;
+                    // The take has to be able to RECORD what it can now hear.
+                    // Taken once for the engine's lifetime — the tap belongs to
+                    // the engine rather than to any one instrument, so it
+                    // survives a slot changing and a take already rolling never
+                    // changes width.
+                    if let Some(tap) =
+                        self.recorder.engine.as_mut().and_then(|e| e.take_recorder_tap())
+                    {
+                        self.recorder.session.set_plugin_tap(Some(tap));
+                    }
                 }
-            }
                 Err(err) => {
                     // The path is REMEMBERED even though it failed. A plugin
                     // that will not load today because its licence server was
@@ -639,7 +636,7 @@ impl DesktopApp {
         }
         // Settled either way, so a plugin that refuses to load is not retried
         // sixty times a second for the rest of the session.
-        self.recorder.plugin_loaded = wanted;
+        self.recorder.plugin_loaded[slot] = wanted;
     }
 
     /// Open the camera the user asked for, if it is not already open.
@@ -807,8 +804,8 @@ impl DesktopApp {
                 camera_denied,
                 engine: None,
                 engine_error: None,
-                plugin_loaded: None,
-                plugin_opening: false,
+                plugin_loaded: [const { None }; ivory_ui::recorder::SLOTS],
+                plugin_opening: None,
                 camera_opening: false,
                 camera_silent_since: None,
                 preview: None,

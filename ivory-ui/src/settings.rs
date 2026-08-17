@@ -230,14 +230,19 @@ pub struct Settings {
     /// preserved but unread: three seconds does not convert into a number of
     /// beats without knowing a tempo it was never measured against.)
     pub record_count_in_beats: i64,
-    /// The VST3 bundle to load as the instrument. Absent means none.
+    /// The VST3 bundle in each instrument slot. `None` is an empty slot.
     ///
-    /// A path and not a name: a plugin's display name is not unique, changes
+    /// Paths and not names: a plugin's display name is not unique, changes
     /// between versions, and cannot be turned back into a file.
-    pub plugin_path: Option<String>,
-    /// Linear gains for the three monitor sources. Stored linear because that
-    /// is what the audio path multiplies by; the band converts to dB to draw.
-    pub plugin_gain: f64,
+    ///
+    /// Three of them because three instruments can be layered. Stored as a JSON
+    /// ARRAY under `plugin_slots`, and a file written by the single-instrument
+    /// build is migrated on read — its `plugin_path` becomes slot 0, so nobody
+    /// loses the instrument they had chosen.
+    pub plugin_slots: [Option<String>; crate::recorder::SLOTS],
+    /// Linear gain per slot. Linear because that is what the audio path
+    /// multiplies by; the band converts to dB to draw.
+    pub plugin_gains: [f64; crate::recorder::SLOTS],
     pub metronome_gain: f64,
     pub input_gain: f64,
     /// The click is running.
@@ -261,6 +266,23 @@ pub struct Settings {
     pub record_export: crate::recorder::ExportSpec,
     /// Unknown keys from the file, preserved verbatim on save (file order).
     pub extra: Map<String, Value>,
+}
+
+/// Where `Settings::path()` points during tests.
+///
+/// One directory per process, so a parallel suite cannot have two tests
+/// clobbering each other, and inside the OS temp dir so nothing survives to
+/// confuse the next run.
+#[cfg(test)]
+fn test_path() -> PathBuf {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("tangent-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("settings.json")
+    })
+    .clone()
 }
 
 /// The most a stored gain may be, as a linear multiplier.
@@ -343,8 +365,8 @@ impl Default for Settings {
             record_audio_device: None,
             record_audio_source: "input".to_owned(),
             record_count_in_beats: 4,
-            plugin_path: None,
-            plugin_gain: 1.0,
+            plugin_slots: [None, None, None],
+            plugin_gains: [1.0; crate::recorder::SLOTS],
             metronome_gain: 0.5,
             input_gain: 1.0,
             metronome_on: false,
@@ -358,9 +380,25 @@ impl Default for Settings {
 
 impl Settings {
     /// Literal `~/.config/ivory/settings.json` on every platform (parity).
+    ///
+    /// **Under `cargo test` this is redirected to a temporary directory.** It
+    /// has to be: several tests exercise code paths that save, and they were
+    /// therefore rewriting the developer's real settings — colours, tunings,
+    /// window positions and all — every time the suite ran. It also made
+    /// `a_plugin_does_not_write_the_shared_settings_file` flaky, because it
+    /// reads the file before and after and another test running in parallel
+    /// would change it in between. A test that mutates the machine it runs on
+    /// is a test nobody can trust twice.
     pub fn path() -> PathBuf {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        home.join(".config").join("ivory").join("settings.json")
+        #[cfg(test)]
+        {
+            return test_path();
+        }
+        #[cfg(not(test))]
+        {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            home.join(".config").join("ivory").join("settings.json")
+        }
     }
 
     pub fn load() -> Self {
@@ -636,7 +674,40 @@ impl Settings {
                 s.record_count_in_beats = n;
             }
         }
-        take_opt_str(&mut map, "plugin_path", &mut s.plugin_path);
+        // Slots, with migration. The single-instrument build wrote
+        // `plugin_path`/`plugin_gain`; a file from it must not silently lose
+        // the instrument somebody chose, so those become slot 0 when the array
+        // form is absent. Both old keys are then consumed rather than left in
+        // `extra`, or they would be written back forever and a later build
+        // would migrate them a second time over whatever slot 0 had become.
+        let mut legacy_path: Option<String> = None;
+        take_opt_str(&mut map, "plugin_path", &mut legacy_path);
+        let legacy_gain = map.remove("plugin_gain").and_then(|v| v.as_f64());
+        match map.remove("plugin_slots") {
+            Some(Value::Array(items)) => {
+                for (slot, item) in s.plugin_slots.iter_mut().zip(items) {
+                    if let Value::String(path) = item {
+                        if !path.trim().is_empty() {
+                            *slot = Some(path);
+                        }
+                    }
+                }
+            }
+            _ => s.plugin_slots[0] = legacy_path,
+        }
+        if let Some(Value::Array(items)) = map.remove("plugin_gains") {
+            for (gain, item) in s.plugin_gains.iter_mut().zip(items) {
+                if let Some(g) = item.as_f64() {
+                    if g.is_finite() && (0.0..=MAX_GAIN).contains(&g) {
+                        *gain = g;
+                    }
+                }
+            }
+        } else if let Some(g) = legacy_gain {
+            if g.is_finite() && (0.0..=MAX_GAIN).contains(&g) {
+                s.plugin_gains[0] = g;
+            }
+        }
         // Gains are sanitised HERE rather than at the point of use, unlike the
         // tuning and the capo, because a NaN or a negative multiplied into an
         // audio buffer is not a display glitch — it is a burst of noise into
@@ -648,7 +719,6 @@ impl Settings {
                 }
             }
         };
-        take_gain(&mut map, "plugin_gain", &mut s.plugin_gain);
         take_gain(&mut map, "metronome_gain", &mut s.metronome_gain);
         take_gain(&mut map, "input_gain", &mut s.input_gain);
         take_bool(&mut map, "metronome_on", &mut s.metronome_on);
@@ -831,11 +901,32 @@ impl Settings {
             "record_count_in_beats".into(),
             Value::Number(self.record_count_in_beats.into()),
         );
-        if let Some(p) = &self.plugin_path {
-            map.insert("plugin_path".into(), Value::String(p.clone()));
-        }
+        // Written as full-length arrays including the empty slots, so slot 2
+        // stays slot 2 when slot 1 is empty. A compacted list would silently
+        // promote an instrument into a slot the user did not put it in.
+        map.insert(
+            "plugin_slots".into(),
+            Value::Array(
+                self.plugin_slots
+                    .iter()
+                    .map(|p| match p {
+                        Some(path) => Value::String(path.clone()),
+                        None => Value::Null,
+                    })
+                    .collect(),
+            ),
+        );
+        map.insert(
+            "plugin_gains".into(),
+            Value::Array(
+                self.plugin_gains
+                    .iter()
+                    .filter_map(|g| serde_json::Number::from_f64(*g))
+                    .map(Value::Number)
+                    .collect(),
+            ),
+        );
         for (key, gain) in [
-            ("plugin_gain", self.plugin_gain),
             ("metronome_gain", self.metronome_gain),
             ("input_gain", self.input_gain),
         ] {
@@ -1032,7 +1123,7 @@ impl Settings {
     pub fn knobs(&self) -> crate::recorder::Knobs {
         crate::recorder::Knobs {
             gains: crate::recorder::Gains {
-                plugin: self.plugin_gain as f32,
+                slots: std::array::from_fn(|i| self.plugin_gains[i] as f32),
                 metronome: self.metronome_gain as f32,
                 input: self.input_gain as f32,
             },

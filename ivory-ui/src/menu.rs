@@ -122,12 +122,6 @@ pub enum MenuAction {
     /// §5: pre-roll countdown in seconds; one of `recorder::PREROLL_CHOICES`.
     /// Count-in length in beats (0 / 4 / 8).
     SetCountIn(u32),
-    /// Open the VST3 instrument picker.
-    ShowPluginPicker,
-    /// Unload whatever instrument is loaded.
-    UnloadPlugin,
-    /// Open the instrument's own editor window.
-    ShowPluginEditor,
     /// The click.
     ToggleMetronome,
     /// Whether the click is mixed into the FILE as well as the monitors.
@@ -203,16 +197,6 @@ pub struct MenuView {
     /// which has already clamped a stray value from a later build's file to
     /// something this menu can mark.
     pub count_in_beats: u32,
-    /// The hosted instrument's name, if one is loaded. `None` renames the row
-    /// from "Change Instrument..." to "Load Instrument...", so the row is the
-    /// state readout — the chrome rule again.
-    pub plugin_name: Option<String>,
-    /// The loaded instrument has an editor to open. A plugin without one is
-    /// legal VST3, and a row that cannot work is worse than an absent row.
-    pub plugin_has_editor: bool,
-    /// Its window is on screen, so the row reads "Close" instead of "Open".
-    /// One row with two names, per the chrome rule at the top of this file.
-    pub plugin_editor_open: bool,
     /// The click is running.
     pub metronome_on: bool,
     /// The click is mixed into the recording as well as the monitors.
@@ -810,36 +794,14 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                     },
                 ));
             }
-            // The instrument. Named "Instrument" and not "Plugin" because that
-            // is what it is FOR — the user is choosing a piano, and "plugin" is
-            // a fact about how it is implemented.
-            recorder.push(row(
-                match view.plugin_name.as_deref() {
-                    Some(_) => "Change Instrument...",
-                    None => "Load Instrument...",
-                },
-                MenuAction::ShowPluginPicker,
-            ));
-            if view.plugin_name.is_some() && view.plugin_has_editor {
-                // The plugin's OWN window: its presets, its knobs, its sound.
-                // Without it a pianist is stuck on whatever preset the
-                // instrument happened to open with, which is the difference
-                // between hosting a piano and hosting one piano.
-                recorder.push(row(
-                    if view.plugin_editor_open {
-                        "Close Instrument Window"
-                    } else {
-                        "Instrument Window"
-                    },
-                    MenuAction::ShowPluginEditor,
-                ));
-            }
-            if let Some(name) = view.plugin_name.as_deref() {
-                // Named rather than a bare "Unload", so the row says what is
-                // about to go away. A user with six pianos installed cannot
-                // otherwise tell which one is loaded without opening the picker.
-                recorder.push(row(&format!("Unload {name}"), MenuAction::UnloadPlugin));
-            }
+            // No instrument rows here. They live in the band — three visible
+            // slots, each with its own volume and its own button to open that
+            // plugin's window — because that is where they are usable and
+            // because a right-click submenu is where the owner could not find
+            // them. The band is also the only place they COULD live: the
+            // monitor engine's life is tied to the band being open, so there is
+            // no state in which a menu row could load an instrument and the
+            // band could not show it.
             recorder.push(row(
                 if view.metronome_on {
                     "Stop the Click"
@@ -1430,9 +1392,6 @@ mod tests {
             recorder_on: false,
             recorder_detached: false,
             count_in_beats: 4,
-            plugin_name: None,
-            plugin_has_editor: false,
-            plugin_editor_open: false,
             metronome_on: false,
             metronome_in_take: false,
             hide_elapsed: false,
@@ -1992,9 +1951,6 @@ mod tests {
             // remembers a plugin path, so a plugin instance will be handed one.
             // The Instrument Window and Unload rows have to be absent because
             // of `caps`, not because nothing happened to be loaded.
-            plugin_name: Some("Pianoteq 9".to_owned()),
-            plugin_has_editor: true,
-            plugin_editor_open: true,
             metronome_on: true,
             ..view()
         };
@@ -2031,9 +1987,6 @@ mod tests {
             // the process and opens a device; the editor opens a native window;
             // and the click writes to an output stream. None of the three is
             // anything a VST3 editor may do inside its host.
-            MenuAction::ShowPluginPicker,
-            MenuAction::ShowPluginEditor,
-            MenuAction::UnloadPlugin,
             MenuAction::ToggleMetronome,
             MenuAction::ToggleMetronomeInTake,
         ];
@@ -2249,7 +2202,6 @@ mod tests {
             vec![
                 "Hide Recorder",
                 "Detach Recorder",
-                "Load Instrument...",
                 "Start the Click",
                 "Record the Click Into Takes",
                 "Export...",
@@ -2352,7 +2304,6 @@ mod tests {
             sub(v.clone(), "Recorder").1,
             vec![
                 "Hide Recorder",
-                "Load Instrument...",
                 "Start the Click",
                 "Record the Click Into Takes",
                 "Export...",

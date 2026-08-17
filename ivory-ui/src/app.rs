@@ -247,6 +247,9 @@ pub struct IvoryApp {
     export_override: Option<recorder::ExportSpec>,
     /// A settings write owed once the user stops dragging a fader.
     settings_save_at: Option<Instant>,
+    /// Which instrument slot the open picker is filling. See
+    /// [`open_plugin_picker`](IvoryApp::open_plugin_picker).
+    picker_slot: usize,
     /// Every VST3 bundle the host found, for the picker.
     ///
     /// Supplied by the host rather than discovered here: `ivory-ui` cannot
@@ -443,6 +446,7 @@ impl IvoryApp {
             dir_request: None,
             export_override: None,
             settings_save_at: None,
+            picker_slot: 0,
             grabbed: None,
             plugin_list: Vec::new(),
             name_focused: false,
@@ -895,9 +899,6 @@ impl IvoryApp {
             recorder_on: self.settings.show_recorder,
             recorder_detached: self.settings.recorder_detached,
             count_in_beats: self.settings.count_in_beats(),
-            plugin_name: self.recorder.plugin_name.clone(),
-            plugin_has_editor: self.recorder.plugin_has_editor,
-            plugin_editor_open: self.recorder.plugin_editor_open,
             metronome_on: self.settings.metronome_on,
             metronome_in_take: self.settings.metronome_in_take,
             hide_elapsed: self.settings.record_hide_elapsed,
@@ -1356,7 +1357,22 @@ impl IvoryApp {
                 self.save_settings();
             }
             Hit::Export => self.open_export_dialog(),
-            Hit::PickPlugin => self.open_plugin_picker(),
+            Hit::PickSlot(slot) => self.open_plugin_picker(slot),
+            Hit::ClearSlot(slot) => {
+                if let Some(p) = self.settings.plugin_slots.get_mut(slot) {
+                    *p = None;
+                    self.save_settings();
+                }
+            }
+            Hit::OpenSlotEditor(slot) => {
+                self.request_recorder(recorder::RecorderRequest::OpenPluginEditor(slot));
+            }
+            Hit::SetSlotGain(slot, p) => {
+                if let Some(g) = self.settings.plugin_gains.get_mut(slot) {
+                    *g = f64::from(recorder::fader_to_gain(p));
+                    self.save_settings_soon();
+                }
+            }
             Hit::ToggleMetronome => {
                 self.settings.metronome_on = !self.settings.metronome_on;
                 self.save_settings();
@@ -1368,10 +1384,6 @@ impl IvoryApp {
             // The faders. Saved through the same debounce the window geometry
             // uses rather than on every frame of a drag — a fader written to
             // disk sixty times a second is sixty file rewrites per gesture.
-            Hit::SetPluginGain(p) => {
-                self.settings.plugin_gain = f64::from(recorder::fader_to_gain(p));
-                self.save_settings_soon();
-            }
             Hit::SetMetronomeGain(p) => {
                 self.settings.metronome_gain = f64::from(recorder::fader_to_gain(p));
                 self.save_settings_soon();
@@ -1503,22 +1515,32 @@ impl IvoryApp {
         self.plugin_list = bundles;
     }
 
-    /// The instrument the user chose, for the host to load after the frame.
-    pub fn chosen_plugin(&self) -> Option<&str> {
-        self.settings.plugin_path.as_deref()
+    /// The instrument chosen for each slot, for the host to load after the
+    /// frame.
+    pub fn chosen_plugin(&self, slot: usize) -> Option<&str> {
+        self.settings
+            .plugin_slots
+            .get(slot)
+            .and_then(|p| p.as_deref())
     }
 
-    fn open_plugin_picker(&mut self) {
-        if !self.caps.capture_devices {
+    /// Which slot the open picker is filling.
+    ///
+    /// The dialog does not know about slots — it chooses a bundle — so the app
+    /// remembers what the question was. Set when the picker opens and read when
+    /// the answer comes back.
+    fn open_plugin_picker(&mut self, slot: usize) {
+        if !self.caps.capture_devices || slot >= recorder::SLOTS {
             return;
         }
+        self.picker_slot = slot;
         // The dialog's own constructor rather than building the variant here:
         // it sorts, it derives the rows from the paths, and it preselects the
         // loaded one. Three things that would otherwise be duplicated and
         // would drift.
         self.dialog = Some(Dialog::plugin_picker(
             &self.plugin_list,
-            self.settings.plugin_path.clone(),
+            self.settings.plugin_slots[slot].clone(),
         ));
     }
 
@@ -2029,14 +2051,6 @@ impl IvoryApp {
                 self.settings.record_count_in_beats = i64::from(beats);
                 self.save_settings();
             }
-            MenuAction::ShowPluginPicker => self.open_plugin_picker(),
-            MenuAction::ShowPluginEditor => {
-                self.request_recorder(recorder::RecorderRequest::OpenPluginEditor);
-            }
-            MenuAction::UnloadPlugin => {
-                self.settings.plugin_path = None;
-                self.save_settings();
-            }
             MenuAction::ToggleMetronome => {
                 self.settings.metronome_on = !self.settings.metronome_on;
                 self.save_settings();
@@ -2352,11 +2366,12 @@ impl IvoryApp {
                 self.save_settings();
             }
             DialogAction::LoadPlugin { path } => {
+                let slot = self.picker_slot.min(recorder::SLOTS - 1);
                 // Written to settings and nothing else: loading is the host's
                 // job, done after the frame, because `Module::open` runs
                 // third-party code and `Instance::create` can take seconds.
                 // The host notices the change by watching `chosen_plugin()`.
-                self.settings.plugin_path = path;
+                self.settings.plugin_slots[slot] = path;
                 self.save_settings();
             }
             DialogAction::ChooseDevice { kind, uid } => {
