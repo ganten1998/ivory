@@ -178,15 +178,28 @@
 //! instead of taking `&mut self`. Until then the audio path's own 8 ms is the
 //! smaller half of what the player feels.
 //!
-//! # The one thing a pianist will notice missing
+//! # The sustain pedal, and what it cost
 //!
-//! **The sustain pedal does not reach the plugin.** `Instance::process` takes
-//! `&[Note]` and nothing else, so there is no door for a control change: VST3
-//! delivers CC64 either as a parameter change through `IMidiMapping` or as a
-//! legacy MIDI CC event, and `ivory-host` implements neither. Every pedal message
-//! is counted by [`Engine::pedal_dropped`] rather than silently discarded, so the
-//! band can say so instead of the user discovering it mid-phrase. This is the
-//! first thing to fix in `ivory-host` after this lands.
+//! It works — and this section used to say it did not, which is why it is still
+//! here. VST3 has no "send a CC": a control change reaches an instrument only as
+//! a parameter change found through `IMidiMapping` on the EDIT CONTROLLER, a
+//! second object the host must create and connect both ways. `ivory-host` now
+//! does all of that, and `Instance::process_with_controls` is the door.
+//!
+//! **It sends the parameter change AND the legacy MIDI CC event, on every
+//! control, always.** Measured on Pianoteq 9, which publishes a mapping for
+//! CC64, accepts the parameter change, returns `kResultOk` and ignores it: a
+//! held C4 released with the pedal down rang at 0.001452 RMS with the parameter
+//! change alone — identical to six decimal places to the same phrase with no
+//! pedal at all. Adding the legacy event took that to 0.012151, which is 8.4x.
+//! A CC is a value rather than a delta, so a plugin honouring both sets the same
+//! parameter twice and nothing is harmed.
+//!
+//! [`Engine::pedal_dropped`] therefore counts what an instrument published no
+//! mapping for — "this plugin has no pedal" — rather than "we never tried". It
+//! reports the MINIMUM across rendering slots, not the sum: one pedal press
+//! refused by three plugins is one refusal, and summing would make the counter a
+//! function of how many slots happen to be full.
 
 // This module is a public API with no caller yet: the Recorder band that will
 // drive it is being written alongside it, and `main.rs` does not wire
