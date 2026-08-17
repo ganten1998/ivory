@@ -506,8 +506,8 @@ fn fader_zones(row: Rect) -> (Rect, Rect, Rect) {
     }
     (
         slice_h(row, 0.00, 0.085),
-        slice_h(row, 0.105, 0.415),
-        slice_h(row, 0.435, 0.600),
+        slice_h(row, 0.105, 0.500),
+        slice_h(row, 0.520, 0.665),
     )
 }
 
@@ -525,7 +525,7 @@ fn fader_zones(row: Rect) -> (Rect, Rect, Rect) {
 /// A constant rather than two literals in [`Layout::fill_monitor`] because the
 /// test that proves nothing in this row overlaps has to slice the row the same
 /// way the painter does.
-const CLICK_SWITCHES: [(f32, f32); 2] = [(0.625, 0.805), (0.825, 1.000)];
+const CLICK_SWITCHES: [f32; 2] = [0.700, 0.925];
 
 /// Text height in a fader row, as a fraction of the row. Shared by the painter
 /// and by the test that asserts the dB reading fits.
@@ -674,8 +674,12 @@ impl Layout {
         let d = top.height().min(top.width() * 0.38);
         self.record = Rect::from_center_size(slice_h(top, 0.0, 0.42).center(), Vec2::splat(d));
         self.stop = Rect::from_center_size(slice_h(top, 0.46, 0.88).center(), Vec2::splat(d));
-        self.meter = slice_v(t, 0.56, 0.74);
-        self.timecode = slice_v(t, 0.78, 1.00);
+        // A quarter of the transport rather than an eighteenth. The meter is a
+        // pair of VU faces now, and a dial needs HEIGHT in a way a bar never
+        // did: the same 34 points that made a perfectly good bar make a face
+        // with no room to print anything on it.
+        self.meter = slice_v(t, 0.54, 0.78);
+        self.timecode = slice_v(t, 0.82, 1.00);
     }
 
     /// The instrument slots, the two faders and the click.
@@ -705,16 +709,17 @@ impl Layout {
         // are a third taller than they were.
         self.metronome_row = slice_v(m, 0.465, 0.700);
         self.input_row = slice_v(m, 0.730, 0.965);
-        let [hear, in_take] = CLICK_SWITCHES;
-        if rolling {
+        // **The click switch is the metronome icon itself**, in both layouts.
+        // It survives a take for the same reason the faders do: turning the
+        // click off halfway through is exactly the thing somebody does with
+        // their eyes on their hands, and a control that moves when the take
+        // starts is one they have to go and find.
+        self.click = fader_zones(self.metronome_row).0;
+        if !rolling {
             // `In take` decides what goes in the FILE, so it leaves with the
-            // rest of the destination and the switch that decides what you HEAR
-            // takes both slots. It is the one control in this band somebody
-            // reaches for mid-take with their eyes on their hands.
-            self.click = slice_h(self.metronome_row, hear.0, in_take.1);
-        } else {
-            self.click = slice_h(self.metronome_row, hear.0, hear.1);
-            self.click_in_take = slice_h(self.metronome_row, in_take.0, in_take.1);
+            // rest of the destination when the take starts.
+            let [from, to] = CLICK_SWITCHES;
+            self.click_in_take = slice_h(self.metronome_row, from, to);
         }
     }
 
@@ -785,8 +790,11 @@ impl Layout {
         if !t.is_positive() {
             return;
         }
-        self.meter = slice_v(t, 0.72, 1.00);
-        let top = slice_v(t, 0.0, 0.66);
+        // More of the column than the bar needed: a pair of dials read from a
+        // piano bench is a question of how big the FACES are, and the faces are
+        // sized by the height they are given.
+        self.meter = slice_v(t, 0.62, 1.00);
+        let top = slice_v(t, 0.0, 0.56);
 
         // The dot stands roughly where the record button stood, so the band
         // does not reshuffle under the eye at the moment the take starts.
@@ -1052,7 +1060,9 @@ impl Hit {
             Hit::ClearSlot(i) => CLEAR[n(i)],
             Hit::CycleCountIn => "Count-in",
             Hit::Export => "Export",
-            Hit::ToggleMetronome => "Click",
+            // The icon IS the switch, so this label is the only text anywhere
+            // that says the metronome can be clicked.
+            Hit::ToggleMetronome => "Click on/off",
             Hit::ToggleMetronomeInTake => "Record the click into takes",
             Hit::SetSlotGain(i, _) => GAIN[n(i)],
             Hit::SetMetronomeGain(_) => "Click level",
@@ -1451,27 +1461,37 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
         let typing = typing_for(view, NumField::Slot(i));
         draw_slot(painter, &l.slots[i], i, slot, l.rolling, typing, p);
     }
-    for (row, icon, gain, field) in [
+    // **The metronome IS the click switch**, and its two states are the icon
+    // at full strength and the icon faded into the panel. There is no tick
+    // beside it any more: a picture of a metronome with a checkbox next to it
+    // was two controls for one question, and the icon was already the most
+    // clickable-looking thing in the row.
+    let click_ink = if view.metronome_on {
+        p.faint
+    } else {
+        toward(p.faint, p.bg, 0.68)
+    };
+    for (row, icon, ink, gain, field) in [
         (
             l.metronome_row,
             FaderIcon::Metronome,
+            click_ink,
             view.gains.metronome,
             NumField::Metronome,
         ),
         (
             l.input_row,
             FaderIcon::Microphone,
+            p.faint,
             view.gains.input,
             NumField::Input,
         ),
     ] {
-        draw_fader(painter, row, icon, gain, typing_for(view, field), p);
+        draw_fader(painter, row, icon, ink, gain, typing_for(view, field), p);
     }
-    // Two questions that sound like one and are not: whether you HEAR the
-    // click, and whether it ends up in the file. The second is off by default
-    // because a click bleeding into a take is a ruined take. Both sit in the
-    // metronome's own row — see `CLICK_SWITCHES`.
-    draw_tick(painter, l.click, "Click", view.metronome_on, p);
+    // Whether the click ends up in the FILE, which is a different question from
+    // whether you hear it and lives on a tick of its own. Off by default,
+    // because a click bleeding into a take is a ruined take.
     draw_tick(painter, l.click_in_take, "In take", view.metronome_in_take, p);
 }
 
@@ -1662,6 +1682,7 @@ fn draw_fader(
     painter: &Painter,
     row: Rect,
     icon: FaderIcon,
+    ink: Color32,
     gain: f32,
     typing: Option<&str>,
     p: &Palette,
@@ -1670,7 +1691,7 @@ fn draw_fader(
         return;
     }
     let (icon_r, track, val_r) = fader_zones(row);
-    draw_fader_icon(painter, icon_r, icon, p);
+    draw_fader_icon(painter, icon_r, icon, ink, p);
     draw_gain_value(painter, val_r, gain, typing, p);
     draw_track(painter, track, gain, p);
 }
@@ -1689,7 +1710,7 @@ fn draw_fader(
 /// icons are the same size as each other whatever the row's aspect — a
 /// metronome larger than the microphone beside it would read as the louder of
 /// the two controls.
-fn draw_fader_icon(painter: &Painter, r: Rect, icon: FaderIcon, p: &Palette) {
+fn draw_fader_icon(painter: &Painter, r: Rect, icon: FaderIcon, ink: Color32, p: &Palette) {
     if !r.is_positive() {
         return;
     }
@@ -1701,9 +1722,20 @@ fn draw_fader_icon(painter: &Painter, r: Rect, icon: FaderIcon, p: &Palette) {
     }
     let b = Rect::from_center_size(Pos2::new(r.left() + s * 0.5, r.center().y), Vec2::splat(s));
     match icon {
-        FaderIcon::Metronome => draw_metronome(painter, b, p),
-        FaderIcon::Microphone => draw_microphone(painter, b, p),
+        FaderIcon::Metronome => draw_metronome(painter, b, ink, p),
+        FaderIcon::Microphone => draw_microphone(painter, b, ink),
     }
+}
+
+/// A colour faded `t` of the way into the background it sits on.
+///
+/// Toward the BACKGROUND rather than scaled toward black, which is what
+/// [`shade`] does. Scaling would darken a faded icon on a cream band as well as
+/// on a walnut one, and on the cream band darker is more prominent — the "off"
+/// state would shout.
+fn toward(c: Color32, bg: Color32, t: f32) -> Color32 {
+    let f = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    Color32::from_rgb(f(c.r(), bg.r()), f(c.g(), bg.g()), f(c.b(), bg.b()))
 }
 
 /// A metronome: the tapered case, with the pendulum and its weight cut out of
@@ -1712,7 +1744,7 @@ fn draw_fader_icon(painter: &Painter, r: Rect, icon: FaderIcon, p: &Palette) {
 /// Cut out rather than stroked on top, because at 16 points a rod drawn in a
 /// second ink over a filled body is two shades of mud, while a gap in a solid
 /// shape stays a gap however small it gets.
-fn draw_metronome(painter: &Painter, b: Rect, p: &Palette) {
+fn draw_metronome(painter: &Painter, b: Rect, ink: Color32, p: &Palette) {
     let s = b.width();
     let (cx, top, bottom) = (b.center().x, b.top() + s * 0.06, b.bottom() - s * 0.06);
     painter.add(egui::Shape::convex_polygon(
@@ -1722,7 +1754,7 @@ fn draw_metronome(painter: &Painter, b: Rect, p: &Palette) {
             Pos2::new(cx + s * 0.38, bottom),
             Pos2::new(cx - s * 0.38, bottom),
         ],
-        p.faint,
+        ink,
         Stroke::NONE,
     ));
     // The rod leans, because a metronome at rest is the one picture of a
@@ -1743,7 +1775,7 @@ fn draw_metronome(painter: &Painter, b: Rect, p: &Palette) {
 /// The cradle is what makes it a microphone rather than a pill — a capsule on
 /// its own reads as a battery — so it is an arc of eleven points rather than
 /// the three-segment bracket that would have been cheaper.
-fn draw_microphone(painter: &Painter, b: Rect, p: &Palette) {
+fn draw_microphone(painter: &Painter, b: Rect, ink: Color32) {
     let s = b.width();
     let cx = b.center().x;
     let top = b.top() + s * 0.04;
@@ -1751,8 +1783,8 @@ fn draw_microphone(painter: &Painter, b: Rect, p: &Palette) {
         Pos2::new(cx - s * 0.17, top),
         Pos2::new(cx + s * 0.17, top + s * 0.50),
     );
-    painter.rect_filled(capsule, s * 0.17, p.faint);
-    let stroke = Stroke::new((s * 0.09).max(1.0), p.faint);
+    painter.rect_filled(capsule, s * 0.17, ink);
+    let stroke = Stroke::new((s * 0.09).max(1.0), ink);
     let (pivot_y, radius) = (top + s * 0.36, s * 0.30);
     let arc: Vec<Pos2> = (0_u8..=10)
         .map(|i| {
@@ -1900,60 +1932,141 @@ fn draw_caption_caret(
 /// quarter of the width rather than a second, similar-looking one: same trough,
 /// same unity mark, same handle, same mapping from gain to position. A control
 /// the user has already learned twenty points lower down the column.
+/// How deep the channel is cut, for a row `h` tall. Shared by the channel and
+/// by the cap, which has to be taller than the slot it rides in or it looks
+/// like a marker printed on the panel rather than a thing sitting in it.
+fn slot_height(h: f32) -> f32 {
+    (h * 0.40).clamp(2.0, 14.0)
+}
+
+/// Where the cap sits on `track` at `gain`.
+///
+/// Its own function because the test that proves a cap never hangs off the end
+/// of its own channel has to ask the same question the painter answers. A test
+/// that recomputed the geometry would be a test of its own copy of it, and the
+/// copy is exactly what drifts.
+fn cap_rect(track: Rect, gain: f32) -> Rect {
+    let h = track.height();
+    // Wholly inside the channel at both ends rather than hanging half off it,
+    // so the ends of the travel look like ends.
+    let cw = (h * 0.30).clamp(4.0, 12.0).min(track.width());
+    let x = track.left() + track.width() * gain_to_fader(gain);
+    let lo = track.left() + cw * 0.5;
+    let hi = (track.right() - cw * 0.5).max(lo);
+    let slot_h = slot_height(h);
+    Rect::from_center_size(
+        Pos2::new(x.clamp(lo, hi), track.center().y),
+        Vec2::new(cw, (h * 0.78).max(slot_h + 2.0)),
+    )
+}
+
+/// The bone the fader caps are moulded in, and the shadow under one.
+///
+/// **Fixed rather than taken from the palette**, and it is the one thing in
+/// this band that does not follow the background colour. A cap is a physical
+/// object sitting in a slot cut into the panel: it reads as bone on walnut and
+/// as bone on ivory, because it is always outlined and it always sits in a dark
+/// channel. A cap that restyled itself for a light background would be a
+/// painted-on rectangle, which is exactly the "strip of colour" the owner
+/// rejected in the first place.
+const CAP_BONE: Color32 = Color32::from_rgb(0xDC, 0xD2, 0xB6);
+
+/// One fader, drawn like the one on a Tascam 388: a channel cut into the panel,
+/// a scale of ticks either side of it, and a ribbed bone cap riding in it.
+///
+/// **The cap's position is the reading.** There is no coloured fill behind it
+/// any more — the old track lit up from the left in the accent colour, which
+/// made a fader look like a progress bar and made two faders at different
+/// levels look like two different KINDS of control. A real fader says how loud
+/// it is by where its cap is, and the dB figure beside it says the rest.
+///
+/// The scale earns its ink: with a bare slot, "a bit left of centre" is the
+/// most anybody can read off a fader from two metres away, and eleven marks
+/// turn that into a position you can return to.
 fn draw_track(painter: &Painter, track: Rect, gain: f32, p: &Palette) {
     if !track.is_positive() {
         return;
     }
-    painter.rect_filled(track, 2.0, p.well);
+    let h = track.height();
+    // The channel, cut into the panel and darker than any well in the band —
+    // it is a hole, and the cap in it is the only bright thing in the row.
+    let slot_h = slot_height(h);
+    let slot = Rect::from_center_size(track.center(), Vec2::new(track.width(), slot_h));
+    painter.rect_filled(slot, 1.0, shade(p.well, 0.55));
+    painter.rect_stroke(
+        slot,
+        1.0,
+        Stroke::new(1.0_f32, shade(p.line, 0.7)),
+        StrokeKind::Inside,
+    );
+
+    // Eleven marks, above and below, and nothing at all when they would merge
+    // into a grey smear — which is what they do on a knob 60 points wide.
+    let arm = (h - slot_h) * 0.5;
+    if track.width() >= 90.0 && arm >= 4.0 {
+        // The scale is PRINTED on the panel, so it is drawn in the panel's own
+        // secondary ink faded back — not in `line`, which is the colour of the
+        // edges of boxes and lands within a shade of the leather it sits on.
+        let stroke = Stroke::new(1.0_f32, toward(p.faint, p.bg, 0.30));
+        for i in 0_u8..=10 {
+            let x = track.left() + track.width() * f32::from(i) / 10.0;
+            // The ends of the scale sit a hair inside, so the first and last
+            // marks are marks rather than the box's own edge.
+            let x = x.clamp(track.left() + 0.5, track.right() - 0.5);
+            let len = if i % 5 == 0 { arm * 0.85 } else { arm * 0.5 };
+            painter.line_segment(
+                [
+                    Pos2::new(x, slot.top() - len),
+                    Pos2::new(x, slot.top() - arm * 0.15),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(x, slot.bottom() + arm * 0.15),
+                    Pos2::new(x, slot.bottom() + len),
+                ],
+                stroke,
+            );
+        }
+    }
+
     // The 0 dB mark, because unity is the one position everybody looks for and
-    // it is nowhere near the middle of a decibel scale.
+    // it is nowhere near the middle of a decibel scale. Inside the channel, so
+    // it reads as a mark on the scale rather than as a twelfth tick.
     let unity = track.left() + track.width() * gain_to_fader(1.0);
     painter.line_segment(
         [
-            Pos2::new(unity, track.top()),
-            Pos2::new(unity, track.bottom()),
+            Pos2::new(unity, slot.top() + 1.0),
+            Pos2::new(unity, slot.bottom() - 1.0),
         ],
-        Stroke::new(1.0_f32, p.line),
+        Stroke::new(1.0_f32, p.faint),
     );
 
-    let t = gain_to_fader(gain);
-    let x = track.left() + track.width() * t;
-    if t > 0.0 {
-        painter.rect_filled(
-            Rect::from_min_max(track.min, Pos2::new(x, track.bottom())),
-            2.0,
-            p.accent,
+    let cap = cap_rect(track, gain);
+    let cw = cap.width();
+    painter.rect_filled(cap, 1.0, CAP_BONE);
+    // Ribs across the travel, the way they are moulded into the real cap so a
+    // thumb can feel where it is. One when there is only room for one: two
+    // hairlines three points apart is a smudge, not a grip.
+    let ribs: &[f32] = if cw >= 9.0 { &[0.32, 0.68] } else { &[0.5] };
+    let rib = Stroke::new(1.0_f32, shade(CAP_BONE, 0.62));
+    for f in ribs {
+        let rx = cap.left() + cw * f;
+        painter.line_segment(
+            [
+                Pos2::new(rx, cap.top() + cap.height() * 0.16),
+                Pos2::new(rx, cap.bottom() - cap.height() * 0.16),
+            ],
+            rib,
         );
     }
-    // The handle stays wholly inside the track at both ends rather than
-    // hanging half off it, so the ends of the travel look like ends.
-    let hw = (track.height() * 0.34).clamp(2.0, 7.0).min(track.width());
-    let lo = track.left() + hw * 0.5;
-    let hi = (track.right() - hw * 0.5).max(lo);
-    painter.rect_filled(
-        Rect::from_center_size(
-            Pos2::new(x.clamp(lo, hi), track.center().y),
-            Vec2::new(hw, track.height()),
-        ),
+    painter.rect_stroke(
+        cap,
         1.0,
-        p.ink,
+        Stroke::new(1.0_f32, shade(CAP_BONE, 0.42)),
+        StrokeKind::Inside,
     );
-    painter.rect_stroke(track, 2.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
-}
-
-/// Where a linear level sits along the meter, 0..=1.
-///
-/// Linear amplitude on a linear bar is why naive meters look broken: a
-/// perfectly healthy take at -20 dBFS fills a tenth of the bar and the user
-/// turns the gain up until it clips. A 60 dB scale puts half the bar at -30 dB
-/// and gives the last tenth to the last 6 dB, which is where clipping lives.
-fn meter_x(level: f32) -> f32 {
-    const FLOOR_DB: f32 = -60.0;
-    if level <= 0.0 {
-        return 0.0;
-    }
-    let db = 20.0 * level.log10();
-    ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0)
 }
 
 /// Where the red zone starts. The last 6 dB, drawn always rather than only once
@@ -1961,64 +2074,224 @@ fn meter_x(level: f32) -> f32 {
 /// first take instead of after it.
 const CLIP_ZONE: f32 = 0.501; // -6 dBFS
 
+/// The VU face, and the ink printed on it.
+///
+/// Fixed, like [`CAP_BONE`] and for the same reason: a meter is an instrument
+/// let into the panel, not a region of it. It is a lit cream card with black
+/// printing behind glass whatever colour the panel around it is, which is what
+/// makes it read as a thing rather than as a drawing.
+const VU_FACE: Color32 = Color32::from_rgb(0xE3, 0xD9, 0xBD);
+const VU_PRINT: Color32 = Color32::from_rgb(0x24, 0x20, 0x1A);
+
+/// Where each printed mark sits along the arc, left to right.
+///
+/// **Not linear in decibels**, because a VU face is not: the bottom half of the
+/// scale is squeezed into the first fifth of the sweep and the marks open out
+/// towards 0. Copying the real spacing is most of what makes a drawn VU read as
+/// a VU rather than as a dial with numbers on it.
+///
+/// `0` is aligned to -6 dBFS, which is where this band's red zone has always
+/// started — so the red arc on the face means exactly what the red end of the
+/// old bar meant, and a take metered to the old picture meters the same on this
+/// one. See [`CLIP_ZONE`].
+const VU_MARKS: [(f32, f32, bool); 9] = [
+    (-20.0, 0.00, true),
+    (-10.0, 0.22, true),
+    (-7.0, 0.33, false),
+    (-5.0, 0.42, true),
+    (-3.0, 0.53, false),
+    (-1.0, 0.65, false),
+    (0.0, 0.72, true),
+    (1.0, 0.80, false),
+    (3.0, 1.00, true),
+];
+
+/// dBFS at 0 VU. The red zone's edge, unchanged from the bar meter.
+const VU_ZERO_DBFS: f32 = -6.0;
+
+/// Where a level sits along the arc, 0 at the left stop and 1 at +3.
+///
+/// Interpolated between the printed marks rather than computed, so the needle
+/// and the scale it is read against cannot disagree — which is the one failure
+/// that would make a beautiful meter lie.
+fn vu_frac(level: f32) -> f32 {
+    if level <= 0.0 {
+        return 0.0;
+    }
+    let vu = 20.0 * level.log10() - VU_ZERO_DBFS;
+    if vu <= VU_MARKS[0].0 {
+        return 0.0;
+    }
+    for w in VU_MARKS.windows(2) {
+        let ((a_vu, a_f, _), (b_vu, b_f, _)) = (w[0], w[1]);
+        if vu <= b_vu {
+            return a_f + (b_f - a_f) * (vu - a_vu) / (b_vu - a_vu);
+        }
+    }
+    1.0
+}
+
+/// Half the needle's sweep, in radians — a shade over 90 degrees end to end,
+/// which is what a real VU movement swings.
+///
+/// It is not a free choice: with the pivot near the bottom edge the radius can
+/// be no more than the face is tall, so the sweep is the only thing left that
+/// decides how much of the window the arc spans. At 35 degrees the arc covered
+/// half the card and the meter read as a small dial adrift on a large blank.
+const VU_SWEEP: f32 = 0.80;
+
+/// The level meter: one analogue VU per channel, modelled on the one in a
+/// Focusrite ISA One.
+///
+/// **A needle rather than a bar**, and the difference is not decoration. A bar
+/// is read by its edge, which means reading a number off a scale you have to
+/// look at; a needle is read by its ANGLE, which is a shape, and a shape is
+/// something you can take in from a piano bench two metres away while your
+/// hands are busy. It is also the picture every person who has stood in front
+/// of a tape machine already knows how to read.
+///
+/// It is driven by RMS, which is what a VU is: an average-responding meter with
+/// slow ballistics. Peak lives in the lamp beside the face, because peak is a
+/// yes-or-no question — did anything get too close — and a needle answering two
+/// questions at once answers neither.
+///
+/// The meter is live before arming, which is the entire point of it: "I
+/// recorded silence" is a failure class that dies at the sight of a moving
+/// needle. Nothing here is gated on the state.
 fn draw_meter(painter: &Painter, r: Rect, m: Meters, p: &Palette) {
     if !r.is_positive() {
         return;
     }
-    // The meter is live before arming, which is the entire point of it: "I
-    // recorded silence" is a failure class that dies at the sight of a moving
-    // bar. Nothing here is gated on the state.
     let one = [m.left];
     let two = [m.left, m.right];
-    let bars: &[Level] = if m.mono { &one } else { &two };
-    let gap = (r.height() * 0.12).min(3.0);
-    let bh = (r.height() - gap * (bars.len() as f32 - 1.0)) / bars.len() as f32;
-    if bh <= 0.0 {
+    let faces: &[Level] = if m.mono { &one } else { &two };
+    let n = faces.len() as f32;
+    let gap = (r.height() * 0.10).min(8.0);
+    // **The face has an aspect, and the box it is given does not.** A VU window
+    // is about half again as wide as it is tall; stretched to fill a long thin
+    // cell it becomes a card with a small arc adrift in the middle of it, which
+    // is the one way to make a drawn meter look like a drawing. So the face
+    // takes the height it is given and only as much width as that height
+    // deserves.
+    //
+    // And the PAIR is centred, not each face in a share of the row. A share
+    // apiece is what put two 65-point meters at either end of a 600-point strip
+    // while a take was rolling, which reads as two instruments on opposite
+    // walls rather than as the left and right of one signal.
+    let fw = ((r.width() - gap * (n - 1.0)) / n).min(r.height() * 1.35);
+    if fw <= 0.0 {
         return;
     }
-    for (i, lv) in bars.iter().enumerate() {
-        let top = r.top() + i as f32 * (bh + gap);
-        let bar = Rect::from_min_max(Pos2::new(r.left(), top), Pos2::new(r.right(), top + bh));
-        painter.rect_filled(bar, 1.0, p.well);
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(bar.left() + bar.width() * meter_x(CLIP_ZONE), bar.top()),
-                bar.max,
-            ),
-            1.0,
-            p.rec.gamma_multiply(0.22),
+    let mut left = r.center().x - (fw * n + gap * (n - 1.0)) * 0.5;
+    for lv in faces {
+        let face = Rect::from_min_max(
+            Pos2::new(left, r.top()),
+            Pos2::new(left + fw, r.bottom()),
         );
-        // Rms as the fill and peak as a brighter tip: they answer different
-        // questions, and a meter that shows only one of them is how people
-        // record either silence or distortion.
-        let x = |v: f32| bar.left() + bar.width() * meter_x(v);
-        painter.rect_filled(
-            Rect::from_min_max(bar.min, Pos2::new(x(lv.rms), bar.bottom())),
-            1.0,
-            p.accent,
-        );
-        let (pk, rms) = (x(lv.peak), x(lv.rms));
-        if pk > rms {
-            painter.rect_filled(
-                Rect::from_min_max(Pos2::new(rms, bar.top()), Pos2::new(pk, bar.bottom())),
-                1.0,
-                p.accent.gamma_multiply(0.45),
+        draw_vu(painter, face, *lv, m.clipped, p);
+        left += fw + gap;
+    }
+}
+
+/// One VU face.
+fn draw_vu(painter: &Painter, face: Rect, lv: Level, clipped: bool, p: &Palette) {
+    let (fw, fh) = (face.width(), face.height());
+    if fw < 12.0 || fh < 10.0 {
+        return;
+    }
+    painter.rect_filled(face, 2.0, VU_FACE);
+
+    // The pivot sits just inside the bottom edge so its hub is visible, the way
+    // it is on a real movement. The radius is whichever of the two dimensions
+    // runs out first, so a wide short face and a tall narrow one both get a
+    // needle that stays on the card.
+    let pivot = Pos2::new(face.center().x, face.bottom() - fh * 0.13);
+    let radius = (fh * 0.74).min((fw * 0.5 - 2.0) / VU_SWEEP.sin()).max(1.0);
+    let at = |f: f32, rr: f32| {
+        let a = (f - 0.5) * 2.0 * VU_SWEEP;
+        Pos2::new(pivot.x + rr * a.sin(), pivot.y - rr * a.cos())
+    };
+
+    // The arc, with its last stretch in red. Two polylines rather than one, so
+    // the red is the SCALE going red and not a band drawn over it.
+    let arc = |from: f32, to: f32, colour: Color32, w: f32| {
+        let pts: Vec<Pos2> = (0_u8..=16)
+            .map(|k| at(from + (to - from) * f32::from(k) / 16.0, radius))
+            .collect();
+        painter.add(egui::Shape::line(pts, Stroke::new(w, colour)));
+    };
+    let hair = (fh * 0.022).max(1.0);
+    let red_from = VU_MARKS[6].1;
+    arc(0.0, red_from, VU_PRINT, hair);
+    arc(red_from, 1.0, p.rec, hair * 1.6);
+
+    // The printed marks. The majors are longer and, when there is room for
+    // them, carry their numbers.
+    let label = fh >= 46.0 && fw >= 90.0;
+    for (vu, f, major) in VU_MARKS {
+        let inner = radius * if major { 0.84 } else { 0.90 };
+        let colour = if f >= red_from { p.rec } else { VU_PRINT };
+        painter.line_segment([at(f, inner), at(f, radius)], Stroke::new(hair, colour));
+        if label && major {
+            let text = if vu > 0.0 {
+                format!("+{vu:.0}")
+            } else {
+                format!("{vu:.0}")
+            };
+            painter.text(
+                at(f, radius * 0.70),
+                Align2::CENTER_CENTER,
+                &text,
+                font(fh * 0.15),
+                colour,
             );
         }
-        if lv.hold > 0.0 {
-            let h = x(lv.hold);
-            painter.line_segment(
-                [Pos2::new(h, bar.top()), Pos2::new(h, bar.bottom())],
-                Stroke::new(2.0_f32, p.ink),
-            );
-        }
-        painter.rect_stroke(
-            bar,
-            1.0,
-            Stroke::new(1.0_f32, if m.clipped { p.rec } else { p.line }),
-            StrokeKind::Inside,
+    }
+    if label {
+        painter.text(
+            Pos2::new(pivot.x, pivot.y - radius * 0.30),
+            Align2::CENTER_CENTER,
+            "VU",
+            font_light(fh * 0.16),
+            VU_PRINT,
         );
     }
+
+    // The needle. RMS, and clamped to the stops rather than allowed off the
+    // card: a needle that leaves the face is a rendering fault, and the lamp is
+    // what says the signal went past the end.
+    let n = at(vu_frac(lv.rms).clamp(0.0, 1.0), radius * 0.97);
+    painter.line_segment([pivot, n], Stroke::new((fh * 0.035).max(1.0), VU_PRINT));
+    painter.circle_filled(pivot, (fh * 0.075).max(1.5), VU_PRINT);
+
+    // The peak lamp: a yes-or-no answer to a yes-or-no question. Lit while the
+    // held peak is in the last six decibels, and LATCHED red once anything has
+    // actually clipped, because the person it is for was looking at their hands
+    // when it happened.
+    let d = (fh * 0.12).clamp(3.0, 8.0);
+    let hot = clipped || lv.hold >= CLIP_ZONE;
+    // Bottom right, where the card is empty. Top right is where the arc's own
+    // last inch is, and a lamp there sits ON the red the lamp is about.
+    let at_lamp = Pos2::new(face.right() - d * 1.5, face.bottom() - d * 1.5);
+    painter.circle_filled(
+        at_lamp,
+        d * 0.5,
+        if hot {
+            p.rec
+        } else {
+            toward(p.rec, VU_FACE, 0.86)
+        },
+    );
+    // A ring, so an unlit lamp reads as a lamp that is not lit rather than as a
+    // mark on the card.
+    painter.circle_stroke(at_lamp, d * 0.5, Stroke::new(1.0_f32, shade(VU_FACE, 0.45)));
+
+    painter.rect_stroke(
+        face,
+        2.0,
+        Stroke::new(1.0_f32, if clipped { p.rec } else { shade(VU_FACE, 0.35) }),
+        StrokeKind::Inside,
+    );
 }
 
 /// What the big readout says.
@@ -3266,12 +3539,15 @@ mod tests {
             }
             assert_eq!(at_rest.metronome_row, live.metronome_row, "click moved");
             assert_eq!(at_rest.input_row, live.input_row, "input moved");
-            // The switch keeps its left edge and its height. It is the one row
-            // that changes shape, because the tick beside it — which decides
-            // what goes in the FILE — leaves with the destination.
-            assert_eq!(at_rest.click.min, live.click.min, "the click switch moved");
-            assert_eq!(at_rest.click.height(), live.click.height());
-            assert!(live.click.width() > at_rest.click.width());
+            // The click switch is the metronome icon, and it is the SAME
+            // rectangle in both layouts — not merely present in both. It is
+            // reached mid-take with the performer's eyes on their hands, so it
+            // may not move, and it no longer grows into the space `In take`
+            // leaves behind: a control that changes size at the moment a take
+            // starts is one you have to look at to be sure you hit.
+            assert_eq!(at_rest.click, live.click, "the click switch moved");
+            // And it is inside the metronome's own row, at the head of it.
+            assert_eq!(at_rest.click, fader_zones(at_rest.metronome_row).0);
             // And the divider that marks the group off does not move either.
             assert_eq!(at_rest.rules[1], live.rules[1]);
         }
@@ -3644,27 +3920,72 @@ mod tests {
         assert!(live.click.is_positive());
     }
 
-    /// Linear amplitude on a linear bar is why naive meters look broken. Half
-    /// the bar has to be a long way below full scale or every user turns the
-    /// gain up until they clip.
+    /// **The needle and the scale it is read against cannot disagree.**
+    ///
+    /// A drawn meter has one failure worse than being ugly: pointing somewhere
+    /// the printing says is a different number. Both come out of `VU_MARKS`, so
+    /// this test checks the one thing that could still drift — that a level
+    /// lands at the fraction its own printed mark is drawn at.
     #[test]
-    fn the_meter_scale_puts_a_usable_signal_in_the_middle() {
-        assert_eq!(meter_x(0.0), 0.0);
-        assert_eq!(meter_x(-1.0), 0.0, "a negative sample is not a level");
-        assert!((meter_x(1.0) - 1.0).abs() < 1e-6);
-        assert!(meter_x(2.0) <= 1.0, "over full scale still fits the bar");
-        // -30 dBFS lands near the middle, not near the floor.
-        let mid = meter_x(0.0316);
-        assert!((0.45..0.55).contains(&mid), "-30 dB drew at {mid}");
-        // Monotonic, or a rising signal could draw a shrinking bar.
-        let mut last = -1.0;
-        for i in 0..=100 {
-            let x = meter_x(i as f32 / 100.0);
-            assert!(x >= last, "the meter went backwards at {i}");
-            last = x;
+    fn the_vu_needle_points_at_the_mark_the_face_prints() {
+        for (vu, frac, _) in VU_MARKS {
+            let level = 10_f32.powf((vu + VU_ZERO_DBFS) / 20.0);
+            let got = vu_frac(level);
+            assert!(
+                (got - frac).abs() < 1e-3,
+                "{vu} VU draws at {frac} and reads at {got}"
+            );
         }
-        assert!(meter_x(CLIP_ZONE) > 0.85, "the red zone is not at the top");
+        // 0 VU is the top of the black arc and the start of the red, and it is
+        // the same level the band has always drawn its red zone from.
+        assert!((vu_frac(CLIP_ZONE) - VU_MARKS[6].1).abs() < 0.02);
+        // Monotonic, and pinned at both stops: a needle that goes backwards or
+        // walks off the card is worse than no meter.
+        let mut last = -1.0;
+        for i in 0..=200 {
+            let f = vu_frac(i as f32 / 100.0);
+            assert!(f >= last, "the needle went backwards at {i}");
+            assert!((0.0..=1.0).contains(&f), "{f} is off the face");
+            last = f;
+        }
+        assert_eq!(vu_frac(0.0), 0.0, "silence is not the left stop");
+        assert_eq!(vu_frac(4.0), 1.0, "a huge level is not the right stop");
     }
+
+    /// The cap rides IN the channel and stops at both ends of it, because the
+    /// ends of a fader's travel have to look like ends — and because a cap half
+    /// off the panel is the picture of a broken machine.
+    #[test]
+    fn a_fader_cap_stays_on_its_own_track_at_both_stops() {
+        for r in [band(500.0), band(1300.0), band(2600.0)] {
+            let l = Layout::new(r, &furnished());
+            let mut tracks: Vec<Rect> = vec![fader_zones(l.metronome_row).1, fader_zones(l.input_row).1];
+            tracks.extend(l.slots.iter().map(|s| s.knob));
+            for track in tracks {
+                if !track.is_positive() {
+                    continue;
+                }
+                // Silence, unity and the top of the scale — the two stops and
+                // the one position everybody actually looks for.
+                for gain in [0.0_f32, 1.0, 100.0] {
+                    let cap = cap_rect(track, gain);
+                    assert!(
+                        cap.left() >= track.left() - 0.01 && cap.right() <= track.right() + 0.01,
+                        "the cap hangs off the track at {gain} in {:?}",
+                        r.size()
+                    );
+                    assert!(
+                        cap.height() > slot_height(track.height()),
+                        "the cap is not taller than the channel it rides in"
+                    );
+                }
+                // And it MOVES: a cap pinned at one end for every level would
+                // pass every assertion above.
+                assert!(cap_rect(track, 1.0).center().x > cap_rect(track, 0.0).center().x);
+            }
+        }
+    }
+
 
     /// A fader with no number beside it is a strip of colour, which is what the
     /// owner was complaining about. The number has to actually FIT, and the

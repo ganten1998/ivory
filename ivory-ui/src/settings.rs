@@ -19,6 +19,21 @@ pub struct Rgb {
     pub b: u8,
 }
 
+/// Recorder backgrounds this app has shipped as its DEFAULT, in the order it
+/// shipped them, and which are therefore not evidence that anybody chose them.
+///
+/// Settings are written whole: every key the app knows goes into the file on
+/// every save, so a user who has ever changed anything at all has the day's
+/// default for every key they never touched. Without this list a default colour
+/// is a one-shot — changeable only for people who have never run the app —
+/// which is how two successive corrections to this band's brown reached nobody
+/// who already had it installed.
+///
+/// The cost is real and small: somebody who deliberately picked one of these
+/// exact values loses it once and picks it again. The alternative is a setting
+/// the app can never correct.
+const SUPERSEDED_RECORDER_BG: [&str; 2] = ["#4a3b2c", "#33271b"];
+
 impl Rgb {
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
@@ -416,16 +431,15 @@ impl Default for Settings {
             keytoggle_enabled: false,
             custom_font_path: None,
             font_choice: crate::fonts::FontChoice::default().key().to_owned(),
-            // A mid walnut. Dark enough that the ivory ink reads on it, warm
-            // enough to be a brown rather than a grey, and desaturated enough
-            // not to fight the accent colour the meters use.
-            // Darker than the first walnut, and warmer: the trim on a Tascam
-            // 388 rather than a furniture stain. Dark enough that the ivory ink
-            // is chosen against it with room to spare.
+            // The leather trim on a Tascam 388, sampled from a photograph of
+            // one: the median of the hide rather than its mean, because the
+            // photograph is lit and the mean carries the lamp. The ivory ink is
+            // chosen against it at better than 6:1, so the band is comfortable
+            // and not merely legible. See `SUPERSEDED_RECORDER_BG`.
             recorder_bg_color: Rgb {
-                r: 0x33,
-                g: 0x27,
-                b: 0x1B,
+                r: 0x62,
+                g: 0x3A,
+                b: 0x38,
             },
             chord_text_color: Rgb {
                 r: 0xE8,
@@ -716,7 +730,18 @@ impl Settings {
         }
         if let Some(v) = map.remove("recorder_bg_color") {
             if let Some(c) = v.as_str().and_then(Rgb::parse) {
-                s.recorder_bg_color = c;
+                // A stored value that is EXACTLY a colour this app used to ship
+                // as its default is not a choice, it is a fossil: the file is
+                // written whole on every save, so the first save any user ever
+                // makes pins the default of the day for ever and no later
+                // default can reach them. Anybody still sitting on one moves to
+                // the current default; anybody who picked their own keeps it.
+                // See `SUPERSEDED_RECORDER_BG`.
+                s.recorder_bg_color = if SUPERSEDED_RECORDER_BG.contains(&c.to_hex().as_str()) {
+                    Settings::default().recorder_bg_color
+                } else {
+                    c
+                };
             }
         }
         if let Some(v) = map.remove("chord_text_color") {
@@ -1570,6 +1595,42 @@ mod tests {
     /// A first launch shows the whole app; a corrupt file does not get
     /// rearranged behind the user's back. Both matter, and they are one line
     /// apart in `load()`.
+    /// **A default that has never reached anybody is not a default.**
+    ///
+    /// The file is written whole, so the first save any user makes pins the
+    /// day's default for every key they never touched — and two successive
+    /// corrections to this band's brown reached nobody who had already run the
+    /// app. A stored value that is EXACTLY a colour this app once shipped as
+    /// its default is treated as that fossil and moves on; anything else is a
+    /// choice and is left alone.
+    #[test]
+    fn a_recorder_background_left_at_an_old_default_moves_to_the_new_one() {
+        let now = Settings::default().recorder_bg_color;
+        for fossil in SUPERSEDED_RECORDER_BG {
+            let json = format!("{{\"recorder_bg_color\": \"{fossil}\"}}");
+            assert_eq!(
+                Settings::from_json(&json).recorder_bg_color,
+                now,
+                "{fossil} is a superseded default and should have moved"
+            );
+        }
+        // A colour nobody ever shipped is somebody's own, and survives.
+        let mine = "#1b3a62";
+        assert!(
+            !SUPERSEDED_RECORDER_BG.contains(&mine),
+            "pick a colour this app has never defaulted to"
+        );
+        let json = format!("{{\"recorder_bg_color\": \"{mine}\"}}");
+        assert_eq!(
+            Settings::from_json(&json).recorder_bg_color.to_hex(),
+            mine,
+            "a chosen colour was overwritten by the migration"
+        );
+        // And the current default is not in the list, or it would migrate to
+        // itself for ever and the next change would silently do nothing.
+        assert!(!SUPERSEDED_RECORDER_BG.contains(&now.to_hex().as_str()));
+    }
+
     /// A custom tuning survives a save/load round trip and is usable.
     #[test]
     fn a_custom_tuning_round_trips_through_the_settings_file() {
