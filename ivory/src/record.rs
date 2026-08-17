@@ -626,7 +626,11 @@ struct Audio {
 }
 
 impl Audio {
-    fn open(selection: &InputSelection, timebase: Timebase) -> Result<Self, String> {
+    fn open(
+        selection: &InputSelection,
+        timebase: Timebase,
+        tap_home: mpsc::Sender<Box<crate::instrument::RecorderTap>>,
+    ) -> Result<Self, String> {
         let wish = audio::ConfigWish::default();
         // Three seconds of ring. The writer thread wakes every 4 ms, so this is
         // absurd headroom — and that is the point: the one thing that must
@@ -739,6 +743,11 @@ impl Audio {
                 if writer.wav.is_some() {
                     let _ = writer.stop();
                 }
+                // Hand the instrument tap back on the way out, so it can be
+                // given to whichever writer runs next. See `Session::tap_tx`.
+                if let Some(t) = writer.plugin.take() {
+                    let _ = tap_home.send(Box::new(t));
+                }
             })
             .map_err(|e| format!("could not start the recording thread: {e}"))?;
 
@@ -764,20 +773,30 @@ impl Audio {
     }
 
     fn levels(&self) -> UiMeters {
-        let Ok(m) = self.meters.lock() else {
-            return UiMeters::SILENT;
-        };
-        let at = |c: usize| Level {
-            peak: m.peak.get(c).copied().unwrap_or(0.0),
-            rms: m.rms.get(c).copied().unwrap_or(0.0),
-            hold: m.hold.get(c).copied().unwrap_or(0.0),
-        };
-        UiMeters {
-            left: at(0),
-            right: at(if m.channels > 1 { 1 } else { 0 }),
-            mono: m.channels <= 1,
-            clipped: m.any_clipped(),
-        }
+        levels_of(&self.meters)
+    }
+}
+
+/// One meter reading, shared by both writers.
+///
+/// A function rather than a method on each, so the band cannot end up showing
+/// the instrument's level in a different SHAPE from the input's — mono/stereo,
+/// hold, and the clip latch are all decisions, and two copies of them would
+/// drift.
+fn levels_of(meters: &Arc<Mutex<AudioMeters>>) -> UiMeters {
+    let Ok(m) = meters.lock() else {
+        return UiMeters::SILENT;
+    };
+    let at = |c: usize| Level {
+        peak: m.peak.get(c).copied().unwrap_or(0.0),
+        rms: m.rms.get(c).copied().unwrap_or(0.0),
+        hold: m.hold.get(c).copied().unwrap_or(0.0),
+    };
+    UiMeters {
+        left: at(0),
+        right: at(if m.channels > 1 { 1 } else { 0 }),
+        mono: m.channels <= 1,
+        clipped: m.any_clipped(),
     }
 }
 
@@ -894,6 +913,23 @@ pub struct Session {
     /// Latched across the take, because the meter's own latch is reset when the
     /// next one is armed and the user may not have looked yet.
     clipped: bool,
+    /// Where a writer thread puts the instrument tap when it shuts down.
+    ///
+    /// **The tap is a single object that has to move between two writers.** It
+    /// is the read end of a lock-free ring, so exactly one thread may hold it,
+    /// and which thread that is depends on whether an input device is open —
+    /// switching the input to "None" mid-session has to carry it from one
+    /// writer to the other. Without this the tap simply died with the thread
+    /// that owned it, and the instrument became unrecordable until the plugin
+    /// was reloaded.
+    tap_tx: mpsc::Sender<Box<crate::instrument::RecorderTap>>,
+    tap_rx: mpsc::Receiver<Box<crate::instrument::RecorderTap>>,
+    /// The instrument's own writer, for takes with no input device.
+    ///
+    /// Mutually exclusive with `audio` in practice: when an input is open it
+    /// drives the take and mixes the instrument in, and when there is none this
+    /// records the instrument alone off the output device's clock.
+    plugin_audio: Option<PluginAudio>,
     /// The take's audio on its way to the video encoder. See
     /// [`StartArgs::audio_tx`] for why it goes THIS way across the threads.
     audio_for_video: Option<mpsc::Receiver<AudioChunk>>,
@@ -909,6 +945,7 @@ impl Session {
     ///
     /// [`open_input`]: Session::open_input
     pub fn new(tap: Arc<RawMidiTap>, timebase: Timebase) -> Self {
+        let (tap_tx, tap_rx) = mpsc::channel();
         Self {
             timebase,
             tap,
@@ -919,6 +956,9 @@ impl Session {
             midi_clock: SourceClock::new(MIDIR_SCALE_NS, MIDI_SETTLE_NS),
             midi: MidiTake::new(),
             state: RecordState::Idle,
+            tap_tx,
+            tap_rx,
+            plugin_audio: None,
             audio_for_video: None,
             video_audio_spec: None,
             t0: 0,
@@ -970,10 +1010,18 @@ impl Session {
         self.audio_error.as_deref()
     }
 
+    /// What the band's meter shows.
+    ///
+    /// The input's level when there is one, and otherwise the INSTRUMENT's —
+    /// because with no input open the instrument is what is being recorded, and
+    /// a dead meter over a take that is capturing audio is the single most
+    /// alarming thing this band can display.
     pub fn meters(&self) -> UiMeters {
-        self.audio
-            .as_ref()
-            .map_or(UiMeters::SILENT, |a| a.levels())
+        match (&self.audio, &self.plugin_audio) {
+            (Some(a), _) => a.levels(),
+            (None, Some(p)) => levels_of(&p.meters),
+            (None, None) => UiMeters::SILENT,
+        }
     }
 
     /// Seconds since the take started writing.
@@ -1007,13 +1055,47 @@ impl Session {
             return; // never swap the device out from under a running take
         }
         self.audio = None; // close the old one FIRST; some drivers refuse two
-        match Audio::open(selection, self.timebase) {
+        // And stop the instrument's own writer, which was only running because
+        // there was no input. Both drops join their threads, and each hands the
+        // instrument tap back on the way out — so after this line the tap is in
+        // the channel rather than lost with the thread.
+        self.plugin_audio = None;
+        let tap = self.recover_tap();
+        match Audio::open(selection, self.timebase, self.tap_tx.clone()) {
             Ok(a) => {
+                if let Some(t) = tap {
+                    let _ = a.cmds.send(Cmd::Plugin(Some(Box::new(t))));
+                }
                 self.audio = Some(a);
                 self.audio_error = None;
             }
-            Err(e) => self.audio_error = Some(e),
+            Err(e) => {
+                // The device would not open, so the instrument goes back to
+                // recording itself rather than being silently dropped along
+                // with the microphone nobody got.
+                if let Some(t) = tap {
+                    self.plugin_audio =
+                        Some(PluginAudio::start(t, self.timebase, self.tap_tx.clone()));
+                }
+                self.audio_error = Some(e);
+            }
         }
+    }
+
+    /// Collect the instrument tap from whichever writer has just released it.
+    ///
+    /// Only meaningful immediately after dropping one: `Drop` joins the thread,
+    /// and the thread sends the tap as its last act, so by the time the drop
+    /// returns the channel is holding it.
+    fn recover_tap(&mut self) -> Option<crate::instrument::RecorderTap> {
+        let mut last = None;
+        // Drained rather than read once: a session that has opened and closed
+        // several devices can have more than one in flight, and the NEWEST is
+        // the one that matches the engine that is running now.
+        while let Ok(t) = self.tap_rx.try_recv() {
+            last = Some(*t);
+        }
+        last
     }
 
     /// Hand the monitor engine's recorder tap to the writer thread.
@@ -1022,8 +1104,34 @@ impl Session {
     /// belongs to exactly one thread. `None` removes it.
     pub fn set_plugin_tap(&mut self, tap: Option<crate::instrument::RecorderTap>) {
         if let Some(audio) = &self.audio {
+            // An input is open, so IT drives the take and mixes the instrument
+            // in. Its writer owns the tap.
+            self.plugin_audio = None;
             let _ = audio.cmds.send(Cmd::Plugin(tap.map(Box::new)));
+            return;
         }
+        // No input. The instrument records itself, on the output device's own
+        // clock — see `PluginAudio`.
+        match tap {
+            Some(t) => match self.plugin_audio.as_ref() {
+                // Already running: hand the new tap over rather than tearing
+                // down a thread that is mid-take.
+                Some(p) => {
+                    let _ = p.cmds.send(Cmd::Plugin(Some(Box::new(t))));
+                }
+                None => {
+                    self.plugin_audio =
+                        Some(PluginAudio::start(t, self.timebase, self.tap_tx.clone()))
+                }
+            },
+            None => self.plugin_audio = None,
+        }
+    }
+
+    /// Whether a take can be recorded at all — with an input, or with an
+    /// instrument on its own.
+    pub fn can_record_audio(&self) -> bool {
+        self.audio.is_some() || self.plugin_audio.is_some()
     }
 
     /// Which sources the next take is made of. Ignored mid-take: a take that
@@ -1047,6 +1155,14 @@ impl Session {
         if !self.state.is_active() {
             self.audio = None;
             self.audio_error = None;
+            // The input's writer has just handed the instrument tap back. Give
+            // it a writer of its own, so choosing "None" as the input leaves a
+            // loaded instrument recordable rather than mute — which is the
+            // whole point of the None row saying what it now says.
+            if let Some(t) = self.recover_tap() {
+                self.plugin_audio =
+                    Some(PluginAudio::start(t, self.timebase, self.tap_tx.clone()));
+            }
         }
     }
 
@@ -1313,9 +1429,15 @@ impl Session {
         // is the only source with a device clock to measure. Somebody who
         // turned the input off and loaded a piano would otherwise get a take
         // with a .mid and no audio, and nothing saying why.
-        if self.spec.audio && self.audio.is_none() && self.source.uses_plugin() {
+        // A take that can write no audio at all, and why. This used to fire
+        // whenever there was no input device, because the input was the only
+        // thing that could drive a writer — so somebody with a piano loaded and
+        // "None" chosen was told to go and pick a microphone in order to record
+        // an instrument the microphone would not be recording. Now the only
+        // case left is the real one: nothing to record from at all.
+        if self.spec.audio && !self.can_record_audio() {
             self.pending_note = Some(
-                "no audio input is open, so there is no clock to record the                  instrument against — the take is MIDI only. Choose an input                  in the Recorder band to record its sound."
+                "no audio input is open and no instrument is loaded, so the                  take is MIDI only. Choose an input, or load an instrument, in                  the Recorder band."
                     .to_owned(),
             );
         }
@@ -1339,6 +1461,25 @@ impl Session {
                 audio_tx,
             };
             let _ = audio.cmds.send(Cmd::Start(Box::new(args)));
+        } else if let (Some(p), true) = (&self.plugin_audio, self.spec.audio) {
+            // No input device: the instrument records itself. Same file, same
+            // folder, same manifest — only the clock is different.
+            let spec = p.spec();
+            let (audio_tx, audio_rx) = if self.spec.video.wants_video() {
+                let (tx, rx) = mpsc::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            self.audio_for_video = audio_rx;
+            self.video_audio_spec = Some((spec.sample_rate, spec.channels));
+            let args = StartArgs {
+                path: take.wav(),
+                spec,
+                bext: Bext::new(at, spec),
+                audio_tx,
+            };
+            let _ = p.cmds.send(Cmd::Start(Box::new(args)));
         }
         self.take = Some(take);
         self.state = RecordState::Rolling;
@@ -1390,6 +1531,21 @@ impl Session {
 
         // ── audio ───────────────────────────────────────────────────────────
         let mut report: Option<AudioReport> = None;
+        // Whichever writer is running this take. `audio` wins when both exist,
+        // which matches `begin`: an open input drives the take.
+        if let Some(p) = self.plugin_audio.as_ref().filter(|_| self.audio.is_none()) {
+            while p.reports.try_recv().is_ok() {}
+            let _ = p.cmds.send(Cmd::Stop);
+            match p.reports.recv_timeout(Duration::from_secs(2)) {
+                Ok(r) => report = Some(r),
+                Err(_) => {
+                    problem = Some(
+                        "the instrument's recording thread did not finish in                          time; the audio file may be incomplete"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
         if let Some(audio) = &self.audio {
             // Drain anything the channel is still holding BEFORE asking for a
             // new report. A previous Stop that timed out at two seconds leaves
@@ -1805,6 +1961,159 @@ mod tests {
     /// bytes, and the only question that matters — "does the file contain
     /// exactly the frames the device produced?" — is invisible until you count
     /// them.
+    /// A `PluginWriter` over a ring the test owns the other end of.
+    fn plugin_writer(channels: usize, slots: usize) -> (PluginWriter, rtrb::Producer<f32>, impl Fn(u64)) {
+        let (tap, tx, note) = crate::instrument::RecorderTap::for_test(slots, channels);
+        let w = PluginWriter {
+            tap: Some(tap),
+            timebase: Timebase::new(),
+            tracker: LevelTracker::new(channels, 48_000.0),
+            meters: Arc::new(Mutex::new(AudioMeters::new(channels))),
+            wav: None,
+            buf: Vec::new(),
+            frames: 0,
+            fit: RateFit::new(),
+            first_frame_ns: None,
+            dropped_at_arm: 0,
+            error: None,
+            audio_tx: None,
+            channels: channels as u16,
+            sample_rate: 48_000,
+        };
+        (w, tx, note)
+    }
+
+    /// **A take with no input device records the instrument.**
+    ///
+    /// The whole point of `PluginAudio`: before it, this take produced a `.mid`
+    /// and nothing else, and the band told the user to go and choose a
+    /// microphone in order to record an instrument the microphone would not
+    /// have been recording.
+    #[test]
+    fn an_instrument_records_itself_with_no_input_device() {
+        let dir = std::env::temp_dir().join("tangent-plugin-only");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("t.wav");
+
+        const CH: usize = 2;
+        const FRAMES: usize = 4096;
+        let (mut w, mut tx, _note) = plugin_writer(CH, FRAMES * CH * 2);
+        let spec = WavSpec {
+            sample_rate: 48_000,
+            channels: CH as u16,
+            format: TAKE_FORMAT,
+        };
+        w.begin(StartArgs {
+            path: path.clone(),
+            spec,
+            bext: Bext::new(WallTime::from_unix(1_786_804_327, 0), spec),
+            audio_tx: None,
+        });
+
+        for i in 0..FRAMES {
+            let v = (i as f32 / FRAMES as f32) * 0.5;
+            for _ in 0..CH {
+                let _ = tx.push(v);
+            }
+            // Pump periodically, as the thread does, so the ring never fills.
+            if i % 512 == 511 {
+                w.pump();
+            }
+        }
+        let report = w.finish();
+
+        assert_eq!(
+            report.frames, FRAMES as u64,
+            "every rendered frame should have reached the file"
+        );
+        assert_eq!(report.channels, CH as u16);
+        assert_eq!(
+            report.frames_dropped, 0,
+            "nothing was lost, so nothing may be reported as lost"
+        );
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert!(
+            report.first_frame_ns.is_some(),
+            "a take that wrote audio knows when its first frame was"
+        );
+        assert!(report.take_peak > 0.0, "the file is silent");
+        // And the file is real.
+        let size = std::fs::metadata(&path).expect("stat").len();
+        // 24-bit stereo: 3 bytes a sample, plus a header.
+        assert!(
+            size >= (FRAMES * CH * 3) as u64,
+            "a {size}-byte file cannot hold {FRAMES} frames"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Rendered audio has no dropouts, so nothing is ever padded.**
+    ///
+    /// The input path pads a gap with silence because the device produced
+    /// frames nobody read. Nothing produces frames here except the engine, and
+    /// the engine's frames all arrive — so a loss can only be a ring overflow,
+    /// which is a fault to report rather than a hole to fill.
+    #[test]
+    fn an_overflowing_ring_is_reported_and_not_padded_over() {
+        let dir = std::env::temp_dir().join("tangent-plugin-overflow");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        const CH: usize = 2;
+        // Deliberately tiny, and never pumped, so it fills.
+        let (mut w, mut tx, note) = plugin_writer(CH, 256);
+        let spec = WavSpec {
+            sample_rate: 48_000,
+            channels: CH as u16,
+            format: TAKE_FORMAT,
+        };
+        w.begin(StartArgs {
+            path: dir.join("t.wav"),
+            spec,
+            bext: Bext::new(WallTime::from_unix(1_786_804_327, 0), spec),
+            audio_tx: None,
+        });
+        for _ in 0..4096 {
+            if tx.push(0.25).is_err() {
+                note(1);
+            }
+        }
+        let report = w.finish();
+        assert!(
+            report.frames_dropped > 0,
+            "the ring overflowed and the take said nothing about it"
+        );
+        // What DID arrive is still in the file — an overflow loses the frames
+        // it refused, not the ones it took.
+        assert!(report.frames > 0, "the file should hold what did fit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ring is drained even when no take is running, for the reason the
+    /// input path had to learn: a ring nobody reads fills up, and then every
+    /// frame it refuses is counted against the next take that IS recording.
+    #[test]
+    fn the_instrument_ring_is_drained_between_takes() {
+        const CH: usize = 2;
+        let (mut w, mut tx, note) = plugin_writer(CH, 1024);
+        for _ in 0..40 {
+            for _ in 0..512 {
+                if tx.push(0.5).is_err() {
+                    note(1);
+                }
+            }
+            // No wav: this is the idle path.
+            w.pump();
+        }
+        let overflowed = w.tap.as_ref().expect("tap").dropped();
+        assert_eq!(
+            overflowed, 0,
+            "the ring overflowed {overflowed} times while idle — it is not \
+             being drained, so the next take inherits the loss"
+        );
+    }
+
     fn writer_with_ring(channels: usize) -> (audio::CaptureSource, Writer) {
         let stats = Arc::new(audio::CaptureStats::new());
         let (source, sink) = audio::capture_channel(channels, 48_000, 512, Arc::clone(&stats));
@@ -2046,6 +2355,76 @@ mod tests {
     /// The state machine has to be right without a device, because that is the
     /// configuration every test machine and every first launch is in.
     #[test]
+    /// **The instrument tap survives the writer that was holding it.**
+    ///
+    /// It is the read end of a lock-free ring, so exactly one thread may own
+    /// it, and which thread that is depends on whether an input device is open.
+    /// Switching the input to "None" tears down one writer and starts another,
+    /// and without the hand-back the tap died with the thread — leaving the
+    /// instrument unrecordable until the plugin was reloaded, which is a bug
+    /// nobody would ever connect to the device they had just changed.
+    #[test]
+    fn the_instrument_tap_survives_its_writer_being_torn_down() {
+        let (tap, _tx, _note) = crate::instrument::RecorderTap::for_test(1024, 2);
+        let (tap_tx, tap_rx) = mpsc::channel();
+        let writer = PluginAudio::start(tap, Timebase::new(), tap_tx);
+        assert_eq!(writer.channels, 2);
+        // Dropping joins the thread, and the thread's last act is to send the
+        // tap back — so by the time this returns it is in the channel.
+        drop(writer);
+        assert!(
+            tap_rx.try_recv().is_ok(),
+            "the tap was lost with the thread that held it"
+        );
+    }
+
+    /// A session with no input device gives the instrument a writer of its own,
+    /// and a take then records audio rather than only MIDI.
+    #[test]
+    fn a_session_with_no_input_still_records_a_loaded_instrument() {
+        let dir = std::env::temp_dir().join("tangent-session-plugin-only");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = session();
+        assert!(!s.can_record_audio(), "nothing is loaded yet");
+
+        let (tap, mut tx, _note) = crate::instrument::RecorderTap::for_test(1 << 16, 2);
+        s.set_plugin_tap(Some(tap));
+        assert!(
+            s.can_record_audio(),
+            "an instrument with no input device should still be recordable"
+        );
+
+        s.toggle(&dir, Some("plugin"), 0, ExportSpec::default());
+        assert_eq!(s.state(), RecordState::Rolling);
+        // Wait for the writer thread to have PROCESSED Start before pushing.
+        // `begin` arms the tap, and arming discards the ring — so audio pushed
+        // in the window between the button press and the thread noticing is
+        // thrown away, which is correct (it is audio from before T0) and which
+        // made the first version of this test record nothing at all.
+        std::thread::sleep(Duration::from_millis(40));
+        for _ in 0..4096 {
+            let _ = tx.push(0.25);
+            let _ = tx.push(0.25);
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        s.stop();
+
+        let summary = s.last_summary().expect("a take produces a summary");
+        assert!(summary.problem.is_none(), "{:?}", summary.problem);
+        assert!(
+            summary.wrote_audio,
+            "the instrument was loaded and its audio should be in the take"
+        );
+        // And the old advice is gone: nothing should be telling the user to go
+        // and choose a microphone.
+        let msg = summary.message();
+        assert!(
+            !msg.contains("MIDI only"),
+            "the take still claims to be MIDI only: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn a_session_with_no_device_still_starts_and_stops_a_take() {
         let dir = std::env::temp_dir().join("tangent-session-test-basic");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2347,6 +2726,284 @@ mod source_tests {
     fn the_setting_round_trips() {
         for s in ["input", "plugin", "both"] {
             assert_eq!(TakeSource::resolve(s, true, true).to_setting(), s);
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// A take with no input device
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The instrument recorded on its OWN clock, with no audio input open.
+///
+/// **Why this exists.** The writer above is driven by an input device's marks,
+/// so a take needed one even when the only thing being recorded was a hosted
+/// instrument — the microphone was there purely to supply a clock. That is
+/// backwards: somebody who has loaded a piano and chosen "None" as their input
+/// wants the piano in the file, and being told "record MIDI only" is being told
+/// the app cannot do the obvious thing.
+///
+/// **Why it is simpler than the input path, rather than a copy of it.** Captured
+/// audio can be LOST — the device produces frames whether or not anyone is
+/// reading, so a dropout is real and has to become padded silence at exactly
+/// the right place, which is what [`FrameCursor`] and [`WritePlan`] are for.
+/// Rendered audio cannot be lost that way. The engine's callback produces every
+/// frame of it, in order, and the only way to lose one is to let the ring
+/// overflow — which is a fault to report, not a hole to pad. So there is no
+/// cursor here, no plan, and no padding: drain the ring, write what it gave.
+///
+/// The clock is the output device's, measured the same way the input's is: a
+/// [`RateFit`] over (frames written, timebase instant) pairs. It is a real
+/// measurement of a real crystal, not the nominal rate.
+struct PluginAudio {
+    channels: u16,
+    sample_rate: u32,
+    cmds: mpsc::Sender<Cmd>,
+    reports: mpsc::Receiver<AudioReport>,
+    meters: Arc<Mutex<AudioMeters>>,
+    running: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PluginAudio {
+    /// Take ownership of the tap and start a writer thread around it.
+    fn start(
+        tap: crate::instrument::RecorderTap,
+        timebase: Timebase,
+        tap_home: mpsc::Sender<Box<crate::instrument::RecorderTap>>,
+    ) -> Self {
+        let channels = tap.channels().max(1);
+        let sample_rate = tap.sample_rate().max(1);
+        let meters = Arc::new(Mutex::new(AudioMeters::new(channels)));
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (report_tx, report_rx) = mpsc::channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let alive = Arc::clone(&running);
+        let meters_for_thread = Arc::clone(&meters);
+
+        let thread = std::thread::Builder::new()
+            .name("tangent-instrument-writer".into())
+            .spawn(move || {
+                let mut w = PluginWriter {
+                    tap: Some(tap),
+                    timebase,
+                    tracker: LevelTracker::new(channels, f64::from(sample_rate)),
+                    meters: meters_for_thread,
+                    wav: None,
+                    buf: Vec::with_capacity(channels * 4096),
+                    frames: 0,
+                    fit: RateFit::new(),
+                    first_frame_ns: None,
+                    dropped_at_arm: 0,
+                    error: None,
+                    audio_tx: None,
+                    channels: channels as u16,
+                    sample_rate,
+                };
+                while alive.load(Ordering::Relaxed) {
+                    match cmd_rx.try_recv() {
+                        Ok(Cmd::Start(args)) => w.begin(*args),
+                        Ok(Cmd::Stop) => {
+                            let report = w.finish();
+                            w.audio_tx = None;
+                            let _ = report_tx.send(report);
+                        }
+                        // The tap can be replaced — a plugin swap does not
+                        // rebuild the engine, but losing the engine does.
+                        Ok(Cmd::Plugin(t)) => w.tap = t.map(|t| *t),
+                        // Meaningless here: with no input there is only one
+                        // thing this can be recording.
+                        Ok(Cmd::Source(_)) => {}
+                        Ok(Cmd::Quit) | Err(mpsc::TryRecvError::Disconnected) => break,
+                        Err(mpsc::TryRecvError::Empty) => {}
+                    }
+                    w.pump();
+                    std::thread::sleep(POLL);
+                }
+                // A take still open when the app quits is finished rather than
+                // abandoned, exactly as the input writer does it.
+                if w.wav.is_some() {
+                    let _ = w.finish();
+                }
+                // Same hand-back as the input writer's: the tap outlives the
+                // thread that was holding it.
+                if let Some(t) = w.tap.take() {
+                    let _ = tap_home.send(Box::new(t));
+                }
+            })
+            .ok();
+
+        Self {
+            channels: channels as u16,
+            sample_rate,
+            cmds: cmd_tx,
+            reports: report_rx,
+            meters,
+            running,
+            thread,
+        }
+    }
+
+    fn spec(&self) -> WavSpec {
+        WavSpec {
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            format: TAKE_FORMAT,
+        }
+    }
+}
+
+impl Drop for PluginAudio {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        let _ = self.cmds.send(Cmd::Quit);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The writer thread's state, for a take with no input device.
+struct PluginWriter {
+    tap: Option<crate::instrument::RecorderTap>,
+    timebase: Timebase,
+    tracker: LevelTracker,
+    meters: Arc<Mutex<AudioMeters>>,
+    wav: Option<WavWriter>,
+    buf: Vec<f32>,
+    frames: u64,
+    fit: RateFit,
+    first_frame_ns: Option<Nanos>,
+    dropped_at_arm: u64,
+    error: Option<String>,
+    audio_tx: Option<mpsc::Sender<AudioChunk>>,
+    channels: u16,
+    sample_rate: u32,
+}
+
+impl PluginWriter {
+    fn begin(&mut self, args: StartArgs) {
+        // Arm FIRST. The ring has been filling since the engine started —
+        // right through the five-second plugin warm-up — so it holds audio from
+        // before anybody played anything. Arming discards that AND resets the
+        // loss counter, so the take begins with the note being played now.
+        if let Some(tap) = self.tap.as_mut() {
+            tap.arm();
+        }
+        self.dropped_at_arm = self.tap.as_ref().map_or(0, |t| t.dropped());
+        self.tracker.arm();
+        self.frames = 0;
+        self.fit = RateFit::new();
+        self.first_frame_ns = None;
+        self.error = None;
+        self.audio_tx = args.audio_tx;
+        match WavWriter::create(&args.path, args.spec, &args.bext) {
+            Ok(w) => self.wav = Some(w),
+            Err(e) => self.error = Some(format!("could not create the audio file: {e}")),
+        }
+    }
+
+    /// Drain the ring; write what came out if a take is running.
+    ///
+    /// **Drained either way**, which is the same rule the input path learned
+    /// the hard way: a ring nobody reads fills up, and every frame it then
+    /// refuses is counted as a loss forever after.
+    fn pump(&mut self) {
+        let Some(tap) = self.tap.as_mut() else {
+            return;
+        };
+        self.buf.clear();
+        tap.drain(&mut self.buf);
+        if !self.buf.is_empty() {
+            self.tracker.absorb(&self.buf);
+            if self.wav.is_some() {
+                // The instant the FIRST frame of the file happened. Read here
+                // rather than at Start, because Start is when the button was
+                // pressed and this is when audio actually began.
+                if self.first_frame_ns.is_none() {
+                    self.first_frame_ns = Some(self.timebase.now());
+                }
+                let frames = (self.buf.len() / usize::from(self.channels).max(1)) as u64;
+                let first_frame = self.frames;
+                // Taken out and put back so `write_samples` can borrow `self`
+                // mutably while the samples are read.
+                let block = std::mem::take(&mut self.buf);
+                self.write_samples(&block, first_frame);
+                self.buf = block;
+                self.frames += frames;
+                // One point per poll, which is 250 a second — the same order
+                // the input's fit gets, and enough to measure a crystal.
+                self.fit.push(self.frames, self.timebase.now());
+            }
+        }
+        if let Ok(mut m) = self.meters.lock() {
+            self.tracker.publish(&mut m);
+        }
+    }
+
+    fn write_samples(&mut self, samples: &[f32], first_frame: u64) {
+        let Some(wav) = self.wav.as_mut() else {
+            return;
+        };
+        if let Err(e) = wav.write_interleaved(samples) {
+            if self.error.is_none() {
+                self.error = Some(format!("could not write the audio file: {e}"));
+            }
+        }
+        // Same funnel, same guarantee as the input path: what the file gets,
+        // the video gets, at the index the file wrote it at.
+        if let Some(tx) = self.audio_tx.as_ref() {
+            let _ = tx.send(AudioChunk {
+                first_frame,
+                samples: samples.to_vec(),
+            });
+        }
+    }
+
+    fn finish(&mut self) -> AudioReport {
+        // One last pass, so the frames the engine rendered between the user
+        // pressing Stop and this thread noticing are in the file.
+        self.pump();
+        if let Some(w) = self.wav.take() {
+            if let Err(e) = w.finish() {
+                if self.error.is_none() {
+                    self.error = Some(format!("could not finish the audio file: {e}"));
+                }
+            }
+        }
+        let (clipped_samples, take_peak) = match self.meters.lock() {
+            Ok(m) => (m.clipped_samples, m.loudest_take_peak()),
+            Err(_) => (0, 0.0),
+        };
+        AudioReport {
+            frames: self.frames,
+            fit: std::mem::replace(&mut self.fit, RateFit::new()),
+            // There is no such thing here: every frame carries its position by
+            // construction, because this thread counts them as it writes them.
+            unstamped: 0,
+            // ONLY ring overflow. Rendered audio has no dropouts — the engine
+            // produces every frame of it — so a non-zero number here means the
+            // ring filled, which is a fault worth reporting and not a hole that
+            // padding could have hidden.
+            frames_dropped: self
+                .tap
+                .as_ref()
+                .map_or(0, |t| t.dropped().saturating_sub(self.dropped_at_arm)),
+            clipped_samples,
+            take_peak,
+            channels: self.channels,
+            first_frame_ns: self.first_frame_ns,
+            running: self.tap.is_some(),
+            source: take::SourceReport {
+                name: "instrument".to_owned(),
+                anchor_ns: self.first_frame_ns,
+                fitted_rate: self.fit.true_rate(),
+                latency_ns: 0,
+                latency_source: take::LatencySource::AssumedZero,
+                observations: self.fit.observations(),
+                jitter_ns: None,
+            },
+            error: self.error.take(),
         }
     }
 }

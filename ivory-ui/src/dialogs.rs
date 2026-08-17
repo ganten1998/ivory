@@ -1084,11 +1084,18 @@ impl DeviceKind {
 
     /// What the None row says. Not just "None": what choosing it DOES is the
     /// part worth spelling out, because a recorder with no camera is a normal
-    /// thing to want and a recorder with no audio input is usually a mistake.
+    /// thing to want and a recorder with no audio input used to be a mistake.
+    ///
+    /// It no longer is, and this row used to say so — "record MIDI only" was
+    /// true when the input device was the only thing that could drive a writer,
+    /// so a loaded instrument went unrecorded and the user was told to go and
+    /// choose a microphone in order to record something the microphone was not
+    /// going to record. A take with no input now records the instrument on the
+    /// output device's own clock.
     fn none_row(self) -> &'static str {
         match self {
             DeviceKind::Camera => "None  —  record without video",
-            DeviceKind::AudioInput => "None  —  record MIDI only",
+            DeviceKind::AudioInput => "None  —  record the instrument, not an input",
         }
     }
 
