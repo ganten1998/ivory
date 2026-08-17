@@ -205,6 +205,16 @@ pub struct Settings {
     /// chosen for this session and the picker will open there next time without
     /// the choice being permanent.
     pub record_dir_is_default: bool,
+    /// Whether the "a chosen camera means video" default has already been
+    /// applied to this settings file.
+    ///
+    /// A one-off migration, and it needs a marker rather than being re-derived
+    /// each launch: without one, somebody who keeps their camera and turns
+    /// video off would have it switched back on every time they started the
+    /// app. Video only became possible in 3.2.0, so nobody can have chosen to
+    /// disable it before this key existed — which is exactly why the migration
+    /// is safe to run once and unsafe to run twice.
+    pub video_default_applied: bool,
     /// Show the take's folder in the file manager as soon as it is finished.
     ///
     /// Off by default. Somebody recording take after take does not want a
@@ -410,6 +420,7 @@ impl Default for Settings {
             recorder_win_y: None,
             record_dir: None,
             record_dir_is_default: false,
+            video_default_applied: false,
             record_open_when_done: false,
             record_take_name: None,
             record_camera_uid: None,
@@ -474,18 +485,49 @@ impl Settings {
         // window because their settings failed to parse would be worse.
         let path = Self::path();
         if !path.exists() {
-            return Self::first_launch();
+            // A first launch has no camera chosen, so there is nothing for the
+            // migration to do — but marking it done stops it looking at an
+            // empty file on the second launch.
+            let mut s = Self::first_launch();
+            s.video_default_applied = true;
+            return s;
         }
-        Self::load_from(&path)
+        let mut s = Self::load_from(&path);
+        s.apply_video_default();
+        s
+    }
+
+    /// A camera that was chosen before video existed still means video.
+    ///
+    /// Choosing a camera is the one act in this app with no other purpose —
+    /// opening one makes a light come on, and nobody does it to look at a
+    /// preview. Everybody who picked one before 3.2.0 did so for a video the
+    /// app could not yet produce, so this turns it on for them once.
+    fn apply_video_default(&mut self) {
+        if self.video_default_applied {
+            return;
+        }
+        self.video_default_applied = true;
+        if self.record_camera_uid.is_some() && self.record_export.video == crate::recorder::VideoMode::None {
+            self.record_export.video = crate::recorder::VideoMode::Composite;
+        }
     }
 
     /// What a brand-new install opens with: everything on.
+    ///
+    /// The Recorder is in here too, and it carries one consequence worth
+    /// knowing: the band opens an audio input so the meter is live, which means
+    /// macOS raises its microphone prompt on first launch rather than at the
+    /// moment somebody asks to record. That is the price of the recorder being
+    /// visible rather than hidden behind a menu nobody opens, and it is the
+    /// trade the owner chose.
     pub fn first_launch() -> Self {
         Self {
             show_fretboard: true,
             theory_circle: true,
             theory_tonnetz: true,
             theory_triangles: true,
+            show_recorder: true,
             ..Self::default()
         }
     }
@@ -719,6 +761,11 @@ impl Settings {
             &mut map,
             "record_open_when_done",
             &mut s.record_open_when_done,
+        );
+        take_bool(
+            &mut map,
+            "video_default_applied",
+            &mut s.video_default_applied,
         );
         take_opt_str(&mut map, "record_take_name", &mut s.record_take_name);
         take_opt_str(&mut map, "record_camera_uid", &mut s.record_camera_uid);
@@ -962,6 +1009,10 @@ impl Settings {
         map.insert(
             "record_open_when_done".into(),
             Value::Bool(self.record_open_when_done),
+        );
+        map.insert(
+            "video_default_applied".into(),
+            Value::Bool(self.video_default_applied),
         );
         map.insert(
             "record_sources".into(),
@@ -1394,13 +1445,20 @@ mod tests {
             first.theory_views().count() == 3,
             "the theory band is invisible on a fresh install"
         );
+        assert!(
+            first.show_recorder,
+            "the recorder is invisible on a fresh install"
+        );
         // Nothing else moves: a first launch is the DEFAULTS plus visibility,
-        // not a second set of preferences to keep in step.
+        // not a second set of preferences to keep in step. Every flag listed
+        // here is one somebody can see; anything else appearing in this list
+        // would mean a first launch had grown a PREFERENCE of its own.
         let same = Settings {
             show_fretboard: false,
             theory_circle: false,
             theory_tonnetz: false,
             theory_triangles: false,
+            show_recorder: false,
             ..first.clone()
         };
         assert_eq!(same, Settings::default());

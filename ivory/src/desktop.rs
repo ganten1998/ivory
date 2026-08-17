@@ -209,6 +209,8 @@ pub struct DesktopApp {
     app: IvoryApp,
     #[cfg(feature = "recorder")]
     recorder: Recorder,
+    /// The launch splash, until it has been earned and faded. `None` after.
+    splash: Option<Splash>,
 }
 
 #[cfg(feature = "recorder")]
@@ -1020,6 +1022,10 @@ impl DesktopApp {
             app,
             #[cfg(feature = "recorder")]
             recorder,
+            splash: Some(Splash {
+                since: std::time::Instant::now(),
+                done_at: None,
+            }),
         }
     }
 }
@@ -1037,6 +1043,7 @@ impl eframe::App for DesktopApp {
         self.app.frame(ctx);
         #[cfg(feature = "recorder")]
         self.after_frame(ctx, frame);
+        self.paint_splash(ctx);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -1286,4 +1293,101 @@ impl DesktopApp {
             }
         }
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// The launch splash
+// ───────────────────────────────────────────────────────────────────────────
+
+/// How long the splash stays up at minimum.
+///
+/// Long enough that a fast launch does not FLASH — a splash that appears and
+/// vanishes inside two frames is a glitch, not a loading screen — and short
+/// enough that it is never the thing keeping anybody waiting.
+const SPLASH_MIN: std::time::Duration = std::time::Duration::from_millis(600);
+/// And the longest it may EVER stay up.
+///
+/// The cap is the important half. Everything the splash waits on is a device,
+/// and a device that never answers is exactly the case where the user must not
+/// be left staring at a wordmark with no way through. After this it lifts
+/// whether or not anything is ready, and the band underneath says what is still
+/// going on — which it was going to do anyway.
+const SPLASH_MAX: std::time::Duration = std::time::Duration::from_secs(12);
+/// The fade out, once it has been earned.
+const SPLASH_FADE: std::time::Duration = std::time::Duration::from_millis(280);
+
+struct Splash {
+    since: std::time::Instant,
+    /// When everything it was waiting for finished, so the fade can run from
+    /// there rather than from the moment the window opened.
+    done_at: Option<std::time::Instant>,
+}
+
+impl DesktopApp {
+    /// Paint the splash, and decide when it goes.
+    ///
+    /// Drawn on the FOREGROUND layer after the app's own frame, so it covers
+    /// everything including any dialog that opened underneath it — a Welcome
+    /// card half-visible through a loading screen is the sort of detail that
+    /// makes an app feel unfinished.
+    fn paint_splash(&mut self, ctx: &egui::Context) {
+        let Some(splash) = self.splash.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(splash.since);
+
+        // What is still being waited on, and what to say about it.
+        #[cfg(feature = "recorder")]
+        let (instrument, camera) = (
+            self.recorder
+                .plugin_opening
+                .and_then(|slot| self.app.chosen_plugin(slot))
+                .map(short_plugin_name),
+            self.recorder.camera_opening,
+        );
+        #[cfg(not(feature = "recorder"))]
+        let (instrument, camera): (Option<String>, bool) = (None, false);
+
+        let busy = instrument.is_some() || camera;
+        // "Ready" is a minimum time AND nothing outstanding — or the cap.
+        if !busy && elapsed >= SPLASH_MIN && splash.done_at.is_none() {
+            splash.done_at = Some(now);
+        }
+        if elapsed >= SPLASH_MAX && splash.done_at.is_none() {
+            splash.done_at = Some(now);
+        }
+
+        let fade = match splash.done_at {
+            None => 1.0,
+            Some(at) => {
+                let gone = now.duration_since(at).as_secs_f32();
+                1.0 - (gone / SPLASH_FADE.as_secs_f32()).clamp(0.0, 1.0)
+            }
+        };
+        if fade <= 0.0 {
+            self.splash = None;
+            return;
+        }
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("tangent-splash"),
+        ));
+        let rect = ctx.screen_rect();
+        let status = ivory_ui::splash::status(instrument.as_deref(), camera);
+        ivory_ui::splash::draw(&painter, rect, &status, fade);
+        // While it is up, the window must keep repainting — nothing else is
+        // asking it to, and a splash that freezes mid-fade because no input
+        // arrived is worse than none.
+        ctx.request_repaint();
+    }
+}
+
+/// A plugin path as a name worth putting on screen.
+#[cfg(feature = "recorder")]
+fn short_plugin_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_owned())
 }

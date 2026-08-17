@@ -2620,6 +2620,27 @@ impl IvoryApp {
                 match kind {
                     dialogs::DeviceKind::Camera => {
                         self.settings.record_camera_uid = uid.clone();
+                        // **Choosing a camera turns video on.**
+                        //
+                        // It is the one act in this app that has no other
+                        // purpose: opening a camera makes a light come on, and
+                        // nobody does it to look at a preview. Before this, a
+                        // user could pick their camera, watch the preview, hit
+                        // Record, and get a `.wav` — with the band quietly
+                        // saying "wav + midi" the whole time.
+                        //
+                        // ONLY when video is off, so an explicit choice of
+                        // "separate file per source" is never overwritten by
+                        // changing camera. And composite rather than per-source
+                        // because one file with the keyboard under the hands is
+                        // what somebody filming themselves play actually wants;
+                        // separate files are an editing decision, made later by
+                        // someone who knows they want it.
+                        if uid.is_some()
+                            && self.settings.record_export.video == recorder::VideoMode::None
+                        {
+                            self.settings.record_export.video = recorder::VideoMode::Composite;
+                        }
                         if let Some(d) = self.cameras.as_mut() {
                             let _ = d.open(uid.as_deref().unwrap_or(""));
                         }

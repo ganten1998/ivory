@@ -668,6 +668,38 @@ pub const VIDEO_EXPORT_READY: bool = true;
 #[cfg(not(target_os = "macos"))]
 pub const VIDEO_EXPORT_READY: bool = false;
 
+/// What the Welcome card says.
+///
+/// A `const` rather than an inline array so the fit test can measure the real
+/// strings: a card whose text overflows its own window is a first impression
+/// nobody recovers from, and it is exactly the sort of thing that breaks when
+/// somebody adds a line.
+const WELCOME_LINES: [&str; 13] = [
+    "Tangent is free, and it stays free.",
+    "",
+    "It is made for the love of it. There are no",
+    "locked features, no trial, no account, and",
+    "nothing is sent anywhere.",
+    "",
+    "If it earns a place in your setup, a donation",
+    "is welcome and genuinely helps — but it buys",
+    "you nothing you do not already have.",
+    "",
+    "Everything lives in the right-click menu.",
+    "",
+    "Press and hold  H  for every keyboard shortcut.",
+];
+
+/// The Welcome card's window, and the size it opens at.
+///
+/// UNCHANGED by the H hint, which is worth recording because the obvious move
+/// was to make it taller: `the_welcome_card_fits_its_own_text` measures the
+/// real strings at the real font and the thirteen lines need 257x366, inside
+/// this comfortably. Growing a dialog that already fits is how a card ends up
+/// with a lake of empty space under its last line.
+const WELCOME_W: f32 = 470.0;
+const WELCOME_H: f32 = 300.0;
+
 /// The dialog as a window. Wide enough for the left column and the longest
 /// radio label on one line, tall enough that the §5 mock needs no scrolling
 /// before a take. After one it does, because the reason the camera controls are
@@ -2141,8 +2173,8 @@ pub fn show(
                 ctx,
                 placement,
                 "Welcome to Tangent",
-                Vec2::new(470.0, 300.0),
-                Vec2::new(410.0, 260.0),
+                Vec2::new(WELCOME_W, WELCOME_H),
+                Vec2::new(WELCOME_W - 60.0, WELCOME_H - 40.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.visuals_mut().extreme_bg_color = t.bg;
@@ -2151,19 +2183,7 @@ pub fn show(
                     egui::Frame::NONE
                         .inner_margin(egui::Margin::same(14))
                         .show(ui, |ui| {
-                            for line in [
-                                "Tangent is free, and it stays free.",
-                                "",
-                                "It is made for the love of it. There are no",
-                                "locked features, no trial, no account, and",
-                                "nothing is sent anywhere.",
-                                "",
-                                "If it earns a place in your setup, a donation",
-                                "is welcome and genuinely helps — but it buys",
-                                "you nothing you do not already have.",
-                                "",
-                                "Everything lives in the right-click menu.",
-                            ] {
+                            for line in WELCOME_LINES {
                                 ui.label(RichText::new(line).font(bold(12.0)).color(t.text));
                             }
                             ui.add_space(8.0);
@@ -4124,6 +4144,59 @@ mod tests {
     /// under the cursor as you click. That only works if the longest thing it
     /// can say fits — and "it should come to about two lines" is exactly the
     /// reasoning that once pushed a dialog's OK button off its own bottom edge.
+    /// **The Welcome card fits its own text.**
+    ///
+    /// It is the first thing anybody sees, and a card whose last line is cut
+    /// off — or whose button has been pushed past the bottom edge — is a first
+    /// impression nobody recovers from. Measured against the real strings at
+    /// the real font, so adding a line fails here rather than in front of a
+    /// user.
+    #[test]
+    fn the_welcome_card_fits_its_own_text() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+
+        let font = FontId::new(12.0, fonts::courier_bold());
+        let (mut widest, mut total_h) = (0.0_f32, 0.0_f32);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // Laid out through the PAINTER, which is the same route
+                // `ui.label` takes — so this measures what will actually be
+                // drawn rather than a reconstruction of it.
+                for line in WELCOME_LINES {
+                    let galley = ui.painter().layout_no_wrap(
+                        line.to_owned(),
+                        font.clone(),
+                        Color32::WHITE,
+                    );
+                    total_h += galley.rect.height().max(font.size);
+                    widest = widest.max(galley.rect.width());
+                }
+            });
+        });
+
+        // The chrome under the text: a checkbox, the spacing around it, and the
+        // button row the layout reserves 30 points for.
+        const CHROME_H: f32 = 8.0 + 22.0 + 30.0;
+        const MARGIN: f32 = 14.0 * 2.0;
+        let needed_h = total_h + CHROME_H + MARGIN;
+        let needed_w = widest + MARGIN;
+        assert!(
+            needed_h <= WELCOME_H,
+            "the welcome card needs {needed_h:.0} points of height and has {WELCOME_H:.0}"
+        );
+        assert!(
+            needed_w <= WELCOME_W,
+            "the longest welcome line needs {needed_w:.0} points of width and has {WELCOME_W:.0}"
+        );
+        // And the hint it exists for is actually in it.
+        assert!(
+            WELCOME_LINES.iter().any(|l| l.contains(" H ")),
+            "the welcome card no longer tells anybody about the help key"
+        );
+    }
+
     #[test]
     fn the_longest_export_refusal_fits_the_space_reserved_for_it() {
         let ctx = egui::Context::default();
