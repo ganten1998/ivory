@@ -542,22 +542,20 @@ pub enum RecorderRequest {
     /// the firewall is the whole point — so it says what it wants heard and
     /// the host plays it.
     ///
-    /// `ms` rather than a matching note-off, because a note-off has to happen
-    /// even if the window loses focus, the mouse is released over another
-    /// window, or the frame that would have sent it never runs. The engine
-    /// schedules both events the moment it gets this, so a note that has
-    /// started is already guaranteed to stop. A held audition would be
-    /// prettier and is exactly the kind of thing that leaves a chord ringing
-    /// forever because a release went missing.
-    Audition { notes: Vec<u8>, ms: u32 },
+    /// **A held gesture, not a timed one.** `on` is the edge: true when the
+    /// key or the mouse goes down, false when it comes up. A duration was
+    /// tried first and was wrong twice over. A note that stops on a timer
+    /// stops in the middle of a phrase somebody is still holding; and
+    /// scheduling the note-off far in the future put it in the MIDI queue
+    /// ahead of everything else, where it blocked the drain and delivered the
+    /// second, third and fourth notes of a chord a second and a half after the
+    /// first.
+    ///
+    /// The release is guaranteed by the sender, not by a timer: losing focus
+    /// counts as letting go, so there is no state in which the key is up and
+    /// the note is still sounding.
+    Audition { notes: Vec<u8>, on: bool },
 }
-
-/// How long an auditioned note sounds.
-///
-/// Long enough to hear a chord settle and short enough that pressing the key
-/// twice in a row does not stack. A real instrument's own release does the
-/// rest: this is a note-off, not a fade.
-pub const AUDITION_MS: u32 = 1_600;
 
 /// How hard an auditioned note is struck.
 ///

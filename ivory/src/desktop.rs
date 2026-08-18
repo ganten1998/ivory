@@ -732,25 +732,25 @@ impl DesktopApp {
                     self.recorder.session.toggle(&root, name.as_deref(), wait, spec);
                 }
                 R::Stop => self.recorder.session.stop(),
-                R::Audition { notes, ms } => {
-                    // **Both events, now.** The note-off is scheduled at the
-                    // same moment as the note-on rather than sent later by a
-                    // frame that might not run: a window that loses focus, a
-                    // dialog that opens, a machine that stalls. A note this app
-                    // starts is already guaranteed to stop before it starts
-                    // sounding.
+                R::Audition { notes, on } => {
+                    // **All of them at one instant.** The events are stamped
+                    // once and pushed together, so a four-note chord arrives as
+                    // a chord. They used to be sent as on/off pairs per note,
+                    // which put a far-future note-off second in the queue,
+                    // where the drain parked it as "not due yet" and stopped —
+                    // delivering the rest of the chord when the first note
+                    // ended rather than when it started.
                     //
                     // Through `send_midi`, so an auditioned note is
-                    // indistinguishable from a played one: it reaches the
-                    // instrument by the same path, and lands in a take that is
-                    // rolling, which is what somebody demonstrating a voicing
-                    // on camera actually wants.
+                    // indistinguishable from a played one: same path, same
+                    // instrument, and it lands in a take that is rolling, which
+                    // is what somebody demonstrating a voicing on camera wants.
                     if let Some(e) = self.recorder.engine.as_ref() {
-                        let on = e.timebase().now();
-                        let off = on + i64::from(ms) * 1_000_000;
+                        let at = e.timebase().now();
+                        let status = if on { 0x90 } else { 0x80 };
+                        let vel = if on { ivory_ui::recorder::AUDITION_VELOCITY } else { 64 };
                         for note in notes {
-                            e.send_midi(on, &[0x90, note, ivory_ui::recorder::AUDITION_VELOCITY]);
-                            e.send_midi(off, &[0x80, note, 64]);
+                            e.send_midi(at, &[status, note, vel]);
                         }
                     }
                 }

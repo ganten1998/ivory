@@ -252,8 +252,15 @@ impl Geom {
     /// a 2pt floor is a 4pt dot, which overlaps its neighbours outright. The
     /// popped-out window can be dragged down to 90pt tall, so this is
     /// reachable, not theoretical.
+    /// How big a fingering dot is.
+    ///
+    /// **0.42 of the string spacing, up from 0.30.** Two dots on adjacent
+    /// strings are one spacing apart centre to centre, so anything under a half
+    /// leaves a gap and a half is exactly touching. This is as close as they
+    /// come without meeting, which is what makes the shape read as a shape and
+    /// leaves room for the letter inside.
     fn dot_r(&self) -> f32 {
-        (self.spacing * 0.30).max(1.0).min(self.spacing * 0.45)
+        (self.spacing * 0.42).max(1.0)
     }
 
     /// Where an open-string ring or a damped-string cross goes, now that there

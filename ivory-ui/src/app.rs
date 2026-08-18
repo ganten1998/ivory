@@ -299,6 +299,19 @@ pub struct IvoryApp {
     /// The Setup button was pressed; the menu opens after the frame, where the
     /// window origin needed to place it is known.
     setup_open: bool,
+    /// Notes sounding because a gesture is holding them: the audition key, or
+    /// a mouse button on a key or a fret.
+    ///
+    /// **They are highlighted while they sound**, which is what makes clicking
+    /// a key on a picture of a piano behave like pressing one. And they are
+    /// released when the gesture ends, including when the window loses focus:
+    /// a note that outlives the gesture that started it rings forever, and the
+    /// only way to stop it is to quit the app.
+    sounding: Vec<u8>,
+    /// Whether the audition key was down last frame, so a hold is one note-on
+    /// rather than one per frame. Key auto-repeat retriggered the chord dozens
+    /// of times a second before this.
+    audition_held: bool,
     /// A numeric field being typed into, if any.
     ///
     /// Mutually exclusive with `name_focused` in practice, because a press
@@ -542,6 +555,8 @@ impl IvoryApp {
             menu_over_recorder: false,
             menu_over_staff: false,
             setup_open: false,
+            sounding: Vec::new(),
+            audition_held: false,
             audio_status: recorder::AudioStatus::default(),
             fullscreen_sent: None,
             plugin_list: Vec::new(),
@@ -859,6 +874,10 @@ impl IvoryApp {
         if self.settings.keytoggle_enabled {
             set.extend(self.manual_notes.iter().copied());
         }
+        // A note being auditioned is a note being played, so it lights up like
+        // one. `sounding` is already in the app's own tuning, so it is added
+        // BEFORE the transpose that the rest of this set has yet to receive.
+        set.extend(self.sounding.iter().copied());
         transposed(&set, self.settings.transpose)
     }
 
@@ -1294,6 +1313,12 @@ impl IvoryApp {
                 self.barre_drag = None;
             }
         }
+        // Letting go of the mouse stops a clicked note, wherever the pointer
+        // ended up. Outside the band, over another window, anywhere: the
+        // release is what ends the gesture, not where it happened.
+        if pointer_released {
+            self.silence();
+        }
 
         // **The popup eats the press, wherever it lands.** Inside, it is a
         // control or it is the panel's own chrome; outside, it is a dismissal
@@ -1471,7 +1496,7 @@ impl IvoryApp {
                         })
                     };
                     if let Some(note) = hit {
-                        self.audition(vec![note]);
+                        self.sound(vec![note]);
                         return;
                     }
                 }
@@ -1670,29 +1695,57 @@ impl IvoryApp {
     ///
     /// Drained by the host AFTER `frame()` returns. A plugin refuses simply by
     /// never calling this, which is why refusal needs no code of its own.
-    /// Sound whatever is lit, in whichever view lit it.
+    /// Start and stop the held audition, once per frame.
     ///
-    /// Deliberately `display_notes` and not the manual set: what a guitarist
-    /// toggled on the neck, what somebody placed on the circle of fifths, and
-    /// what is arriving from a MIDI keyboard are the same notes by the time
-    /// they are drawn, and "play what I can see" is the only rule anybody
-    /// should have to remember.
-    fn audition_highlighted(&mut self) {
-        let mut notes: Vec<u8> = self.display_notes().into_iter().collect();
-        // Low to high, so a chord arrives at the instrument as a chord rather
-        // than in whatever order a hash set happened to hold it.
-        notes.sort_unstable();
-        self.audition(notes);
-    }
+    /// **A hold and not a press.** Key auto-repeat fires `key_pressed` many
+    /// times a second, which retriggered the whole chord at the repeat rate;
+    /// and a note that stops on a timer stops in the middle of a phrase
+    /// somebody is still holding. Down means sounding, up means silent, and
+    /// the edges are the only events.
+    ///
+    /// Losing focus counts as letting go. The release for a key the OS stopped
+    /// telling us about never arrives, and the chord would ring until the app
+    /// was quit.
+    fn audition_tick(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.focused);
+        let down = focused
+            && !self.name_focused
+            && self.num_edit.is_none()
+            && self.dialog.is_none()
+            && !self.recorder.state.is_active()
+            && ctx.input(|i| !i.modifiers.any() && i.key_down(egui::Key::Space));
 
-    fn audition(&mut self, notes: Vec<u8>) {
-        if notes.is_empty() {
+        if down == self.audition_held {
             return;
         }
-        self.request_recorder(recorder::RecorderRequest::Audition {
-            notes,
-            ms: recorder::AUDITION_MS,
-        });
+        self.audition_held = down;
+        if down {
+            let mut notes: Vec<u8> = self.display_notes().into_iter().collect();
+            // Low to high, so a chord reaches the instrument as a chord rather
+            // than in whatever order a hash set happened to hold it.
+            notes.sort_unstable();
+            self.sound(notes);
+        } else {
+            self.silence();
+        }
+    }
+
+    /// Begin sounding `notes`, and remember them so they can be stopped.
+    fn sound(&mut self, notes: Vec<u8>) {
+        if notes.is_empty() || !self.sounding.is_empty() {
+            return;
+        }
+        self.sounding = notes.clone();
+        self.request_recorder(recorder::RecorderRequest::Audition { notes, on: true });
+    }
+
+    /// Stop whatever a gesture was holding. Safe to call when nothing is.
+    fn silence(&mut self) {
+        if self.sounding.is_empty() {
+            return;
+        }
+        let notes = std::mem::take(&mut self.sounding);
+        self.request_recorder(recorder::RecorderRequest::Audition { notes, on: false });
     }
 
     pub fn take_recorder_request(&mut self) -> Option<recorder::RecorderRequest> {
@@ -2516,7 +2569,22 @@ impl IvoryApp {
             K::ToggleFretboard => self.apply_menu_action(ctx, MenuAction::ToggleFretboard),
             K::ToggleCameraPane => self.apply_menu_action(ctx, MenuAction::ToggleCameraPane),
             K::CycleClef => self.apply_menu_action(ctx, MenuAction::CycleClef),
-            K::ToggleNoteNames => self.apply_menu_action(ctx, MenuAction::ToggleNoteNames),
+            // **All three surfaces, one key.** `U` is "show me the letters",
+            // and having it mean the staff alone while the keyboard and the
+            // neck each needed a menu row was three switches for one question.
+            // The staff's own default differs and stays different; what this
+            // key does is turn them all on together and all off together, from
+            // whatever they were.
+            K::ToggleNoteNames => {
+                let any = self.settings.staff_note_names
+                    || self.settings.show_piano_note_names
+                    || self.settings.show_fret_note_names;
+                let want = !any;
+                self.settings.staff_note_names = want;
+                self.settings.show_piano_note_names = want;
+                self.settings.show_fret_note_names = want;
+                self.save_settings();
+            }
             // **Every element back, in the numbered order.** It used to walk a
             // five-state cycle through combinations of three diagrams, which
             // existed because three independent flags have eight states and no
@@ -2549,11 +2617,12 @@ impl IvoryApp {
             // bound to. It is the obvious key for "let me hear that" and the
             // rest of the time "stop" means nothing, so the rest of the time it
             // sounds whatever is lit.
+            // Stop only. The audition half of this key is a HOLD and is
+            // driven per frame by `audition_tick`, because a press repeats and
+            // a held chord must not.
             K::StopRecording => {
                 if self.recorder.state.is_active() {
                     self.request_recorder(recorder::RecorderRequest::Stop);
-                } else {
-                    self.audition_highlighted();
                 }
             }
             K::ToggleRecorder => self.apply_menu_action(ctx, MenuAction::ToggleRecorder),
@@ -4113,6 +4182,11 @@ impl IvoryApp {
                 self.apply_key_action(&ctx, action);
             }
         }
+        // Every frame, gated or not: the audition is a HOLD, and its release
+        // has to run even when the press that started it would no longer be
+        // accepted — a dialog opening mid-chord must stop the chord, not
+        // abandon it.
+        self.audition_tick(&ctx);
 
         // Track our position on the monitor for global menu placement, child
         // window centring, and so the main window reopens where it was left.
@@ -5016,6 +5090,29 @@ mod tests {
         app.take_recorder_request()
     }
 
+    /// The release edge for anything Space was holding.
+    ///
+    /// An explicit release EVENT, not merely a frame with no events: egui keeps
+    /// a key down until it is told otherwise, which is right for real input and
+    /// means a quiet frame is not a let-go.
+    fn key_up(ctx: &egui::Context, app: &mut IvoryApp) -> Option<recorder::RecorderRequest> {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Space,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        app.take_recorder_request()
+    }
+
     fn run_one_frame(ctx: &egui::Context, app: &mut IvoryApp, size: Vec2) -> Vec<String> {
         let out = ctx.run(
             egui::RawInput {
@@ -5663,6 +5760,16 @@ mod tests {
                 Some(recorder::RecorderRequest::Audition { .. })
             ),
             "with nothing rolling, Space sounds what is lit"
+        );
+        // The chord is HELD, so a frame with the key up is its release. It is
+        // asserted rather than merely drained: a hold that never lets go is
+        // the failure this whole model exists to prevent.
+        assert!(
+            matches!(
+                key_up(&ctx, &mut app),
+                Some(recorder::RecorderRequest::Audition { on: false, .. })
+            ),
+            "letting go of the key did not release the chord"
         );
         app.manual_notes.clear();
 
