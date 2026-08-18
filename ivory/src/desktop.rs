@@ -1321,6 +1321,15 @@ struct TakeVideo {
     /// Frames the compositor or the encoder refused, so the summary can say so
     /// rather than the user counting them in the finished file.
     failed: u64,
+    /// Ticks filled by repeating the previous frame because the machine could
+    /// not composite in real time. The video stays on the wall clock; this is
+    /// the honest count of how much of it is a freeze-frame.
+    padded: u64,
+    /// Whether the file carries an audio track, for the manifest's report.
+    has_audio: bool,
+    /// `Session::camera_frames_delivered` at take start. The camera opens with
+    /// the band, not the take, so the per-take figure is a difference.
+    cam_frames_at_start: u64,
 }
 
 #[cfg(feature = "recorder")]
@@ -1385,6 +1394,7 @@ impl DesktopApp {
         // The offscreen context needs the app's fonts or every chord name in
         // the video renders in egui's default face.
         self.app.install_fonts(compositor.context());
+        let has_audio = audio.is_some();
         let encoder = match ivory_record::encode::Encoder::create(&path, video, audio) {
             Ok(e) => e,
             Err(e) => {
@@ -1403,6 +1413,9 @@ impl DesktopApp {
             display: want_display,
             path,
             failed: 0,
+            padded: 0,
+            has_audio,
+            cam_frames_at_start: self.recorder.session.camera_frames_delivered(),
         });
     }
 
@@ -1430,12 +1443,27 @@ impl DesktopApp {
             }
         }
         let elapsed = self.recorder.session.elapsed();
-        // A cap per window frame. Without it, a machine that stalls for two
-        // seconds tries to composite sixty frames in one go and stalls for two
-        // more — the classic spiral of death.
+        // The tick whose presentation time has arrived. Everything below is
+        // about keeping `v.next` caught up to this number by the END of every
+        // pump, because the timestamps come from `v.next` — a pump that leaves
+        // ticks unproduced does not make a shorter video, it makes one whose
+        // clock runs slow: each late frame carries late content at an early
+        // timestamp, and a machine compositing at half speed used to squeeze
+        // a whole performance into half its real duration.
+        let due = (elapsed * f64::from(v.fps)) as u64;
+
+        // Fresh frames first — capped by COUNT for the window-is-slow case (a
+        // plugin drag at 8 fps still needs ~4 video frames per pump, and they
+        // are cheap when the machine is fast), and by WALL TIME for the
+        // machine-is-slow case: three 80 ms composites in one pump is the
+        // classic spiral of death, a UI at 4 fps compositing ever further
+        // behind. The first composite always runs; the budget only stops a
+        // pump from doubling down on a machine that is already saturated.
         const MAX_PER_FRAME: u32 = 3;
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
+        let pump_started = std::time::Instant::now();
         let mut made = 0;
-        while made < MAX_PER_FRAME && (v.next as f64) < elapsed * f64::from(v.fps) {
+        while v.next < due && made < MAX_PER_FRAME {
             let pts = (v.next as i64 * 1_000_000_000) / i64::from(v.fps);
             let frame = self.recorder.camera_rgba.as_ref().map(|(px, w, h)| (px.as_slice(), *w, *h));
             match v
@@ -1451,6 +1479,30 @@ impl DesktopApp {
             }
             v.next += 1;
             made += 1;
+            if pump_started.elapsed() > BUDGET {
+                break;
+            }
+        }
+
+        // Still behind: the machine cannot composite this fast, so hold the
+        // timeline instead of falling off it — the missed ticks repeat the
+        // frame just made. A repeated frame is a visible stutter and an honest
+        // one (`v.padded` reports it); a slow clock is invisible and wrong.
+        // The burst is capped at a second of video: after a long UI stall the
+        // encoder's queue is the wrong place to shove a gigabyte of
+        // duplicates, and the deficit carries to the next pump.
+        if v.next < due {
+            let target = due.min(v.next + u64::from(v.fps));
+            if let Some(last) = v.compositor.last_frame() {
+                while v.next < target {
+                    let pts = (v.next as i64 * 1_000_000_000) / i64::from(v.fps);
+                    if v.encoder.push(last, pts).is_err() {
+                        v.failed += 1;
+                    }
+                    v.next += 1;
+                    v.padded += 1;
+                }
+            }
         }
         self.recorder.video = Some(v);
     }
@@ -1471,12 +1523,58 @@ impl DesktopApp {
         let path = v.path.clone();
         match v.encoder.finish() {
             Ok(()) => {
-                if dropped > 0 {
+                if dropped > 0 || v.padded > 0 {
+                    // Both numbers, because they are different failures: a
+                    // dropped frame is a hole, a padded one is a freeze —
+                    // and both mean the same advice about this machine.
+                    let mut what = Vec::new();
+                    if dropped > 0 {
+                        what.push(format!("{dropped} frames were dropped"));
+                    }
+                    if v.padded > 0 {
+                        what.push(format!(
+                            "{} frames were repeated to keep the video on the clock",
+                            v.padded
+                        ));
+                    }
                     self.recorder.engine_error = Some(format!(
-                        "the video is complete, but {dropped} frames were dropped - \
-                         this machine could not composite and encode in real time"
+                        "the video is complete, but {} - this machine could \
+                         not composite and encode in real time; a smaller \
+                         resolution in Take Settings will help",
+                        what.join(" and ")
                     ));
                 }
+                // The manifest was written at Stop, before this file existed;
+                // fold the finished video into it. §7's report: what the file
+                // is, what the rate implies, and what the camera delivered.
+                let (width, height) = v.compositor.size();
+                let file_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.recorder.session.record_video(
+                    ivory_record::take::VideoReport {
+                        container: ivory_record::encode::CONTAINER.to_owned(),
+                        video_codec: ivory_record::encode::VIDEO_CODEC.to_owned(),
+                        audio_codec: if v.has_audio {
+                            ivory_record::encode::AUDIO_CODEC.to_owned()
+                        } else {
+                            String::new()
+                        },
+                        width,
+                        height,
+                        fps: f64::from(v.fps),
+                        // Ticks scheduled over the take. The pump holds these
+                        // to the wall clock, so this IS duration x rate.
+                        frames_expected: v.next,
+                        frames_received: self
+                            .recorder
+                            .session
+                            .camera_frames_delivered()
+                            .saturating_sub(v.cam_frames_at_start),
+                    },
+                    &file_name,
+                );
             }
             Err(e) => {
                 self.recorder.engine_error = Some(format!("the video could not be finished: {e}"));

@@ -10,6 +10,70 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+## [4.4.1] - 2026-08-18
+
+A Linux fix release; the macOS and Windows builds are unchanged. Found by
+running 4.4.0 on the machine it was built on, under i3.
+
+### Added
+
+- **The camera works on Linux.** A V4L2 backend (via `linuxvideo`), behind the
+  same seam as the macOS one: enumeration by stable bus identity, the shared
+  format-choice policy, YUYV converted directly and MJPEG decoded (pure-Rust
+  `zune-jpeg`) — which matters because most UVC webcams offer their full frame
+  rate only compressed. Preview and recorded takes both.
+
+### Changed
+
+- **The Linux and Windows artifacts now carry their own video encoder.** An
+  unmodified, checksum-pinned static ffmpeg ships as `tangent-ffmpeg` beside
+  the app binary, and Tangent finds it there before consulting `PATH` — so
+  filming a take needs nothing installed. Its GPL licence and provenance ship
+  beside it in `ffmpeg-licenses/`. (macOS needs none of this: AVFoundation.)
+- The Linux installer now checks for a Vulkan driver — the one remaining
+  system dependency for video, present on nearly every desktop — and prints
+  the distribution's exact one-line fix when it is missing, instead of leaving
+  it to be discovered mid-take.
+
+### Fixed
+
+- **The right-click menu no longer vanishes on the way to its lower items**
+  under i3 and other Linux window managers. The desktop close rule was "close
+  when neither menu window has focus"; i3 hands focus to the submenu window
+  and never gives it back, so the first hover of a plain row read as
+  "clicked away". The rule now also requires the pointer to be outside both
+  windows.
+- **Dialogs cannot open invisibly behind the main window on tiling WMs.**
+  Dialogs are modal — the app drops all input while one is open — and i3 was
+  tiling them underneath the floating main window, which read as the app
+  freezing the moment a camera was selected. Menus and dialogs now carry the
+  X11 window-type hints (`POPUP_MENU`, `DIALOG`) that tell the WM to float
+  them.
+- The empty device-picker no longer sends Linux users to "System Settings >
+  Privacy & Security"; it names the actual fix (the `video` group).
+- **A slow machine no longer records a fast video.** The video's frames are
+  timestamped on the take's clock, but a machine that composites slower than
+  real time used to fall behind schedule and stay there — every frame carried
+  late content at an early timestamp, and a whole performance came out
+  time-compressed. The pump now holds the timeline: when compositing cannot
+  keep up, the missed ticks repeat the previous frame (a visible, counted
+  stutter) and the fresh-frame work is capped by wall time per window frame so
+  a saturated machine keeps a usable UI. The take summary reports repeated
+  frames alongside dropped ones. All platforms.
+- **`take.json` now records the video.** The manifest is written at Stop,
+  before the encoder has finished the file, so its `video` section was always
+  null and `take.mp4` never appeared in `files` — on every platform, since the
+  recorder shipped. The session now keeps the manifest it wrote and folds a
+  full video report in when the encoder finishes: container and codecs, size
+  and rate, frames the rate implies, and frames the camera actually delivered.
+- **Filming a take can no longer take the app down on Linux.** The video
+  compositor needs a Vulkan adapter; on machines without one it used to fall
+  through to wgpu's OpenGL backend, whose first make-current against the
+  window's own GL context is `EGL_BAD_ACCESS` — an abort, mid-take. A GL
+  adapter is now refused up front with a message that names the fix
+  (a hardware Vulkan driver, or mesa's lavapipe on any GPU), and a software
+  Vulkan adapter is accepted when the hardware ask comes up empty.
+
 ## [4.4.0] - 2026-08-18
 
 The largest release since the Rust rewrite. Tangent writes music down, and a

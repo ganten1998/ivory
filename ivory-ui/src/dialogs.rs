@@ -1156,6 +1156,25 @@ impl DeviceKind {
         }
     }
 
+    /// Per-platform, because the advice is: "System Settings > Privacy &
+    /// Security" on a Linux box sends the user hunting for a panel that does
+    /// not exist, when the actual fix is group membership on the device node.
+    #[cfg(target_os = "linux")]
+    fn nothing_found(self) -> &'static str {
+        match self {
+            DeviceKind::Camera => {
+                "No cameras found. If one is connected, your user may not be \
+                 able to read /dev/video* - add yourself to the 'video' \
+                 group, then log out and back in."
+            }
+            DeviceKind::AudioInput => {
+                "No audio inputs found. If an interface is connected, check \
+                 that it shows up in your sound settings (or `arecord -l`)."
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn nothing_found(self) -> &'static str {
         match self {
             DeviceKind::Camera => {
@@ -1651,6 +1670,12 @@ fn show_dialog_viewport(
         resizable: true,
         takes_focus: true,
         modal: true,
+        // Without this a tiling WM (i3, sway) TILES the dialog — it opens as
+        // a pane underneath the floating main window, invisible, while
+        // `handle_main_interaction` drops every event waiting on it. That is
+        // an app that has frozen for no visible reason, which is exactly what
+        // the comment above `pos` warns about.
+        window_type: Some(egui::X11WindowType::Dialog),
         ..Default::default()
     };
     let report = crate::shell::surface(ctx, placement.caps, &spec, &mut |ui, want_close| {

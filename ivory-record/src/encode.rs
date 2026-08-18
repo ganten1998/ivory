@@ -98,6 +98,16 @@ impl VideoSpec {
     }
 }
 
+/// What the file IS, for `take.json`'s video report.
+///
+/// Constants of this module rather than queried from a backend, because both
+/// backends are ASKED for exactly this — H.264 and AAC in an `.mp4` — and a
+/// backend producing something else is a bug in `create`, not a configuration
+/// for a manifest to discover.
+pub const CONTAINER: &str = "mp4";
+pub const VIDEO_CODEC: &str = "h264";
+pub const AUDIO_CODEC: &str = "aac";
+
 /// A live video-only encode.
 ///
 /// Frames go in with a presentation time in nanoseconds **relative to the first

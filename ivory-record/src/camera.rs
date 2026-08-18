@@ -72,13 +72,14 @@
 //!
 //! # Platforms
 //!
-//! macOS is implemented. Windows (`IMFSourceReader`) and Linux (`linuxvideo`)
-//! are RECORDER-PLAN §4 work and slot in behind [`VideoSource`] and the two
-//! `backend::` entry points; everything above that seam — the types, the format
-//! policy, the conversion, the slot — is shared and already tested. Until then
-//! those platforms get a stub that enumerates nothing and returns
-//! [`CameraError::Unsupported`], so the crate builds everywhere from day one and
-//! the UI degrades by saying so rather than by not compiling.
+//! macOS (AVFoundation) and Linux (`linuxvideo`/V4L2) are implemented, each
+//! behind [`VideoSource`] and the two `backend::` entry points; everything
+//! above that seam — the types, the format policy, the conversions, the slot —
+//! is shared and tested. Windows (`IMFSourceReader`) is RECORDER-PLAN §4 work
+//! and slots in the same way; until then it gets a stub that enumerates
+//! nothing and returns [`CameraError::Unsupported`], so the crate builds
+//! everywhere from day one and the UI degrades by saying so rather than by not
+//! compiling.
 
 use std::error::Error;
 use std::fmt;
@@ -94,9 +95,14 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as backend;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as backend;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod stub;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use stub as backend;
 
 /// Bytes per pixel in both BGRA and RGBA. Named because a bare `4` in a stride
@@ -487,6 +493,77 @@ pub fn bgra_to_rgba(
             px_out[1] = px_in[1];
             px_out[2] = px_in[0];
             px_out[3] = px_in[3];
+        }
+    }
+    true
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// YUYV → RGBA
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Convert one YUYV (YUY2, 4:2:2) frame to tightly packed RGBA8.
+///
+/// The Linux path's [`bgra_to_rgba`]: V4L2 webcams deliver their uncompressed
+/// formats almost universally as YUYV, and this is the one byte-reshuffle that
+/// stands between that and egui. The contract is the same as `bgra_to_rgba`'s,
+/// on purpose — `stride` is the driver's `bytes_per_line` and may exceed
+/// `width * 2`, the output is always tight `width * 4`, and a bad
+/// stride/length combination returns `false` leaving `dst` untouched, because
+/// this too runs on a capture thread where a panic is not an option.
+///
+/// The matrix is BT.601 limited range, which is what UVC hardware emits.
+/// Fixed-point (×256) integer math, saturated to 0..=255: a fast path that is
+/// exact enough for a preview and an encode alike, and it cannot NaN.
+///
+/// `width` must be even — YUYV carries two pixels per four bytes, and every
+/// V4L2 discrete frame size is. An odd width is refused rather than rounded so
+/// a driver bug is counted ([`CameraStats::frames_unreadable`]) instead of
+/// silently cropped.
+pub fn yuyv_to_rgba(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    dst: &mut Vec<u8>,
+) -> bool {
+    let rows = height as usize;
+    let row_bytes_in = width as usize * 2;
+    let row_bytes_out = width as usize * BYTES_PER_PIXEL;
+
+    if width == 0 || rows == 0 {
+        dst.clear();
+        return true;
+    }
+    if width % 2 != 0 || stride < row_bytes_in {
+        return false;
+    }
+    let needed = stride * (rows - 1) + row_bytes_in;
+    if src.len() < needed {
+        return false;
+    }
+
+    dst.resize(row_bytes_out * rows, 0);
+
+    for y in 0..rows {
+        let s = &src[y * stride..y * stride + row_bytes_in];
+        let d = &mut dst[y * row_bytes_out..(y + 1) * row_bytes_out];
+        for (px_in, px_out) in s.chunks_exact(4).zip(d.chunks_exact_mut(8)) {
+            // Y0 U Y1 V — two pixels sharing one chroma sample.
+            let u = i32::from(px_in[1]) - 128;
+            let v = i32::from(px_in[3]) - 128;
+            // BT.601 limited range, ×256: 1.164, 1.596, 0.813, 0.391, 2.018.
+            let r_off = 409 * v;
+            let g_off = -100 * u - 208 * v;
+            let b_off = 516 * u;
+            for (i, &y_raw) in [px_in[0], px_in[2]].iter().enumerate() {
+                let yy = 298 * (i32::from(y_raw) - 16);
+                let at = i * 4;
+                px_out[at] = ((yy + r_off + 128) >> 8).clamp(0, 255) as u8;
+                px_out[at + 1] = ((yy + g_off + 128) >> 8).clamp(0, 255) as u8;
+                px_out[at + 2] = ((yy + b_off + 128) >> 8).clamp(0, 255) as u8;
+                px_out[at + 3] = 0xFF;
+            }
         }
     }
     true
@@ -1143,6 +1220,93 @@ mod tests {
         };
         assert_eq!(frame.stride, tight, "Frame::stride's documented claim");
         assert_eq!(frame.pixels.len(), frame.stride * frame.height as usize);
+    }
+
+    // ── YUYV → RGBA ─────────────────────────────────────────────────────────
+
+    /// One YUYV macropixel (4 bytes, 2 pixels) with both Y samples equal.
+    fn yuyv_px(y: u8, u: u8, v: u8) -> [u8; 4] {
+        [y, u, y, v]
+    }
+
+    #[test]
+    fn yuyv_nominal_black_white_and_grey_land_where_bt601_says() {
+        // Limited-range anchors: Y=16 is black, Y=235 is white, neutral chroma.
+        let mut src = Vec::new();
+        src.extend_from_slice(&yuyv_px(16, 128, 128));
+        src.extend_from_slice(&yuyv_px(235, 128, 128));
+        let mut dst = Vec::new();
+        assert!(yuyv_to_rgba(&src, 4, 1, 8, &mut dst));
+        assert_eq!(&dst[0..4], &[0, 0, 0, 0xFF], "Y=16 must be full black");
+        assert_eq!(
+            &dst[8..12],
+            &[255, 255, 255, 0xFF],
+            "Y=235 must be full white"
+        );
+        for px in dst.chunks_exact(4) {
+            assert_eq!(px[0], px[1], "neutral chroma may not tint");
+            assert_eq!(px[1], px[2], "neutral chroma may not tint");
+        }
+    }
+
+    #[test]
+    fn yuyv_a_pure_red_sample_comes_out_red() {
+        // BT.601 pure red: Y=81, U=90, V=240.
+        let src = yuyv_px(81, 90, 240);
+        let mut dst = Vec::new();
+        assert!(yuyv_to_rgba(&src, 2, 1, 4, &mut dst));
+        let (r, g, b) = (dst[0], dst[1], dst[2]);
+        assert!(r >= 250, "red channel is {r}, expected ~255");
+        assert!(g <= 5 && b <= 5, "green/blue are ({g},{b}), expected ~0");
+    }
+
+    #[test]
+    fn yuyv_a_padded_stride_does_not_shear_and_rows_stay_rows() {
+        // Row y carries Y = 20*y + 30 uniformly; if any output row's pixels
+        // disagree with each other, a row was picked up at the wrong offset.
+        let (width, height, stride) = (4u32, 3u32, 32usize);
+        let mut src = vec![0xEE; stride * height as usize];
+        for y in 0..height as usize {
+            for m in 0..(width as usize / 2) {
+                let at = y * stride + m * 4;
+                src[at..at + 4].copy_from_slice(&yuyv_px(30 + 20 * y as u8, 128, 128));
+            }
+        }
+        let mut dst = Vec::new();
+        assert!(yuyv_to_rgba(&src, width, height, stride, &mut dst));
+        let row_bytes = width as usize * BYTES_PER_PIXEL;
+        assert_eq!(dst.len(), row_bytes * height as usize, "output must be tight");
+        for y in 0..height as usize {
+            let row = &dst[y * row_bytes..(y + 1) * row_bytes];
+            let first = row[0];
+            for px in row.chunks_exact(4) {
+                assert_eq!(px[0], first, "row {y} mixes rows: stride was mis-read");
+                assert_eq!(px[3], 0xFF);
+            }
+        }
+        // And the rows are distinct, so "all equal" is not vacuously true.
+        assert_ne!(dst[0], dst[row_bytes], "test rows must differ to prove anything");
+    }
+
+    #[test]
+    fn yuyv_refuses_an_odd_width_rather_than_rounding_it() {
+        let mut dst = vec![7u8; 8];
+        assert!(!yuyv_to_rgba(&[0; 64], 3, 2, 8, &mut dst));
+        assert_eq!(dst, vec![7u8; 8], "a refused frame must not clobber the scratch");
+    }
+
+    #[test]
+    fn yuyv_refuses_a_source_too_short_for_its_own_geometry() {
+        let mut dst = Vec::new();
+        // 3 rows of stride 16 needs 2*16 + 8 = 40 bytes; give it 30.
+        assert!(!yuyv_to_rgba(&[0; 30], 4, 3, 16, &mut dst));
+    }
+
+    #[test]
+    fn yuyv_a_zero_sized_frame_converts_to_nothing_rather_than_failing() {
+        let mut dst = vec![9u8; 16];
+        assert!(yuyv_to_rgba(&[], 0, 0, 0, &mut dst));
+        assert!(dst.is_empty());
     }
 
     // ── format selection ────────────────────────────────────────────────────

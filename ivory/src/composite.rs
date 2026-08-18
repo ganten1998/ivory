@@ -56,6 +56,10 @@ pub struct Compositor {
     camera: Option<CameraTexture>,
     /// The tightly-packed BGRA the encoder is handed.
     frame: Vec<u8>,
+    /// Whether `frame` holds a real picture yet. `frame` is allocated zeroed,
+    /// and handing that out as [`last_frame`](Self::last_frame) would pad a
+    /// slow take's opening with black frames that were never composited.
+    has_frame: bool,
 }
 
 struct CameraTexture {
@@ -86,6 +90,20 @@ fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
         }
         std::thread::yield_now();
     }
+}
+
+/// A software adapter, because the hardware ones came up empty.
+///
+/// `force_fallback_adapter` picks a CPU device — lavapipe on Linux, WARP on
+/// Windows — where one is installed. Slower is reported by the frame counters;
+/// absent is reported by nothing, which is why this rung exists.
+fn software_adapter(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
+    block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::None,
+        force_fallback_adapter: true,
+        compatible_surface: None,
+    }))
+    .ok()
 }
 
 impl Compositor {
@@ -128,7 +146,38 @@ impl Compositor {
             force_fallback_adapter: false,
             compatible_surface: None,
         }))
-        .map_err(|e| format!("no graphics adapter this build can composite with: {e}"))?;
+        // A CPU rasterizer beats no video. The hardware ask fails on real
+        // machines: a 2012-era GPU has no Vulkan driver at all, and mesa's
+        // crocus answers wgpu's robust-context request with BAD_MATCH, which
+        // wgpu treats as fatal — so the GL backend enumerates nothing either.
+        // lavapipe supports everything wgpu asks for; slow is reported by the
+        // frame counters, absent is reported by nothing.
+        .or_else(|first| software_adapter(&instance).ok_or(first))
+        .map_err(|e| {
+            format!(
+                "no graphics adapter this build can composite with: {e}{}",
+                if cfg!(target_os = "linux") {
+                    " - installing your distribution's software Vulkan driver \
+                     (mesa lavapipe) makes video work on any GPU"
+                } else {
+                    ""
+                }
+            )
+        })?;
+        // A GL adapter is REFUSED, not tried. This runs on the window's own
+        // thread and the window is drawn with OpenGL on this platform; EGL
+        // allows one current context per thread, so wgpu's first make-current
+        // against the window's is EGL_BAD_ACCESS — which wgpu-hal unwraps,
+        // taking the whole app down mid-take. Observed, not theorised. Vulkan
+        // has no notion of "current" and coexists fine.
+        if adapter.get_info().backend == wgpu::Backend::Gl {
+            return Err(
+                "compositing cannot share a thread with the window's OpenGL - \
+                 install your distribution's Vulkan driver (hardware, or mesa's \
+                 lavapipe for any GPU) and video will work"
+                    .to_owned(),
+            );
+        }
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
             .map_err(|e| format!("the graphics adapter would not open a device: {e}"))?;
         Self::on(device, queue, width, height)
@@ -194,6 +243,7 @@ impl Compositor {
             padded_bpr,
             camera: None,
             frame: vec![0; (width as usize) * (height as usize) * 4],
+            has_frame: false,
         })
     }
 
@@ -349,7 +399,18 @@ impl Compositor {
         }
 
         self.read_back()?;
+        self.has_frame = true;
         Ok(&self.frame)
+    }
+
+    /// The most recent successfully composited frame, tightly-packed BGRA.
+    ///
+    /// `None` until [`frame`](Self::frame) has succeeded once. This is what
+    /// lets the video pump hold the timeline on a machine that composites
+    /// slower than real time: a repeated real frame keeps the clock honest,
+    /// where compositing every tick late would compress the whole performance.
+    pub fn last_frame(&self) -> Option<&[u8]> {
+        self.has_frame.then_some(self.frame.as_slice())
     }
 
     fn read_back(&mut self) -> Result<(), String> {

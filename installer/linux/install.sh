@@ -135,6 +135,7 @@ fi
 if [ "$UNINSTALL" = "1" ]; then
     echo "Removing $NAME"
     run rm -f  "$BIN_DIR/tangent"
+    run rm -f  "$BIN_DIR/tangent-ffmpeg"
     run rm -rf "$VST3_DIR/$NAME.vst3"
     run rm -f  "$DESKTOP_DIR/tangent.desktop"
     run rm -f  "$ICON_DIR/tangent.png"
@@ -157,6 +158,16 @@ if [ "$WANT_APP" = "1" ]; then
     run mkdir -p "$BIN_DIR"
     run cp "$SELF_DIR/tangent" "$BIN_DIR/tangent"
     run chmod 755 "$BIN_DIR/tangent"
+
+    # The bundled video encoder. Prefixed `tangent-`, never plain `ffmpeg`:
+    # ~/.local/bin is on most users' PATH and an unprefixed copy there would
+    # shadow the system ffmpeg for every shell they own. Tangent looks for
+    # this name beside its own binary, so video works with nothing installed.
+    if [ -f "$SELF_DIR/tangent-ffmpeg" ]; then
+        echo "  encoder     -> $BIN_DIR/tangent-ffmpeg"
+        run cp "$SELF_DIR/tangent-ffmpeg" "$BIN_DIR/tangent-ffmpeg"
+        run chmod 755 "$BIN_DIR/tangent-ffmpeg"
+    fi
 
     # The menu entry, when the tarball carries one.
     if [ -f "$SELF_DIR/tangent.desktop" ]; then
@@ -207,6 +218,36 @@ if [ "$WANT_APP" = "1" ]; then
         echo "Run it with:  tangent"
     else
         echo "Run it with:  $BIN_DIR/tangent"
+    fi
+
+    # Filming a take composites on the GPU through Vulkan. Everything else in
+    # Tangent works without it, so a missing driver is a note with the exact
+    # command, not an error. ICD manifests are how the loader finds drivers;
+    # no manifest anywhere means takes will record audio and MIDI but no video.
+    have_vulkan=0
+    for d in /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d /etc/vulkan/icd.d; do
+        if [ -d "$d" ] && [ -n "$(ls "$d"/*.json 2>/dev/null)" ]; then
+            have_vulkan=1
+            break
+        fi
+    done
+    if [ "$have_vulkan" = "0" ]; then
+        echo
+        echo "  NOTE: no Vulkan driver was found, so takes will record audio and"
+        echo "        MIDI but not video. Any Vulkan driver fixes it - mesa's"
+        echo "        lavapipe works on every GPU:"
+        . /etc/os-release 2>/dev/null || ID=""
+        case "$ID" in
+            debian|ubuntu|linuxmint|pop)
+                     echo "          sudo apt install mesa-vulkan-drivers" ;;
+            fedora)  echo "          sudo dnf install mesa-vulkan-drivers" ;;
+            arch|manjaro|endeavouros)
+                     echo "          sudo pacman -S vulkan-swrast" ;;
+            void)    echo "          sudo xbps-install mesa-vulkan-lavapipe" ;;
+            opensuse*|suse*)
+                     echo "          sudo zypper install libvulkan1 Mesa-vulkan-device-select" ;;
+            *)       echo "          (install your distribution's mesa Vulkan package)" ;;
+        esac
     fi
 fi
 [ "$WANT_VST3" = "1" ] && echo "Your DAW will find the plugin the next time it scans for plugins."

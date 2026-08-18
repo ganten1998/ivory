@@ -34,8 +34,18 @@ Linux
 
     tar -xzf tangent-<version>-linux-<arch>.tar.gz
     cd tangent-<version>-linux-<arch>
-    chmod +x tangent
-    ./tangent
+    ./install.sh
+
+  That installs the app, the menu entry and the VST3 plugin into your home
+  directory — no root needed — and prints how to undo it (./install.sh
+  --uninstall). Or skip installing entirely: `chmod +x tangent && ./tangent`
+  runs it from the folder.
+
+  Everything the recorder needs ships in the tarball: the video encoder is
+  bundled as tangent-ffmpeg, found automatically as long as it sits beside the
+  tangent binary. Filming a take also wants a Vulkan driver, which nearly every
+  desktop already has; if yours does not, install.sh notices and prints your
+  distribution's one-line fix (mesa's lavapipe works on any GPU).
 
   MIDI goes through ALSA, so libasound.so.2 needs to be present — package
   libasound2 on Debian/Ubuntu, alsa-lib elsewhere. It already is on essentially
@@ -46,9 +56,10 @@ Linux
   Your keyboard has to be plugged in and switched on before Tangent can see it —
   ALSA only creates a port for hardware that is actually there.
 
-  For a launcher entry:
+  Installing by hand instead:
 
     install -Dm755 tangent         ~/.local/bin/tangent
+    install -Dm755 tangent-ffmpeg  ~/.local/bin/tangent-ffmpeg
     install -Dm644 tangent.desktop ~/.local/share/applications/tangent.desktop
     install -Dm644 tangent.png     ~/.local/share/icons/hicolor/128x128/apps/tangent.png
 

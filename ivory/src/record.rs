@@ -960,6 +960,15 @@ pub struct Session {
     /// encoder needs to describe its input and which the UI thread cannot
     /// assume — the device decides it, not the settings.
     video_audio_spec: Option<(u32, u16)>,
+    /// The last take's manifest, kept in memory after `stop` wrote it.
+    ///
+    /// The video is the one report that cannot be in the manifest at Stop:
+    /// the encoder is the app's, not the session's, and it finishes AFTER
+    /// `stop` returns. Keeping the written manifest is what lets
+    /// [`record_video`](Session::record_video) fold the video in without
+    /// parsing `take.json` back off disk — this crate writes JSON and
+    /// deliberately does not read it.
+    finished: Option<(std::path::PathBuf, Manifest)>,
 }
 
 impl Session {
@@ -997,6 +1006,7 @@ impl Session {
             arm_override: None,
             last: None,
             clipped: false,
+            finished: None,
         }
     }
 
@@ -1309,6 +1319,33 @@ impl Session {
         self.camera.as_ref()?.latest()
     }
 
+    /// Camera frames delivered since the camera OPENED — a counter, not a
+    /// per-take figure. The camera outlives the take (it opens with the band),
+    /// so a per-take number is this read at Stop minus the same read at start;
+    /// `TakeVideo` keeps the baseline.
+    pub fn camera_frames_delivered(&self) -> u64 {
+        self.camera
+            .as_ref()
+            .map_or(0, |c| c.stats().frames_delivered())
+    }
+
+    /// Fold the finished video into the last take's manifest.
+    ///
+    /// `stop` wrote `take.json` without a video section, because the encoder
+    /// belongs to the app and was still finishing the file. This sets the
+    /// report, appends the file name, and rewrites the manifest atomically.
+    /// A no-op when there is no finished take to amend — a video that
+    /// finalises after the NEXT take has started must not write into it,
+    /// which is why `begin` clears the retained manifest.
+    pub fn record_video(&mut self, report: take::VideoReport, file_name: &str) {
+        let Some((dir, manifest)) = self.finished.as_mut() else {
+            return;
+        };
+        manifest.video = Some(report);
+        manifest.files.push(file_name.to_owned());
+        let _ = manifest.write(dir);
+    }
+
     /// Drain the always-on MIDI tap into the take buffer.
     ///
     /// Called every frame, recording or not. The tap is always on because midir
@@ -1469,6 +1506,9 @@ impl Session {
     fn begin(&mut self, root: &std::path::Path, name: Option<&str>) {
         self.clipped = false;
         self.last = None;
+        // The previous take's manifest must not be amendable once a new take
+        // exists, or a slow encoder could write take N's video into take N+1.
+        self.finished = None;
         self.pending_note = None;
         let at = WallTime::now_utc();
         let slug = name.and_then(take::sanitise_slug);
@@ -1822,6 +1862,9 @@ impl Session {
             manifest.finish();
         }
         let _ = manifest.write(take.dir());
+        // Retained for `record_video`: the encoder finishes after this returns
+        // and the manifest is the only place its report can live.
+        self.finished = Some((take.dir().to_path_buf(), manifest.clone()));
 
         let silent = report
             .as_ref()

@@ -740,7 +740,18 @@ mod stub {
     use vst3::ComPtr;
     use vst3::Steinberg::IPlugView;
 
-    pub(super) enum Window {}
+    /// Uninhabited, like the empty enum it replaces — `void` can never be
+    /// produced, so a `Window` can never exist. The phantom raw pointer is
+    /// there for the tests' compile-time assertion that an `Editor` is not
+    /// `Send`: an empty ENUM is vacuously `Send`, so on the platforms that use
+    /// this stub the assertion held on macOS and failed to even compile here.
+    /// The invariant is about the type's contract, not about whether a value
+    /// can currently be made, so the stub carries the same marker the real
+    /// windows do.
+    pub(super) struct Window {
+        void: std::convert::Infallible,
+        _not_send: std::marker::PhantomData<*const ()>,
+    }
 
     impl Window {
         pub(super) fn open(view: ComPtr<IPlugView>, title: &str) -> Result<Self, EditorError> {
@@ -753,19 +764,19 @@ mod stub {
         }
 
         pub(super) fn closed(&self) -> bool {
-            match *self {}
+            match self.void {}
         }
 
         pub(super) fn focus(&self) {
-            match *self {}
+            match self.void {}
         }
 
         pub(super) fn size(&self) -> (i32, i32) {
-            match *self {}
+            match self.void {}
         }
 
         pub(super) fn resizes(&self) -> u64 {
-            match *self {}
+            match self.void {}
         }
     }
 }

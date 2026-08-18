@@ -62,6 +62,19 @@ ship in the font-licenses/ folder of every artifact:
 Tangent's own MIT grant (LICENSE) covers Tangent's source and compiled code only.
 The fonts above are not relicensed by it and remain under their own terms.
 
+Bundled video encoder (Linux and Windows artifacts)
+---------------------------------------------------
+The Linux and Windows artifacts ship an UNMODIFIED ffmpeg build as
+`tangent-ffmpeg` (`tangent-ffmpeg.exe`), invoked by Tangent as a separate
+process to encode a take's video. ffmpeg is a trademark of Fabrice Bellard;
+these builds are GPL-licensed and their full licence text plus a provenance
+note (exact upstream URL and checksum) ship beside the binary in the
+ffmpeg-licenses/ folder of those artifacts. Source code for ffmpeg is
+available from https://ffmpeg.org/. Because it runs as a separate program,
+its GPL terms apply to that binary and do not extend to Tangent itself
+(see LICENSING.md for the same reasoning applied to the VST3 plugin).
+The macOS artifact bundles no encoder: it uses AVFoundation, part of macOS.
+
 Rust crates
 -----------
 The Rust crates statically linked into Tangent are listed below with their

@@ -152,5 +152,22 @@ dispatch2 = { version = "0.3", default-features = false, features = [
     "objc2",
 ] }
 
+# ── the camera, Linux ───────────────────────────────────────────────────────
+#
+# Target-gated exactly like the macOS block above and for the same reason: the
+# Windows build must never see these. `linuxvideo` is the crate
+# RECORDER-PLAN §4 names — 0BSD, pure Rust ioctl wrappers, no bindgen, no
+# libclang — so the V4L2 backend adds no C toolchain requirement to the build.
+[target.'cfg(target_os = "linux")'.dependencies]
+linuxvideo = "0.3.5"
+# MJPEG. Most UVC webcams offer their full frame rate only compressed — the
+# 2012 FaceTime HD this was written against does YUYV at 30 fps up to 640x480
+# and needs MJPG for 1280x720 at 30 — so a backend without a JPEG decoder is a
+# backend that silently caps most cameras at VGA. Pure Rust,
+# MIT/Apache-2.0/Zlib — and 0.5 specifically because eframe already carries
+# zune-jpeg 0.5 transitively (image → tiff), so this pins to the version that
+# is in the tree anyway rather than adding a second copy of the decoder.
+zune-jpeg = "0.5"
+
 [lints]
 workspace = true

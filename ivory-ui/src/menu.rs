@@ -1689,6 +1689,8 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         min_size: state.size,
         pos: Some(state.pos),
         order: egui::Order::Foreground,
+        // Tells a Linux WM this is a menu, not an app window to tile.
+        window_type: Some(egui::X11WindowType::PopupMenu),
         ..Default::default()
     };
     let font_scale = state.font_scale;
@@ -1829,6 +1831,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
             // Don't steal key focus from the menu — and inline, sit above it.
             takes_focus: false,
             order: egui::Order::Tooltip,
+            window_type: Some(egui::X11WindowType::PopupMenu),
             ..Default::default()
         };
         let report = crate::shell::surface(ctx, caps, &sub_spec, &mut |ui, want_close| {
@@ -1874,7 +1877,16 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         let grace = state.opened_at.elapsed() > std::time::Duration::from_millis(250);
         let all_unfocused = menu_report.focused == Some(false)
             && submenu_report.is_none_or(|r| r.focused != Some(true));
-        if state.saw_focus && grace && all_unfocused {
+        // Focus loss alone is NOT enough evidence while the pointer is inside
+        // one of the two windows. Under i3 a freshly mapped submenu window
+        // takes the OS focus and the menu never gets it back — so the frame
+        // that closed the submenu (any hover of a plain row) used to read as
+        // "nobody is focused" and shut the whole menu while the user was in
+        // the middle of using it. That was the "menu vanishes when moving to
+        // the lower items" bug on Linux.
+        let pointer_inside = menu_report.pointer_over == Some(true)
+            || submenu_report.is_some_and(|r| r.pointer_over == Some(true));
+        if state.saw_focus && grace && all_unfocused && !pointer_inside {
             close = true;
         }
     } else if menu_report.pressed_outside && submenu_report.is_none_or(|r| r.pressed_outside) {

@@ -330,6 +330,12 @@ cp assets/fonts/OFL.txt "$WINSTAGE/"
 # Licences for the four fonts eframe's `default_fonts` embeds in ivory.exe.
 mkdir -p "$WINSTAGE/font-licenses"
 cp assets/font-licenses/*.txt "$WINSTAGE/font-licenses/"
+# The bundled encoder, so video needs nothing installed — the app looks for
+# `tangent-ffmpeg.exe` beside `tangent.exe` before falling back to PATH.
+# Checksum-pinned and cached; offline after the first fetch.
+scripts/fetch-ffmpeg.sh windows
+cp dist/vendor/windows/tangent-ffmpeg.exe "$WINSTAGE/"
+cp -R dist/vendor/windows/ffmpeg-licenses "$WINSTAGE/ffmpeg-licenses"
 # User-facing instructions travel with the build (SmartScreen steps, connecting a
 # keyboard, the teach/correct features, where settings live). Shipped as .txt, not
 # .md: Windows has no default handler for .md.

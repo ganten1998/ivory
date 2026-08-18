@@ -55,6 +55,15 @@ pub struct SurfaceSpec<'a> {
     pub modal: bool,
     /// Inline stacking. The submenu must sit above the menu.
     pub order: egui::Order,
+    /// The `_NET_WM_WINDOW_TYPE` hint, X11 only, ignored everywhere else.
+    ///
+    /// This is what tells a Linux window manager what the window IS. It
+    /// matters most under tiling WMs (i3, sway): a `Normal` resizable window
+    /// gets TILED into the layout — which for a modal dialog means it opens
+    /// as a random pane UNDERNEATH the floating main window while the app
+    /// ignores all input waiting on it, i.e. the app appears frozen. `Dialog`
+    /// and `PopupMenu` windows are floated by every WM that reads the hint.
+    pub window_type: Option<egui::X11WindowType>,
 }
 
 impl Default for SurfaceSpec<'_> {
@@ -70,6 +79,7 @@ impl Default for SurfaceSpec<'_> {
             takes_focus: true,
             modal: false,
             order: egui::Order::Foreground,
+            window_type: None,
         }
     }
 }
@@ -90,6 +100,15 @@ pub struct SurfaceReport {
     /// A pointer press landed outside this surface's rect this frame. Only ever
     /// true inline; on the desktop, a click elsewhere shows up as focus loss.
     pub pressed_outside: bool,
+    /// Whether the pointer is currently over this surface's window. `Some`
+    /// only on the desktop, where each viewport has its own pointer stream and
+    /// a `PointerGone` marks the cursor leaving. `None` inline.
+    ///
+    /// This exists because focus is not a safe proxy for attention on Linux:
+    /// under i3 a freshly created submenu window takes the focus and the menu
+    /// window never gets it back, so "nothing of mine is focused" can be true
+    /// while the user's pointer is sitting in the middle of the menu.
+    pub pointer_over: Option<bool>,
 }
 
 fn viewport_id(id: &str) -> egui::ViewportId {
@@ -133,17 +152,22 @@ pub fn surface(
         if let Some(p) = spec.pos {
             builder = builder.with_position(p);
         }
+        if let Some(t) = spec.window_type {
+            builder = builder.with_window_type(t);
+        }
 
         ctx.show_viewport_immediate(viewport_id(spec.id), builder, |vp, _class| {
             viewport_ui(vp, |ui| {
-                let (close_req, esc, focused) = ui.input(|i| {
+                let (close_req, esc, focused, pointer_over) = ui.input(|i| {
                     (
                         i.viewport().close_requested(),
                         i.key_pressed(egui::Key::Escape),
                         i.viewport().focused,
+                        i.pointer.has_pointer(),
                     )
                 });
                 report.focused = focused;
+                report.pointer_over = Some(pointer_over);
                 report.close |= close_req || esc;
                 add(ui, &mut body_wants_close);
             });

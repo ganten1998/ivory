@@ -42,6 +42,19 @@ ship in the font-licenses/ folder of every artifact:
 Tangent's own MIT grant (LICENSE) covers Tangent's source and compiled code only.
 The fonts above are not relicensed by it and remain under their own terms.
 
+Bundled video encoder (Linux and Windows artifacts)
+---------------------------------------------------
+The Linux and Windows artifacts ship an UNMODIFIED ffmpeg build as
+`tangent-ffmpeg` (`tangent-ffmpeg.exe`), invoked by Tangent as a separate
+process to encode a take's video. ffmpeg is a trademark of Fabrice Bellard;
+these builds are GPL-licensed and their full licence text plus a provenance
+note (exact upstream URL and checksum) ship beside the binary in the
+ffmpeg-licenses/ folder of those artifacts. Source code for ffmpeg is
+available from https://ffmpeg.org/. Because it runs as a separate program,
+its GPL terms apply to that binary and do not extend to Tangent itself
+(see LICENSING.md for the same reasoning applied to the VST3 plugin).
+The macOS artifact bundles no encoder: it uses AVFoundation, part of macOS.
+
 Rust crates
 -----------
 The Rust crates statically linked into Tangent are listed below with their
@@ -99,6 +112,11 @@ android-properties 0.2.2
     authors: Mikhail Lappo <mikhail.lappo@esrlabs.com>
     repository: https://github.com/miklelappo/android-properties
 
+android_system_properties 0.1.5
+    license: MIT/Apache-2.0
+    authors: Nicolas Silva <nical@fastmail.com>
+    repository: https://github.com/nical/android_system_properties
+
 arboard 3.6.1
     license: MIT OR Apache-2.0
     authors: unknown
@@ -113,6 +131,11 @@ as-raw-xcb-connection 1.0.1
     license: MIT OR Apache-2.0
     authors: unknown
     repository: https://github.com/psychon/as-raw-xcb-connection
+
+ash 0.38.0+1.3.281
+    license: MIT OR Apache-2.0
+    authors: Maik Klein <maikklein@googlemail.com>, Benjamin Saunders <ben.e.saunders@gmail.com>, Marijn Suijten <marijn@traverseresearch.nl>
+    repository: https://github.com/ash-rs/ash
 
 ashpd 0.11.1
     license: MIT
@@ -564,6 +587,11 @@ flate2 1.1.9
     authors: Alex Crichton <alex@alexcrichton.com>, Josh Triplett <josh@joshtriplett.org>
     repository: https://github.com/rust-lang/flate2-rs
 
+foldhash 0.1.5
+    license: Zlib
+    authors: Orson Peters <orsonpeters@gmail.com>
+    repository: https://github.com/orlp/foldhash
+
 foldhash 0.2.0
     license: Zlib
     authors: Orson Peters <orsonpeters@gmail.com>
@@ -684,10 +712,35 @@ glutin_wgl_sys 0.6.1
     authors: Kirill Chibisov <contact@kchibisov.com>
     repository: https://github.com/rust-windowing/glutin
 
+gpu-alloc 0.6.2
+    license: MIT OR Apache-2.0
+    authors: Zakarum <roman@barykin.me>
+    repository: https://github.com/zakarumych/gpu-alloc
+
+gpu-alloc-types 0.3.1
+    license: MIT OR Apache-2.0
+    authors: Zakarum <roman@barykin.me>
+    repository: https://github.com/zakarumych/gpu-alloc
+
+gpu-descriptor 0.3.2
+    license: MIT OR Apache-2.0
+    authors: Zakarum <zakarumych@ya.ru>
+    repository: https://github.com/zakarumych/gpu-descriptor
+
+gpu-descriptor-types 0.2.0
+    license: MIT OR Apache-2.0
+    authors: Zakarum <zakarumych@ya.ru>
+    repository: https://github.com/zakarumych/gpu-descriptor
+
 half 2.7.1
     license: MIT OR Apache-2.0
     authors: Kathryn Long <squeeself@gmail.com>
     repository: https://github.com/VoidStarKat/half-rs
+
+hashbrown 0.15.5
+    license: MIT OR Apache-2.0
+    authors: Amanieu d'Antras <amanieu@gmail.com>
+    repository: https://github.com/rust-lang/hashbrown
 
 hashbrown 0.16.1
     license: MIT OR Apache-2.0
@@ -824,6 +877,11 @@ js-sys 0.3.103
     authors: The wasm-bindgen Developers
     repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys
 
+khronos-egl 6.0.0
+    license: MIT/Apache-2.0
+    authors: Timothée Haudebourg <author@haudebourg.net>, Sean Kerr <sean@metatomic.io>
+    repository: https://github.com/timothee-haudebourg/khronos-egl
+
 khronos_api 3.1.0
     license: Apache-2.0
     authors: Brendan Zabarauskas <bjzaba@yahoo.com.au>, Corey Richardson, Arseny Kapoulkine, Pierre Krieger <pierre.krieger1708@gmail.com>
@@ -863,6 +921,11 @@ linux-raw-sys 0.4.15
     license: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
     authors: Dan Gohman <dev@sunfishcode.online>
     repository: https://github.com/sunfishcode/linux-raw-sys
+
+linuxvideo 0.3.5
+    license: 0BSD
+    authors: unknown
+    repository: https://github.com/SludgePhD/LinuxVideo.git
 
 litemap 0.8.2
     license: Unicode-3.0
@@ -1143,6 +1206,11 @@ orbclient 0.3.55
     license: MIT
     authors: Jeremy Soller <jackpot51@gmail.com>
     repository: https://gitlab.redox-os.org/redox-os/orbclient
+
+ordered-float 5.3.0
+    license: MIT
+    authors: Jonathan Reem <jonathan.reem@gmail.com>, Matt Brubeck <mbrubeck@limpet.net>
+    repository: https://github.com/reem/rust-ordered-float
 
 ordered-stream 0.2.0
     license: MIT OR Apache-2.0
@@ -1479,6 +1547,11 @@ smol_str 0.2.2
     authors: Aleksey Kladov <aleksey.kladov@gmail.com>
     repository: https://github.com/rust-analyzer/smol_str
 
+spirv 0.3.0+sdk-1.3.268.0
+    license: Apache-2.0
+    authors: Lei Zhang <antiagainst@gmail.com>
+    repository: https://github.com/gfx-rs/rspirv
+
 stable_deref_trait 1.2.1
     license: MIT OR Apache-2.0
     authors: Robert Grosse <n210241048576@gmail.com>
@@ -1598,6 +1671,11 @@ unicode-width 0.2.2
     license: MIT OR Apache-2.0
     authors: kwantam <kwantam@gmail.com>, Manish Goregaokar <manishsmail@gmail.com>
     repository: https://github.com/unicode-rs/unicode-width
+
+uoctl 1.0.1
+    license: 0BSD
+    authors: unknown
+    repository: https://github.com/SludgePhD/uoctl
 
 url 2.5.8
     license: MIT OR Apache-2.0
@@ -1759,6 +1837,11 @@ wgpu-core-deps-apple 27.0.0
     authors: gfx-rs developers
     repository: https://github.com/gfx-rs/wgpu
 
+wgpu-core-deps-emscripten 27.0.0
+    license: MIT OR Apache-2.0
+    authors: gfx-rs developers
+    repository: https://github.com/gfx-rs/wgpu
+
 wgpu-core-deps-windows-linux-android 27.0.0
     license: MIT OR Apache-2.0
     authors: gfx-rs developers
@@ -1799,6 +1882,11 @@ windows 0.54.0
     authors: Microsoft
     repository: https://github.com/microsoft/windows-rs
 
+windows 0.58.0
+    license: MIT OR Apache-2.0
+    authors: Microsoft
+    repository: https://github.com/microsoft/windows-rs
+
 windows 0.62.2
     license: MIT OR Apache-2.0
     authors: unknown
@@ -1814,6 +1902,11 @@ windows-core 0.54.0
     authors: Microsoft
     repository: https://github.com/microsoft/windows-rs
 
+windows-core 0.58.0
+    license: MIT OR Apache-2.0
+    authors: Microsoft
+    repository: https://github.com/microsoft/windows-rs
+
 windows-core 0.62.2
     license: MIT OR Apache-2.0
     authors: unknown
@@ -1824,9 +1917,19 @@ windows-future 0.3.2
     authors: unknown
     repository: https://github.com/microsoft/windows-rs
 
+windows-implement 0.58.0
+    license: MIT OR Apache-2.0
+    authors: Microsoft
+    repository: https://github.com/microsoft/windows-rs
+
 windows-implement 0.60.2
     license: MIT OR Apache-2.0
     authors: unknown
+    repository: https://github.com/microsoft/windows-rs
+
+windows-interface 0.58.0
+    license: MIT OR Apache-2.0
+    authors: Microsoft
     repository: https://github.com/microsoft/windows-rs
 
 windows-interface 0.59.3
@@ -1849,9 +1952,19 @@ windows-result 0.1.2
     authors: Microsoft
     repository: https://github.com/microsoft/windows-rs
 
+windows-result 0.2.0
+    license: MIT OR Apache-2.0
+    authors: Microsoft
+    repository: https://github.com/microsoft/windows-rs
+
 windows-result 0.4.1
     license: MIT OR Apache-2.0
     authors: unknown
+    repository: https://github.com/microsoft/windows-rs
+
+windows-strings 0.1.0
+    license: MIT OR Apache-2.0
+    authors: Microsoft
     repository: https://github.com/microsoft/windows-rs
 
 windows-strings 0.5.1
@@ -2164,4 +2277,4 @@ zvariant_utils 3.5.0
     authors: Zeeshan Ali Khan <zeeshanak@gnome.org>, turbocooler <turbocooler@cocaine.ninja>
     repository: https://github.com/z-galaxy/zbus/
 
-(423 crates)
+(443 crates)

@@ -66,20 +66,48 @@ const WAIT_FRAMES: u32 = 2;
 
 /// Where `ffmpeg` is, or why it is not.
 ///
-/// `IVORY_FFMPEG` overrides the search, which is what a bundled copy would set
-/// and what the tests use. Otherwise the name alone, so `PATH` decides.
+/// The bundled encoder's file name, beside the executable. Deliberately NOT
+/// `ffmpeg`: the Linux installer puts it in `~/.local/bin`, which is on most
+/// users' `PATH`, and an unprefixed `ffmpeg` there would silently shadow the
+/// system one for every shell the user owns.
+const BUNDLED: &str = if cfg!(target_os = "windows") {
+    "tangent-ffmpeg.exe"
+} else {
+    "tangent-ffmpeg"
+};
+
+/// `IVORY_FFMPEG` overrides everything, which is what the tests use. Then the
+/// copy shipped beside the executable, so the artifact works on a machine with
+/// nothing installed — the release carries its own encoder on the platforms
+/// that need one. Only then the bare name, so `PATH` decides.
 fn program() -> PathBuf {
-    std::env::var_os("IVORY_FFMPEG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("ffmpeg"))
+    if let Some(p) = std::env::var_os("IVORY_FFMPEG") {
+        return PathBuf::from(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join(BUNDLED);
+            if bundled.is_file() {
+                return bundled;
+            }
+        }
+    }
+    PathBuf::from("ffmpeg")
 }
 
 /// Named so the message tells somebody what to actually do about it.
+///
+/// Reachable only when the bundled copy beside the executable is gone too —
+/// somebody copied `tangent` out of its folder, most likely — so the bundled
+/// copy is worth naming ahead of the package manager.
 fn how_to_install() -> &'static str {
     if cfg!(target_os = "windows") {
-        "install it with `winget install ffmpeg`, or put ffmpeg.exe on PATH"
+        "restore the tangent-ffmpeg.exe that shipped next to tangent.exe, \
+         install it with `winget install ffmpeg`, or put ffmpeg.exe on PATH"
     } else {
-        "install it with your package manager, for example `sudo apt install ffmpeg`"
+        "reinstall so the bundled tangent-ffmpeg sits next to the tangent \
+         binary, or install ffmpeg with your package manager, for example \
+         `sudo apt install ffmpeg`"
     }
 }
 

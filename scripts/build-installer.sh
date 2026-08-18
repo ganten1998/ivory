@@ -278,6 +278,14 @@ build_linux() {
   chmod +x "$dir/install.sh"
   cp LICENSING.md LICENSE-GPL-3.0 "$dir/"
 
+  # The bundled encoder, so video needs nothing installed. Cached and
+  # checksum-pinned; offline after the first fetch.
+  scripts/fetch-ffmpeg.sh linux
+  cp dist/vendor/linux/tangent-ffmpeg "$dir/tangent-ffmpeg"
+  chmod 755 "$dir/tangent-ffmpeg"
+  rm -rf "$dir/ffmpeg-licenses"
+  cp -R dist/vendor/linux/ffmpeg-licenses "$dir/ffmpeg-licenses"
+
   # Strip macOS extended attributes before repacking.
   #
   # This tarball is built on Linux, brought here, unpacked, added to, and
@@ -300,7 +308,12 @@ build_linux() {
   # rebuild to get back. `package_linux` in build-cross.sh learned this the
   # same way.
   local out="dist/tangent-$VERSION-linux-x86_64.tar.gz"
-  ( cd "$WORK/linux" && tar --no-mac-metadata --no-xattrs -czf "$ROOT/$out.new" "$(basename "$dir")" )
+  # `--no-mac-metadata` is bsdtar-only, and bsdtar is only where the Mac
+  # metadata is. GNU tar (this step run ON Linux, where a Linux-only fix
+  # release is assembled end to end) has neither the flag nor the problem.
+  local strip_meta=""
+  tar --no-mac-metadata --version >/dev/null 2>&1 && strip_meta="--no-mac-metadata"
+  ( cd "$WORK/linux" && tar $strip_meta --no-xattrs -czf "$ROOT/$out.new" "$(basename "$dir")" )
   mv -f "$ROOT/$out.new" "$ROOT/$out"
 
   echo "==> $out"
@@ -309,7 +322,9 @@ build_linux() {
   tar -tzf "$out" | sed 's/^/      /'
   # Same lesson as everywhere else in this repo: an archive that exists proves
   # nothing. Both payloads and the installer must actually be in it.
-  for want in '/tangent$' '/install.sh$' 'Tangent.vst3/Contents/x86_64-linux/Tangent.so$'; do
+  for want in '/tangent$' '/install.sh$' '/tangent-ffmpeg$' \
+              'ffmpeg-licenses/GPLv3.txt$' \
+              'Tangent.vst3/Contents/x86_64-linux/Tangent.so$'; do
     if [ "$(tar -tzf "$out" | grep -cE "$want")" -eq 0 ]; then
       echo "FAIL: nothing matching $want in $out" >&2
       exit 1
