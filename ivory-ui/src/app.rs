@@ -4222,12 +4222,7 @@ impl IvoryApp {
         // note in somebody's recording.
         if let Some(hr) = heart_rect_for_card {
             if ctx.pointer_latest_pos().is_some_and(|p| hr.contains(p)) {
-                chord_strip::draw_thanks(
-                    ui.painter(),
-                    hr,
-                    ui.max_rect(),
-                    self.settings.chord_text_color.to_color32(),
-                );
+                chord_strip::draw_thanks(ui.painter(), hr, ui.max_rect(), self.settings.dark_mode);
             }
         }
 

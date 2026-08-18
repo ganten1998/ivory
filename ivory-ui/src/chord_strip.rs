@@ -160,8 +160,27 @@ pub const THANKS: &[&str] = &[
 /// Drawn here rather than as an egui tooltip because this band is a pure
 /// painter with no `Ui` anywhere near it, and because the compositor draws the
 /// same band into a video where a tooltip would not exist at all.
-pub fn draw_thanks(painter: &Painter, heart: Rect, screen: Rect, ink: Color32) {
-    let size = (heart.height() * 0.62).clamp(9.0, 15.0);
+pub fn draw_thanks(painter: &Painter, heart: Rect, screen: Rect, dark: bool) {
+    // **The card's own colours, and its own size.**
+    //
+    // It used to take the chord label's colour and paint itself on a fixed
+    // near-opaque black, so it was a dark card in light mode — the one surface
+    // in the app that ignored the theme. And it took its type size from the
+    // HEART, which is a sprite in a corner: a small heart made an unreadable
+    // card, and the two have nothing to do with each other.
+    let (card_bg, ink) = if dark {
+        (
+            Color32::from_rgb(0x0a, 0x0a, 0x0a),
+            Color32::from_rgb(0xE8, 0xDC, 0xC0),
+        )
+    } else {
+        (
+            Color32::from_rgb(0xE8, 0xDC, 0xC0),
+            Color32::from_rgb(0x1a, 0x1a, 0x1a),
+        )
+    };
+    // Sized off the WINDOW, which is what anybody reading it is looking at.
+    let size = (screen.height() * 0.019).clamp(11.0, 22.0);
     let line = size * 1.05;
     // Head, a blank line, then each name with a blank line after it.
     let rows = 2.0 + THANKS.len() as f32 * 2.0 - 1.0;
@@ -179,7 +198,7 @@ pub fn draw_thanks(painter: &Painter, heart: Rect, screen: Rect, ink: Color32) {
     let dy = (card.bottom() - screen.bottom()).max(0.0);
     card = card.translate(egui::vec2(dx, -dy));
 
-    painter.rect_filled(card, 3.0, Color32::from_black_alpha(238));
+    painter.rect_filled(card, 3.0, card_bg);
     painter.rect_stroke(card, 3.0, Stroke::new(1.0_f32, ink), StrokeKind::Inside);
     let mut y = card.top() + pad + line * 0.5;
     painter.text(
@@ -229,10 +248,12 @@ mod thanks_tests {
                     egui::vec2(screen.width(), 40.0),
                 ),
             ] {
-                let _ = ctx.run(Default::default(), |ctx| {
-                    let p = ctx.layer_painter(egui::LayerId::background());
-                    draw_thanks(&p, heart_rect(strip), screen, Color32::WHITE);
-                });
+                for dark in [false, true] {
+                    let _ = ctx.run(Default::default(), |ctx| {
+                        let p = ctx.layer_painter(egui::LayerId::background());
+                        draw_thanks(&p, heart_rect(strip), screen, dark);
+                    });
+                }
             }
         }
     }

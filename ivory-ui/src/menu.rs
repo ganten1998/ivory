@@ -758,20 +758,6 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
             },
             MenuAction::ToggleChordDetection,
         ));
-        if view.detection_enabled {
-            // **The strip, as its own line.** It is off by default in 5.0
-            // because the staff prints the chord name itself; this is how
-            // somebody gets the old piano-and-strip window back, and how
-            // anybody who wants the name in two places may have it.
-            chords.push(row(
-                if view.chord_strip {
-                    "Hide Chord Strip"
-                } else {
-                    "Show Chord Strip"
-                },
-                MenuAction::ToggleChordStrip,
-            ));
-        }
         if view.detection_enabled && view.caps.detachable {
             chords.push(row("Detach Chord Window", MenuAction::DetachChordWindow));
         }
@@ -945,6 +931,33 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                     enabled: true,
                 })
                 .collect(),
+        );
+    }
+
+    // ── Chord strip ────────────────────────────────────────────────────────
+    // **A BAND, so it sits with the bands.** It lived inside the Chords
+    // category for one release and nobody could find it: every other band this
+    // app can hide says so at the top level — "Show Fretboard", "Show
+    // Recorder" — and a band whose only way back is the seventh row of a
+    // submenu is a band that is gone. Off by default in 5.0, because the sheet
+    // music prints the chord name itself; turning it on is how somebody gets
+    // the piano-and-strip window this app had for years.
+    //
+    // Nothing to say about a strip with no detector behind it, so with
+    // detection off the row is not there at all — the row above it is the one
+    // that brings both back.
+    if view.detection_enabled && !(view.detached && view.caps.detachable) {
+        push_category(
+            &mut e,
+            "Chord Strip",
+            vec![row(
+                if view.chord_strip {
+                    "Hide Chord Strip"
+                } else {
+                    "Show Chord Strip"
+                },
+                MenuAction::ToggleChordStrip,
+            )],
         );
     }
 
@@ -2048,6 +2061,40 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The chord strip says how to get it back, where the other bands do.
+    ///
+    /// **The regression this exists for**: it shipped inside the Chords
+    /// submenu, seventh of seven rows, and the owner could not find it. Every
+    /// other band this app can hide offers its way back at the TOP level.
+    #[test]
+    fn the_chord_strip_is_a_top_level_row_beside_the_other_bands() {
+        let mut v = view();
+        v.chord_strip = false;
+        let labels: Vec<String> = rows(v.clone()).into_iter().map(|(l, ..)| l).collect();
+        let at = |want: &str| {
+            labels
+                .iter()
+                .position(|l| l == want)
+                .unwrap_or_else(|| panic!("no top-level {want:?} in {labels:?}"))
+        };
+        // Beside the other two, and above them: the strip is the band a first
+        // launch does NOT have, so it is the one somebody comes looking for.
+        assert!(at("Show Chord Strip") < at("Show Fretboard"));
+        assert!(at("Show Fretboard") < at("Show Recorder"));
+
+        // It says the other thing when it is up.
+        v.chord_strip = true;
+        assert!(rows(v.clone()).iter().any(|(l, ..)| l == "Hide Chord Strip"));
+
+        // And it is gone with no detector behind it, since the row above it
+        // brings back the strip and the detector together.
+        v.detection_enabled = false;
+        assert!(
+            !rows(v).iter().any(|(l, ..)| l.contains("Chord Strip")),
+            "a strip offered with detection off"
+        );
     }
 
     /// One submenu by name. Positional indexing broke every time a submenu

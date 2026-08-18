@@ -661,7 +661,7 @@ impl Layout {
     /// and pushed hard into the corner: it is a credit, not a control, and it
     /// earns its place by staying out of the way.
     fn fill_heart(&mut self, body: Rect, monitor: Rect) {
-        let h = (Self::heart_h(body) * 0.72).max(5.0);
+        let h = (Self::heart_h(body) * 0.85).max(6.0);
         let w = h * crate::chord_strip::HEART_ASPECT;
         self.heart = Rect::from_min_size(
             Pos2::new(body.right() - w, body.bottom() - h),
@@ -679,7 +679,7 @@ impl Layout {
     /// are a list that grows and anything drawn on top of a list is something
     /// the list will eventually reach.
     fn heart_h(body: Rect) -> f32 {
-        (body.height() * 0.13).clamp(6.0, 16.0)
+        (body.height() * 0.18).clamp(9.0, 24.0)
     }
 
     /// Idle: preview, transport, destination, monitor.
