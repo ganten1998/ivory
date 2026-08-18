@@ -1,4 +1,4 @@
-# Tangent 5.0 feature list
+# Tangent 4.4 feature list
 
 Written to be lifted from. Grouped by what somebody would be trying to DO,
 because that is how the app is now: a monitor is a thing you glance at, and

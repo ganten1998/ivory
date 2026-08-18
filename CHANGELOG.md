@@ -10,31 +10,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
-## [5.0.0-beta.2] - 2026-08-18
+## [4.4.0] - 2026-08-18
 
-### Added
-
-- **Video on Windows and Linux.** They encode through `ffmpeg`, which has to be
-  on the PATH; a take that cannot find it names the install command and still
-  writes its audio and its MIDI. macOS is unchanged and still encodes natively
-  through AVFoundation, with nothing to install.
-
-### Changed
-
-- The video compositor no longer depends on the renderer the window is using.
-  It borrows the window's graphics device when there is one and opens its own
-  when there is not, which is what made it look macOS-only: it is wgpu and
-  egui, the same two things that draw the window, and it was never
-  platform-specific.
-
-### Fixed
-
-- Em dashes are gone from every string the app can put on screen.
-
-## [5.0.0-beta.1] - 2026-08-18
-
-Published as a pre-release, so every permanent download link still resolves to
-the last stable build.
+The largest release since the Rust rewrite. Tangent writes music down, and a
+take is now simply the window it was played in.
 
 ### Added
 
@@ -51,6 +30,10 @@ the last stable build.
   fifths, Tonnetz, harmonic triangles and sheet music. Pressing a number for a
   panel that is showing moves it to the end, so the same keys choose what is up
   and where. All four off collapses the band; any number from empty fills it.
+- **Video on Windows and Linux.** They encode through `ffmpeg`, which has to be
+  on the PATH; a take that cannot find it names the install command and still
+  writes its audio and its MIDI. macOS is unchanged and still encodes natively
+  through AVFoundation, with nothing to install.
 - **A take-settings panel behind a settings cog**, holding everything that used
   to be nine controls in the middle of the recorder band.
 - **Five instrument slots**, up from three, and a pair of VU meters.
@@ -67,9 +50,14 @@ the last stable build.
 - **The window is 16:9** while the usual bands are up, so a take needs neither
   letterbox nor crop. The theory band absorbs the difference and gives up about
   five per cent of its height.
+- **The video compositor no longer depends on the renderer the window is
+  using.** It borrows the window's graphics device when there is one and opens
+  its own when there is not, which is what made it look macOS-only: it is wgpu
+  and egui, the same two things that draw the window, and it was never
+  platform-specific.
 - **Nothing is behind a supporter key.** The heart is drawn for everybody, in
   the colour they choose, and hovering it shows the thanks. There are no locked
-  features in this build and none are planned before 5.0 is final.
+  features in this build, and none are planned.
 - The recorder band is a transport again: record, stop and the cog as three
   icons of one size, with reachable metronome and input faders.
 - VST3 scanning is recursive, takes folders you add yourself, and rescans
@@ -81,6 +69,7 @@ the last stable build.
 - The Welcome card waited for the splash instead of opening on top of it, and
   fits its own text again.
 - Chord alternates no longer flicker between equally scored matches.
+- Em dashes are gone from every string the app can put on screen.
 
 ## [3.0.0] - 2026-08-14
 

@@ -1,11 +1,11 @@
-# Gumroad product page for 5.0
+# Gumroad product page for 4.4
 
 Paste-ready copy for <https://ganten.gumroad.com/l/ivory>. The product is the
 **supporter key**, not the app: the app is free and always has been, and the
 page has to say so before it says anything else or the whole thing reads as a
 paywall with the price filed off.
 
-## What changed for 5.0, and it is a repositioning
+## What changed for 4.4, and it is a repositioning
 
 Through 4.x this page sold a MIDI monitor with good theory panels. That is what
 it was. It is not what it is now.
@@ -23,8 +23,8 @@ recording tool is a thing you build a lesson or a channel on, and those are
 different sentences.
 
 **And the key gates nothing.** The heart used to be the one thing it switched
-on. It is drawn for everybody now, and it will stay that way at least until 5.0
-is final, so the page says exactly that. A page promising a feature Tangent no
+on. It is drawn for everybody now and it is staying that way, so the page says
+exactly that. A page promising a feature Tangent no
 longer gates is a page that lies to somebody who paid.
 
 ## Cover / screenshots, in order
@@ -142,7 +142,7 @@ macOS 11+ (Apple Silicon and Intel, signed and notarized), Windows 10+, Linux
 Every feature is in the free build. There is no locked panel, no watermark, no
 nag, no trial, no export limit. The supporter heart that used to be the one
 thing a key switched on is drawn for everybody now, in whatever colour they
-pick, and it will stay that way at least until 5.0 is final.
+pick.
 
 What you do get:
 
