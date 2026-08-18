@@ -1137,71 +1137,19 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 },
                 MenuAction::ToggleMetronome,
             ));
-            recorder.push(row(
-                // Worded as what it DOES rather than as a state, because the
-                // consequence is the whole point: a click in the file is a
-                // ruined take and the default is off for that reason.
-                if view.metronome_in_take {
-                    "Keep the Click Out of Recordings"
-                } else {
-                    "Record the Click Into Takes"
-                },
-                MenuAction::ToggleMetronomeInTake,
-            ));
-            recorder.push(row(
-                // Worded as what it does, like the click row above it. The
-                // consequence is the whole point: with it on, Record starts
-                // writing IMMEDIATELY and the count is at the head of the file.
-                if view.count_in_in_take {
-                    "Count In Before the Take Starts"
-                } else {
-                    "Record the Count-in Into the Take"
-                },
-                MenuAction::ToggleCountInInTake,
-            ));
-            // **No camera row.** The camera has one home: the full-height
-            // preview at the band's top-left, which is the inset the recording
-            // carries. A second one beside the theory diagrams was two places
-            // for the same picture to be, and the diagrams are what the theory
-            // band is for. The pane's code is still here and switched off; it
-            // comes out after the beta.
-            // **The take's settings, which used to be nine controls in the
-            // middle of the band.** They are all set once at the start of a
-            // session and most of them already opened a picker, so a menu row
-            // is the same interaction with less furniture — and the space they
-            // left is what the meters and the faders grew into. The SETUP
-            // button in the band opens this menu, for anybody who never thinks
-            // to right-click.
-            recorder.push(row("Where Takes Go...", MenuAction::ChooseFolder));
-            recorder.push(row("Show the Folder", MenuAction::RevealFolder));
-            recorder.push(row(
-                if view.record_dir_is_default {
-                    "Stop Using This Folder by Default"
-                } else {
-                    "Use This Folder by Default"
-                },
-                MenuAction::ToggleDefaultDir,
-            ));
-            recorder.push(row("Camera...", MenuAction::PickCamera));
-            recorder.push(row("Audio Input...", MenuAction::PickAudio));
-            recorder.push(row("Audio Status...", MenuAction::ShowAudioStatus));
-            recorder.push(row("Export...", MenuAction::ShowExportDialog));
-            recorder.push(row(
-                if view.open_when_done {
-                    "Do Not Show the Take When It Is Finished"
-                } else {
-                    "Show the Take When It Is Finished"
-                },
-                MenuAction::ToggleOpenWhenDone,
-            ));
-            recorder.push(row(
-                if view.hide_elapsed {
-                    "Show Elapsed Time"
-                } else {
-                    "Hide Elapsed Time"
-                },
-                MenuAction::ToggleHideElapsed,
-            ));
+            // **And that is the whole category.** Everything else that used to
+            // be here — where takes go, the camera, the audio input, the
+            // count-in, the export, the four ticks — is in the take-settings
+            // popup behind the cog in the band. They are boxes with captions
+            // and VALUES: a folder path you want to read, a device that may
+            // say "(not connected)", a tick whose current state is the whole
+            // question. A menu row can show none of that, and having them in
+            // two places meant two wordings for one setting.
+            //
+            // What stays is what is about the BAND rather than about a take:
+            // whether it is on screen, whether it is in this window, and the
+            // click — which is a thing you start and stop while playing, so it
+            // wants to be reachable without opening a panel.
         }
         push_category(&mut e, "Recorder", recorder);
         if view.recorder_on {
@@ -3052,31 +3000,23 @@ mod tests {
                 "Hide Recorder",
                 "Detach Recorder",
                 "Start the Click",
-                "Record the Click Into Takes",
-                "Record the Count-in Into the Take",
-                "Where Takes Go...",
-                "Show the Folder",
-                "Use This Folder by Default",
-                "Camera...",
-                "Audio Input...",
-                "Audio Status...",
-                "Export...",
-                "Show the Take When It Is Finished",
-                "Hide Elapsed Time",
-            ]
+                            ]
         );
-        // The elapsed-time switch renames itself too.
-        assert_eq!(
-            find(
-                MenuView {
-                    hide_elapsed: true,
-                    ..v.clone()
-                },
-                MenuAction::ToggleHideElapsed
-            )
-            .map(|(l, _)| l),
-            Some("Show Elapsed Time".to_owned())
-        );
+        // **And nothing else.** The take's settings are in the popup behind
+        // the cog now, so none of them may be here as well: one setting with
+        // two homes is one setting with two wordings.
+        for gone in [
+            MenuAction::ToggleHideElapsed,
+            MenuAction::ChooseFolder,
+            MenuAction::PickCamera,
+            MenuAction::PickAudio,
+            MenuAction::ShowExportDialog,
+            MenuAction::ToggleOpenWhenDone,
+            MenuAction::ToggleCountInInTake,
+        ] {
+            let name = format!("{gone:?}");
+            assert_eq!(find(v.clone(), gone), None, "{name} is still in the menu");
+        }
         // Recorder is LAST of the subjects, after the whole display block, and
         // Pre-roll is its sibling for the reason Wood/Tuning/Capo are the
         // fretboard's. Asserted as the whole list, in order: an inserted
@@ -3168,17 +3108,6 @@ mod tests {
             vec![
                 "Hide Recorder",
                 "Start the Click",
-                "Record the Click Into Takes",
-                "Record the Count-in Into the Take",
-                "Where Takes Go...",
-                "Show the Folder",
-                "Use This Folder by Default",
-                "Camera...",
-                "Audio Input...",
-                "Audio Status...",
-                "Export...",
-                "Show the Take When It Is Finished",
-                "Hide Elapsed Time"
             ],
             "everything that does not need a window stays"
         );

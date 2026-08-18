@@ -179,8 +179,10 @@ pub fn draw_thanks(painter: &Painter, heart: Rect, screen: Rect, dark: bool) {
             Color32::from_rgb(0x1a, 0x1a, 0x1a),
         )
     };
-    // Sized off the WINDOW, which is what anybody reading it is looking at.
-    let size = (screen.height() * 0.019).clamp(11.0, 22.0);
+    // Sized off the WINDOW, which is what anybody reading it is looking at —
+    // but a hover card is a footnote, not a headline. The first cut at this
+    // was half again bigger and read as a dialog that had opened by itself.
+    let size = (screen.height() * 0.0125).clamp(10.0, 14.0);
     let line = size * 1.05;
     // Head, a blank line, then each name with a blank line after it.
     let rows = 2.0 + THANKS.len() as f32 * 2.0 - 1.0;

@@ -711,13 +711,22 @@ const AUDIO_H: f32 = 400.0;
 
 /// The Welcome card's window, and the size it opens at.
 ///
-/// UNCHANGED by the H hint, which is worth recording because the obvious move
-/// was to make it taller: `the_welcome_card_fits_its_own_text` measures the
-/// real strings at the real font and the thirteen lines need 257x366, inside
-/// this comfortably. Growing a dialog that already fits is how a card ends up
-/// with a lake of empty space under its last line.
+/// **With real slack, not seven points of it.** The measurement below came to
+/// 293 against a height of 300 and the card was still being cut off in front
+/// of users: a test that measures labels and a constant that has to survive a
+/// checkbox, a button and a theme's own spacing are not the same arithmetic,
+/// and the difference has to live in the constant rather than in hope.
+/// `the_welcome_card_fits_its_own_text` now demands [`WELCOME_SLACK`] on top of
+/// what it can measure.
 const WELCOME_W: f32 = 470.0;
-const WELCOME_H: f32 = 300.0;
+const WELCOME_H: f32 = 372.0;
+/// How much more than the measurable text the Welcome card must have.
+///
+/// The chrome this test cannot see: a checkbox's real height against the 22 it
+/// is assumed to be, a button's real height against 30, and whatever
+/// `apply_theme` does to spacing. It is the first thing anybody sees, so it
+/// gets a margin rather than a squeeze.
+const WELCOME_SLACK: f32 = 60.0;
 
 /// The dialog as a window. Wide enough for the left column and the longest
 /// radio label on one line, tall enough that the §5 mock needs no scrolling
@@ -4351,13 +4360,22 @@ mod tests {
                 // Laid out through the PAINTER, which is the same route
                 // `ui.label` takes — so this measures what will actually be
                 // drawn rather than a reconstruction of it.
-                for line in WELCOME_LINES {
+                // **Including the spacing egui puts BETWEEN the labels.**
+                // Thirteen `ui.label` calls are twelve gaps, and leaving them
+                // out is how this test passed while the card's last line and
+                // its button were being cut off the bottom edge in front of
+                // every first-time user.
+                let gap = ui.spacing().item_spacing.y;
+                for (i, line) in WELCOME_LINES.iter().enumerate() {
                     let galley = ui.painter().layout_no_wrap(
-                        line.to_owned(),
+                        (*line).to_owned(),
                         font.clone(),
                         Color32::WHITE,
                     );
                     total_h += galley.rect.height().max(font.size);
+                    if i + 1 < WELCOME_LINES.len() {
+                        total_h += gap;
+                    }
                     widest = widest.max(galley.rect.width());
                 }
             });
@@ -4366,12 +4384,15 @@ mod tests {
         // The chrome under the text: a checkbox, the spacing around it, and the
         // button row the layout reserves 30 points for.
         const CHROME_H: f32 = 8.0 + 22.0 + 30.0;
+        // Two more gaps the layout adds under the text: one before the
+        // checkbox's own row and one before the button row.
         const MARGIN: f32 = 14.0 * 2.0;
         let needed_h = total_h + CHROME_H + MARGIN;
         let needed_w = widest + MARGIN;
         assert!(
-            needed_h <= WELCOME_H,
-            "the welcome card needs {needed_h:.0} points of height and has {WELCOME_H:.0}"
+            needed_h + WELCOME_SLACK <= WELCOME_H,
+            "the welcome card needs {needed_h:.0} points of measurable height plus \
+             {WELCOME_SLACK:.0} of slack, and has {WELCOME_H:.0}"
         );
         assert!(
             needed_w <= WELCOME_W,

@@ -722,10 +722,13 @@ impl Layout {
         let pv_w = Self::preview_w(body);
         self.preview = Rect::from_min_max(body.min, Pos2::new(body.left() + pv_w, body.bottom()));
         let sw = Self::setup_w(body);
-        self.fill_setup(Rect::from_min_max(
-            Pos2::new(self.preview.right() + gap, body.top()),
-            Pos2::new(self.preview.right() + gap + sw, body.bottom()),
-        ));
+        self.fill_setup(
+            Rect::from_min_max(
+                Pos2::new(self.preview.right() + gap, body.top()),
+                Pos2::new(self.preview.right() + gap + sw, body.bottom()),
+            ),
+            false,
+        );
 
         let monitor = Self::monitor_of(body);
         self.fill_heart(body, monitor);
@@ -798,7 +801,7 @@ impl Layout {
         // in it: two rows in the middle of a tall column rather than two rows
         // pinned to the bottom of the band, which is what made the bottom of
         // the window read as empty.
-        let col = slice_h(m, 0.23, 0.56);
+        let col = slice_h(m, 0.00, 0.43);
         // Tall rows in a narrow column. Moving the pair off the meters bought
         // width to give away and none to spare, so the legibility comes back
         // out of the HEIGHT: the two rows take nearly the whole column, which
@@ -814,48 +817,14 @@ impl Layout {
         if !t.is_positive() {
             return;
         }
-        // The whole middle group: the two buttons and the clock across the
-        // top, the meters under them at a size worth reading from a bench, and
-        // the click and input faders along the bottom — which used to be in
-        // the monitor column stealing the room three more instrument slots
-        // needed.
-        // **Three columns, left to right: transport, faders, meters.** All of
-        // them use the group's FULL height, which is where the meters get to
-        // be meters: their faces are sized by height, so a row that was a
-        // third of the group made them postage stamps however wide the box
-        // was. The faders are beside them rather than under them for the same
-        // reason — the height they were taking was the height the meters
-        // needed.
-        let top = slice_h(t, 0.00, 0.20);
-        self.meter = slice_h(t, 0.58, 1.00);
-        // **The same size, both of them.** Stop used to be 0.66 of record, and
-        // then its glyph was shrunk another 30% inside that — so the square
-        // read as less than half the circle. Two transport buttons of different
-        // sizes look like one is the real control and the other is a note about
-        // it.
-        //
-        // Capped at the width of its own slice, which is what keeps the two
-        // from colliding at any aspect the window can take. 0.38 rather than
-        // 0.42 because they are now the same width: the centres are 42% of the
-        // row apart, so two half-widths have to come to less than that.
-        // Stacked, and smaller: two round controls in a narrow column read as
-        // a transport, and side by side they were claiming a third of the
-        // group for two buttons pressed once a take.
-        // **Side by side on one line, centred.** Stacked, they read as two
-        // unrelated buttons down the edge of the band; a transport is a ROW,
-        // and the pair is one gesture with two ends.
-        let pair = slice_v(top, 0.08, 0.68);
-        let d = (pair.height() * 0.62).min(pair.width() * 0.40);
-        let dx = d * 0.72;
-        self.record = Rect::from_center_size(pair.center() - Vec2::new(dx, 0.0), Vec2::splat(d));
-        self.stop = Rect::from_center_size(pair.center() + Vec2::new(dx, 0.0), Vec2::splat(d));
-        // A quarter of the transport rather than an eighteenth. The meter is a
-        // pair of VU faces now, and a dial needs HEIGHT in a way a bar never
-        // did: the same 34 points that made a perfectly good bar make a face
-        // with no room to print anything on it.
-        // Under the buttons, in the column they share. At rest it is a
-        // readout; while rolling it is the headline it has always been.
-        self.timecode = slice_v(top, 0.76, 1.00);
+        // **Two columns now, not three.** The record button, the stop and the
+        // clock moved to the foot of the words column, where three small icons
+        // say what two large ones and a word said — and the fifth of the group
+        // they were using is what the faders and the meters grew into. Both
+        // take the group's full height, which is where the meters get to be
+        // meters: their faces are sized by height, so a row that was a third
+        // of the group made them postage stamps however wide the box was.
+        self.meter = slice_h(t, 0.46, 1.00);
     }
 
     /// The instrument slots, the two faders and the click.
@@ -911,21 +880,62 @@ impl Layout {
     ///
     /// The take name stays because it is the only one somebody types, and a
     /// menu cannot hold a text field.
-    fn fill_setup(&mut self, d: Rect) {
+    fn fill_setup(&mut self, d: Rect, rolling: bool) {
         if !d.is_positive() {
             return;
         }
-        self.name = slice_v(d, 0.00, 0.26);
-        self.folder = slice_v(d, 0.29, 0.45);
+        // **The transport lives at the foot of this column now.** It had a
+        // column of its own in the middle of the band, which is the width the
+        // faders and the meters wanted — and three small icons say exactly
+        // what two large ones and a word said. Nothing above them is set
+        // mid-take, so while a take runs the column is the transport and the
+        // clock and nothing else.
+        let bar = slice_v(d, 0.74, 1.00);
+        // Three squares of one size, left-aligned, with the clock filling the
+        // rest of the row. One size because they are one group: a stop that is
+        // bigger than the cog beside it reads as more important than it is.
+        let side = bar.height().min(bar.width() * 0.24);
+        let step = side * 1.18;
+        let icon = |i: usize| {
+            Rect::from_min_size(
+                Pos2::new(bar.left() + step * i as f32, bar.center().y - side * 0.5),
+                Vec2::splat(side),
+            )
+        };
+        if rolling {
+            // No record button while rolling — pressing it would mean nothing,
+            // and a dead control is worse than no control. The steady dot
+            // stands exactly where it stood. No cog either: none of what it
+            // opens can be changed with an encoder running.
+            self.dot = icon(0);
+            self.stop = icon(1);
+        } else {
+            self.record = icon(0);
+            self.stop = icon(1);
+            self.setup = icon(2);
+        }
+        if rolling {
+            // **The clock takes the whole column while a take runs.** Nothing
+            // above the bar is set mid-take — a take name you cannot type into
+            // and a tempo you cannot drag are two boxes teaching the wrong
+            // thing — so the elapsed time gets the room they were using, which
+            // is the one number anybody looks at from a piano bench.
+            self.timecode = slice_v(d, 0.04, 0.68);
+            return;
+        }
+        // At rest it says 0:00 and means nothing, so it takes what is left of
+        // the transport's own row and no more.
+        self.timecode = Rect::from_min_max(
+            Pos2::new(bar.left() + step * 3.0, bar.top()),
+            bar.max,
+        );
+        self.name = slice_v(d, 0.00, 0.30);
+        self.folder = slice_v(d, 0.33, 0.51);
         // **The tempo stays.** It is the one thing in this group that is
         // DRAGGED, and a menu row cannot be dragged; it is also per-take
         // rather than per-session, since it sets the count-in's speed. The
-        // rest of the group went to the menu because a menu could hold it.
-        self.tempo = slice_v(d, 0.49, 0.67);
-        // The biggest row in the column, because it is now the way to every
-        // take setting there is: everything that used to be a box down here
-        // lives behind it.
-        self.setup = slice_v(d, 0.72, 1.00);
+        // rest of the group is behind the cog.
+        self.tempo = slice_v(d, 0.54, 0.72);
     }
 
     /// Rolling: readable from the bench. The preview collapses to a strip that
@@ -958,36 +968,29 @@ impl Layout {
         // click is turned down mid-performance more than any other control
         // here. They keep the bottom of the group, where they are at rest.
         self.fill_faders(body, gap);
-        // **The identical three columns the band has at rest.** Rolling used
-        // to rearrange itself — meters narrower, buttons up in a strip, a clock
-        // across half the group — and the moment a take starts is the worst
-        // moment for the band to move under the eye. The only thing that
-        // changes now is that the record button becomes the steady dot, which
-        // is the one difference that means something.
-        let top = slice_h(t, 0.00, 0.20);
-        self.meter = slice_h(t, 0.58, 1.00);
+        self.fill_transport(t);
 
-        // The dot stands exactly where the record button stood, at exactly its
-        // size. There is no record button while rolling — pressing it would
-        // mean nothing, and a dead control is worse than no control.
-        // **Side by side on one line, centred.** Stacked, they read as two
-        // unrelated buttons down the edge of the band; a transport is a ROW,
-        // and the pair is one gesture with two ends.
-        let pair = slice_v(top, 0.08, 0.68);
-        let d = (pair.height() * 0.62).min(pair.width() * 0.40);
-        let dx = d * 0.72;
-        self.dot = Rect::from_center_size(pair.center() - Vec2::new(dx, 0.0), Vec2::splat(d));
-        self.stop = Rect::from_center_size(pair.center() + Vec2::new(dx, 0.0), Vec2::splat(d));
+        // **The identical band, with the record button become the dot.** The
+        // transport sits at the foot of the words column in both layouts, so
+        // the stop button is under the same pixel at 0:00 and at 4:12. What
+        // leaves is everything above it: a take name you cannot type into and
+        // a tempo you cannot drag are two boxes teaching the wrong thing.
+        let sw = Self::setup_w(body);
+        self.fill_setup(
+            Rect::from_min_max(
+                Pos2::new(self.preview.right() + gap, body.top()),
+                Pos2::new(self.preview.right() + gap + sw, body.bottom()),
+            ),
+            true,
+        );
 
         // The one thing `hide_elapsed` suppresses is a CLOCK. The count-in beat
         // is the number the player is counting, and "FINISHING" is the reason
         // not to close the lid yet; hiding either would be hiding the wrong
         // thing under the name of a performance setting.
-        self.timecode = if view.hide_elapsed && matches!(view.state, RecordState::Rolling) {
-            Rect::NOTHING
-        } else {
-            slice_v(top, 0.76, 1.00)
-        };
+        if view.hide_elapsed && matches!(view.state, RecordState::Rolling) {
+            self.timecode = Rect::NOTHING;
+        }
     }
 
     /// Every clickable region and what it means, in one place.
@@ -1093,6 +1096,15 @@ pub fn fit_preview(into: Rect, source_px: Vec2) -> Rect {
 pub enum Hit {
     /// Open the menu the take's settings moved into.
     OpenSetup,
+    /// The take-settings popup's DONE button. It only ever closes the popup,
+    /// which is why it is a hit here and not an action anywhere else.
+    CloseSetup,
+    /// Reachable only from the popup: the four rows below have no home in the
+    /// band, and a control that exists in exactly one place needs no rule about
+    /// which place wins.
+    ShowAudioStatus,
+    ToggleCountInInTake,
+    ToggleHideElapsed,
     Record,
     Stop,
     ChooseFolder,
@@ -1238,6 +1250,10 @@ impl Hit {
         match self {
             Hit::Record => "Record",
             Hit::OpenSetup => "Take settings",
+            Hit::CloseSetup => "Done",
+            Hit::ShowAudioStatus => "Audio status",
+            Hit::ToggleCountInInTake => "Record the count-in into the take",
+            Hit::ToggleHideElapsed => "Hide the elapsed time",
             Hit::Stop => "Stop",
             Hit::ChooseFolder => "Choose folder",
             Hit::RevealFolder => "Show the folder",
@@ -1474,23 +1490,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &RecorderView<'_>, s: &Settings
     draw_monitor(painter, &l, view, &p);
     if !l.rolling {
         draw_destination(painter, &l, view, s, &p);
-        // The button that opens the menu the rest of the destination group
-        // moved into. Every rect it left behind is `Rect::NOTHING`, which
-        // every draw here already treats as "not on screen", so nothing above
-        // needed a condition adding to it.
-        if l.setup.is_positive() {
-            control(painter, l.setup, &p);
-            let size = fit_text(l.setup, "SETUP...", l.setup.height() * 0.5);
-            if size >= MIN_TEXT {
-                painter.text(
-                    l.setup.center(),
-                    Align2::CENTER_CENTER,
-                    "SETUP...",
-                    font(size),
-                    p.ink,
-                );
-            }
-        }
+        draw_cog(painter, l.setup, &p);
     }
     for r in l.rules {
         if r.is_positive() {
@@ -2386,22 +2386,27 @@ const VU_PRINT: Color32 = Color32::from_rgb(0x24, 0x20, 0x1A);
 /// started — so the red arc on the face means exactly what the red end of the
 /// old bar meant, and a take metered to the old picture meters the same on this
 /// one. See [`CLIP_ZONE`].
-/// **`true` means the mark carries its NUMBER**, not merely that it is long.
+/// **Every mark carries its number**, the way the face on the desk does.
 ///
-/// The bottom of a VU scale is squeezed into the first fifth of the sweep, so
-/// -20, -10 and -5 sit almost on top of each other there — printed, their
-/// numbers overlapped into an unreadable smear. Three labels across the arc is
-/// what a real face carries at this size: the two ends and the one number
-/// anybody is actually looking for.
-const VU_MARKS: [(f32, f32, bool); 9] = [
+/// Three labels was the wrong answer to real crowding: the crowding came from
+/// printing "-20" and "-10" — a minus sign in front of every number on the
+/// left two thirds of a scale, eating the width the digits needed. A real VU
+/// prints the numbers BARE and puts one `−` at the left end and one `+` at the
+/// right, which is what `draw_vu` does, and ten of them fit with room over.
+///
+/// The positions are the reference face's, not a formula's: the bottom of a VU
+/// scale is compressed and the top is not, and no smooth curve gets 20 and 10
+/// as close as they really are while leaving 0 to +3 as open as it really is.
+const VU_MARKS: [(f32, f32, bool); 10] = [
     (-20.0, 0.00, true),
-    (-10.0, 0.22, false),
-    (-7.0, 0.33, false),
-    (-5.0, 0.42, false),
-    (-3.0, 0.53, false),
-    (-1.0, 0.65, false),
-    (0.0, 0.72, true),
-    (1.0, 0.80, false),
+    (-10.0, 0.20, true),
+    (-7.0, 0.30, true),
+    (-5.0, 0.38, true),
+    (-3.0, 0.48, true),
+    (-1.0, 0.58, true),
+    (0.0, 0.64, true),
+    (1.0, 0.76, true),
+    (2.0, 0.87, true),
     (3.0, 1.00, true),
 ];
 
@@ -2439,13 +2444,21 @@ fn vu_frac(level: f32) -> f32 {
 /// half the card and the meter read as a small dial adrift on a large blank.
 /// A VU window's width over its height.
 ///
-/// Half again as wide as it is tall, which is what the movement behind the
-/// glass needs and what every meter anybody has looked at is. The face is
-/// fitted to this and CENTRED in whatever box it was given, rather than
-/// stretched to fill it.
-const VU_ASPECT: f32 = 1.45;
+/// Measured off the ISA One on the owner's desk: the glass is a hair under
+/// five by three. That much width is not decoration — it is what puts ten
+/// numbers along the arc without them touching, which is the difference
+/// between a scale you read and a scale you infer. The face is fitted to this
+/// and CENTRED in whatever box it was given, rather than stretched to fill it.
+const VU_ASPECT: f32 = 1.65;
 
-const VU_SWEEP: f32 = 0.80;
+/// Half the needle's sweep, in radians.
+///
+/// **±56°, measured off the reference face**, not the ±46° this had. The two
+/// end ticks sit 275 and 200 pixels out from the hub, which is 54° and 58° off
+/// vertical. A narrower sweep drew the same arc into the middle of the glass
+/// and left a finger of empty card down each side — the face looked oversized
+/// for its own scale, which is the tell that the geometry is invented.
+const VU_SWEEP: f32 = 0.97;
 
 /// The level meter: one analogue VU per channel, modelled on the one in a
 /// Focusrite ISA One.
@@ -2516,8 +2529,12 @@ fn draw_vu(painter: &Painter, face: Rect, lv: Level, clipped: bool, p: &Palette)
     // it is on a real movement. The radius is whichever of the two dimensions
     // runs out first, so a wide short face and a tall narrow one both get a
     // needle that stays on the card.
-    let pivot = Pos2::new(face.center().x, face.bottom() - fh * 0.13);
-    let radius = (fh * 0.74).min((fw * 0.5 - 2.0) / VU_SWEEP.sin()).max(1.0);
+    // The hub sits just inside the bottom edge, the way the chrome half-moon
+    // does on the real one, and the arc is as big as the shorter of the two
+    // dimensions allows. The width term leaves a card's-width margin at each
+    // end rather than two points, so the scale ends inside the glass.
+    let pivot = Pos2::new(face.center().x, face.bottom() - fh * 0.07);
+    let radius = (fh * 0.72).min(fw * 0.46 / VU_SWEEP.sin()).max(1.0);
     let at = |f: f32, rr: f32| {
         let a = (f - 0.5) * 2.0 * VU_SWEEP;
         Pos2::new(pivot.x + rr * a.sin(), pivot.y - rr * a.cos())
@@ -2532,36 +2549,59 @@ fn draw_vu(painter: &Painter, face: Rect, lv: Level, clipped: bool, p: &Palette)
         painter.add(egui::Shape::line(pts, Stroke::new(w, colour)));
     };
     let hair = (fh * 0.022).max(1.0);
-    let red_from = VU_MARKS[6].1;
+    // By VALUE, not by index: the scale gained a mark and an index into it is
+    // a thing that goes quietly wrong when it does.
+    let red_from = VU_MARKS
+        .iter()
+        .find(|(vu, ..)| *vu >= 0.0)
+        .map_or(1.0, |(_, f, _)| *f);
     arc(0.0, red_from, VU_PRINT, hair);
     arc(red_from, 1.0, p.rec, hair * 1.6);
 
-    // The printed marks. The majors are longer and, when there is room for
-    // them, carry their numbers.
-    let label = fh >= 46.0 && fw >= 90.0;
-    for (vu, f, major) in VU_MARKS {
-        // The five-in-ten marks stay long whether or not they are numbered:
-        // the scale is read by its ticks and labelled at three points.
-        let long = major || (vu as i32) % 5 == 0;
-        let inner = radius * if long { 0.84 } else { 0.90 };
+    // The printed marks, each with its number above it.
+    let label = fh >= 40.0 && fw >= 76.0;
+    // **The reference face's own proportion.** Its digits are 38 pixels on a
+    // 485-pixel face — 7.8% — and that is not a stylistic choice, it is what
+    // ten numbers along an arc of that radius will physically take without
+    // touching. At 13.5% they overlapped into a smear, which is the same
+    // mistake as printing minus signs: spending width the arc does not have.
+    let num = fh * 0.085;
+    for (vu, f, _) in VU_MARKS {
+        let inner = radius * 0.86;
         let colour = if f >= red_from { p.rec } else { VU_PRINT };
         painter.line_segment([at(f, inner), at(f, radius)], Stroke::new(hair, colour));
-        if label && major {
-            let text = if vu > 0.0 {
-                format!("+{vu:.0}")
-            } else {
-                format!("{vu:.0}")
-            };
+        if label {
+            // **Bare.** No sign in front of any of them — the two signs live
+            // at the ends of the scale, which is where a face that has to fit
+            // ten numbers along an arc puts them.
             painter.text(
-                at(f, radius * 0.70),
+                // Just inside the ticks, which start at 0.86. Further in is
+                // a shorter arc and therefore less room, which is the other
+                // half of why they were colliding.
+                at(f, radius * 0.80),
                 Align2::CENTER_CENTER,
-                &text,
-                font(fh * 0.15),
+                &format!("{:.0}", vu.abs()),
+                font(num),
                 colour,
             );
         }
     }
     if label {
+        // The signs, outboard of the first and last marks and level with them,
+        // saying which half of the scale is which. One character each: the
+        // whole reason the numbers between them can be bare.
+        for (f, sign, colour) in [
+            (-0.09_f32, "\u{2212}", VU_PRINT),
+            (1.09, "+", p.rec),
+        ] {
+            painter.text(
+                at(f, radius * 0.90),
+                Align2::CENTER_CENTER,
+                sign,
+                font(num * 1.15),
+                colour,
+            );
+        }
         painter.text(
             Pos2::new(pivot.x, pivot.y - radius * 0.30),
             Align2::CENTER_CENTER,
@@ -2857,6 +2897,43 @@ fn draw_destination(
         s.record_open_when_done,
         p,
     );
+}
+
+/// The settings cog: the way into the take-settings popup.
+///
+/// **Solid, with stubby teeth.** The first cut drew a thin ring and ran eight
+/// long thin spokes from it out to the edge, which is a ship's wheel — the
+/// owner said so and was right. A gear is a SOLID body whose teeth barely
+/// stand proud of it: the teeth are short and wide, the hub is a hole punched
+/// through the middle, and there is nothing in between for a spoke to be.
+fn draw_cog(painter: &Painter, r: Rect, p: &Palette) {
+    if !r.is_positive() {
+        return;
+    }
+    let c = r.center();
+    let rad = r.width().min(r.height()) * 0.5;
+    // Below this the teeth merge into the body and it is a smudge of a circle,
+    // so nothing is drawn at all rather than something that reads as a fault.
+    if rad < 5.0 {
+        return;
+    }
+    // The body: most of the circle. The teeth reach from inside it to the
+    // edge, so they read as bumps ON it rather than as arms coming OFF it.
+    let body = rad * 0.74;
+    painter.circle_filled(c, body, p.ink);
+    const TEETH: u8 = 8;
+    // Wide enough that eight of them nearly meet at the rim, which is what a
+    // gear looks like; a thin one is a spoke however short it is.
+    let tooth = Stroke::new(rad * 0.34, p.ink);
+    for i in 0..TEETH {
+        let a = std::f32::consts::TAU * f32::from(i) / f32::from(TEETH);
+        let (sn, cs) = a.sin_cos();
+        let d = Vec2::new(sn, -cs);
+        painter.line_segment([c + d * (body * 0.72), c + d * rad], tooth);
+    }
+    // The hub, punched through to the band behind it. Big enough to read as a
+    // hole at sixteen points, which is the size this is actually drawn at.
+    painter.circle_filled(c, rad * 0.30, p.bg);
 }
 
 /// The tempo box, with a hairline of travel along its bottom.
@@ -4228,10 +4305,7 @@ mod tests {
         let at_rest = shown(RecordState::Idle).timecode;
         let live = shown(RecordState::Rolling).timecode;
         assert!(at_rest.is_positive() && live.is_positive());
-        assert_eq!(
-            live, at_rest,
-            "the clock moved when the take started: {live:?} vs {at_rest:?}"
-        );
+
         // The meter, the stop button and the faders are still there either way.
         for state in [RecordState::Idle, RecordState::Rolling] {
             let l = Layout::new(
@@ -4264,6 +4338,18 @@ mod tests {
         assert!(at_rest.record.is_positive() && !at_rest.dot.is_positive());
         let live = Layout::new(r, &rolling());
         assert!(live.dot.is_positive() && !live.record.is_positive());
+        // **The clock is the one thing that moves, and it grows.** At rest it
+        // says 0:00 and takes what is left of the transport's row; while a
+        // take runs it is the number somebody reads from a piano bench, and
+        // the name and tempo boxes it replaces cannot be touched mid-take
+        // anyway.
+        assert!(
+            live.timecode.area() > at_rest.timecode.area() * 2.0,
+            "the clock did not take the column: {:?} vs {:?}",
+            live.timecode,
+            at_rest.timecode
+        );
+
         // **And the preview does NOT collapse.** It used to, back when it was
         // a framing check somebody glanced at before a take. A take records
         // the window now, so this box is the camera inset the recording will
@@ -4700,5 +4786,349 @@ mod tests {
             }
         }
         v
+    }
+}
+
+// ── The take-settings popup ─────────────────────────────────────────────────
+//
+// **The controls that left the band, back as controls.** They spent one
+// release as menu rows, and a menu row is a poor home for a folder path you
+// want to READ, a device that may say "(not connected)", or three ticks whose
+// current state is the question. Every one of them is a box with a caption and
+// a value again — the same boxes the band drew, in the same ink, laid out with
+// room to breathe rather than squeezed into a column between the transport and
+// the instruments.
+//
+// A popup and not a band, because that is what they are: set once at the start
+// of a session, and in the way for the rest of it. It hangs off the cog in the
+// band and it is drawn by the same painters as everything else here, so it
+// works in a window, in a plugin, and in a recording.
+
+/// How wide the popup is, as a share of the window, and the bounds on that.
+/// **Small.** The first cut took a third of the window and gave every row
+/// forty points of height, which `labelled` turns into type twice the size of
+/// the band's own — a settings panel that shouts. It is a utility panel: it
+/// wants to be readable and out of the way, at about the weight of the boxes
+/// it was summoned from.
+const SETUP_W: (f32, f32, f32) = (0.24, 290.0, 430.0);
+/// Its height over its width.
+const SETUP_ASPECT: f32 = 0.72;
+/// Rows of controls under the title.
+const SETUP_ROWS: usize = 7;
+
+/// Every rectangle in the popup.
+struct SetupLayout {
+    panel: Rect,
+    title: Rect,
+    close: Rect,
+    dest: Rect,
+    reveal: Rect,
+    default_tick: Rect,
+    folder: Rect,
+    disk: Rect,
+    camera: Rect,
+    audio: Rect,
+    audio_status: Rect,
+    count_in: Rect,
+    time_sig: Rect,
+    export: Rect,
+    open_when_done: Rect,
+    click_in_take: Rect,
+    count_in_in_take: Rect,
+    hide_elapsed: Rect,
+}
+
+impl SetupLayout {
+    const NONE: Self = Self {
+        panel: Rect::NOTHING,
+        title: Rect::NOTHING,
+        close: Rect::NOTHING,
+        dest: Rect::NOTHING,
+        reveal: Rect::NOTHING,
+        default_tick: Rect::NOTHING,
+        folder: Rect::NOTHING,
+        disk: Rect::NOTHING,
+        camera: Rect::NOTHING,
+        audio: Rect::NOTHING,
+        audio_status: Rect::NOTHING,
+        count_in: Rect::NOTHING,
+        time_sig: Rect::NOTHING,
+        export: Rect::NOTHING,
+        open_when_done: Rect::NOTHING,
+        hide_elapsed: Rect::NOTHING,
+        click_in_take: Rect::NOTHING,
+        count_in_in_take: Rect::NOTHING,
+    };
+
+    /// Hung off `anchor` — the cog — and pulled back onto `screen`.
+    ///
+    /// Below and left-aligned with the cog when there is room, which is where a
+    /// popup belongs relative to the thing that opened it. The clamp is not a
+    /// nicety: the cog sits near the left of a band that can be half a screen
+    /// wide, and a panel that ran off the bottom would put the ticks where
+    /// nobody could reach them.
+    fn new(screen: Rect, anchor: Rect) -> Self {
+        if !screen.is_positive() {
+            return Self::NONE;
+        }
+        let w = (screen.width() * SETUP_W.0).clamp(SETUP_W.1, SETUP_W.2.min(screen.width()));
+        let h = (w * SETUP_ASPECT).min(screen.height() * 0.80);
+        let mut panel = Rect::from_min_size(
+            Pos2::new(anchor.left(), anchor.bottom() + h * 0.04),
+            Vec2::new(w, h),
+        );
+        let dx = (screen.left() - panel.left()).max(0.0) - (panel.right() - screen.right()).max(0.0);
+        let dy = (screen.top() - panel.top()).max(0.0) - (panel.bottom() - screen.bottom()).max(0.0);
+        panel = panel.translate(Vec2::new(dx, dy));
+
+        let pad = (h * 0.055).clamp(4.0, 16.0);
+        let body = panel.shrink(pad);
+        if !body.is_positive() {
+            return Self {
+                panel,
+                ..Self::NONE
+            };
+        }
+        // The title keeps a band of its own at the top, with the way out at the
+        // right of it. Everything else is seven rows of equal height, because a
+        // dialog whose rows are all different sizes reads as a form somebody
+        // assembled rather than as a panel.
+        let title_h = body.height() * 0.13;
+        let title = Rect::from_min_max(
+            body.min,
+            Pos2::new(body.right(), body.top() + title_h),
+        );
+        let close_w = (title.height() * 1.1).min(body.width() * 0.16);
+        let close = Rect::from_min_max(
+            Pos2::new(title.right() - close_w, title.top()),
+            title.max,
+        );
+        let rows = Rect::from_min_max(Pos2::new(body.left(), title.bottom()), body.max);
+        // A real gap between rows: `Rect::contains` is inclusive at both edges,
+        // so two rows that merely touch share a line of pixels and every
+        // overlap test in this file fails there.
+        let row = |i: usize| {
+            let pitch = 1.0 / SETUP_ROWS as f32;
+            let top = i as f32 * pitch;
+            slice_v(rows, top + pitch * 0.10, top + pitch * 0.92)
+        };
+
+        let r0 = row(0);
+        let r3 = row(3);
+        let r4 = row(4);
+        let r5 = row(5);
+        let r6 = row(6);
+        Self {
+            panel,
+            title,
+            close,
+            // Where takes go, how to see it, and whether it is the default.
+            dest: slice_h(r0, 0.00, 0.54),
+            reveal: slice_h(r0, 0.57, 0.74),
+            default_tick: slice_h(r0, 0.77, 1.00),
+            // What the next take will be called, and whether it will fit.
+            // Answers rather than questions, so they carry no box.
+            folder: slice_h(row(1), 0.00, 0.60),
+            disk: slice_h(row(1), 0.62, 1.00),
+            camera: row(2),
+            audio: slice_h(r3, 0.00, 0.74),
+            audio_status: slice_h(r3, 0.77, 1.00),
+            // How long a bar is, how many of them you get, and what comes out
+            // at the end. The three that describe the take itself.
+            count_in: slice_h(r4, 0.00, 0.30),
+            time_sig: slice_h(r4, 0.33, 0.55),
+            export: slice_h(r4, 0.58, 1.00),
+            // The four questions with yes-or-no answers, in two rows of two, so
+            // a tick is never the only thing on a line.
+            open_when_done: slice_h(r5, 0.00, 0.49),
+            click_in_take: slice_h(r5, 0.51, 1.00),
+            count_in_in_take: slice_h(r6, 0.00, 0.49),
+            hide_elapsed: slice_h(r6, 0.51, 1.00),
+        }
+    }
+
+    /// Every clickable region and what it means. The popup's [`Layout::targets`].
+    fn targets(&self) -> [(Rect, Hit); 12] {
+        [
+            (self.close, Hit::CloseSetup),
+            (self.dest, Hit::ChooseFolder),
+            (self.reveal, Hit::RevealFolder),
+            (self.default_tick, Hit::ToggleDefaultDir),
+            (self.camera, Hit::PickCamera),
+            (self.audio, Hit::PickAudio),
+            (self.audio_status, Hit::ShowAudioStatus),
+            (self.count_in, Hit::CycleCountIn),
+            (self.time_sig, Hit::EditTimeSignature),
+            (self.export, Hit::Export),
+            (self.open_when_done, Hit::ToggleOpenWhenDone),
+            (self.click_in_take, Hit::ToggleMetronomeInTake),
+        ]
+    }
+}
+
+/// Where the take-settings popup goes, given the window and the cog.
+///
+/// [`Rect::NOTHING`] when there is no room for it. The app needs this to know
+/// whether a press landed inside the popup or outside it, which is the whole of
+/// "click away to dismiss".
+pub fn setup_popup_rect(screen: Rect, anchor: Rect) -> Rect {
+    SetupLayout::new(screen, anchor).panel
+}
+
+/// What a press inside the popup means, or `None` for a press on its chrome.
+///
+/// A press anywhere in the panel that is not a control returns `None` and is
+/// still SWALLOWED by the caller — a dialog you can click through is one that
+/// closes when you meant to press something in it.
+pub fn setup_hit_test(
+    screen: Rect,
+    anchor: Rect,
+    view: &RecorderView<'_>,
+    pos: Pos2,
+) -> Option<Hit> {
+    let l = SetupLayout::new(screen, anchor);
+    if !l.panel.contains(pos) {
+        return None;
+    }
+    let rolling = view.state.is_active();
+    l.targets()
+        .into_iter()
+        // Nothing here is set MID-TAKE. Every one of these decides how the
+        // file being written right now was going to be written, and a picker
+        // that swaps the camera under a running encoder is not a setting, it
+        // is a crash with a caption.
+        .find(|(r, _)| !rolling && r.contains(pos))
+        .map(|(_, h)| h)
+        .or_else(|| l.close.contains(pos).then_some(Hit::CloseSetup))
+        .or({
+            // Extra rows that are only reachable here.
+            let extra = [
+                (l.count_in_in_take, Hit::ToggleCountInInTake),
+                (l.hide_elapsed, Hit::ToggleHideElapsed),
+            ];
+            extra
+                .into_iter()
+                .find(|(r, _)| r.contains(pos))
+                .map(|(_, h)| h)
+        })
+}
+
+/// Draw the take-settings popup over `screen`, hung off the cog at `anchor`.
+pub fn draw_setup(
+    painter: &Painter,
+    screen: Rect,
+    anchor: Rect,
+    view: &RecorderView<'_>,
+    s: &Settings,
+) {
+    let l = SetupLayout::new(screen, anchor);
+    if !l.panel.is_positive() {
+        return;
+    }
+    let p = palette(s);
+
+    // A scrim over the whole window. It is what says the panel is modal, and
+    // it is what makes a dialog drawn in the app's own ink read as being IN
+    // FRONT of the window rather than as another band that appeared.
+    painter.rect_filled(screen, 0.0, Color32::from_black_alpha(96));
+    painter.rect_filled(l.panel, 4.0, p.bg);
+    painter.rect_stroke(l.panel, 4.0, Stroke::new(1.0_f32, p.ink), StrokeKind::Inside);
+
+    if l.title.is_positive() {
+        let size = fit_text(l.title, "TAKE SETTINGS", l.title.height() * 0.62);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(l.title.left(), l.title.center().y),
+                Align2::LEFT_CENTER,
+                "TAKE SETTINGS",
+                font(size),
+                p.ink,
+            );
+        }
+    }
+    draw_word_button(painter, l.close, &["DONE", "OK"], &p);
+
+    labelled(painter, l.dest, "FOLDER", view.dest, p.ink, &p);
+    // "Choose..." lives INSIDE the folder box, right-aligned, because the box
+    // itself is the target: two adjacent controls that open the same picker is
+    // one control too many.
+    if l.dest.is_positive() {
+        let size = fit_text(l.dest, "Choose...", l.dest.height() * 0.45);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(l.dest.right() - label_inset(l.dest), l.dest.center().y),
+                Align2::RIGHT_CENTER,
+                "Choose...",
+                font_light(size),
+                p.faint,
+            );
+        }
+    }
+    // SHOW rather than OPEN, for the reason the tick beside Export has: nothing
+    // is opened, a folder is shown.
+    draw_word_button(painter, l.reveal, &["SHOW FOLDER", "SHOW"], &p);
+    draw_tick(
+        painter,
+        l.default_tick,
+        "Default",
+        s.record_dir_is_default,
+        &p,
+    );
+
+    text_line(painter, l.folder, view.folder_preview, p.faint, false);
+    // Disk as a DURATION. "214 GB free" means nothing to a pianist and "~58
+    // min" means everything, which is why the view carries minutes and not
+    // bytes in the first place.
+    let disk = match view.disk_minutes {
+        Some(m) if m >= 90.0 => format!("~{:.0} h left", m / 60.0),
+        Some(m) => format!("~{m:.0} min left"),
+        None => "measuring free space".to_owned(),
+    };
+    text_line(painter, l.disk, &disk, p.faint, true);
+
+    for (r, cap, dev) in [
+        (l.camera, "CAMERA", view.camera),
+        (l.audio, "AUDIO", view.audio),
+    ] {
+        let value = format!("{}{}", dev.text(), device_note(dev, "  (not connected)"));
+        labelled(painter, r, cap, &value, device_ink(dev, &p), &p);
+    }
+    draw_word_button(painter, l.audio_status, &["STATUS"], &p);
+
+    labelled(
+        painter,
+        l.count_in,
+        "COUNT-IN",
+        &count_in_text(view.count_in_bars),
+        p.ink,
+        &p,
+    );
+    {
+        let typing = typing_for(view, NumField::Meter);
+        let shown = typing.map_or_else(|| view.time_signature.label(), str::to_owned);
+        labelled(painter, l.time_sig, "SIG", &shown, p.ink, &p);
+        if let Some(typed) = typing {
+            draw_caption_caret(painter, l.time_sig, "SIG", &shown, typed.chars().count(), &p);
+        }
+    }
+    labelled(
+        painter,
+        l.export,
+        "EXPORT",
+        &export_summary(&s.record_export),
+        p.ink,
+        &p,
+    );
+
+    // The four yes-or-no questions. Each is worded as the STATE it is in, not
+    // as the action that changes it, because a tick already says which way it
+    // is set and a row that says both is a row you have to read twice.
+    for (r, cap, on) in [
+        (l.open_when_done, "Show when done", s.record_open_when_done),
+        (l.click_in_take, "Click into takes", s.metronome_in_take),
+        (l.count_in_in_take, "Count-in into take", s.record_count_in_in_take),
+        (l.hide_elapsed, "Hide elapsed time", s.record_hide_elapsed),
+    ] {
+        draw_tick(painter, r, cap, on, &p);
     }
 }

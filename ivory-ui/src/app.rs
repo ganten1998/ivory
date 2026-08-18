@@ -298,7 +298,7 @@ pub struct IvoryApp {
     menu_over_staff: bool,
     /// The Setup button was pressed; the menu opens after the frame, where the
     /// window origin needed to place it is known.
-    setup_menu_wanted: bool,
+    setup_open: bool,
     /// A numeric field being typed into, if any.
     ///
     /// Mutually exclusive with `name_focused` in practice, because a press
@@ -529,7 +529,7 @@ impl IvoryApp {
             num_edit: None,
             menu_over_recorder: false,
             menu_over_staff: false,
-            setup_menu_wanted: false,
+            setup_open: false,
             audio_status: recorder::AudioStatus::default(),
             fullscreen_sent: None,
             plugin_list: Vec::new(),
@@ -1114,28 +1114,6 @@ impl IvoryApp {
         }
     }
 
-    /// Raise the take-settings menu if the Setup button asked for it.
-    ///
-    /// **A method rather than five lines inline so it can be tested.** The
-    /// button's whole failure mode was a flag that nothing read — it set
-    /// `setup_menu_wanted` and the frame ended, so the one control that now
-    /// leads to every take setting did nothing at all, twice over: no menu and
-    /// no visible press either. Returns whether it opened one.
-    fn open_setup_menu_if_wanted(&mut self, ctx: &egui::Context, band: Rect) -> bool {
-        if !std::mem::take(&mut self.setup_menu_wanted) {
-            return false;
-        }
-        // Led by the Recorder's own categories, because that is what the
-        // button means: these are the take's settings, not the piano's.
-        self.menu_over_recorder = true;
-        self.menu_over_staff = false;
-        // Anchored on the BUTTON, not the pointer, so the list always hangs
-        // off the same corner however the button was hit.
-        let anchor = recorder_panel::setup_rect(band, &self.recorder_layout_view());
-        self.open_menu_at(ctx, self.main_inner_origin + anchor.center().to_vec2());
-        true
-    }
-
     fn open_menu_at(&mut self, ctx: &egui::Context, global_pos: Pos2) {
         self.menu_state = Some(MenuState::open(
             ctx,
@@ -1301,6 +1279,26 @@ impl IvoryApp {
             }
         }
 
+        // **The popup eats the press, wherever it lands.** Inside, it is a
+        // control or it is the panel's own chrome; outside, it is a dismissal
+        // and nothing else — a modal you can click THROUGH is one that closes
+        // when you meant to press something behind it, which is every mis-click
+        // in a dialog anybody has ever sworn at.
+        if self.setup_open && primary_pressed {
+            if let Some(pos) = pointer {
+                let band = recorder_rect.unwrap_or(Rect::NOTHING);
+                let view = self.recorder_layout_view();
+                let anchor = recorder_panel::setup_rect(band, &view);
+                let panel = recorder_panel::setup_popup_rect(ui.max_rect(), anchor);
+                match recorder_panel::setup_hit_test(ui.max_rect(), anchor, &view, pos) {
+                    Some(hit) => self.apply_recorder_hit(hit),
+                    None if !panel.contains(pos) => self.setup_open = false,
+                    None => {}
+                }
+            }
+            return;
+        }
+
         if primary_pressed && !ctrl_as_context {
             if let Some(pos) = pointer {
                 // The Recorder band first, and NOT behind `keytoggle_enabled`.
@@ -1368,7 +1366,6 @@ impl IvoryApp {
                     // does nothing, which is exactly how this one behaved.
                     // Anchored on the button rather than the pointer so the
                     // list always hangs off the same corner.
-                    self.open_setup_menu_if_wanted(ctx, r);
                     return;
                 }
                 // Clicking anywhere else also drops the field's focus, or the
@@ -1731,7 +1728,26 @@ impl IvoryApp {
             // button. The take's settings live there now, and a button that
             // opens the place they went is what keeps them findable by
             // somebody who never thinks to right-click a band.
-            Hit::OpenSetup => self.setup_menu_wanted = true,
+            // **A panel, not a menu.** These are boxes with captions and
+            // values — a folder path you want to READ, a device that may say
+            // "(not connected)", four ticks whose current state is the whole
+            // question — and a menu row can show none of that.
+            Hit::OpenSetup => self.setup_open = true,
+            Hit::CloseSetup => self.setup_open = false,
+            Hit::ShowAudioStatus => {
+                self.dialog = Some(dialogs::Dialog::AudioStatus {
+                    status: self.audio_status.clone(),
+                    buffer: self.settings.buffer_frames(),
+                });
+            }
+            Hit::ToggleCountInInTake => {
+                self.settings.record_count_in_in_take = !self.settings.record_count_in_in_take;
+                self.save_settings();
+            }
+            Hit::ToggleHideElapsed => {
+                self.settings.record_hide_elapsed = !self.settings.record_hide_elapsed;
+                self.save_settings();
+            }
             Hit::ChooseFolder => self.ask_for_a_folder(),
             Hit::ToggleDefaultDir => {
                 self.settings.record_dir_is_default = !self.settings.record_dir_is_default;
@@ -2184,7 +2200,17 @@ impl IvoryApp {
                     key: egui::Key::Escape,
                     pressed: true,
                     ..
-                } => self.num_edit = None,
+                } => {
+                    // Escape backs out of ONE thing at a time, innermost
+                    // first: a number being typed into the popup belongs to
+                    // the popup, and closing both on one press would throw
+                    // away the panel somebody was still working in.
+                    if self.num_edit.is_some() {
+                        self.num_edit = None;
+                    } else {
+                        self.setup_open = false;
+                    }
+                }
                 _ => {}
             }
         }
@@ -4220,6 +4246,28 @@ impl IvoryApp {
         // Only in the live window: the compositor draws these same bands into
         // a video, where there is no pointer and a hover card would be a stray
         // note in somebody's recording.
+        // **The take-settings popup, in front of everything.** It is modal:
+        // it paints a scrim over the whole window, so anything drawn after it
+        // would float on top of its own dimming. Only the thanks card comes
+        // later, and only because a card raised from a heart you can still see
+        // is a card that belongs in front.
+        if self.setup_open {
+            if let Some(rect) = recorder_rect_for_hit {
+                let view = self.recorder_layout_view();
+                recorder_panel::draw_setup(
+                    ui.painter(),
+                    ui.max_rect(),
+                    recorder_panel::setup_rect(rect, &view),
+                    &view,
+                    &self.settings,
+                );
+            } else {
+                // No band, no cog, no popup. Nothing can have opened it, and
+                // leaving it latched would put a panel on screen with no way
+                // back to the thing it belongs to.
+                self.setup_open = false;
+            }
+        }
         if let Some(hr) = heart_rect_for_card {
             if ctx.pointer_latest_pos().is_some_and(|p| hr.contains(p)) {
                 chord_strip::draw_thanks(ui.painter(), hr, ui.max_rect(), self.settings.dark_mode);
@@ -4766,48 +4814,70 @@ mod tests {
         (ctx, app)
     }
 
-    /// The Setup button opens the take-settings menu, and does it every time.
+    /// The cog opens the take-settings popup, and the popup can be dismissed.
     ///
     /// **The regression this exists for**: `Hit::OpenSetup` set a flag, and
     /// nothing anywhere read the flag. The button was the only way to reach
     /// the settings that left the band in 5.0, and pressing it did nothing —
     /// which is exactly what "unresponsive" looks like from the outside.
     #[test]
-    fn the_setup_button_opens_the_take_settings_menu() {
-        let (ctx, mut app) = headless_with(Caps::DESKTOP, Settings::first_launch());
+    fn the_cog_opens_the_take_settings_popup_and_it_can_be_closed() {
+        let (_, mut app) = headless_with(Caps::DESKTOP, Settings::first_launch());
         let w = main_width(&app.settings);
         let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, recorder_panel::band_height(w)));
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w * 0.7));
 
-        // Fonts, which `open_menu_at` measures with. Nothing exists in an
-        // `egui::Context` until it has run once.
-        let _ = ctx.run(Default::default(), |_| {});
-
-        // Nothing pending: nothing opens. A menu that appears on its own is a
-        // worse bug than one that never appears.
-        assert!(!app.open_setup_menu_if_wanted(&ctx, band));
-        assert!(app.menu_state.is_none());
-
-        // The button is really there, and really says Setup.
-        let setup = recorder_panel::setup_rect(band, &app.recorder_layout_view());
-        assert!(setup.is_positive(), "the band has no Setup button");
+        // The cog is really there, and pressing it is really a Setup hit.
+        let cog = recorder_panel::setup_rect(band, &app.recorder_layout_view());
+        assert!(cog.is_positive(), "the band has no cog");
         assert_eq!(
-            recorder_panel::hit_test(band, &app.recorder_layout_view(), setup.center()),
+            recorder_panel::hit_test(band, &app.recorder_layout_view(), cog.center()),
             Some(recorder_panel::Hit::OpenSetup),
-            "the Setup button's own centre is not a Setup hit"
+            "the cog's own centre is not a Setup hit"
         );
 
-        // Press it, and the menu is up — led by the Recorder's categories,
-        // since these are the take's settings and not the piano's.
+        assert!(!app.setup_open);
         app.apply_recorder_hit(recorder_panel::Hit::OpenSetup);
-        assert!(app.setup_menu_wanted, "the press did not ask for a menu");
-        assert!(app.open_setup_menu_if_wanted(&ctx, band), "no menu opened");
-        assert!(app.menu_state.is_some());
-        assert!(app.menu_over_recorder);
+        assert!(app.setup_open, "the cog did not open the popup");
 
-        // And the ask is spent, so the menu does not reopen every frame after.
-        app.menu_state = None;
-        assert!(!app.open_setup_menu_if_wanted(&ctx, band));
-        assert!(app.menu_state.is_none());
+        // The panel is on screen and has room for its controls.
+        let panel = recorder_panel::setup_popup_rect(screen, cog);
+        assert!(panel.is_positive(), "the popup has no rectangle");
+        assert!(screen.contains_rect(panel), "the popup hangs off the window");
+
+        // Every control in it is reachable, and each is a DIFFERENT control:
+        // a panel where two boxes answer to the same press is a panel where
+        // one of them is dead.
+        let view = app.recorder_layout_view();
+        let mut seen: Vec<recorder_panel::Hit> = Vec::new();
+        let (mut y, step) = (panel.top(), 2.0_f32);
+        while y <= panel.bottom() {
+            let mut x = panel.left();
+            while x <= panel.right() {
+                if let Some(h) =
+                    recorder_panel::setup_hit_test(screen, cog, &view, Pos2::new(x, y))
+                {
+                    if !seen.contains(&h) {
+                        seen.push(h);
+                    }
+                }
+                x += step;
+            }
+            y += step;
+        }
+        assert!(
+            seen.len() >= 12,
+            "only {} controls are reachable in the popup: {:?}",
+            seen.len(),
+            seen.iter().map(|h| h.label()).collect::<Vec<_>>()
+        );
+        assert!(seen.contains(&recorder_panel::Hit::CloseSetup), "no way out");
+        assert!(seen.contains(&recorder_panel::Hit::ChooseFolder));
+        assert!(seen.contains(&recorder_panel::Hit::ToggleHideElapsed));
+
+        // DONE closes it, and so does the Setup hit coming round again.
+        app.apply_recorder_hit(recorder_panel::Hit::CloseSetup);
+        assert!(!app.setup_open, "DONE did not close the popup");
     }
 
     /// The heart is drawn for everybody, in the band, out of everything's way.
