@@ -72,6 +72,13 @@ pub enum MenuAction {
     ToggleFretboard,
     /// Show or hide the camera pane beside the theory band.
     ToggleCameraPane,
+    /// The take's destination and devices, which moved out of the band.
+    ChooseFolder,
+    RevealFolder,
+    ToggleDefaultDir,
+    ToggleOpenWhenDone,
+    PickCamera,
+    PickAudio,
     /// Step to the next clef preset.
     CycleClef,
     /// Set the staves outright, by key.
@@ -230,6 +237,10 @@ pub struct MenuView {
     pub camera_pane_on: bool,
     /// How many folders the user has added to the plugin search list.
     pub extra_plugin_folders: usize,
+    /// The take folder is remembered between sessions.
+    pub record_dir_is_default: bool,
+    /// The take's folder opens when it finishes.
+    pub open_when_done: bool,
     /// The sheet music band is showing.
     pub staff_on: bool,
     /// Letter names are printed inside the noteheads.
@@ -1128,8 +1139,35 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 },
                 MenuAction::ToggleCameraPane,
             ));
+            // **The take's settings, which used to be nine controls in the
+            // middle of the band.** They are all set once at the start of a
+            // session and most of them already opened a picker, so a menu row
+            // is the same interaction with less furniture — and the space they
+            // left is what the meters and the faders grew into. The SETUP
+            // button in the band opens this menu, for anybody who never thinks
+            // to right-click.
+            recorder.push(row("Where Takes Go...", MenuAction::ChooseFolder));
+            recorder.push(row("Show the Folder", MenuAction::RevealFolder));
+            recorder.push(row(
+                if view.record_dir_is_default {
+                    "Stop Using This Folder by Default"
+                } else {
+                    "Use This Folder by Default"
+                },
+                MenuAction::ToggleDefaultDir,
+            ));
+            recorder.push(row("Camera...", MenuAction::PickCamera));
+            recorder.push(row("Audio Input...", MenuAction::PickAudio));
             recorder.push(row("Audio Status...", MenuAction::ShowAudioStatus));
             recorder.push(row("Export...", MenuAction::ShowExportDialog));
+            recorder.push(row(
+                if view.open_when_done {
+                    "Do Not Show the Take When It Is Finished"
+                } else {
+                    "Show the Take When It Is Finished"
+                },
+                MenuAction::ToggleOpenWhenDone,
+            ));
             recorder.push(row(
                 if view.hide_elapsed {
                     "Show Elapsed Time"
@@ -1908,6 +1946,8 @@ mod tests {
             recorder_on: false,
             camera_pane_on: false,
             extra_plugin_folders: 0,
+            record_dir_is_default: false,
+            open_when_done: false,
             staff_on: true,
             staff_note_names: false,
             staff_set: "grand".to_owned(),
@@ -2953,8 +2993,14 @@ mod tests {
                 "Record the Click Into Takes",
                 "Record the Count-in Into the Take",
                 "Show Camera (W)",
+                "Where Takes Go...",
+                "Show the Folder",
+                "Use This Folder by Default",
+                "Camera...",
+                "Audio Input...",
                 "Audio Status...",
                 "Export...",
+                "Show the Take When It Is Finished",
                 "Hide Elapsed Time",
             ]
         );
@@ -3064,8 +3110,14 @@ mod tests {
                 "Record the Click Into Takes",
                 "Record the Count-in Into the Take",
                 "Show Camera (W)",
+                "Where Takes Go...",
+                "Show the Folder",
+                "Use This Folder by Default",
+                "Camera...",
+                "Audio Input...",
                 "Audio Status...",
                 "Export...",
+                "Show the Take When It Is Finished",
                 "Hide Elapsed Time"
             ],
             "everything that does not need a window stays"

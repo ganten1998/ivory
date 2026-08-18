@@ -315,6 +315,10 @@ struct Layout {
     click: Rect,
 
     // ── destination ──
+    /// Opens the menu the take's settings moved into. A button rather than
+    /// only a right-click, because a control nobody can find is a control that
+    /// was removed.
+    setup: Rect,
     dest: Rect,
     /// The button that shows the folder in the file manager.
     ///
@@ -444,7 +448,23 @@ fn slot_zones(row: Rect, filled: bool) -> (Rect, Rect, Rect, Rect, Rect) {
 /// not touch each other all read the same numbers. The gaps are real gaps:
 /// `Rect::contains` is inclusive at both edges, so two rows that merely meet
 /// share a line of points and the overlap test fails there.
-const SLOT_ROWS: [(f32, f32); SLOTS] = [(0.000, 0.135), (0.150, 0.285), (0.300, 0.435)];
+/// Where each slot row sits in the column, as a fraction of it.
+///
+/// Generated rather than written out, because there are six of them now and a
+/// hand-typed table of six pairs is a table with a typo in it. Even gaps, and
+/// the last row ends at the bottom.
+const SLOT_ROWS: [(f32, f32); SLOTS] = {
+    let mut out = [(0.0, 0.0); SLOTS];
+    let mut i = 0;
+    // A twelfth of the column between rows, so six rows breathe.
+    let pitch = 1.0 / SLOTS as f32;
+    while i < SLOTS {
+        let top = i as f32 * pitch;
+        out[i] = (top, top + pitch * 0.86);
+        i += 1;
+    }
+    out
+};
 
 /// A horizontal slice of `r`, by fraction of its width.
 fn slice_h(r: Rect, from: f32, to: f32) -> Rect {
@@ -505,9 +525,9 @@ fn fader_zones(row: Rect) -> (Rect, Rect, Rect) {
         return (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING);
     }
     (
-        slice_h(row, 0.00, 0.085),
-        slice_h(row, 0.105, 0.500),
-        slice_h(row, 0.520, 0.665),
+        slice_h(row, 0.00, 0.07),
+        slice_h(row, 0.09, 0.73),
+        slice_h(row, 0.755, 1.00),
     )
 }
 
@@ -525,7 +545,7 @@ fn fader_zones(row: Rect) -> (Rect, Rect, Rect) {
 /// A constant rather than two literals in [`Layout::fill_monitor`] because the
 /// test that proves nothing in this row overlaps has to slice the row the same
 /// way the painter does.
-const CLICK_SWITCHES: [f32; 2] = [0.700, 0.925];
+
 
 /// Text height in a fader row, as a fraction of the row. Shared by the painter
 /// and by the test that asserts the dB reading fits.
@@ -548,6 +568,7 @@ impl Layout {
             metronome_row: Rect::NOTHING,
             input_row: Rect::NOTHING,
             click: Rect::NOTHING,
+            setup: Rect::NOTHING,
             dest: Rect::NOTHING,
             reveal: Rect::NOTHING,
             default_tick: Rect::NOTHING,
@@ -631,22 +652,33 @@ impl Layout {
         // The 0.22 cap only binds in a DETACHED window, where the band is tall
         // for its width; in the band itself the height term is smaller than
         // either bound long before the cap matters.
-        let pv_w = (body.height() * 1.55).clamp(body.width() * 0.14, body.width() * 0.22);
-        self.preview = Rect::from_min_max(body.min, Pos2::new(body.left() + pv_w, body.bottom()));
+        // **Three groups now, not four.** The take's settings went to the
+        // menu, so the band is what you look at (the preview and the name),
+        // what you touch every take (transport, meters, faders), and what you
+        // load into it (the slots). The middle group is more than twice the
+        // width it had, which is where the bigger meters and the reachable
+        // faders come from.
+        let pv_w = Self::preview_w(body);
+        let left = Rect::from_min_max(body.min, Pos2::new(body.left() + pv_w, body.bottom()));
+        // The preview keeps a landscape box at the top; the name and the
+        // Setup button take the rest of the column.
+        self.preview = slice_v(left, 0.00, 0.56);
+        self.fill_setup(slice_v(left, 0.60, 1.00));
+
         let monitor = Self::monitor_of(body);
         self.fill_monitor(monitor, view);
         self.rules[1] = rule_x(body, monitor.left() - gap * 0.5);
 
         let middle = Rect::from_min_max(
-            Pos2::new(self.preview.right() + gap, body.top()),
+            Pos2::new(left.right() + gap, body.top()),
             Pos2::new(monitor.left() - gap, body.bottom()),
         );
         if !middle.is_positive() {
             return;
         }
-        self.rules[0] = rule_x(body, middle.left() + middle.width() * 0.265);
-        self.fill_transport(slice_h(middle, 0.00, 0.25));
-        self.fill_destination(slice_h(middle, 0.28, 1.00));
+        self.rules[0] = rule_x(body, left.right() + gap * 0.5);
+        self.fill_transport(middle);
+        self.fill_faders(body, gap);
     }
 
     /// The transport column: the round record button, a stop beside it, the
@@ -655,11 +687,59 @@ impl Layout {
     /// The clock now takes the whole width of the column. That is what deleting
     /// the `CLOCK` toggle bought — the timecode used to share its row with a
     /// small mystery box, and the box is what was making the number small.
+    /// The middle group's rectangle AT REST, whatever the state.
+    ///
+    /// The faders are placed from this in both layouts, so the two controls
+    /// somebody reaches for with their eyes on their hands do not move when a
+    /// take starts. Everything else in the group is free to grow — the clock
+    /// triples and the meters get the room the preview gives up — but a fader
+    /// that slid sideways at the moment it became the only thing you might
+    /// still want to touch would be half a survivor. Same argument the monitor
+    /// column has always made; the faders took it with them when they moved.
+    fn middle_of(body: Rect, gap: f32) -> Rect {
+        let pv_w = Self::preview_w(body);
+        let monitor = Self::monitor_of(body);
+        Rect::from_min_max(
+            Pos2::new(body.left() + pv_w + gap, body.top()),
+            Pos2::new(monitor.left() - gap, body.bottom()),
+        )
+    }
+
+    /// The left column's width, which is the same in both layouts because the
+    /// faders are placed against it. See [`Layout::middle_of`].
+    fn preview_w(body: Rect) -> f32 {
+        (body.height() * 1.05).clamp(body.width() * 0.13, body.width() * 0.20)
+    }
+
+    /// The two fader rows, from the at-rest middle. See [`Layout::middle_of`].
+    fn fill_faders(&mut self, body: Rect, gap: f32) {
+        let m = Self::middle_of(body, gap);
+        if !m.is_positive() {
+            return;
+        }
+        self.metronome_row = slice_v(m, 0.655, 0.815);
+        self.input_row = slice_v(m, 0.84, 1.00);
+        self.click = fader_zones(self.metronome_row).0;
+    }
+
     fn fill_transport(&mut self, t: Rect) {
         if !t.is_positive() {
             return;
         }
-        let top = slice_v(t, 0.0, 0.52);
+        // The whole middle group: the two buttons and the clock across the
+        // top, the meters under them at a size worth reading from a bench, and
+        // the click and input faders along the bottom — which used to be in
+        // the monitor column stealing the room three more instrument slots
+        // needed.
+        // **The buttons and the meters share the upper two thirds**, side by
+        // side rather than stacked. Stacked, the meters got a third of the
+        // group's height and the VU faces are sized by height, so they came
+        // out as postage stamps in a very wide box. Beside the transport they
+        // get twice that, and the width they do not need goes to the buttons
+        // and the clock, which had a chasm between them.
+        let upper = slice_v(t, 0.0, 0.62);
+        let top = slice_h(upper, 0.00, 0.34);
+        self.meter = slice_h(upper, 0.38, 1.00);
         // **The same size, both of them.** Stop used to be 0.66 of record, and
         // then its glyph was shrunk another 30% inside that — so the square
         // read as less than half the circle. Two transport buttons of different
@@ -670,15 +750,17 @@ impl Layout {
         // from colliding at any aspect the window can take. 0.38 rather than
         // 0.42 because they are now the same width: the centres are 42% of the
         // row apart, so two half-widths have to come to less than that.
-        let d = top.height().min(top.width() * 0.38);
-        self.record = Rect::from_center_size(slice_h(top, 0.0, 0.42).center(), Vec2::splat(d));
-        self.stop = Rect::from_center_size(slice_h(top, 0.46, 0.88).center(), Vec2::splat(d));
+        let buttons = slice_v(top, 0.00, 0.62);
+        let d = buttons.height().min(buttons.width() * 0.40);
+        self.record = Rect::from_center_size(slice_h(buttons, 0.02, 0.46).center(), Vec2::splat(d));
+        self.stop = Rect::from_center_size(slice_h(buttons, 0.52, 0.96).center(), Vec2::splat(d));
         // A quarter of the transport rather than an eighteenth. The meter is a
         // pair of VU faces now, and a dial needs HEIGHT in a way a bar never
         // did: the same 34 points that made a perfectly good bar make a face
         // with no room to print anything on it.
-        self.meter = slice_v(t, 0.54, 0.78);
-        self.timecode = slice_v(t, 0.82, 1.00);
+        // Under the buttons, in the column they share. At rest it is a
+        // readout; while rolling it is the headline it has always been.
+        self.timecode = slice_v(top, 0.72, 1.00);
     }
 
     /// The instrument slots, the two faders and the click.
@@ -698,22 +780,15 @@ impl Layout {
         if !m.is_positive() {
             return;
         }
+        // **Nothing but slots now.** The two faders moved into the middle
+        // group with the transport, which is where a hand goes during a take
+        // anyway — and the column they vacated is exactly the room three more
+        // instruments needed. Six rows where there were three, and an empty
+        // one is an invitation rather than a gap: see `EMPTY_SLOT`.
         let rolling = view.state.is_active();
         for (i, (from, to)) in SLOT_ROWS.into_iter().enumerate() {
             self.slots[i] = SlotRow::new(slice_v(m, from, to), &view.slots[i], rolling);
         }
-        // Two rows where there were three. The switches moved into the click's
-        // own row (see `CLICK_SWITCHES`), and the row they left is split
-        // between the two faders — which is why the tracks and their readings
-        // are a third taller than they were.
-        self.metronome_row = slice_v(m, 0.465, 0.700);
-        self.input_row = slice_v(m, 0.730, 0.965);
-        // **The click switch is the metronome icon itself**, in both layouts.
-        // It survives a take for the same reason the faders do: turning the
-        // click off halfway through is exactly the thing somebody does with
-        // their eyes on their hands, and a control that moves when the take
-        // starts is one they have to go and find.
-        self.click = fader_zones(self.metronome_row).0;
     }
 
     /// The destination column: seven small rows of things set once.
@@ -728,39 +803,31 @@ impl Layout {
     /// instrument, and there are three now, each with its own name box in the
     /// slot rows. Every remaining row is a little taller for it, which is most
     /// of what pays for the narrower column.
-    fn fill_destination(&mut self, d: Rect) {
+    /// What is left of the destination group: a button that opens the menu it
+    /// moved into, and the one control in it that has to be TYPED.
+    ///
+    /// **Everything else went to the right-click menu.** Folder, camera, audio,
+    /// count-in, signature, tempo, export, show-when-done: nine controls set
+    /// once at the start of a session, sitting in the middle of the band in
+    /// front of the transport, which is touched every take. Most of them
+    /// already opened a picker or cycled a value, so a menu row is the same
+    /// interaction with less furniture — and the space they leave is what
+    /// makes room for a bigger meter and a fader you can actually hit.
+    ///
+    /// The take name stays because it is the only one somebody types, and a
+    /// menu cannot hold a text field.
+    fn fill_setup(&mut self, d: Rect) {
         if !d.is_positive() {
             return;
         }
-        // Real gaps between the rows. They are not decoration: `Rect::contains`
-        // is inclusive at both edges, so two rows that merely touch share a
-        // line of pixels and the overlap test fails there.
-        let folder_row = slice_v(d, 0.000, 0.125);
-        self.dest = slice_h(folder_row, 0.00, 0.52);
-        self.reveal = slice_h(folder_row, 0.55, 0.70);
-        self.default_tick = slice_h(folder_row, 0.73, 1.00);
-        self.name = slice_v(d, 0.150, 0.275);
-        // The two answers about where the take is going, side by side and in
-        // the faint ink: what it will be called, and whether it will fit.
-        let note = slice_v(d, 0.285, 0.375);
-        self.folder = slice_h(note, 0.00, 0.58);
-        self.disk = slice_h(note, 0.60, 1.00);
-        self.camera = slice_v(d, 0.400, 0.525);
-        self.audio = slice_v(d, 0.545, 0.670);
-        let take_row = slice_v(d, 0.700, 0.825);
-        // Three cells now, not two. The signature belongs beside the count-in
-        // and the tempo because the three describe one thing between them —
-        // how long a bar is, how many of them you get, and how fast.
-        self.count_in = slice_h(take_row, 0.00, 0.34);
-        self.time_sig = slice_h(take_row, 0.37, 0.62);
-        self.tempo = slice_h(take_row, 0.65, 1.00);
-        // The Export button keeps the left of its row; the tick that says what
-        // to do when a take finishes takes the right. Beside Export rather than
-        // beside the folder because it is a question about the END of a take,
-        // and the folder row is the group set once at the start of a session.
-        let export_row = slice_v(d, 0.855, 0.980);
-        self.export = slice_h(export_row, 0.00, 0.60);
-        self.open_when_done = slice_h(export_row, 0.63, 1.00);
+        self.name = slice_v(d, 0.00, 0.30);
+        self.folder = slice_v(d, 0.33, 0.51);
+        // **The tempo stays.** It is the one thing in this group that is
+        // DRAGGED, and a menu row cannot be dragged; it is also per-take
+        // rather than per-session, since it sets the count-in's speed. The
+        // rest of the group went to the menu because a menu could hold it.
+        self.tempo = slice_v(d, 0.56, 0.76);
+        self.setup = slice_v(d, 0.80, 1.00);
     }
 
     /// Rolling: readable from the bench. The preview collapses to a strip that
@@ -768,7 +835,12 @@ impl Layout {
     /// the two things worth reading from two metres away take most of the rest,
     /// and the monitor column stays exactly where it was.
     fn fill_rolling(&mut self, body: Rect, gap: f32, view: &RecorderView<'_>) {
-        let pv_w = (body.height() * 1.1).min(body.width() * 0.15);
+        // Never wider than the preview at rest: this box only ever COLLAPSES
+        // when a take starts, and a rolling preview that grew would run under
+        // the faders, which are pinned to the at-rest geometry.
+        let pv_w = (body.height() * 1.1)
+            .min(body.width() * 0.15)
+            .min(Self::preview_w(body));
         self.preview = Rect::from_min_max(body.min, Pos2::new(body.left() + pv_w, body.bottom()));
         let monitor = Self::monitor_of(body);
         self.fill_monitor(monitor, view);
@@ -786,8 +858,18 @@ impl Layout {
         // More of the column than the bar needed: a pair of dials read from a
         // piano bench is a question of how big the FACES are, and the faces are
         // sized by the height they are given.
-        self.meter = slice_v(t, 0.62, 1.00);
-        let top = slice_v(t, 0.0, 0.56);
+        // The faders survive a take for the same reason they always did: the
+        // click is turned down mid-performance more than any other control
+        // here. They keep the bottom of the group, where they are at rest.
+        self.fill_faders(body, gap);
+        // Three columns across the upper two thirds: the pair of buttons, the
+        // meters, and the clock — which takes nearly half the group, because
+        // reading the elapsed time from a piano bench is what this layout is
+        // for. The meters are a little smaller than at rest and still large;
+        // the clock is four times the size of the one at rest.
+        let upper = slice_v(t, 0.0, 0.62);
+        self.meter = slice_h(upper, 0.20, 0.54);
+        let top = slice_h(upper, 0.00, 0.16);
 
         // The dot stands roughly where the record button stood, so the band
         // does not reshuffle under the eye at the moment the take starts.
@@ -800,8 +882,8 @@ impl Layout {
         // other is the way out of it, and they belong to the same pair.
         // 0.16 of the row each, so the pair fits left of the timecode, which
         // starts at 0.36 and is the biggest thing in the band while a take runs.
-        let dot_d = top.height().min(top.width() * 0.16);
-        self.dot = Rect::from_center_size(slice_h(top, 0.01, 0.17).center(), Vec2::splat(dot_d));
+        let dot_d = (top.height() * 0.42).min(top.width() * 0.9);
+        self.dot = Rect::from_center_size(slice_v(top, 0.02, 0.46).center(), Vec2::splat(dot_d));
         // As close to its resting size as the row allows. It used to be 0.62
         // of the row height against a resting 1.0, so the one control you reach
         // for while your hands are on the keys shrank the moment the take
@@ -811,7 +893,7 @@ impl Layout {
         // at rest: the timecode starts at 0.36 and is the biggest thing in the
         // band while a take runs.
         let stop_d = dot_d;
-        self.stop = Rect::from_center_size(slice_h(top, 0.18, 0.34).center(), Vec2::splat(stop_d));
+        self.stop = Rect::from_center_size(slice_v(top, 0.54, 0.98).center(), Vec2::splat(stop_d));
 
         // The one thing `hide_elapsed` suppresses is a CLOCK. The count-in beat
         // is the number the player is counting, and "FINISHING" is the reason
@@ -820,7 +902,7 @@ impl Layout {
         self.timecode = if view.hide_elapsed && matches!(view.state, RecordState::Rolling) {
             Rect::NOTHING
         } else {
-            slice_h(top, 0.36, 1.00)
+            slice_h(upper, 0.58, 1.00)
         };
     }
 
@@ -829,13 +911,14 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 28] {
+    fn targets(&self) -> [(Rect, Produces); 41] {
         use Produces::{Along, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
         let s = &self.slots;
         [
             (self.record, Fixed(Hit::Record)),
             (self.stop, Fixed(Hit::Stop)),
+            (self.setup, Fixed(Hit::OpenSetup)),
             // Written out per slot rather than built in a loop, because a
             // fixed-size array of them is what makes forgetting one a compile
             // error, and because the index in the `Hit` has to be the index of
@@ -854,6 +937,18 @@ impl Layout {
             (s[2].knob, SlotGain(2)),
             (s[2].open, Fixed(Hit::OpenSlotEditor(2))),
             (s[2].clear, Fixed(Hit::ClearSlot(2))),
+            (s[3].pick, Fixed(Hit::PickSlot(3))),
+            (s[3].knob, SlotGain(3)),
+            (s[3].open, Fixed(Hit::OpenSlotEditor(3))),
+            (s[3].clear, Fixed(Hit::ClearSlot(3))),
+            (s[4].pick, Fixed(Hit::PickSlot(4))),
+            (s[4].knob, SlotGain(4)),
+            (s[4].open, Fixed(Hit::OpenSlotEditor(4))),
+            (s[4].clear, Fixed(Hit::ClearSlot(4))),
+            (s[5].pick, Fixed(Hit::PickSlot(5))),
+            (s[5].knob, SlotGain(5)),
+            (s[5].open, Fixed(Hit::OpenSlotEditor(5))),
+            (s[5].clear, Fixed(Hit::ClearSlot(5))),
             (track(self.metronome_row), Along(Hit::SetMetronomeGain)),
             (track(self.input_row), Along(Hit::SetInputGain)),
             (self.click, Fixed(Hit::ToggleMetronome)),
@@ -916,6 +1011,8 @@ pub fn fit_preview(into: Rect, source_px: Vec2) -> Rect {
 /// one, and that is [`Hit::is_same_control`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Hit {
+    /// Open the menu the take's settings moved into.
+    OpenSetup,
     Record,
     Stop,
     ChooseFolder,
@@ -981,9 +1078,10 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 29] = [
+    pub const ALL: [Hit; 42] = [
         Hit::Record,
         Hit::Stop,
+        Hit::OpenSetup,
         Hit::ChooseFolder,
         Hit::RevealFolder,
         Hit::ToggleDefaultDir,
@@ -994,12 +1092,21 @@ impl Hit {
         Hit::PickSlot(0),
         Hit::PickSlot(1),
         Hit::PickSlot(2),
+        Hit::PickSlot(3),
+        Hit::PickSlot(4),
+        Hit::PickSlot(5),
         Hit::OpenSlotEditor(0),
         Hit::OpenSlotEditor(1),
         Hit::OpenSlotEditor(2),
+        Hit::OpenSlotEditor(3),
+        Hit::OpenSlotEditor(4),
+        Hit::OpenSlotEditor(5),
         Hit::ClearSlot(0),
         Hit::ClearSlot(1),
         Hit::ClearSlot(2),
+        Hit::ClearSlot(3),
+        Hit::ClearSlot(4),
+        Hit::ClearSlot(5),
         Hit::CycleCountIn,
         Hit::Export,
         Hit::ToggleMetronome,
@@ -1007,6 +1114,9 @@ impl Hit {
         Hit::SetSlotGain(0, Hit::MIDWAY),
         Hit::SetSlotGain(1, Hit::MIDWAY),
         Hit::SetSlotGain(2, Hit::MIDWAY),
+        Hit::SetSlotGain(3, Hit::MIDWAY),
+        Hit::SetSlotGain(4, Hit::MIDWAY),
+        Hit::SetSlotGain(5, Hit::MIDWAY),
         Hit::SetMetronomeGain(Hit::MIDWAY),
         Hit::SetInputGain(Hit::MIDWAY),
         Hit::SetTempo((MIN_BPM + MAX_BPM) * 0.5),
@@ -1018,27 +1128,44 @@ impl Hit {
         // cannot format. If `SLOTS` ever changes, these stop compiling, which
         // is the point: a fourth slot whose controls were all called
         // "Instrument 3" would be a menu nobody could read.
-        const PICK: [&str; SLOTS] = ["Instrument 1", "Instrument 2", "Instrument 3"];
+        const PICK: [&str; SLOTS] = [
+            "Instrument 1",
+            "Instrument 2",
+            "Instrument 3",
+            "Instrument 4",
+            "Instrument 5",
+            "Instrument 6",
+        ];
         const OPEN: [&str; SLOTS] = [
             "Open instrument 1's window",
             "Open instrument 2's window",
             "Open instrument 3's window",
+            "Open instrument 4's window",
+            "Open instrument 5's window",
+            "Open instrument 6's window",
         ];
         const CLEAR: [&str; SLOTS] = [
             "Clear instrument 1",
             "Clear instrument 2",
             "Clear instrument 3",
+            "Clear instrument 4",
+            "Clear instrument 5",
+            "Clear instrument 6",
         ];
         const GAIN: [&str; SLOTS] = [
             "Instrument 1 level",
             "Instrument 2 level",
             "Instrument 3 level",
+            "Instrument 4 level",
+            "Instrument 5 level",
+            "Instrument 6 level",
         ];
         // A hit is only ever built from a real row, but the index arrives as a
         // `usize` and a panic in a label is a crash in a tooltip.
         let n = |i: usize| i.min(SLOTS - 1);
         match self {
             Hit::Record => "Record",
+            Hit::OpenSetup => "Take settings",
             Hit::Stop => "Stop",
             Hit::ChooseFolder => "Choose folder",
             Hit::RevealFolder => "Show the folder",
@@ -1212,6 +1339,11 @@ fn along(r: Rect, pos: Pos2) -> f32 {
 /// preset between two passes is a real thing, and it is the plugin's own window
 /// that does it. The one monitor control that DOES change the file — whether the
 /// click is recorded into it — goes away with the destination.
+/// Where the Setup button is, so the app can open the menu at it.
+pub fn setup_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
+    Layout::new(rect, view).setup
+}
+
 pub fn hit_test(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<Hit> {
     if !rect.contains(pos) {
         return None;
@@ -1261,6 +1393,23 @@ pub fn draw(painter: &Painter, rect: Rect, view: &RecorderView<'_>, s: &Settings
     draw_monitor(painter, &l, view, &p);
     if !l.rolling {
         draw_destination(painter, &l, view, s, &p);
+        // The button that opens the menu the rest of the destination group
+        // moved into. Every rect it left behind is `Rect::NOTHING`, which
+        // every draw here already treats as "not on screen", so nothing above
+        // needed a condition adding to it.
+        if l.setup.is_positive() {
+            control(painter, l.setup, &p);
+            let size = fit_text(l.setup, "SETUP...", l.setup.height() * 0.5);
+            if size >= MIN_TEXT {
+                painter.text(
+                    l.setup.center(),
+                    Align2::CENTER_CENTER,
+                    "SETUP...",
+                    font(size),
+                    p.ink,
+                );
+            }
+        }
     }
     for r in l.rules {
         if r.is_positive() {
@@ -1564,7 +1713,7 @@ fn draw_slot(
     // rather than as three copies of the same control. Sized by `SLOTS`, so a
     // fourth slot has to be given a name here rather than quietly being a
     // second slot three.
-    const NUMBER: [&str; SLOTS] = ["1", "2", "3"];
+    const NUMBER: [&str; SLOTS] = ["1", "2", "3", "4", "5", "6"];
     let n = NUMBER[i.min(SLOTS - 1)];
     let (value, ink) = match (v.name, v.missing) {
         (None, _) => (
@@ -2936,6 +3085,9 @@ mod tests {
                 loaded("Pianoteq 8", 1.0, true),
                 loaded("Kontakt 7", 0.5, true),
                 loaded("Dexed", 0.0, true),
+                loaded("sfizz", 0.7, true),
+                loaded("Surge XT", 0.3, true),
+                loaded("Vital", 0.9, true),
             ],
             ..RecorderView::empty()
         }
@@ -2962,11 +3114,17 @@ mod tests {
                 loaded("Pianoteq 8", 1.0, true),
                 loaded("Kontakt 7", 0.5, true),
                 loaded("Dexed", 0.0, true),
+                loaded("sfizz", 0.7, true),
+                loaded("Surge XT", 0.3, true),
+                loaded("Vital", 0.9, true),
             ],
             [
                 loaded("sfizz", 1.0, false),
                 SlotView::EMPTY,
                 loaded("Surge XT", 0.25, false),
+                SlotView::EMPTY,
+                SlotView::EMPTY,
+                loaded("Vital", 0.6, true),
             ],
             [
                 SlotView {
@@ -2980,6 +3138,9 @@ mod tests {
                     editor_open: true,
                     ..loaded("Dexed", 3.98, true)
                 },
+                SlotView::EMPTY,
+                loaded("Surge XT", 0.5, true),
+                SlotView::EMPTY,
             ],
         ]
     }
@@ -3006,14 +3167,20 @@ mod tests {
     /// which is the whole distinction: reaching a preset in a plugin's own
     /// window between two passes is a real thing, and loading a plugin blocks
     /// the main thread for seconds and would cost the take.
-    const SURVIVORS: [Hit; 10] = [
+    const SURVIVORS: [Hit; 16] = [
         Hit::Stop,
         Hit::SetSlotGain(0, 0.0),
         Hit::SetSlotGain(1, 0.0),
         Hit::SetSlotGain(2, 0.0),
+        Hit::SetSlotGain(3, 0.0),
+        Hit::SetSlotGain(4, 0.0),
+        Hit::SetSlotGain(5, 0.0),
         Hit::OpenSlotEditor(0),
         Hit::OpenSlotEditor(1),
         Hit::OpenSlotEditor(2),
+        Hit::OpenSlotEditor(3),
+        Hit::OpenSlotEditor(4),
+        Hit::OpenSlotEditor(5),
         Hit::SetMetronomeGain(0.0),
         Hit::SetInputGain(0.0),
         Hit::ToggleMetronome,
@@ -3460,12 +3627,30 @@ mod tests {
                 // metronome, because it is set once and was taking a box and a
                 // caption in the busiest row of the band. Its reachability is
                 // the app's to prove, not the layout's.
-                if want == Hit::ToggleMetronomeInTake {
+                // The take's settings moved to the menu, so they have no
+                // rectangle in the band any more. Their reachability is the
+                // menu's to prove, not the layout's — the same bargain the
+                // in-take toggle already made.
+                const IN_THE_MENU: [Hit; 9] = [
+                    Hit::ChooseFolder,
+                    Hit::RevealFolder,
+                    Hit::ToggleDefaultDir,
+                    Hit::ToggleOpenWhenDone,
+                    Hit::PickCamera,
+                    Hit::PickAudio,
+                    Hit::CycleCountIn,
+                    Hit::Export,
+                    Hit::EditTimeSignature,
+                ];
+                if IN_THE_MENU.iter().any(|m| m.is_same_control(want))
+                    || want == Hit::ToggleMetronomeInTake
+                {
                     assert!(
-                        l.targets()
-                            .into_iter()
-                            .all(|(_, k)| !k.hit(Hit::MIDWAY).is_same_control(want)),
-                        "the in-take toggle grew a rectangle again"
+                        l.targets().into_iter().all(|(rect, k)| {
+                            !k.hit(Hit::MIDWAY).is_same_control(want) || !rect.is_positive()
+                        }),
+                        "{} grew a rectangle in the band again",
+                        want.label()
                     );
                     continue;
                 }
@@ -3961,9 +4146,23 @@ mod tests {
             live.preview.width() < at_rest.preview.width(),
             "the preview did not collapse for the rolling layout"
         );
+        // **The meter no longer has to grow, and asserting that it does would
+        // be asserting the old band.** It was tiny at rest when the transport
+        // was a quarter of a narrow column, so growing was the only way it
+        // could become readable. The transport is half the band now and the
+        // meters are large in both layouts; what the rolling one buys is the
+        // CLOCK, which takes nearly half the group. So: the meter stays
+        // substantial, and the clock is what changes.
+        let area = |r: Rect| r.width() * r.height();
         assert!(
-            live.meter.height() > at_rest.meter.height(),
-            "the meter did not grow for the rolling layout"
+            area(live.meter) > area(at_rest.meter) * 0.4,
+            "the rolling meter collapsed: {:?} vs {:?}",
+            live.meter,
+            at_rest.meter
+        );
+        assert!(
+            live.meter.height() >= at_rest.meter.height(),
+            "the rolling meter got shorter, which is what its faces are sized by"
         );
         // And the tick that decides what goes in the FILE leaves with the rest
         // of the destination, while the switch that decides what you HEAR does
@@ -4311,7 +4510,7 @@ mod tests {
                                 // Every fader at a different, awkward place:
                                 // silence, past unity, and the click's default.
                                 gains: Gains {
-                                    slots: [3.98, 0.0, 1.0],
+                                    slots: [3.98, 0.0, 1.0, 0.5, 0.25, 2.0],
                                     metronome: 0.0,
                                     input: 0.5,
                                 },

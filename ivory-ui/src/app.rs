@@ -296,6 +296,9 @@ pub struct IvoryApp {
     menu_over_recorder: bool,
     /// The last right-click landed on the sheet music panel.
     menu_over_staff: bool,
+    /// The Setup button was pressed; the menu opens after the frame, where the
+    /// window origin needed to place it is known.
+    setup_menu_wanted: bool,
     /// A numeric field being typed into, if any.
     ///
     /// Mutually exclusive with `name_focused` in practice, because a press
@@ -526,6 +529,7 @@ impl IvoryApp {
             num_edit: None,
             menu_over_recorder: false,
             menu_over_staff: false,
+            setup_menu_wanted: false,
             audio_status: recorder::AudioStatus::default(),
             fullscreen_sent: None,
             plugin_list: Vec::new(),
@@ -977,6 +981,17 @@ impl IvoryApp {
     /// painting — the live ones, or the composite's override. `None` when
     /// detection is off in that copy, which is what lets the staff take the
     /// readout strip's height back.
+    /// The view the band's LAYOUT depends on, which is all `setup_rect` needs.
+    fn recorder_layout_view(&self) -> recorder::RecorderView<'_> {
+        self.recorder.view(
+            self.settings.record_take_name.as_deref().unwrap_or_default(),
+            self.name_focused,
+            self.num_edit.as_ref(),
+            self.settings.knobs(),
+            self.settings.record_hide_elapsed,
+        )
+    }
+
     fn staff_readout(&self, s: &Settings) -> Option<staff::Readout<'_>> {
         s.chord_detection_enabled.then_some(staff::Readout {
             chord: self.current_chord.as_deref(),
@@ -1052,6 +1067,8 @@ impl IvoryApp {
             recorder_on: self.settings.show_recorder,
             camera_pane_on: self.settings.show_camera_pane,
             extra_plugin_folders: self.settings.plugin_paths.len(),
+            record_dir_is_default: self.settings.record_dir_is_default,
+            open_when_done: self.settings.record_open_when_done,
             staff_on: self.settings.theory_views().contains(theory_panel::View::Staff),
             staff_note_names: self.settings.staff_note_names,
             staff_set: self.settings.staff_set.clone(),
@@ -1108,8 +1125,17 @@ impl IvoryApp {
     /// Colour of the supporter heart, or None when it should not be drawn.
     /// Derived every frame from the licence — never a cached flag.
     fn heart_color(&self) -> Option<egui::Color32> {
-        if !(self.settings.show_heart && self.license.is_supporter()) {
+        if !self.settings.show_heart {
             return None;
+        }
+        // **Always drawn, and quiet unless it has been paid for.** The heart is
+        // the way into the thanks card, and the people on that card are being
+        // thanked for the app existing rather than for anybody's purchase — so
+        // gating the credit behind a key would be a strange thing to do to
+        // them. A supporter gets the colour they chose; everybody else gets a
+        // heart the same weight as the rest of the chrome.
+        if !self.license.is_supporter() {
+            return Some(egui::Color32::from_rgb(0x4a, 0x45, 0x3c));
         }
         let n = chord_strip::HEART_COLORS.len() as i64;
         // rem_euclid so a hand-edited negative index still lands in range.
@@ -1647,6 +1673,11 @@ impl IvoryApp {
         match hit {
             Hit::Record => self.request_recorder(R::Toggle),
             Hit::Stop => self.request_recorder(R::Stop),
+            // Opens the menu, led by the Recorder's own categories, at the
+            // button. The take's settings live there now, and a button that
+            // opens the place they went is what keeps them findable by
+            // somebody who never thinks to right-click a band.
+            Hit::OpenSetup => self.setup_menu_wanted = true,
             Hit::ChooseFolder => self.ask_for_a_folder(),
             Hit::ToggleDefaultDir => {
                 self.settings.record_dir_is_default = !self.settings.record_dir_is_default;
@@ -2608,6 +2639,19 @@ impl IvoryApp {
                 self.save_settings();
                 self.request_natural_size();
             }
+            // The take's settings that moved out of the band. Each one is the
+            // SAME action the band's own hit produced, so the two can never
+            // drift: one handler, two ways in.
+            MenuAction::ChooseFolder => self.apply_recorder_hit(recorder_panel::Hit::ChooseFolder),
+            MenuAction::RevealFolder => self.apply_recorder_hit(recorder_panel::Hit::RevealFolder),
+            MenuAction::ToggleDefaultDir => {
+                self.apply_recorder_hit(recorder_panel::Hit::ToggleDefaultDir);
+            }
+            MenuAction::ToggleOpenWhenDone => {
+                self.apply_recorder_hit(recorder_panel::Hit::ToggleOpenWhenDone);
+            }
+            MenuAction::PickCamera => self.apply_recorder_hit(recorder_panel::Hit::PickCamera),
+            MenuAction::PickAudio => self.apply_recorder_hit(recorder_panel::Hit::PickAudio),
             MenuAction::RescanPlugins => {
                 self.plugin_rescan = true;
             }
@@ -4057,6 +4101,22 @@ impl IvoryApp {
                 None, // attached: it already has the piano below it as an edge
                 self.transpose_view(),
             );
+            // The thanks, while the pointer is on the heart. Painted last of
+            // the band so it sits over the piano below it, and only in the
+            // live window: the compositor draws this same band into a video,
+            // where there is no pointer and a hover would be a stray card in
+            // somebody's recording.
+            if self.heart_color().is_some() {
+                let hr = chord_strip::heart_rect(chord_rect);
+                if ctx.pointer_latest_pos().is_some_and(|p| hr.contains(p)) {
+                    chord_strip::draw_thanks(
+                        ui.painter(),
+                        hr,
+                        ui.max_rect(),
+                        self.settings.chord_text_color.to_color32(),
+                    );
+                }
+            }
         }
         piano::draw(
             ui.painter(),

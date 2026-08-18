@@ -136,7 +136,11 @@ impl Meters {
 /// of slots — a variable count would make the band's height depend on how many
 /// instruments are loaded, and every band's height in this app is a function of
 /// width alone.
-pub const SLOTS: usize = 3;
+/// **Six, up from three.** The two monitor faders moved into the transport
+/// group, and the column they left is what three more instruments fit in. A
+/// layered pad, a bass and a lead is three; anybody building a rig wanted more
+/// than that the first time they tried.
+pub const SLOTS: usize = 6;
 
 /// One instrument slot, as the band draws it.
 #[derive(Debug, Clone, Copy, PartialEq)]

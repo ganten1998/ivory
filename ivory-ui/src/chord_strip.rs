@@ -131,6 +131,104 @@ fn draw_heart(painter: &Painter, rect: Rect, color: Color32) {
     }
 }
 
+/// The people the app is for, in the order they are read.
+///
+/// **A blank line between every one**, because six names in a stack read as a
+/// list of parts and six names with air between them read as six people. The
+/// card is small and the space is the whole of what makes it feel like thanks
+/// rather than credits.
+pub const THANKS: &[&str] = &[
+    "Alejandro",
+    "Aiden",
+    "Omer",
+    "Hatsu",
+    "Joanne",
+    "My wonderful Mother",
+];
+
+/// The thanks card, anchored under the heart and kept inside `screen`.
+///
+/// Drawn here rather than as an egui tooltip because this band is a pure
+/// painter with no `Ui` anywhere near it, and because the compositor draws the
+/// same band into a video where a tooltip would not exist at all.
+pub fn draw_thanks(painter: &Painter, heart: Rect, screen: Rect, ink: Color32) {
+    let size = (heart.height() * 0.62).clamp(9.0, 15.0);
+    let line = size * 1.05;
+    // Head, a blank line, then each name with a blank line after it.
+    let rows = 2.0 + THANKS.len() as f32 * 2.0 - 1.0;
+    let pad = size * 1.1;
+    let w = size * 0.62 * 21.0 + pad * 2.0;
+    let h = rows * line + pad * 2.0;
+    // Under the heart and left of it, then pulled back onto the screen. The
+    // heart lives in the top-right corner, so left-and-down is the only
+    // direction with room in it.
+    let mut card = Rect::from_min_size(
+        Pos2::new(heart.right() - w, heart.bottom() + size * 0.6),
+        egui::vec2(w, h),
+    );
+    let dx = (screen.left() - card.left()).max(0.0) - (card.right() - screen.right()).max(0.0);
+    let dy = (card.bottom() - screen.bottom()).max(0.0);
+    card = card.translate(egui::vec2(dx, -dy));
+
+    painter.rect_filled(card, 3.0, Color32::from_black_alpha(238));
+    painter.rect_stroke(card, 3.0, Stroke::new(1.0_f32, ink), StrokeKind::Inside);
+    let mut y = card.top() + pad + line * 0.5;
+    painter.text(
+        Pos2::new(card.center().x, y),
+        egui::Align2::CENTER_CENTER,
+        "Special thanks to:",
+        FontId::new(size, fonts::courier_bold()),
+        ink,
+    );
+    y += line * 2.0;
+    for name in THANKS {
+        painter.text(
+            Pos2::new(card.center().x, y),
+            egui::Align2::CENTER_CENTER,
+            *name,
+            FontId::new(size, fonts::courier()),
+            ink,
+        );
+        y += line * 2.0;
+    }
+}
+
+#[cfg(test)]
+mod thanks_tests {
+    use super::*;
+
+    /// The card stays on screen wherever the heart is, and says what it is for.
+    #[test]
+    fn the_thanks_card_names_everyone_and_stays_on_screen() {
+        assert_eq!(THANKS.len(), 6);
+        assert_eq!(THANKS.last(), Some(&"My wonderful Mother"));
+        // Nobody twice, and nobody blank.
+        for (i, n) in THANKS.iter().enumerate() {
+            assert!(!n.trim().is_empty());
+            assert!(!THANKS[..i].contains(n), "{n} is thanked twice");
+        }
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        for screen in [
+            Rect::from_min_size(Pos2::ZERO, egui::vec2(1300.0, 800.0)),
+            Rect::from_min_size(Pos2::ZERO, egui::vec2(420.0, 260.0)),
+        ] {
+            for strip in [
+                Rect::from_min_size(screen.min, egui::vec2(screen.width(), 50.0)),
+                Rect::from_min_size(
+                    Pos2::new(screen.left(), screen.bottom() - 40.0),
+                    egui::vec2(screen.width(), 40.0),
+                ),
+            ] {
+                let _ = ctx.run(Default::default(), |ctx| {
+                    let p = ctx.layer_painter(egui::LayerId::background());
+                    draw_thanks(&p, heart_rect(strip), screen, Color32::WHITE);
+                });
+            }
+        }
+    }
+}
+
 pub fn viewport_id() -> ViewportId {
     ViewportId::from_hash_of("ivory-chord-window")
 }

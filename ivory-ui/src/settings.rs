@@ -580,7 +580,7 @@ impl Default for Settings {
             record_time_signature: "4/4".to_owned(),
             record_count_in_in_take: false,
             record_buffer_frames: 0,
-            plugin_slots: [None, None, None],
+            plugin_slots: [const { None }; crate::recorder::SLOTS],
             plugin_gains: [1.0; crate::recorder::SLOTS],
             metronome_gain: 0.5,
             input_gain: 1.0,
