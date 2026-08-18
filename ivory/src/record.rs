@@ -2593,6 +2593,106 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **`take.json` records the video, and the video's own file.**
+    ///
+    /// The regression this exists for ran the whole life of the recorder and
+    /// was never noticed on a Mac, because a Mac encodes fine and nobody reads
+    /// the manifest when the `.mp4` is sitting right there. `stop` writes the
+    /// manifest before the encoder has finished the file, so the video section
+    /// was always `null` and `take.mp4` was never in `files`. The session now
+    /// keeps what it wrote and folds the report in afterwards.
+    ///
+    /// Asserted through the FILE rather than the in-memory manifest: what is
+    /// on disk is the only thing anybody ever reads, and an amend that updated
+    /// the struct and forgot to rewrite would pass any weaker test.
+    #[test]
+    fn the_manifest_gains_the_video_after_the_encoder_finishes() {
+        let dir = std::env::temp_dir().join("tangent-session-test-video");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = session();
+        s.toggle(&dir, Some("filmed"), 0, ExportSpec::default());
+        s.stop();
+        let folder = s.last_summary().expect("a take produces a summary").folder.clone();
+        let manifest = dir.join(&folder).join("take.json");
+
+        // At Stop the encoder is still writing, so there is no video yet.
+        let before: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest).expect("take.json"))
+                .expect("valid json");
+        assert!(before["video"].is_null(), "a video before the encoder finished");
+
+        s.record_video(
+            ivory_record::take::VideoReport {
+                container: "mp4".into(),
+                video_codec: "h264".into(),
+                audio_codec: "aac".into(),
+                width: 1920,
+                height: 1080,
+                fps: 30.0,
+                frames_expected: 300,
+                frames_received: 297,
+            },
+            "take.mp4",
+        );
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest).expect("take.json"))
+                .expect("valid json");
+        assert_eq!(after["video"]["video_codec"], "h264", "{after:#}");
+        assert_eq!(after["video"]["width"], 1920);
+        assert_eq!(after["video"]["frames_received"], 297);
+        assert!(
+            after["files"]
+                .as_array()
+                .expect("files is a list")
+                .iter()
+                .any(|f| f == "take.mp4"),
+            "the video is not in files: {after:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A video that finalises after the NEXT take has started must not write
+    /// into it. `begin` clears the retained manifest, and this is that rule.
+    #[test]
+    fn a_late_video_does_not_land_in_the_following_take() {
+        let dir = std::env::temp_dir().join("tangent-session-test-late");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = session();
+        s.toggle(&dir, Some("first"), 0, ExportSpec::default());
+        s.stop();
+        let first = s.last_summary().expect("summary").folder.clone();
+        s.toggle(&dir, Some("second"), 0, ExportSpec::default());
+        s.record_video(
+            ivory_record::take::VideoReport {
+                container: "mp4".into(),
+                video_codec: "h264".into(),
+                audio_codec: "aac".into(),
+                width: 640,
+                height: 360,
+                fps: 30.0,
+                frames_expected: 10,
+                frames_received: 10,
+            },
+            "take.mp4",
+        );
+        s.stop();
+        let second = s.last_summary().expect("summary").folder.clone();
+        assert_ne!(first, second);
+        for folder in [first, second] {
+            let m: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.join(&folder).join("take.json")).expect("take.json"),
+            )
+            .expect("valid json");
+            assert!(m["video"].is_null(), "{folder} was amended by a late video");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **It had no `#[test]`.** It has never run, in any release, since it was
+    /// written. Third of its kind found in this file's neighbourhood; the two
+    /// before it were loops whose variable was unused.
+    #[test]
     fn a_session_with_no_device_still_starts_and_stops_a_take() {
         let dir = std::env::temp_dir().join("tangent-session-test-basic");
         let _ = std::fs::remove_dir_all(&dir);
