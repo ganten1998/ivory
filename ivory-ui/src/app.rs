@@ -3828,6 +3828,14 @@ impl IvoryApp {
             let at = ui.max_rect().min + Vec2::new(20.0, 20.0);
             self.open_menu_at(&ctx, at);
         }
+        // The same hook for the take-settings popup, which cannot be
+        // photographed any other way: it is dismissed by a press anywhere
+        // outside it, and taking a screenshot is a press somewhere outside it.
+        //   IVORY_INLINE=setup /Applications/Tangent.app/Contents/MacOS/tangent
+        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("setup") {
+            self.demo_menu_done = true;
+            self.setup_open = true;
+        }
 
         self.process_midi_events();
 

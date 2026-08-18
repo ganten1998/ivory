@@ -890,12 +890,18 @@ impl Layout {
         // what two large ones and a word said. Nothing above them is set
         // mid-take, so while a take runs the column is the transport and the
         // clock and nothing else.
-        let bar = slice_v(d, 0.74, 1.00);
+        // Three rows of one height: the name, the tempo, and the transport.
+        let bar = slice_v(d, 0.68, 0.97);
         // Three squares of one size, left-aligned, with the clock filling the
         // rest of the row. One size because they are one group: a stop that is
         // bigger than the cog beside it reads as more important than it is.
-        let side = bar.height().min(bar.width() * 0.24);
-        let step = side * 1.18;
+        //
+        // **Sized from the ROW's width, not from its height.** At the height
+        // three icons and their gaps came to more than the row was wide and
+        // the clock was left twenty-two points to say "0:00" in — which after
+        // a take is where "FINISHING" has to fit, so it is not decoration.
+        let side = bar.height().min(bar.width() * 0.19);
+        let step = bar.width() * 0.205;
         let icon = |i: usize| {
             Rect::from_min_size(
                 Pos2::new(bar.left() + step * i as f32, bar.center().y - side * 0.5),
@@ -920,22 +926,29 @@ impl Layout {
             // and a tempo you cannot drag are two boxes teaching the wrong
             // thing — so the elapsed time gets the room they were using, which
             // is the one number anybody looks at from a piano bench.
-            self.timecode = slice_v(d, 0.04, 0.68);
+            // Stopping short of the bar, not at it: `Rect::contains` is
+            // inclusive at both edges, so two rows that merely touch share a
+            // line of pixels and the overlap test is right to fail there.
+            self.timecode = slice_v(d, 0.04, 0.64);
             return;
         }
         // At rest it says 0:00 and means nothing, so it takes what is left of
         // the transport's own row and no more.
         self.timecode = Rect::from_min_max(
-            Pos2::new(bar.left() + step * 3.0, bar.top()),
+            Pos2::new(bar.left() + bar.width() * 0.64, bar.top()),
             bar.max,
         );
-        self.name = slice_v(d, 0.00, 0.30);
-        self.folder = slice_v(d, 0.33, 0.51);
+        // **No filename preview here.** A running timestamp that changes
+        // every second taught the naming scheme once and then spent the rest
+        // of the session being a clock nobody asked for — and it was the row
+        // making the other three different sizes from each other. It is in the
+        // popup, beside the folder it belongs to.
+        self.name = slice_v(d, 0.00, 0.29);
         // **The tempo stays.** It is the one thing in this group that is
         // DRAGGED, and a menu row cannot be dragged; it is also per-take
         // rather than per-session, since it sets the count-in's speed. The
         // rest of the group is behind the cog.
-        self.tempo = slice_v(d, 0.54, 0.72);
+        self.tempo = slice_v(d, 0.34, 0.63);
     }
 
     /// Rolling: readable from the bench. The preview collapses to a strip that
@@ -2533,8 +2546,12 @@ fn draw_vu(painter: &Painter, face: Rect, lv: Level, clipped: bool, p: &Palette)
     // does on the real one, and the arc is as big as the shorter of the two
     // dimensions allows. The width term leaves a card's-width margin at each
     // end rather than two points, so the scale ends inside the glass.
-    let pivot = Pos2::new(face.center().x, face.bottom() - fh * 0.07);
-    let radius = (fh * 0.72).min(fw * 0.46 / VU_SWEEP.sin()).max(1.0);
+    // **The hub is BELOW the glass**, the way a real movement's is: what you
+    // see is a needle coming up out of the bottom edge, not a pointer pinned
+    // to a dot sitting on the card. Everything it draws is clipped to the
+    // face, so the part below the edge simply is not there.
+    let pivot = Pos2::new(face.center().x, face.bottom() + fh * 0.05);
+    let radius = (fh * 0.80).min(fw * 0.46 / VU_SWEEP.sin()).max(1.0);
     let at = |f: f32, rr: f32| {
         let a = (f - 0.5) * 2.0 * VU_SWEEP;
         Pos2::new(pivot.x + rr * a.sin(), pivot.y - rr * a.cos())
@@ -2615,8 +2632,11 @@ fn draw_vu(painter: &Painter, face: Rect, lv: Level, clipped: bool, p: &Palette)
     // card: a needle that leaves the face is a rendering fault, and the lamp is
     // what says the signal went past the end.
     let n = at(vu_frac(lv.rms).clamp(0.0, 1.0), radius * 0.97);
-    painter.line_segment([pivot, n], Stroke::new((fh * 0.035).max(1.0), VU_PRINT));
-    painter.circle_filled(pivot, (fh * 0.075).max(1.5), VU_PRINT);
+    // Thin. A VU needle is a wire with a counterweight, and at 3.5% of the
+    // face it was a pointer drawn by somebody who had not looked at one.
+    let needle = painter.with_clip_rect(face);
+    needle.line_segment([pivot, n], Stroke::new((fh * 0.018).max(1.0), VU_PRINT));
+    needle.circle_filled(pivot, (fh * 0.085).max(1.5), VU_PRINT);
 
     // The peak lamp: a yes-or-no answer to a yes-or-no question. Lit while the
     // held peak is in the last six decibels, and LATCHED red once anything has
@@ -4914,6 +4934,10 @@ impl SetupLayout {
         };
 
         let r0 = row(0);
+        let note = {
+            let r = row(1);
+            Rect::from_center_size(r.center(), Vec2::new(r.width(), r.height() * 0.60))
+        };
         let r3 = row(3);
         let r4 = row(4);
         let r5 = row(5);
@@ -4927,9 +4951,12 @@ impl SetupLayout {
             reveal: slice_h(r0, 0.57, 0.74),
             default_tick: slice_h(r0, 0.77, 1.00),
             // What the next take will be called, and whether it will fit.
-            // Answers rather than questions, so they carry no box.
-            folder: slice_h(row(1), 0.00, 0.60),
-            disk: slice_h(row(1), 0.62, 1.00),
+            // Answers rather than questions, so they carry no box — and a
+            // HALF-HEIGHT row, because `text_line` sizes itself to whatever it
+            // is given and a full row made the one line nobody clicks the
+            // biggest thing in the panel.
+            folder: slice_h(note, 0.00, 0.60),
+            disk: slice_h(note, 0.62, 1.00),
             camera: row(2),
             audio: slice_h(r3, 0.00, 0.74),
             audio_status: slice_h(r3, 0.77, 1.00),
@@ -5035,7 +5062,7 @@ pub fn draw_setup(
     painter.rect_stroke(l.panel, 4.0, Stroke::new(1.0_f32, p.ink), StrokeKind::Inside);
 
     if l.title.is_positive() {
-        let size = fit_text(l.title, "TAKE SETTINGS", l.title.height() * 0.62);
+        let size = fit_text(l.title, "TAKE SETTINGS", l.title.height() * 0.50);
         if size >= MIN_TEXT {
             painter.text(
                 Pos2::new(l.title.left(), l.title.center().y),
@@ -5048,13 +5075,23 @@ pub fn draw_setup(
     }
     draw_word_button(painter, l.close, &["DONE", "OK"], &p);
 
-    labelled(painter, l.dest, "FOLDER", view.dest, p.ink, &p);
     // "Choose..." lives INSIDE the folder box, right-aligned, because the box
     // itself is the target: two adjacent controls that open the same picker is
     // one control too many.
+    //
+    // **Its width is taken out of the box BEFORE the path is placed.** The
+    // band's folder box was wide enough that the two never met; this one is
+    // half of a small panel, and the path ran straight under the word. A
+    // reserved zone rather than a clip, so the path shrinks to fit the room it
+    // really has instead of being cut off mid-directory.
+    control(painter, l.dest, &p);
     if l.dest.is_positive() {
         let size = fit_text(l.dest, "Choose...", l.dest.height() * 0.45);
-        if size >= MIN_TEXT {
+        let gap = if size >= MIN_TEXT {
+            let w = painter
+                .layout_no_wrap("Choose...".to_owned(), font_light(size), p.faint)
+                .rect
+                .width();
             painter.text(
                 Pos2::new(l.dest.right() - label_inset(l.dest), l.dest.center().y),
                 Align2::RIGHT_CENTER,
@@ -5062,7 +5099,15 @@ pub fn draw_setup(
                 font_light(size),
                 p.faint,
             );
-        }
+            w + label_inset(l.dest) * 2.0
+        } else {
+            0.0
+        };
+        let value = Rect::from_min_max(
+            l.dest.min,
+            Pos2::new(l.dest.right() - gap, l.dest.bottom()),
+        );
+        label_text(painter, value, "FOLDER", view.dest, p.ink, &p);
     }
     // SHOW rather than OPEN, for the reason the tick beside Export has: nothing
     // is opened, a folder is shown.
