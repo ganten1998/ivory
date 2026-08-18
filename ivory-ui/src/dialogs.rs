@@ -16,7 +16,7 @@ use crate::menu::ColorTarget;
 // because `unused_qualifications` is a workspace lint and the two would
 // otherwise have to be spelled out in full on alternate lines.
 use crate::recorder::{
-    DisplayShows, ExportSpec, Layout as VideoLayout, Resolution, VideoMode, FPS_CHOICES, MAX_BPM,
+    DisplayShows, ExportSpec, Resolution, VideoMode, FPS_CHOICES, MAX_BPM,
     MIN_BPM,
 };
 use egui::{
@@ -3327,7 +3327,6 @@ pub fn show(
                                     // only control that is about the composite
                                     // specifically.
                                     let video_on = spec.video.wants_video();
-                                    let composite_on = spec.video.has_composite();
                                     ui.add_space(6.0);
                                     ui.horizontal(|ui| {
                                         export_label(ui, &t, "Composite contains", true);
