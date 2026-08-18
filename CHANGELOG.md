@@ -10,6 +10,27 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+## [5.0.0-beta.2] - 2026-08-18
+
+### Added
+
+- **Video on Windows and Linux.** They encode through `ffmpeg`, which has to be
+  on the PATH; a take that cannot find it names the install command and still
+  writes its audio and its MIDI. macOS is unchanged and still encodes natively
+  through AVFoundation, with nothing to install.
+
+### Changed
+
+- The video compositor no longer depends on the renderer the window is using.
+  It borrows the window's graphics device when there is one and opens its own
+  when there is not, which is what made it look macOS-only: it is wgpu and
+  egui, the same two things that draw the window, and it was never
+  platform-specific.
+
+### Fixed
+
+- Em dashes are gone from every string the app can put on screen.
+
 ## [5.0.0-beta.1] - 2026-08-18
 
 Published as a pre-release, so every permanent download link still resolves to

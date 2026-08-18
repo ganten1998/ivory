@@ -1,4 +1,4 @@
-# The 5.0.0-beta.1 announcement email
+# The 5.0.0-beta.2 announcement email
 
 Draft for the people who already hold a supporter key. Sent from
 `keys@ivorymidi.com` via Resend, the same way 3.0.0 went out. Gumroad still
@@ -10,7 +10,7 @@ real inbox or every reply disappears silently.
 ## Read this before sending
 
 **Every link below is version-scoped, and that is not a style choice.**
-5.0.0-beta.1 is published as a GitHub pre-release, so
+5.0.0-beta.2 is published as a GitHub pre-release, so
 `releases/latest/download/<name>` still resolves to 3.0.0 and will keep doing
 so until a final 5.0 ships. That is the whole point of the pre-release flag:
 nobody who has not asked for a beta gets handed one. It also means the
@@ -105,16 +105,16 @@ install command and still writes its audio and its MIDI. That was the last
 thing in this app that only worked on one platform.
 
   macOS 11 or later, Apple Silicon and Intel
-  https://github.com/ganten1998/ivory/releases/download/v5.0.0-beta.1/Tangent-5.0.0-beta.1-macos-universal.dmg
+  https://github.com/ganten1998/ivory/releases/download/v5.0.0-beta.2/Tangent-5.0.0-beta.2-macos-universal.dmg
 
   Windows 10 or later
-  https://github.com/ganten1998/ivory/releases/download/v5.0.0-beta.1/tangent-5.0.0-beta.1-windows-x86_64.zip
+  https://github.com/ganten1998/ivory/releases/download/v5.0.0-beta.2/tangent-5.0.0-beta.2-windows-x86_64.zip
 
   Linux x86_64. The tarball has an install.sh that needs no root
-  https://github.com/ganten1998/ivory/releases/download/v5.0.0-beta.1/tangent-5.0.0-beta.1-linux-x86_64.tar.gz
+  https://github.com/ganten1998/ivory/releases/download/v5.0.0-beta.2/tangent-5.0.0-beta.2-linux-x86_64.tar.gz
 
 The release page, with the aarch64 Linux build and the checksums:
-https://github.com/ganten1998/ivory/releases/tag/v5.0.0-beta.1
+https://github.com/ganten1998/ivory/releases/tag/v5.0.0-beta.2
 
 If something in this one is wrong, I would genuinely like to know, and that is
 most of what a beta is for.
@@ -134,7 +134,7 @@ there too:
 ```sh
 flyctl ssh sftp get /data/ledger.jsonl -a ivory-fulfil      # 1. fetch the list
 sed -n '/^Hello,$/,/^Ganten$/p' \
-  docs/release/5.0/RELEASE-EMAIL-5.0.0-beta.1.md > /tmp/body.txt
+  docs/release/5.0/RELEASE-EMAIL-5.0.0-beta.2.md > /tmp/body.txt
 
 cd tools/ivory-fulfil                                        # 2. DRY RUN first
 cargo run -- announce --subject "Tangent 5.0 is in beta: it writes the music down and records the room" \

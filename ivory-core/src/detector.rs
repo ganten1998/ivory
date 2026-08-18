@@ -1827,3 +1827,25 @@ mod tests {
     // ── Cm7 not Am6 ─────────────────────────────────────────────────────────
     #[test] fn t_cm7_not_am6() { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,63,67,70])), Some("Cm7".into())); }
 }
+
+#[cfg(test)]
+mod winner_probe {
+    use super::*;
+    #[test]
+    fn probe_two_paths() {
+        let mut d = ChordDetector::default();
+        for notes in [
+            vec![48u8, 52, 57, 62, 67, 71],
+            vec![51, 55, 61, 65, 69, 72],
+            vec![43, 53, 58, 59, 63],
+        ] {
+            let set: std::collections::HashSet<u8> = notes.iter().copied().collect();
+            let plain = d.detect_chord(&set);
+            let (dbg, ranked) = d.detect_chord_debug(&set, 3);
+            println!(
+                "{notes:?}\n  detect_chord       = {plain:?}\n  detect_chord_debug = {dbg:?}\n  ranked = {:?}",
+                ranked.iter().map(|(n, s)| format!("{n} {s:.3}")).collect::<Vec<_>>()
+            );
+        }
+    }
+}

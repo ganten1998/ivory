@@ -548,7 +548,7 @@ pub fn draw(
             // that looks wrong to anybody who did not set it.
             View::Staff => {
                 let legend = format!(
-                    "{}  \u{2014}  {}",
+                    "{}  /  {}",
                     s.staff_set().label(),
                     crate::staff::key_label(s.staff_key)
                 );

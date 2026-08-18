@@ -11,6 +11,22 @@ and there will not be any before 5.0 leaves beta. The supporter heart is drawn
 for everybody now, in the colour you pick, and hovering it shows the people
 this app exists because of.
 
+## New in beta.2
+
+**Video works on all three platforms.** macOS encodes natively through
+AVFoundation with nothing to install. Windows and Linux encode through
+`ffmpeg`, which they need on the PATH; a take that cannot find it tells you the
+install command and still writes its audio and its MIDI.
+
+That was the last thing in this app that only worked on one platform. The
+encoder was half of it. The other half was the video compositor, which looked
+macOS-only for years and never was: it is wgpu and egui, the same two things
+that draw the window, and it only appeared tied to the platform because it
+borrowed its graphics device from the window's renderer. It opens its own now.
+
+Windows is compile-checked but has not been run by the author. If you are on
+Windows, that is the most useful thing you could try in this beta.
+
 ## Sheet music
 
 There is a staff panel. What you are playing, engraved properly: six clefs
@@ -78,13 +94,13 @@ chords you have taught it, your colours, your tunings. Your settings carry over.
 ## Downloads
 
   macOS 11 or later, Apple Silicon and Intel, signed and notarized
-    Tangent-5.0.0-beta.1-macos-universal.dmg
+    Tangent-5.0.0-beta.2-macos-universal.dmg
 
   Windows 10 or later
-    tangent-5.0.0-beta.1-windows-x86_64.zip
+    tangent-5.0.0-beta.2-windows-x86_64.zip
 
   Linux x86_64 and aarch64, glibc 2.32 or later, ALSA
-    tangent-5.0.0-beta.1-linux-x86_64.tar.gz
-    tangent-5.0.0-beta.1-linux-aarch64.tar.gz
+    tangent-5.0.0-beta.2-linux-x86_64.tar.gz
+    tangent-5.0.0-beta.2-linux-aarch64.tar.gz
 
 Checksums are in SHA256SUMS.

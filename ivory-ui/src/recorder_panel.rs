@@ -1666,7 +1666,11 @@ fn draw_camera(
             // camera pointed at a wall, and one of those is the user's problem
             // to fix while the other is not.
             let (top, hint) = match camera {
-                DeviceLabel::None => ("NO CAMERA SELECTED", "choose one on the right"),
+                // "on the right" was true when the camera picker was a box in
+                // the middle of the band. It is behind the cog now, and a
+                // placeholder pointing at somewhere the control has not been
+                // for a release is worse than no placeholder.
+                DeviceLabel::None => ("NO CAMERA SELECTED", "choose one under the cog"),
                 DeviceLabel::Missing(_) => ("CAMERA NOT AVAILABLE", "it is not plugged in"),
                 DeviceLabel::Open(_) => ("WAITING FOR CAMERA", "the first frame has not arrived"),
             };
