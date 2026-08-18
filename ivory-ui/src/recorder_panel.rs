@@ -890,18 +890,28 @@ impl Layout {
         // what two large ones and a word said. Nothing above them is set
         // mid-take, so while a take runs the column is the transport and the
         // clock and nothing else.
-        // Three rows of one height: the name, the tempo, and the transport.
-        let bar = slice_v(d, 0.68, 0.97);
-        // Three squares of one size, left-aligned, with the clock filling the
-        // rest of the row. One size because they are one group: a stop that is
-        // bigger than the cog beside it reads as more important than it is.
+        // **The ICON decides the row height, and the rows decide nothing.**
         //
-        // **Sized from the ROW's width, not from its height.** At the height
-        // three icons and their gaps came to more than the row was wide and
-        // the clock was left twenty-two points to say "0:00" in — which after
-        // a take is where "FINISHING" has to fit, so it is not decoration.
-        let side = bar.height().min(bar.width() * 0.19);
-        let step = bar.width() * 0.205;
+        // Three squares of one size sit in the bottom row — one size because
+        // they are one group, and a stop bigger than the cog beside it reads
+        // as more important than it is. Their side comes from the column's
+        // WIDTH, since three of them and their gaps have to fit across it with
+        // room left for the clock; at the row's height they did not, and the
+        // clock was left twenty-two points to say "FINISHING" in.
+        //
+        // Then the name and the tempo take that same height, and all three
+        // rows are spread evenly down the column — four equal spaces, one
+        // above each row and one below the last. Sized the other way round,
+        // the boxes were half again as tall as the icons under them and the
+        // section read as two things stacked rather than one.
+        let side = (d.width() * 0.19).min(d.height() * 0.30);
+        let step = d.width() * 0.205;
+        let space = ((d.height() - side * 3.0) / 4.0).max(0.0);
+        let stack = |i: usize| {
+            let top = d.top() + space * (i as f32 + 1.0) + side * i as f32;
+            Rect::from_min_size(Pos2::new(d.left(), top), Vec2::new(d.width(), side))
+        };
+        let bar = stack(2);
         let icon = |i: usize| {
             Rect::from_min_size(
                 Pos2::new(bar.left() + step * i as f32, bar.center().y - side * 0.5),
@@ -943,12 +953,12 @@ impl Layout {
         // of the session being a clock nobody asked for — and it was the row
         // making the other three different sizes from each other. It is in the
         // popup, beside the folder it belongs to.
-        self.name = slice_v(d, 0.00, 0.29);
+        self.name = stack(0);
         // **The tempo stays.** It is the one thing in this group that is
         // DRAGGED, and a menu row cannot be dragged; it is also per-take
         // rather than per-session, since it sets the count-in's speed. The
         // rest of the group is behind the cog.
-        self.tempo = slice_v(d, 0.34, 0.63);
+        self.tempo = stack(1);
     }
 
     /// Rolling: readable from the bench. The preview collapses to a strip that
