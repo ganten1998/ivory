@@ -12,7 +12,7 @@ weighted-scoring chord engine names what you are playing, from plain triads to
 altered dominants, rootless jazz voicings, slash chords, and scales.
 
 It also shows you the same notes **on a guitar neck**, where a player would
-actually put their fingers, and **as geometry** — on the circle of fifths, on a
+actually put their fingers, and **as geometry**: on the circle of fifths, on a
 Tonnetz, and as the I-IV-V triangles.
 
 ![Tangent in dark mode naming an altered dominant, on an ebony fingerboard](docs/img/screenshot-dark-alt.png)
@@ -35,14 +35,14 @@ your DAW already looks.
 | Windows 10+ | [`setup.exe`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-windows-setup.exe) | [`.zip`](https://github.com/ganten1998/ivory/releases/latest/download/tangent-windows-x86_64.zip) |
 | Linux x86_64 | `install.sh`, inside the tarball | [`.tar.gz`](https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz) |
 
-macOS builds are universal from 3.0.0 — Apple Silicon and Intel — and signed
+macOS builds are universal from 3.0.0, Apple Silicon and Intel, and signed
 and notarized. The Linux `install.sh` needs no root by default and takes
 `--app`, `--vst3`, `--system`, `--prefix`, `--uninstall` and `--dry-run`.
 
 ### The plugin
 
 Tangent.vst3 shows everything the app does, reading the notes on the track it
-is on. **It produces no audio** — it is a monitor, not an instrument — so put
+is on. **It produces no audio.** It is a monitor, not an instrument, so put
 it on a MIDI or instrument track rather than in an effect slot. Its settings
 live in the DAW project, so two instances and the standalone can each be set
 up differently.
@@ -64,24 +64,24 @@ up differently.
   `Cm(add9)/G`, `CΔ7`, `6/9`, with lead sheet symbols `Δ`, `°`, `ø` and `+`.
   Flats and sharps preference toggle.
 - **A theory band.** A tall section above everything else with three ways of
-  seeing what you are playing — any combination of them, side by side.
-  - **Circle of fifths** — each key shaded by how much of what you are playing
+  seeing what you are playing, in any combination, side by side.
+  - **Circle of fifths.** Each key shaded by how much of what you are playing
     belongs to it, so keys that are close light up together. A filled disc for
     every note you are sounding: a triad is a tight cluster, a tritone is a
     line straight across. Relative minors sit on the same spoke as their major,
     because they share a key signature.
-  - **Tonnetz** — the lattice where left-to-right is fifths and the diagonals
+  - **Tonnetz.** The lattice where left-to-right is fifths and the diagonals
     are thirds, so every major triad is a triangle pointing up, every minor
     triad one pointing down, and two chords that share two notes share an edge.
-  - **Harmonic triangles** — I, IV and V pointing up with i, iv and v inverted
+  - **Harmonic triangles.** I, IV and V pointing up with i, iv and v inverted
     through the same centre. Between them those three chords use every note of
     the key and no others, which is why so many songs need no more.
 
   It shows what you **put there** rather than what you are playing, so it holds
-  still while your hands are busy — click the piano, the neck or the diagrams
+  still while your hands are busy: click the piano, the neck or the diagrams
   themselves. *Follow MIDI* makes it live if you would rather.
 - **Keyboard shortcuts.** Hold **H** for the list. **N** names the chord you are
-  holding — the box opens with the current name selected, so you just type.
+  holding. The box opens with the current name selected, so you just type.
   **E** corrects a reading, **M** opens what you have taught, **T** cycles the
   theory band, **G** the guitar view, and **K**, **R**, **C**, **D**, **B**,
   **F**, **L**, **P**, **A**, **S** the rest.
@@ -111,11 +111,11 @@ up differently.
 
   It is an **input** too: with Keytoggle on, click the neck to place notes and
   read the chord off the piano above, instead of only the other way round.
-  Shapes stay where you put them. Hold and drag along a fret to lay a barre —
+  Shapes stay where you put them. Hold and drag along a fret to lay a barre,
   which is the only way to get one by hand, so two notes that happen to share a
   fret stay two notes.
 - **A VST3 plugin.** The same display inside your DAW, reading the notes on the
-  track it is on. It produces no audio — put it on a MIDI or instrument track.
+  track it is on. It produces no audio, so put it on a MIDI or instrument track.
   Settings live in the project, so instances can differ from each other and
   from the standalone. macOS is a signed universal binary.
 - **Detachable chord display.** Pop the chord strip into its own independent
@@ -271,10 +271,13 @@ Release history, including the Python lineage, is in
 
 ## Thanks
 
-- **Omer**, for the rounded macOS app icon — the one Tangent wears in the Dock
+- **Omer**, for the rounded macOS app icon, the one Tangent wears in the Dock
   and in Finder.
 - **Hatsu**, for extensive Windows testing and feedback, on a platform the
   author does not develop on and could not have got right alone.
+- **Joanne**, for knowing what the sheet music panel had to be before it
+  existed. The staff view is in Tangent because of them, and it reads the way
+  it does because of what they said about the first attempt.
 
 ## License
 

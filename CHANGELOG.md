@@ -10,6 +10,57 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+## [5.0.0-beta.1] - 2026-08-18
+
+Published as a pre-release, so every permanent download link still resolves to
+the last stable build.
+
+### Added
+
+- **A sheet music panel.** Six clefs, all fifteen key signatures, accidentals
+  spelled for the key you are in, `8va` above and below the ledger lines, and
+  letter names inside the noteheads by default. Several clefs can be stacked at
+  once and every staff shows every note, which is a teaching view: a violist
+  and a cellist read the same chord in their own clefs from one keyboard. Key
+  signatures are on the staff's own right-click menu.
+- **The chord readout names its runners-up.** The staff carries the chord name
+  and the next two best matches, so "C6, or Am7" instead of a single answer to
+  a question that has two.
+- **The theory band is four panels you arrange.** `1` to `4` toggle circle of
+  fifths, Tonnetz, harmonic triangles and sheet music. Pressing a number for a
+  panel that is showing moves it to the end, so the same keys choose what is up
+  and where. All four off collapses the band; any number from empty fills it.
+- **A take-settings panel behind a settings cog**, holding everything that used
+  to be nine controls in the middle of the recorder band.
+- **Five instrument slots**, up from three, and a pair of VU meters.
+- **The chord strip is a setting**, off by default, so piano and chord name and
+  nothing else is reachable again.
+
+### Changed
+
+- **A take records the window.** It used to be an arrangement of its own, with
+  the app's bands in one pane, the camera composited into another and a layout
+  picker deciding which floated over which. Now the video is the window: the
+  same bands in the same order, with the camera where the window already puts
+  it, at the top left of the recorder band. The layout picker is gone.
+- **The window is 16:9** while the usual bands are up, so a take needs neither
+  letterbox nor crop. The theory band absorbs the difference and gives up about
+  five per cent of its height.
+- **Nothing is behind a supporter key.** The heart is drawn for everybody, in
+  the colour they choose, and hovering it shows the thanks. There are no locked
+  features in this build and none are planned before 5.0 is final.
+- The recorder band is a transport again: record, stop and the cog as three
+  icons of one size, with reachable metronome and input faders.
+- VST3 scanning is recursive, takes folders you add yourself, and rescans
+  without a restart.
+- The launch splash spells TANGENT on the app's own Tonnetz.
+
+### Fixed
+
+- The Welcome card waited for the splash instead of opening on top of it, and
+  fits its own text again.
+- Chord alternates no longer flicker between equally scored matches.
+
 ## [3.0.0] - 2026-08-14
 
 ### Added
