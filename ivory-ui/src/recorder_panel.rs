@@ -313,7 +313,6 @@ struct Layout {
     metronome_row: Rect,
     input_row: Rect,
     click: Rect,
-    click_in_take: Rect,
 
     // ── destination ──
     dest: Rect,
@@ -549,7 +548,6 @@ impl Layout {
             metronome_row: Rect::NOTHING,
             input_row: Rect::NOTHING,
             click: Rect::NOTHING,
-            click_in_take: Rect::NOTHING,
             dest: Rect::NOTHING,
             reveal: Rect::NOTHING,
             default_tick: Rect::NOTHING,
@@ -716,12 +714,6 @@ impl Layout {
         // their eyes on their hands, and a control that moves when the take
         // starts is one they have to go and find.
         self.click = fader_zones(self.metronome_row).0;
-        if !rolling {
-            // `In take` decides what goes in the FILE, so it leaves with the
-            // rest of the destination when the take starts.
-            let [from, to] = CLICK_SWITCHES;
-            self.click_in_take = slice_h(self.metronome_row, from, to);
-        }
     }
 
     /// The destination column: seven small rows of things set once.
@@ -837,7 +829,7 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 29] {
+    fn targets(&self) -> [(Rect, Produces); 28] {
         use Produces::{Along, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
         let s = &self.slots;
@@ -865,7 +857,6 @@ impl Layout {
             (track(self.metronome_row), Along(Hit::SetMetronomeGain)),
             (track(self.input_row), Along(Hit::SetInputGain)),
             (self.click, Fixed(Hit::ToggleMetronome)),
-            (self.click_in_take, Fixed(Hit::ToggleMetronomeInTake)),
             (self.dest, Fixed(Hit::ChooseFolder)),
             (self.reveal, Fixed(Hit::RevealFolder)),
             (self.default_tick, Fixed(Hit::ToggleDefaultDir)),
@@ -1527,10 +1518,21 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
     ] {
         draw_fader(painter, row, icon, ink, gain, typing_for(view, field), p);
     }
-    // Whether the click ends up in the FILE, which is a different question from
-    // whether you hear it and lives on a tick of its own. Off by default,
-    // because a click bleeding into a take is a ruined take.
-    draw_tick(painter, l.click_in_take, "In take", view.metronome_in_take, p);
+    // **Whether the click ends up in the FILE has no control of its own.** It
+    // is set once a year and it was sitting in the busiest row of the band
+    // wearing a box and a caption, which is a lot of furniture for a question
+    // nobody asks twice. It lives on a right-click of the metronome now, and
+    // says so only when it is ON: a dot on the icon, because a setting that
+    // puts a click track into your recording may not be invisible.
+    if view.metronome_in_take && l.click.is_positive() {
+        let r = l.click;
+        let d = (r.height() * 0.16).clamp(2.0, 5.0);
+        painter.circle_filled(
+            Pos2::new(r.right() - d, r.top() + d),
+            d,
+            if view.metronome_on { p.ink } else { p.faint },
+        );
+    }
 }
 
 // ── the instrument slots ───────────────────────────────────────────────────
@@ -3396,7 +3398,6 @@ mod tests {
                         ("input track", in_track),
                         ("input reading", in_val),
                         ("click switch", l.click),
-                        ("in-take tick", l.click_in_take),
                         ("preview", l.preview),
                         ("meter", l.meter),
                         ("timecode", l.timecode),
@@ -3454,6 +3455,20 @@ mod tests {
             let v = furnished();
             let l = Layout::new(r, &v);
             for want in Hit::ALL {
+                // The one control with no rectangle of its own: whether the
+                // click lands in the FILE is set by right-clicking the
+                // metronome, because it is set once and was taking a box and a
+                // caption in the busiest row of the band. Its reachability is
+                // the app's to prove, not the layout's.
+                if want == Hit::ToggleMetronomeInTake {
+                    assert!(
+                        l.targets()
+                            .into_iter()
+                            .all(|(_, k)| !k.hit(Hit::MIDWAY).is_same_control(want)),
+                        "the in-take toggle grew a rectangle again"
+                    );
+                    continue;
+                }
                 let (rect, _) = l
                     .targets()
                     .into_iter()
@@ -3953,8 +3968,7 @@ mod tests {
         // And the tick that decides what goes in the FILE leaves with the rest
         // of the destination, while the switch that decides what you HEAR does
         // not.
-        assert!(at_rest.click_in_take.is_positive());
-        assert!(!live.click_in_take.is_positive());
+
         assert!(live.click.is_positive());
     }
 

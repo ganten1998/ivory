@@ -784,10 +784,6 @@ pub struct Readout<'a> {
 /// any amount of idle headroom.
 const READOUT_FRACTION: f32 = 0.20;
 
-/// The readout's share of the width when it sits BESIDE the staff. The staff
-/// keeps the larger share: it is the subject, and the name is the thing that
-/// can grow to fill whatever it is given.
-const READOUT_COLUMN: f32 = 0.42;
 
 /// Draw the band. `readout` is `None` when chord detection is off entirely —
 /// only then does the staff take the whole rect.
@@ -817,15 +813,15 @@ pub fn draw(
     // the full height and is centred in the whole width. In a narrow one, a
     // cell of the four-panel band, there is no gutter and it stacks as before.
     let wide = rect.width() > rect.height() * 2.0;
-    // Two columns when wide, so the panel reads as a balanced pair rather than
-    // as a caption, a staff and a stretch of nothing. The staff takes the
-    // larger share because it is the subject; the name takes the rest because
-    // it is the one thing that can usefully grow to fill it.
+    // **The staff is centred in the whole panel either way, and never moves.**
+    // Giving the readout its own column pushed the staff into the right-hand
+    // share, which looks deliberate while a chord is sounding and looks broken
+    // the rest of the time: an empty column and a staff shoved off centre is
+    // what the app shows for every second nobody is playing. The name goes in
+    // the gutter the staff leaves, and appears and disappears there without
+    // moving anything.
     let staff_rect = match readout {
-        Some(_) if wide => Rect::from_min_max(
-            Pos2::new(rect.left() + rect.width() * READOUT_COLUMN, rect.top()),
-            rect.max,
-        ),
+        Some(_) if wide => rect,
         Some(_) => {
             let h = (rect.height() * READOUT_FRACTION).clamp(24.0, 64.0);
             Rect::from_min_max(Pos2::new(rect.min.x, rect.min.y + h), rect.max)
@@ -888,7 +884,7 @@ pub fn draw(
         let strip = if wide {
             Rect::from_min_max(
                 Pos2::new(rect.left() + space, rect.top()),
-                Pos2::new(staff_rect.left() - space * 0.5, rect.bottom()),
+                Pos2::new(left - space, rect.bottom()),
             )
         } else {
             Rect::from_min_max(
@@ -1869,17 +1865,12 @@ mod tests {
         // The solo panel: five times wider than tall, so it splits in two.
         let wide = Rect::from_min_size(Pos2::ZERO, egui::vec2(1250.0, 258.0));
         assert!(wide.width() > wide.height() * 2.0);
-        // And the staff's share of a wide panel is the larger one.
-        assert!(READOUT_COLUMN < 0.5, "the name took more width than the music");
+        // And the staff is centred in the WHOLE panel either way, so it does
+        // not move when a chord starts or stops sounding.
         // Whichever way it lands, the staff has to be able to fit: the width
         // budget must not starve the space below what the height would give.
         for r in [narrow, wide] {
-            let staff_w = if r.width() > r.height() * 2.0 {
-                r.width() * (1.0 - READOUT_COLUMN)
-            } else {
-                r.width()
-            };
-            let space = (r.height() / total_spaces(2, true)).min(staff_w / staff_w_spaces(0));
+            let space = (r.height() / total_spaces(2, true)).min(r.width() / staff_w_spaces(0));
             assert!(space > 4.0, "{r:?} leaves a {space}pt staff space");
         }
     }

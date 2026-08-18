@@ -1158,6 +1158,27 @@ impl IvoryApp {
                 // reaching the sixteenth meant a right-click anywhere else
                 // followed by a hunt down a list of subjects that are mostly
                 // about the piano.
+                // **Right-clicking the metronome sets whether the click goes
+                // into the FILE**, and opens no menu. It is the one control in
+                // the band with no box of its own: it is set once and it was
+                // taking a caption and a tick in the busiest row there is.
+                // Everywhere else on the band, a right-click opens the menu.
+                if let Some(r) = recorder_rect.filter(|r| r.contains(pos)) {
+                    let view = self.recorder.view(
+                        self.settings.record_take_name.as_deref().unwrap_or_default(),
+                        self.name_focused,
+                        self.num_edit.as_ref(),
+                        self.settings.knobs(),
+                        self.settings.record_hide_elapsed,
+                    );
+                    if recorder_panel::hit_test(r, &view, pos)
+                        == Some(recorder_panel::Hit::ToggleMetronome)
+                    {
+                        self.settings.metronome_in_take = !self.settings.metronome_in_take;
+                        self.save_settings();
+                        return;
+                    }
+                }
                 self.menu_over_recorder = recorder_rect.is_some_and(|r| r.contains(pos));
                 // And the same for the sheet music: right-clicking the staff
                 // leads with its own controls, which is where the key signature
