@@ -7,7 +7,7 @@ paywall with the price filed off.
 
 ## What changed for 4.4, and it is a repositioning
 
-Through 4.x this page sold a MIDI monitor with good theory panels. That is what
+Up to 4.3 this page sold a MIDI monitor with good theory panels. That is what
 it was. It is not what it is now.
 
 Two things changed it. **The sheet music panel** made it something you can
