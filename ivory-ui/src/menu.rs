@@ -53,6 +53,8 @@ pub enum MenuAction {
     ToggleDarkMode,
     ToggleKeytoggle,
     ToggleNotePreference,
+    ToggleKeyNoteNames,
+    ToggleFretNoteNames,
     ToggleChordDetection,
     ToggleChordStrip,
     /// Cycle the built-in UI typeface (Courier Prime <-> Terminess).
@@ -191,6 +193,8 @@ pub struct MenuView {
     pub borderless: bool,
     pub keytoggle: bool,
     pub prefer_flats: bool,
+    pub key_note_names: bool,
+    pub fret_note_names: bool,
     pub detection_enabled: bool,
     /// Whether the chord strip band is up. Independent of detection: the staff
     /// reads the same chord, so detection can be on with no strip at all.
@@ -741,6 +745,17 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         },
         MenuAction::ToggleNotePreference,
     ));
+    // The stickers. With the keys because that is what they are printed on,
+    // and worded as what you will get rather than as a state, like every other
+    // row in this menu.
+    keyboard.push(row(
+        if view.key_note_names {
+            "Hide Note Names on the Keys"
+        } else {
+            "Show Note Names on the Keys"
+        },
+        MenuAction::ToggleKeyNoteNames,
+    ));
     push_category(&mut e, "Keyboard", keyboard);
 
     // ── Chords ─────────────────────────────────────────────────────────────
@@ -991,6 +1006,14 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 },
             ));
         }
+        fretboard.push(row(
+            if view.fret_note_names {
+                "Hide Note Names on the Neck"
+            } else {
+                "Show Note Names on the Neck"
+            },
+            MenuAction::ToggleFretNoteNames,
+        ));
         fretboard.push(row("Custom Tuning...", MenuAction::EditCustomTuning));
     }
     push_category(&mut e, "Fretboard", fretboard);
@@ -1911,6 +1934,8 @@ mod tests {
             borderless: false,
             keytoggle: false,
             prefer_flats: true,
+            key_note_names: false,
+            fret_note_names: false,
             detection_enabled: true,
             chord_strip: true,
             detached: false,

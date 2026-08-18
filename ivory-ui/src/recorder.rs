@@ -516,7 +516,9 @@ pub struct SlotState {
 /// own business. A request enum that carried them would be a second, weaker
 /// copy of the menu. What is here is what needs a THING the app does not own: a
 /// take, or a window belonging to somebody else's code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Not `Copy`: `Audition` carries the notes it wants heard, and a list of them
+// is the only honest shape for a chord.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecorderRequest {
     /// The one button. Start a pre-roll, start a take, or stop one — the
     /// session decides which, because only it knows what state it is in.
@@ -534,7 +536,35 @@ pub enum RecorderRequest {
     /// egui frame still on the stack is the same re-entrancy the folder picker
     /// avoids.
     OpenPluginEditor(usize),
+    /// **Sound these notes through the loaded instrument.**
+    ///
+    /// The one way this crate can make a noise. It cannot reach the engine —
+    /// the firewall is the whole point — so it says what it wants heard and
+    /// the host plays it.
+    ///
+    /// `ms` rather than a matching note-off, because a note-off has to happen
+    /// even if the window loses focus, the mouse is released over another
+    /// window, or the frame that would have sent it never runs. The engine
+    /// schedules both events the moment it gets this, so a note that has
+    /// started is already guaranteed to stop. A held audition would be
+    /// prettier and is exactly the kind of thing that leaves a chord ringing
+    /// forever because a release went missing.
+    Audition { notes: Vec<u8>, ms: u32 },
 }
+
+/// How long an auditioned note sounds.
+///
+/// Long enough to hear a chord settle and short enough that pressing the key
+/// twice in a row does not stack. A real instrument's own release does the
+/// rest: this is a note-off, not a fade.
+pub const AUDITION_MS: u32 = 1_600;
+
+/// How hard an auditioned note is struck.
+///
+/// Firmly, but not at the top of the scale: a sampled piano's loudest layer is
+/// usually its harshest, and this is a note somebody asked to hear rather than
+/// one they played.
+pub const AUDITION_VELOCITY: u8 = 88;
 
 // ── The export contract ─────────────────────────────────────────────────────
 

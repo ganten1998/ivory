@@ -329,6 +329,10 @@ struct Palette {
     wire: Color32,
     inlay: Color32,
     dot: Color32,
+    /// Ink for a letter printed INSIDE a dot. Chosen against the dot's own
+    /// fill, which is the user's colour and can be anything, so it is decided
+    /// by brightness rather than by the theme.
+    dot_text: Color32,
     /// Drawn around a note dot when the board is pale, so a light accent
     /// colour on blonde maple is still a dot rather than a smudge.
     dot_edge: Option<Color32>,
@@ -388,8 +392,23 @@ fn palette(s: &Settings, wood: Wood) -> Palette {
         // Whatever a held key looks like on the piano is what a held note
         // looks like here. The user already chose this colour once.
         dot: s.white_key_active_color.to_color32(),
+        dot_text: {
+            let c = s.white_key_active_color.to_color32();
+            let bright = u32::from(c.r()) + u32::from(c.g()) + u32::from(c.b()) > 3 * 140;
+            if bright { Color32::from_gray(0x18) } else { Color32::from_gray(0xF0) }
+        },
         dot_edge: wood.pale().then(|| Color32::from_rgb(0x3a, 0x2c, 0x1a)),
         on_board,
+    }
+}
+
+/// A pitch class as a letter, in the user's own preference.
+fn pc_name(pc: u8, prefer_flats: bool) -> &'static str {
+    let i = usize::from(pc % 12);
+    if prefer_flats {
+        ivory_core::patterns::NOTE_NAMES_FLAT[i]
+    } else {
+        ivory_core::patterns::NOTE_NAMES[i]
     }
 }
 
@@ -577,6 +596,22 @@ pub fn draw(
             painter.circle_filled(c, r, p.dot);
             if let Some(edge) = p.dot_edge {
                 painter.circle_stroke(c, r, Stroke::new(1.5_f32, edge));
+            }
+            // The letter, inside the dot it belongs to. Opt-in, and drawn only
+            // where the dot is big enough to hold it: a two-character name at
+            // four points is a smudge that makes the board harder to read, not
+            // easier, which is the whole failure mode of a teaching label.
+            if s.show_fret_note_names {
+                let size = r * 1.05;
+                if size >= 6.0 {
+                    painter.text(
+                        c,
+                        Align2::CENTER_CENTER,
+                        pc_name(n.pitch % 12, s.prefer_flats),
+                        FontId::new(size, fonts::courier_bold()),
+                        p.dot_text,
+                    );
+                }
             }
         }
     }

@@ -101,6 +101,15 @@ pub struct Settings {
     /// since 5.0: the sheet music panel carries the name. Turning it back on
     /// gives you piano-plus-strip, which is what this app was for years.
     pub show_chord_strip: bool,
+    /// Letter names printed on the piano keys, and on the neck's dots.
+    ///
+    /// **Off by default, both of them.** They are a beginner's stickers: the
+    /// fastest way to learn where the notes are, and clutter the moment you
+    /// have. The staff's own labels are a separate switch with a separate
+    /// default, because a staff without them is unreadable to the person the
+    /// panel exists for and a keyboard without them is not.
+    pub show_piano_note_names: bool,
+    pub show_fret_note_names: bool,
     pub window_size_percent: i64,
     pub borderless_mode: bool,
     pub chord_window_detached: bool,
@@ -507,6 +516,8 @@ impl Default for Settings {
             prefer_flats: true,
             chord_detection_enabled: true,
             show_chord_strip: false,
+            show_piano_note_names: false,
+            show_fret_note_names: false,
             window_size_percent: 100,
             borderless_mode: false,
             chord_window_detached: false,
@@ -774,6 +785,8 @@ impl Settings {
             &mut s.chord_detection_enabled,
         );
         take_bool(&mut map, "show_chord_strip", &mut s.show_chord_strip);
+        take_bool(&mut map, "show_piano_note_names", &mut s.show_piano_note_names);
+        take_bool(&mut map, "show_fret_note_names", &mut s.show_fret_note_names);
         take_bool(&mut map, "borderless_mode", &mut s.borderless_mode);
         take_bool(
             &mut map,
@@ -1254,6 +1267,14 @@ impl Settings {
         map.insert(
             "show_chord_strip".into(),
             Value::Bool(self.show_chord_strip),
+        );
+        map.insert(
+            "show_piano_note_names".into(),
+            Value::Bool(self.show_piano_note_names),
+        );
+        map.insert(
+            "show_fret_note_names".into(),
+            Value::Bool(self.show_fret_note_names),
         );
         map.insert(
             "window_size_percent".into(),
@@ -2332,7 +2353,7 @@ mod tests {
         // 13, not 12: `show_chord_strip` went in ahead of it in 5.0. The
         // index is not the point — that the order is DETERMINISTIC is, so a
         // settings file does not churn its key order on every save.
-        assert_eq!(keys[13], "keytoggle_enabled");
+        assert_eq!(keys[15], "keytoggle_enabled");
         assert_eq!(*keys.last().unwrap(), "future_key");
         // custom_font_path is absent when None
         assert!(!out.contains_key("custom_font_path"));

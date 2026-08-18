@@ -1106,6 +1106,8 @@ impl IvoryApp {
             count_in_bars: self.settings.count_in_bars(),
             count_in_in_take: self.settings.record_count_in_in_take,
             chord_strip: self.settings.show_chord_strip,
+            key_note_names: self.settings.show_piano_note_names,
+            fret_note_names: self.settings.show_fret_note_names,
             recorder_first: self.menu_over_recorder && self.settings.show_recorder,
             staff_first: self.menu_over_staff,
             staff_key: self.settings.staff_key,
@@ -1454,6 +1456,25 @@ impl IvoryApp {
                         return;
                     }
                 }
+                // **Keytoggle off: a click SOUNDS the note and lets it go.**
+                // The keyboard and the neck are instruments either way; the
+                // switch decides whether a click leaves the note behind. With
+                // it off, clicking a key used to do nothing at all, which is
+                // the wrong answer for a picture of a piano.
+                if !self.settings.keytoggle_enabled {
+                    let hit = if piano_rect.contains(pos) {
+                        let local = pos - piano_rect.min;
+                        piano::hit_test(local.x, local.y, piano_rect.width(), piano_rect.height())
+                    } else {
+                        fret_rect.filter(|r| r.contains(pos)).and_then(|r| {
+                            fretboard_panel::hit_test(r, &self.settings.fretboard_spec(), pos)
+                        })
+                    };
+                    if let Some(note) = hit {
+                        self.audition(vec![note]);
+                        return;
+                    }
+                }
                 if self.settings.keytoggle_enabled {
                     // Either instrument can put a note in, and they toggle the
                     // same set — so a shape entered on the neck lights up on the
@@ -1649,6 +1670,31 @@ impl IvoryApp {
     ///
     /// Drained by the host AFTER `frame()` returns. A plugin refuses simply by
     /// never calling this, which is why refusal needs no code of its own.
+    /// Sound whatever is lit, in whichever view lit it.
+    ///
+    /// Deliberately `display_notes` and not the manual set: what a guitarist
+    /// toggled on the neck, what somebody placed on the circle of fifths, and
+    /// what is arriving from a MIDI keyboard are the same notes by the time
+    /// they are drawn, and "play what I can see" is the only rule anybody
+    /// should have to remember.
+    fn audition_highlighted(&mut self) {
+        let mut notes: Vec<u8> = self.display_notes().into_iter().collect();
+        // Low to high, so a chord arrives at the instrument as a chord rather
+        // than in whatever order a hash set happened to hold it.
+        notes.sort_unstable();
+        self.audition(notes);
+    }
+
+    fn audition(&mut self, notes: Vec<u8>) {
+        if notes.is_empty() {
+            return;
+        }
+        self.request_recorder(recorder::RecorderRequest::Audition {
+            notes,
+            ms: recorder::AUDITION_MS,
+        });
+    }
+
     pub fn take_recorder_request(&mut self) -> Option<recorder::RecorderRequest> {
         self.recorder_request.take()
     }
@@ -2498,7 +2544,18 @@ impl IvoryApp {
                     self.request_recorder(recorder::RecorderRequest::Toggle);
                 }
             }
-            K::StopRecording => self.request_recorder(recorder::RecorderRequest::Stop),
+            // **One key, whichever meaning is live.** Space stops a take while
+            // one is running, which is what every transport the user owns is
+            // bound to. It is the obvious key for "let me hear that" and the
+            // rest of the time "stop" means nothing, so the rest of the time it
+            // sounds whatever is lit.
+            K::StopRecording => {
+                if self.recorder.state.is_active() {
+                    self.request_recorder(recorder::RecorderRequest::Stop);
+                } else {
+                    self.audition_highlighted();
+                }
+            }
             K::ToggleRecorder => self.apply_menu_action(ctx, MenuAction::ToggleRecorder),
             K::TransposeUp => self.transpose_by(1),
             K::TransposeDown => self.transpose_by(-1),
@@ -2745,6 +2802,14 @@ impl IvoryApp {
             // The take's settings that moved out of the band. Each one is the
             // SAME action the band's own hit produced, so the two can never
             // drift: one handler, two ways in.
+            MenuAction::ToggleKeyNoteNames => {
+                self.settings.show_piano_note_names = !self.settings.show_piano_note_names;
+                self.save_settings();
+            }
+            MenuAction::ToggleFretNoteNames => {
+                self.settings.show_fret_note_names = !self.settings.show_fret_note_names;
+                self.save_settings();
+            }
             MenuAction::ToggleChordStrip => {
                 self.settings.show_chord_strip = !self.settings.show_chord_strip;
                 self.save_settings();
@@ -5579,11 +5644,27 @@ mod tests {
     fn a_focused_take_name_swallows_the_transport_key() {
         let (ctx, mut app) = recorder_app();
         app.settings.show_recorder = true;
+        // **Space means whichever of its two jobs is live.** Rolling, it
+        // stops. Idle, "stop" means nothing, so it sounds what is lit.
+        app.recorder.state = recorder::RecordState::Rolling;
         assert_eq!(
             space(&ctx, &mut app),
             Some(recorder::RecorderRequest::Stop),
-            "with the band open and nothing focused, Space stops"
+            "with a take rolling, Space stops it"
         );
+        app.recorder.state = recorder::RecordState::Idle;
+        // Keytoggle on, because that is what "toggle notes on the neck" means
+        // and it is the only way a placed note is one of the notes on screen.
+        app.settings.keytoggle_enabled = true;
+        app.manual_notes.insert(60);
+        assert!(
+            matches!(
+                space(&ctx, &mut app),
+                Some(recorder::RecorderRequest::Audition { .. })
+            ),
+            "with nothing rolling, Space sounds what is lit"
+        );
+        app.manual_notes.clear();
 
         app.name_focused = true;
         assert_eq!(
@@ -5608,6 +5689,7 @@ mod tests {
         // And the same app, one flag later, DOES respond — otherwise this test
         // would go on passing if Space stopped working entirely.
         app.settings.show_recorder = true;
+        app.recorder.state = recorder::RecordState::Rolling;
         assert_eq!(
             space(&ctx, &mut app),
             Some(recorder::RecorderRequest::Stop)

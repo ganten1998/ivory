@@ -732,6 +732,28 @@ impl DesktopApp {
                     self.recorder.session.toggle(&root, name.as_deref(), wait, spec);
                 }
                 R::Stop => self.recorder.session.stop(),
+                R::Audition { notes, ms } => {
+                    // **Both events, now.** The note-off is scheduled at the
+                    // same moment as the note-on rather than sent later by a
+                    // frame that might not run: a window that loses focus, a
+                    // dialog that opens, a machine that stalls. A note this app
+                    // starts is already guaranteed to stop before it starts
+                    // sounding.
+                    //
+                    // Through `send_midi`, so an auditioned note is
+                    // indistinguishable from a played one: it reaches the
+                    // instrument by the same path, and lands in a take that is
+                    // rolling, which is what somebody demonstrating a voicing
+                    // on camera actually wants.
+                    if let Some(e) = self.recorder.engine.as_ref() {
+                        let on = e.timebase().now();
+                        let off = on + i64::from(ms) * 1_000_000;
+                        for note in notes {
+                            e.send_midi(on, &[0x90, note, ivory_ui::recorder::AUDITION_VELOCITY]);
+                            e.send_midi(off, &[0x80, note, 64]);
+                        }
+                    }
+                }
                 R::OpenPluginEditor(slot) => {
                     // The plugin's own window, created here rather than in the
                     // frame: VST3 requires the main thread and AppKit will not

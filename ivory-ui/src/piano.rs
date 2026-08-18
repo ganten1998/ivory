@@ -4,8 +4,9 @@
 //! Python's int() truncation. Sub-pixel background slivers between truncated
 //! key rects are part of the look and are preserved.
 
+use crate::fonts;
 use crate::settings::Settings;
-use egui::{Color32, Painter, Pos2, Rect, Stroke, StrokeKind};
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind};
 use std::collections::HashSet;
 
 pub const NOTE_START: u8 = 21; // A0
@@ -175,6 +176,104 @@ pub fn draw(
             Stroke::new(1.0_f32, outline),
             StrokeKind::Middle,
         );
+    }
+
+    if s.show_piano_note_names {
+        draw_names(painter, rect, display_notes, s);
+    }
+}
+
+/// Letter names on the keys, the way a beginner's stickers sit.
+///
+/// **Last, over everything.** They are the only thing on this band that has to
+/// be readable against four different fills — idle and lit, white and black —
+/// so they are drawn after all of them and coloured against the key they
+/// landed on rather than against the theme.
+///
+/// Near the bottom of each key, because that is where a sticker goes and
+/// because it keeps the letters clear of the black keys entirely.
+fn draw_names(painter: &Painter, rect: Rect, display_notes: &HashSet<u8>, s: &Settings) {
+    let w = rect.width() as f64;
+    let h = rect.height() as f64;
+    let white_key_w = w / WHITE_KEYS as f64;
+    let black_key_w = white_key_w * 0.7;
+    let black_key_h = h * 0.65;
+
+    // Sized off the key, and not drawn at all below the point where the letters
+    // would be a grey smear. A label nobody can read is worse than the space it
+    // took.
+    let size = (white_key_w as f32 * 0.46).min(rect.height() * 0.12);
+    if size < 6.0 {
+        return;
+    }
+    let font = FontId::new(size, fonts::courier_bold());
+    let lit_ink = |lit: bool, on_black: bool| {
+        if lit {
+            // A lit key is the user's own colour, which can be anything, so the
+            // label goes to whichever end of the scale it is furthest from.
+            let c = if on_black {
+                s.black_key_active_color.to_color32()
+            } else {
+                s.white_key_active_color.to_color32()
+            };
+            let bright = u32::from(c.r()) + u32::from(c.g()) + u32::from(c.b()) > 3 * 140;
+            if bright { Color32::from_gray(0x18) } else { Color32::from_gray(0xF0) }
+        } else if on_black {
+            Color32::from_gray(0xD0)
+        } else {
+            Color32::from_gray(0x30)
+        }
+    };
+
+    // White keys: centred in the key, low enough to clear the black ones.
+    let mut idx = 0usize;
+    for note in NOTE_START..=NOTE_END {
+        if !is_white(note) {
+            continue;
+        }
+        let x0 = (idx as f64 * white_key_w).trunc() as f32;
+        let x1 = ((idx + 1) as f64 * white_key_w).trunc() as f32;
+        idx += 1;
+        painter.text(
+            Pos2::new(rect.left() + (x0 + x1) * 0.5, rect.bottom() - size * 0.95),
+            Align2::CENTER_CENTER,
+            pc_name(note % 12, s.prefer_flats),
+            font.clone(),
+            lit_ink(display_notes.contains(&note), false),
+        );
+    }
+
+    // Black keys, only where the sharp's two characters actually fit.
+    if black_key_w as f32 >= size * 1.5 {
+        for note in NOTE_START..=NOTE_END {
+            let Some(before) = white_keys_before(note) else {
+                continue;
+            };
+            if !(before < WHITE_KEYS && before + 1 < WHITE_KEYS) {
+                continue;
+            }
+            let key_x = (before as f64 + 1.0) * white_key_w - black_key_w / 2.0;
+            painter.text(
+                Pos2::new(
+                    rect.left() + (key_x + black_key_w * 0.5) as f32,
+                    rect.top() + black_key_h as f32 - size * 0.9,
+                ),
+                Align2::CENTER_CENTER,
+                pc_name(note % 12, s.prefer_flats),
+                font.clone(),
+                lit_ink(display_notes.contains(&note), true),
+            );
+        }
+    }
+}
+
+/// A pitch class as a letter, in the user's own preference.
+fn pc_name(pc: u8, prefer_flats: bool) -> &'static str {
+    let i = usize::from(pc % 12);
+    if prefer_flats {
+        ivory_core::patterns::NOTE_NAMES_FLAT[i]
+    } else {
+        ivory_core::patterns::NOTE_NAMES[i]
     }
 }
 
