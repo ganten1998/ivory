@@ -26,6 +26,15 @@ Unicode true
 !ifndef VERSION
   !error "VERSION not defined (pass -DVERSION=x.y.z)"
 !endif
+
+; The binary version field NSIS writes into the .exe resource, which must be
+; four numbers and nothing else. A pre-release version like "5.0.0-beta.2" is a
+; perfectly good VERSION and an illegal VIProductVersion, so the caller passes
+; the numeric part separately rather than this file trying to parse it. Falls
+; back to VERSION for a plain x.y.z, which is every release before 5.0.
+!ifndef NUMVERSION
+  !define NUMVERSION "${VERSION}"
+!endif
 !ifndef SRCDIR
   !error "SRCDIR not defined"
 !endif
@@ -42,7 +51,7 @@ InstallDirRegKey HKLM "Software\Tangent" "InstallDir"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 
-VIProductVersion "${VERSION}.0"
+VIProductVersion "${NUMVERSION}.0"
 VIAddVersionKey "ProductName" "Tangent"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 VIAddVersionKey "CompanyName" "Ganten"

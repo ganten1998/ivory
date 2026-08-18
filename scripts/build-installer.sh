@@ -236,6 +236,7 @@ build_windows() {
   local out="dist/$NAME-$VERSION-windows-setup.exe"
   makensis -NOCD \
     "-DVERSION=$VERSION" \
+    "-DNUMVERSION=${VERSION%%-*}" \
     "-DSRCDIR=$WORK/windows" \
     "-DOUTFILE=$ROOT/$out" \
     installer/windows/tangent.nsi | sed 's/^/    /'
