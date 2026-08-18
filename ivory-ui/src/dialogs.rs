@@ -49,6 +49,36 @@ pub enum Dialog {
         /// The uid currently open.
         current: Option<String>,
     },
+    /// Choose a patch for the built-in FM instrument, and the cartridge it
+    /// comes from.
+    ///
+    /// **Selecting is auditioning.** Every other picker in this file waits for
+    /// a Load button, because loading a VST3 costs a second and running
+    /// somebody else's code is a decision. A DX7 patch is 155 numbers and
+    /// applies between one buffer and the next, so a click here changes the
+    /// sound at once and the only button is Done. Dialing in a patch means
+    /// playing while you move down the list, and a picker that made you confirm
+    /// each one would make that impossible.
+    PatchPicker {
+        /// The instrument slot the built-in is in, carried so the action can
+        /// name it without the app having to look it up again.
+        slot: usize,
+        /// What the loaded cartridge calls itself, or empty for the patch that
+        /// is compiled in.
+        bank: String,
+        /// The cartridge failed its own checksum. Shown, never refused — see
+        /// `Cartridge::parse`.
+        bad_checksum: bool,
+        /// The patch names, in cartridge order. Empty until one is loaded, and
+        /// that is the state a fresh install is in.
+        voices: Vec<String>,
+        selected: Option<usize>,
+        filter: String,
+        focus: bool,
+        /// What went wrong with the last cartridge somebody chose. The whole
+        /// point of the lenient parser is that this is rare and specific.
+        error: String,
+    },
     /// Choose the VST3 instrument Tangent plays through.
     ///
     /// **The list is a directory listing and nothing more** — see the "plugin
@@ -282,6 +312,16 @@ pub enum DialogAction {
     LoadPlugin {
         path: Option<String>,
     },
+    /// Play this patch of the loaded cartridge now. See [`Dialog::PatchPicker`]:
+    /// selecting is auditioning, so this fires on the click and not on a
+    /// button.
+    ChoosePatch {
+        slot: usize,
+        index: usize,
+    },
+    /// Raise a file panel for a `.syx` cartridge. The dialog stays open: the
+    /// answer comes back into it.
+    LoadCartridge,
     SetExport(ExportSpec),
     /// As above, and write it to the settings file so every later take starts
     /// from it. This is the "Use these settings for every take" tick, and it
@@ -1235,6 +1275,21 @@ const PLUGIN_FOOTER_H: f32 = 60.0;
 /// worth spelling out, exactly as on [`DeviceKind::none_row`].
 const PLUGIN_NONE_ROW: &str = "None  -  no instrument; unloads the one that is loaded";
 
+/// The path that means "the instrument Tangent ships with".
+///
+/// **Not a real path, on purpose.** It travels through every layer that
+/// already carries a plugin's bundle path — the picker's selection, the slot's
+/// setting, the saved session — without any of them needing to know there is
+/// such a thing as a built-in. The one place that looks at it is where a slot
+/// is actually loaded.
+///
+/// It begins with a character no filesystem path does, so it can never collide
+/// with a bundle somebody has installed.
+pub const BUILTIN_PATH: &str = "@tangent-dx7";
+
+/// What the built-in calls itself in the picker.
+pub const BUILTIN_NAME: &str = "Tangent DX7";
+
 /// Said under the list, every time, in full-strength text rather than the faint
 /// grey the other note gets.
 ///
@@ -1476,6 +1531,19 @@ impl Dialog {
                 // them differently on different runs.
                 .then_with(|| a.path.cmp(&b.path))
         });
+        // **The built-in goes first, above the sort.** It is the instrument
+        // that is always there, it is what a fresh install plays, and it is
+        // where somebody who has never installed a VST3 should find something
+        // rather than an empty list. Inserted after the sort so it stays at the
+        // top rather than landing under T.
+        plugins.insert(
+            0,
+            PluginEntry {
+                path: BUILTIN_PATH.to_owned(),
+                name: BUILTIN_NAME.to_owned(),
+                vendor: "built in, six-operator FM".to_owned(),
+            },
+        );
         let selected = current
             .as_deref()
             .and_then(|c| plugins.iter().position(|p| p.path == c));
@@ -1487,6 +1555,60 @@ impl Dialog {
             focus: true,
         }
     }
+}
+
+// ── the patch picker ────────────────────────────────────────────────────────
+
+/// Voices in a DX7 cartridge. The format has exactly this many, always.
+pub const CARTRIDGE_VOICES: usize = 32;
+
+/// The row shown when no cartridge is loaded: the patch compiled into the app.
+pub const BUILTIN_PATCH_ROW: &str = "E.PIANO 1  (built in)";
+
+const PATCH_DIALOG_W: f32 = 460.0;
+const PATCH_DIALOG_H: f32 = 470.0;
+
+impl Dialog {
+    /// Open the patch picker for the built-in in `slot`.
+    ///
+    /// `voices` empty means no cartridge: the dialog still opens, because the
+    /// button that loads one is inside it and a picker you can only reach after
+    /// loading a cartridge is a picker nobody finds.
+    pub fn patch_picker(
+        slot: usize,
+        bank: String,
+        bad_checksum: bool,
+        voices: Vec<String>,
+        selected: Option<usize>,
+    ) -> Dialog {
+        Dialog::PatchPicker {
+            slot,
+            bank,
+            bad_checksum,
+            // A cartridge is 32 voices or it is not a cartridge, but this comes
+            // from outside and indexes an array.
+            selected: selected.filter(|i| *i < voices.len()),
+            voices,
+            filter: String::new(),
+            focus: true,
+            error: String::new(),
+        }
+    }
+}
+
+/// Rows matching `filter`, as indices into `voices`.
+///
+/// By name only. A cartridge's patches have no other text, and the number is
+/// shown but not searched: typing "3" to find every patch with a 3 in its
+/// position is not a thing anybody wants.
+fn visible_patches(voices: &[String], filter: &str) -> Vec<usize> {
+    let f = filter.trim().to_lowercase();
+    voices
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| f.is_empty() || v.to_lowercase().contains(&f))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Stable surface identity: a viewport id on the desktop, an `Area` id in a
@@ -1798,6 +1920,199 @@ pub fn show(
             )
         }
 
+        Dialog::PatchPicker {
+            slot,
+            bank,
+            bad_checksum,
+            voices,
+            selected,
+            filter,
+            focus,
+            error,
+        } => {
+            let t = theme(dark_mode);
+            let slot = *slot;
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Tangent DX7",
+                Vec2::new(PATCH_DIALOG_W, PATCH_DIALOG_H),
+                Vec2::new(360.0, 300.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.visuals_mut().extreme_bg_color = t.bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    let faint = t.text.gamma_multiply(0.72);
+                    let first_frame = *focus;
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(PLUGIN_MARGIN))
+                        .show(ui, |ui| {
+                            // ── which cartridge ─────────────────────────────
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(if bank.is_empty() {
+                                        "No cartridge loaded".to_owned()
+                                    } else {
+                                        format!("Cartridge: {bank}")
+                                    })
+                                    .font(bold(12.0))
+                                    .color(t.text),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .add(Button::new(
+                                            RichText::new("Load .syx...")
+                                                .font(bold(11.0))
+                                                .color(t.text),
+                                        ))
+                                        .clicked()
+                                    {
+                                        action = Some(DialogAction::LoadCartridge);
+                                    }
+                                });
+                            });
+                            // A bad checksum is worth saying and not worth
+                            // stopping for: several hundred cartridges in the
+                            // wild fail their own and play perfectly.
+                            if *bad_checksum && !bank.is_empty() {
+                                ui.label(
+                                    RichText::new(
+                                        "This cartridge failed its own checksum. That is common \
+                                         and it still plays.",
+                                    )
+                                    .font(bold(PLUGIN_NOTE_PT))
+                                    .color(faint),
+                                );
+                            }
+                            if !error.is_empty() {
+                                ui.label(
+                                    RichText::new(error.as_str())
+                                        .font(bold(PLUGIN_NOTE_PT))
+                                        .color(t.text),
+                                );
+                            }
+                            ui.add_space(4.0);
+                            if !voices.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Filter:").font(bold(11.0)).color(t.text),
+                                    );
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(filter)
+                                            .font(bold(12.0))
+                                            .text_color(t.text)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    if *focus {
+                                        *focus = false;
+                                        focus_and_select_all(ui, &resp, filter);
+                                    }
+                                });
+                            } else {
+                                *focus = false;
+                            }
+
+                            // ── the patches ─────────────────────────────────
+                            let bottom_h = 52.0;
+                            let list_h = (ui.available_height() - bottom_h).max(40.0);
+                            let visible = visible_patches(voices, filter);
+                            egui::ScrollArea::vertical()
+                                .max_height(list_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    // The built-in patch, always first and never
+                                    // filtered: it is the sound a fresh install
+                                    // makes, and getting back to it has to not
+                                    // depend on still having the cartridge that
+                                    // replaced it.
+                                    if ui
+                                        .selectable_label(
+                                            selected.is_none(),
+                                            RichText::new(format!("  {BUILTIN_PATCH_ROW}"))
+                                                .font(bold(12.0))
+                                                .color(t.text),
+                                        )
+                                        .clicked()
+                                        && selected.is_some()
+                                    {
+                                        *selected = None;
+                                        action = Some(DialogAction::ChoosePatch {
+                                            slot,
+                                            index: usize::MAX,
+                                        });
+                                    }
+                                    for &i in &visible {
+                                        let Some(name) = voices.get(i) else { continue };
+                                        let resp = ui.selectable_label(
+                                            *selected == Some(i),
+                                            // Numbered as the instrument does,
+                                            // from 1: every DX7 cartridge sheet
+                                            // ever printed says A1 through B16,
+                                            // and none of them start at zero.
+                                            RichText::new(format!("{:>3}. {name}", i + 1))
+                                                .font(bold(12.0))
+                                                .color(t.text),
+                                        );
+                                        // One click, one sound. See the variant.
+                                        if resp.clicked() {
+                                            *selected = Some(i);
+                                            action =
+                                                Some(DialogAction::ChoosePatch { slot, index: i });
+                                        }
+                                        if first_frame && *selected == Some(i) {
+                                            resp.scroll_to_me(Some(Align::Center));
+                                        }
+                                    }
+                                    if voices.is_empty() {
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            RichText::new(
+                                                "Load a DX7 cartridge to get thirty-two more \
+                                                 patches. Any .syx bank will do.",
+                                            )
+                                            .font(bold(11.0))
+                                            .color(t.text),
+                                        );
+                                    } else if visible.is_empty() {
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            RichText::new(
+                                                "Nothing matches that. Clear the filter to see \
+                                                 them all.",
+                                            )
+                                            .font(bold(11.0))
+                                            .color(t.text),
+                                        );
+                                    }
+                                });
+
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(
+                                    "Play while you click: each patch sounds as you pick it.",
+                                )
+                                .font(bold(PLUGIN_NOTE_PT))
+                                .color(faint),
+                            );
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                // One button, and it does not undo anything.
+                                // There is no Cancel because there is nothing to
+                                // cancel: the patch is already playing, and the
+                                // way back is the row at the top of the list.
+                                if ui
+                                    .add(Button::new(RichText::new("Done").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
         Dialog::PluginPicker {
             plugins,
             selected,
@@ -1862,7 +2177,13 @@ pub fn show(
                             });
 
                             let visible = visible_plugins(plugins, filter);
-                            if plugins.is_empty() {
+                            // **No INSTALLED plugins**, not no rows. The
+                            // built-in is always a row, so counting rows would
+                            // hide the note telling somebody where to put a
+                            // VST3 from exactly the person who has none.
+                            let installed =
+                                plugins.iter().filter(|p| p.path != BUILTIN_PATH).count();
+                            if installed == 0 {
                                 // Not an empty box with a greyed button: an
                                 // empty list cannot be told apart from a picker
                                 // that failed, and the ordinary cause is an
@@ -1941,7 +2262,7 @@ pub fn show(
                                             resp.scroll_to_me(Some(Align::Center));
                                         }
                                     }
-                                    if visible.is_empty() && !plugins.is_empty() {
+                                    if visible.is_empty() && installed > 0 {
                                         ui.add_space(6.0);
                                         ui.label(
                                             RichText::new(
@@ -4852,28 +5173,43 @@ mod tests {
             } => {
                 assert_eq!(
                     plugins.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-                    ["analog lab v", "Pianoteq 8", "Vital"],
+                    // The built-in leads, above the sort: it is what a fresh
+                    // install plays, and the one entry somebody with no VST3s
+                    // installed can still choose.
+                    [BUILTIN_NAME, "analog lab v", "Pianoteq 8", "Vital"],
                     "sorted the way a byte comparison sorts, not the way a person reads"
                 );
                 // The name is the stem: nobody wants to read ".vst3" 112 times.
                 assert!(plugins.iter().all(|p| !p.name.contains(".vst3")));
                 // Nothing was opened, so nothing knows a vendor. This is the
                 // assertion that fails the day the picker starts scanning.
-                assert!(plugins.iter().all(|p| p.vendor.is_empty()));
-                assert_eq!(*selected, Some(1), "it did not open on what is loaded");
+                // The built-in is exempt: it was not scanned, it is compiled
+                // in, and it is the one entry that can describe itself.
+                assert!(plugins
+                    .iter()
+                    .filter(|p| p.path != BUILTIN_PATH)
+                    .all(|p| p.vendor.is_empty()));
+                // Two, not one: the built-in took the first row.
+                assert_eq!(*selected, Some(2), "it did not open on what is loaded");
                 assert_eq!(current.as_deref(), Some(loaded.as_str()));
                 assert!(filter.is_empty() && *focus);
                 assert!(
-                    plugin_row(&plugins[1], Some(&loaded)).starts_with('\u{2022}'),
+                    plugin_row(&plugins[2], Some(&loaded)).starts_with('\u{2022}'),
                     "the loaded plugin is not marked"
                 );
                 assert!(
-                    plugin_row(&plugins[0], Some(&loaded)).starts_with(' '),
+                    plugin_row(&plugins[1], Some(&loaded)).starts_with(' '),
                     "a plugin that is not loaded was marked as if it were"
                 );
                 // A blank vendor leaves no empty brackets behind; a known one
                 // is shown, which is the only reason the field exists.
-                assert_eq!(plugin_row(&plugins[2], None), "  Vital");
+                assert_eq!(plugin_row(&plugins[3], None), "  Vital");
+                // And the built-in describes itself, which is the one row that
+                // can: nothing was opened to find out.
+                assert_eq!(
+                    plugin_row(&plugins[0], None),
+                    format!("  {BUILTIN_NAME}   (built in, six-operator FM)")
+                );
                 assert_eq!(
                     plugin_row(&entry("/x/A.vst3", "A", "Arturia"), None),
                     "  A   (Arturia)"

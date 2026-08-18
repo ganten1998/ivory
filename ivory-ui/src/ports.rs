@@ -90,6 +90,48 @@ pub struct DirRequest {
     pub purpose: DirPurpose,
 }
 
+/// A file the app has asked the host to choose.
+///
+/// The same request pattern as [`DirRequest`], and for the same reason: a
+/// native panel cannot be raised from inside an egui frame. A plugin refuses
+/// simply by never draining it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRequest {
+    pub start_at: Option<std::path::PathBuf>,
+    pub title: String,
+    /// Extensions to offer, without dots, and the name of the group. Empty
+    /// means every file.
+    pub extensions: Vec<String>,
+    pub extension_label: String,
+    pub purpose: FilePurpose,
+}
+
+/// What the host found in a DX7 cartridge, for the picker to show.
+///
+/// **Names, not voices.** `ivory-ui` cannot parse SysEx and has no business
+/// knowing what an operator is; it draws a list and reports an index, and the
+/// host turns that index back into a patch. That is the same firewall the
+/// plugin picker keeps by holding paths rather than modules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CartridgeInfo {
+    /// What the cartridge calls itself. Empty means none is loaded.
+    pub bank: String,
+    /// It failed its own checksum. Loaded anyway; worth showing.
+    pub bad_checksum: bool,
+    /// The patch names, in cartridge order.
+    pub voices: Vec<String>,
+    /// Why the last attempt failed, if it did. Empty on success, and on
+    /// failure everything above is left as it was.
+    pub error: String,
+}
+
+/// Why a file is being asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePurpose {
+    /// A DX7 cartridge to load into the built-in FM instrument.
+    Cartridge,
+}
+
 /// Why a folder is being asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirPurpose {

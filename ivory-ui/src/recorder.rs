@@ -254,6 +254,9 @@ pub struct RecorderView<'a> {
     /// The four faders, as LINEAR gains (not fader positions). See
     /// [`gain_to_fader`] for turning one into a knob angle.
     pub gains: Gains,
+    /// The two effect sends, 0..=1, as the knobs are drawn.
+    pub reverb: f32,
+    pub delay: f32,
     /// The click is on. Independent of `metronome_in_take`.
     pub metronome_on: bool,
     /// The click is mixed into the recording as well as the monitors.
@@ -307,6 +310,8 @@ impl RecorderView<'_> {
             folder_preview: "",
             slots: [SlotView::EMPTY; SLOTS],
             gains: Gains::default(),
+            reverb: 0.0,
+            delay: 0.0,
             metronome_on: false,
             metronome_in_take: false,
             tempo_bpm: DEFAULT_BPM,
@@ -454,6 +459,8 @@ impl RecorderState {
             count_in_beats: knobs.count_in_beats,
             count_in_bars: knobs.count_in_bars,
             time_signature: knobs.time_signature,
+            reverb: knobs.reverb,
+            delay: knobs.delay,
             camera: label(&self.camera_name, self.camera_missing),
             audio: label(&self.audio_name, self.audio_missing),
             preview: self.preview,
@@ -479,6 +486,10 @@ pub struct Knobs {
     pub count_in_beats: u32,
     pub count_in_bars: u32,
     pub time_signature: TimeSignature,
+    /// The two effect sends, 0..=1. See `effects.rs` in the binary for what
+    /// they reach: every instrument, and nothing else.
+    pub reverb: f32,
+    pub delay: f32,
 }
 
 impl Default for Knobs {
@@ -490,6 +501,8 @@ impl Default for Knobs {
             tempo_bpm: DEFAULT_BPM,
             count_in_beats: 4,
             count_in_bars: 1,
+            reverb: 0.0,
+            delay: 0.0,
             time_signature: TimeSignature::default(),
         }
     }
@@ -536,6 +549,12 @@ pub enum RecorderRequest {
     /// egui frame still on the stack is the same re-entrancy the folder picker
     /// avoids.
     OpenPluginEditor(usize),
+    /// Play patch `index` of the loaded cartridge in `slot`'s built-in.
+    /// `usize::MAX` means the patch compiled into the app.
+    ChoosePatch {
+        slot: usize,
+        index: usize,
+    },
     /// **Sound these notes through the loaded instrument.**
     ///
     /// The one way this crate can make a noise. It cannot reach the engine —
@@ -1388,10 +1407,27 @@ pub enum NumField {
     Slot(usize),
     Metronome,
     Input,
+    /// The two effect sends, typed as a PERCENT. Every other field here is
+    /// typed in the unit it is displayed in, and "40" for four tenths wet is
+    /// the only reading of a send anybody has ever wanted to write.
+    Reverb,
+    Delay,
     Tempo,
     /// The time signature. Typed rather than dragged — "6/8" is two numbers and
     /// a slash, and there is no continuum between 4/4 and 7/8 to drag along.
     Meter,
+}
+
+/// A percent typed into an effect send, as 0..=1.
+///
+/// Lenient about a trailing `%` because somebody typing a percentage will write
+/// one, and refuses anything that is not a number rather than treating it as
+/// zero — a field that silently reads "abc" as silence is a field that loses
+/// your setting when you fumble a key.
+pub fn parse_percent(text: &str) -> Option<f32> {
+    let t = text.trim().trim_end_matches('%').trim();
+    let v: f32 = t.parse().ok()?;
+    v.is_finite().then(|| (v / 100.0).clamp(0.0, 1.0))
 }
 
 /// A numeric field mid-edit: which one, and what has been typed so far.

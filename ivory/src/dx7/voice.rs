@@ -82,8 +82,77 @@ pub struct Voice {
     pub name: [u8; 10],
 }
 
-impl Default for Voice {
-    fn default() -> Self {
+impl Voice {
+    /// The patch a fresh install plays.
+    ///
+    /// **Written here rather than shipped as a cartridge**, and that is a
+    /// licensing decision as much as a size one. The factory ROMs are Yamaha's
+    /// and the banks people trade are their authors'; a patch typed into this
+    /// file is unambiguously the app's to give away, and it is 155 numbers.
+    ///
+    /// A tine electric piano on algorithm 1, which is two carriers each with
+    /// one modulator. OP2 at fourteen times the fundamental is the strike and
+    /// dies in a fifth of a second; OP4 at the fundamental thickens the body.
+    /// The carriers decay to nothing rather than sustaining, because that is
+    /// what a struck instrument does and a synth pad default would be the wrong
+    /// first impression for an app that draws a piano.
+    pub fn electric_piano() -> Self {
+        let carrier = |level: u8| Op {
+            rate: [99, 62, 21, 68],
+            level: [99, 92, 0, 0],
+            output_level: level,
+            coarse: 1,
+            fine: 0,
+            detune: 7,
+            rate_scaling: 3,
+            vel_sens: 3,
+            break_point: 39,
+            ..Op::default()
+        };
+        // A modulator's envelope is what the ear hears as brightness, so the
+        // strike falls far faster than the note it is on.
+        let tine = Op {
+            rate: [99, 70, 40, 78],
+            level: [99, 26, 0, 0],
+            output_level: 74,
+            coarse: 14,
+            fine: 0,
+            detune: 7,
+            rate_scaling: 4,
+            vel_sens: 6,
+            ..Op::default()
+        };
+        let body = Op {
+            rate: [99, 58, 26, 68],
+            level: [99, 68, 0, 0],
+            output_level: 58,
+            coarse: 1,
+            fine: 0,
+            detune: 9,
+            rate_scaling: 2,
+            vel_sens: 2,
+            ..Op::default()
+        };
+        Self {
+            // Algorithm 1: 2 modulates 1, and 4 modulates 3 through the stack.
+            algorithm: 0,
+            feedback: 3,
+            ops: [
+                carrier(99), // OP1, heard
+                tine,        // OP2 -> OP1
+                carrier(82), // OP3, heard
+                body,        // OP4 -> OP3
+                Op::default(),
+                Op::default(),
+            ],
+            name: *b"E.PIANO  1",
+            ..Self::silent()
+        }
+    }
+
+    /// Every parameter at rest. Silent, and the base every other patch is
+    /// built from.
+    fn silent() -> Self {
         Self {
             ops: [Op::default(); 6],
             pitch_rate: [99; 4],
@@ -101,6 +170,15 @@ impl Default for Voice {
             transpose: 24,
             name: *b"INIT VOICE",
         }
+    }
+}
+
+impl Default for Voice {
+    /// **A sound, not silence.** A default of all zeros is a patch that plays
+    /// nothing, which is what a fresh install did before there was a patch to
+    /// give it.
+    fn default() -> Self {
+        Self::electric_piano()
     }
 }
 
@@ -235,8 +313,12 @@ mod tests {
     #[test]
     fn operator_one_is_the_last_block_in_the_file() {
         let mut p = [0u8; 128];
-        p[0 * 17 + 14] = 11; // first block in the file is OP6
-        p[5 * 17 + 14] = 66; // last block is OP1
+        // Byte 14 of a block is that operator's output level, and a block is
+        // seventeen bytes. Named rather than written out, so the two lines
+        // below differ only in which BLOCK they name.
+        let level_of = |block: usize| block * 17 + 14;
+        p[level_of(0)] = 11; // first block in the file is OP6
+        p[level_of(5)] = 66; // last block is OP1
         let v = Voice::unpack(&p);
         assert_eq!(v.ops[0].output_level, 66, "ops[0] is not OP1");
         assert_eq!(v.ops[5].output_level, 11, "ops[5] is not OP6");

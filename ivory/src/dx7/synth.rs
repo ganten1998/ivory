@@ -45,11 +45,20 @@ pub const VOICES: usize = 16;
 const RANGE_DB: f32 = 96.0;
 
 /// Seconds for a full-range sweep at rate 99, the fastest the DX7 has.
-const FASTEST_SWEEP: f32 = 0.0015;
+///
+/// **Fitted to the hardware, and the fit is audible.** These two constants are
+/// the whole rate curve, and getting them wrong does not sound like a bug: it
+/// sounds like every patch in every cartridge has the wrong decay. An earlier
+/// pair here put rate 99 at 1.5ms and rate 0 at twenty seconds, which made a
+/// held electric piano note die in a third of a second.
+///
+/// The DX7 sweeps its full range in about 5.5ms at rate 99 and about 38
+/// seconds at rate 0, with roughly 8 rate steps per halving between them.
+const FASTEST_SWEEP: f32 = 0.0055;
 
-/// How many rate steps halve the time. Fitted so rate 0 is about twenty
-/// seconds and rate 50 about a sixth of one, which is where the hardware sits.
-const RATE_HALVING: f32 = 7.2;
+/// How many rate steps halve the time. See [`FASTEST_SWEEP`]: together they put
+/// rate 0 near 38 seconds and rate 50 near a third of one.
+const RATE_HALVING: f32 = 7.76;
 
 /// Headroom before the limiter. Six carriers at full level is the loudest a
 /// DX7 patch can be, and that has to leave room rather than clip.
@@ -271,19 +280,6 @@ impl Dx7 {
         };
         self.lfo_step = lfo_hz(v.lfo_speed) / self.sample_rate;
         self.voice = v;
-    }
-
-    pub fn voice(&self) -> &Voice {
-        &self.voice
-    }
-
-    pub fn set_sample_rate(&mut self, sample_rate: f32) {
-        let sr = sample_rate.max(8_000.0);
-        if (sr - self.sample_rate).abs() > 0.5 {
-            self.sample_rate = sr;
-            self.lfo_step = lfo_hz(self.voice.lfo_speed) / sr;
-            self.all_notes_off();
-        }
     }
 
     pub fn active(&self) -> bool {
@@ -790,6 +786,134 @@ mod tests {
                 a + 1
             );
         }
+    }
+
+    /// Render the default patch, and a cartridge patch if one is offered, to a
+    /// `.wav` so a human can hear it.
+    ///
+    ///   IVORY_SYX_DEMO=/path/to/bank.syx cargo test -p ivory --bins dx7_demo \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore = "writes a file for a person to listen to"]
+    fn dx7_demo_wav() {
+        const SR: u32 = 48_000;
+        let mut d = Dx7::new(SR as f32);
+        let mut left = Vec::<f32>::new();
+
+        let mut banks: Vec<(String, Voice)> = vec![("default".into(), Voice::default())];
+        if let Ok(path) = std::env::var("IVORY_SYX_DEMO") {
+            match super::super::Cartridge::load(std::path::Path::new(&path)) {
+                Ok(c) => {
+                    println!("bank {} ({} checksum)", c.name, if c.checksum_ok { "good" } else { "bad" });
+                    for (i, v) in c.voices.iter().enumerate().take(4) {
+                        banks.push((format!("{i}: {}", v.display_name()), *v));
+                    }
+                }
+                Err(e) => println!("could not load {path}: {e}"),
+            }
+        }
+
+        for (label, v) in &banks {
+            println!("  playing {label}");
+            d.all_notes_off();
+            d.set_voice(*v);
+            // A ii-V-I, then a low note alone, per patch.
+            let phrase: [(&[u8], f32); 4] = [
+                (&[50, 57, 60, 65, 69], 1.2),
+                (&[43, 53, 57, 62, 64], 1.2),
+                (&[48, 55, 59, 64, 67], 1.8),
+                (&[36], 2.0),
+            ];
+            for (notes, secs) in phrase {
+                for n in notes {
+                    d.note_on(*n, 0.85);
+                }
+                let frames = (secs * SR as f32) as usize;
+                let mut block = vec![0.0_f32; frames * 2];
+                d.render(&mut block, frames, 2);
+                left.extend(block.chunks_exact(2).map(|f| f[0]));
+                for n in notes {
+                    d.note_off(*n);
+                }
+            }
+        }
+
+        let path = std::env::temp_dir().join("tangent-dx7.wav");
+        let mut wav = Vec::<u8>::new();
+        let data_len = (left.len() * 2) as u32;
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&SR.to_le_bytes());
+        wav.extend_from_slice(&(SR * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for s in &left {
+            wav.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+        }
+        std::fs::write(&path, wav).expect("write the demo");
+        println!("wrote {} ({:.1}s)", path.display(), left.len() as f32 / SR as f32);
+    }
+
+    /// **The rate curve, against the hardware.** Three points off a real DX7,
+    /// which is the only thing that says whether a decay is right. Wide
+    /// tolerances: the exact figures vary by unit and by who measured them, and
+    /// what this catches is a curve off by a factor, not by a few percent.
+    #[test]
+    fn the_envelope_rate_curve_matches_a_real_dx7() {
+        let secs = |rate: f32| RANGE_DB / (rate_to_db_per_sample(rate, 48_000.0) * 48_000.0);
+        for (rate, want) in [(99.0, 0.0055_f32), (50.0, 0.33), (0.0, 38.0)] {
+            let got = secs(rate);
+            assert!(
+                got > want * 0.6 && got < want * 1.7,
+                "rate {rate} sweeps in {got:.4}s; the hardware is near {want}s"
+            );
+        }
+        // Monotonic, or a higher rate number would somewhere be slower.
+        for r in 0..99 {
+            let (a, b) = (r as f32, (r + 1) as f32);
+            assert!(secs(a) > secs(b), "rate {a} is not slower than {b}");
+        }
+    }
+
+    /// **The default patch has to still be sounding when the note is.** A patch
+    /// whose decay outruns the key is the bug this whole rate fit came from, and
+    /// it is invisible in every test that only asks whether a sample is nonzero.
+    #[test]
+    fn the_default_patch_sustains_a_held_note() {
+        const SR: f32 = 48_000.0;
+        let mut d = Dx7::new(SR);
+        d.note_on(60, 0.85);
+        let peak_over = |d: &mut Dx7, secs: f32| {
+            let frames = (secs * SR) as usize;
+            let mut b = vec![0.0_f32; frames * 2];
+            d.render(&mut b, frames, 2);
+            b.iter().fold(0.0_f32, |m, s| m.max(s.abs()))
+        };
+        let attack = peak_over(&mut d, 0.05);
+        assert!(attack > 0.05, "the attack is {attack}, which is inaudible");
+        let after_1s = peak_over(&mut d, 1.0);
+        let after_2s = peak_over(&mut d, 1.0);
+        // A struck note decays, so this is a floor and not an equality.
+        assert!(
+            after_1s > attack * 0.1,
+            "a second in, the note is at {:.0}% of its attack",
+            after_1s / attack * 100.0
+        );
+        assert!(
+            after_2s > attack * 0.02,
+            "two seconds in, the note is at {:.1}% of its attack",
+            after_2s / attack * 100.0
+        );
+        // And it does eventually stop, or it is a drone.
+        let _ = peak_over(&mut d, 8.0);
+        let late = peak_over(&mut d, 1.0);
+        assert!(late < attack * 0.01, "still at {late} after eleven seconds");
     }
 
     /// Velocity has to matter, or every patch plays like a machine.

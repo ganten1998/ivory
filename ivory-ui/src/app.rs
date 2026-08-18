@@ -241,6 +241,10 @@ pub struct IvoryApp {
     /// A folder the host has been asked to choose. Drained after the frame so
     /// the native panel's nested run loop never starts inside an egui frame.
     dir_request: Option<crate::ports::DirRequest>,
+    file_request: Option<crate::ports::FileRequest>,
+    /// Patch names of the cartridge the host has loaded, for the picker. The
+    /// app never reads a `.syx`: this is pushed in after the host parses one.
+    cartridge: crate::ports::CartridgeInfo,
     /// The host has been asked to look for plugins again.
     plugin_rescan: bool,
     /// A folder the app has asked the host to show in the file manager.
@@ -545,6 +549,8 @@ impl IvoryApp {
             recorder: recorder::RecorderState::default(),
             recorder_request: None,
             dir_request: None,
+            file_request: None,
+            cartridge: crate::ports::CartridgeInfo::default(),
             plugin_rescan: false,
             reveal_request: None,
             export_override: None,
@@ -1790,6 +1796,105 @@ impl IvoryApp {
         self.dir_request.take()
     }
 
+    /// The dialog on screen, if any. The host reads it to keep a slot row in
+    /// step with the picker that belongs to it.
+    pub fn open_dialog(&self) -> Option<&dialogs::Dialog> {
+        self.dialog.as_ref()
+    }
+
+    /// The two effect sends, 0..=1, for the host to hand the audio thread.
+    pub fn effect_sends(&self) -> (f32, f32) {
+        (
+            self.settings.reverb_mix as f32,
+            self.settings.delay_mix as f32,
+        )
+    }
+
+    /// The cartridge path and patch the host should restore at launch.
+    pub fn dx7_choice(&self) -> (&str, usize) {
+        (&self.settings.dx7_cartridge, self.settings.dx7_patch)
+    }
+
+    /// Remember which cartridge is loaded, so the next launch opens it.
+    pub fn set_dx7_cartridge(&mut self, path: String) {
+        self.settings.dx7_cartridge = path;
+        // The patch index belonged to the cartridge that was there before.
+        self.settings.dx7_patch = 0;
+        self.save_settings();
+    }
+
+    /// Take a pending "choose a file" request. Same contract again.
+    pub fn take_file_request(&mut self) -> Option<crate::ports::FileRequest> {
+        self.file_request.take()
+    }
+
+    /// The host has read a cartridge (or failed to). Show it.
+    ///
+    /// **Pushed in, because the UI cannot open a file.** `ivory-ui` has no
+    /// filesystem and no SysEx parser; it has thirty-two strings and a name.
+    /// Updates the open picker in place rather than reopening it, so the
+    /// scroll position and the filter survive loading a bank.
+    pub fn set_cartridge(&mut self, info: crate::ports::CartridgeInfo) {
+        self.cartridge = info;
+        let Some(dialogs::Dialog::PatchPicker {
+            bank,
+            bad_checksum,
+            voices,
+            selected,
+            filter,
+            error,
+            ..
+        }) = self.dialog.as_mut()
+        else {
+            return;
+        };
+        // A failed load leaves the cartridge that was working right where it
+        // was. Somebody who picks the wrong file should not lose their sound.
+        if !self.cartridge.error.is_empty() {
+            error.clone_from(&self.cartridge.error);
+            return;
+        }
+        error.clear();
+        bank.clone_from(&self.cartridge.bank);
+        *bad_checksum = self.cartridge.bad_checksum;
+        voices.clone_from(&self.cartridge.voices);
+        // A new bank means the old selection is a different patch. Nothing is
+        // selected until somebody picks, and until then the built-in plays.
+        *selected = None;
+        filter.clear();
+    }
+
+    /// Show what is in `slot`: a VST3's own editor, or the built-in's patches.
+    ///
+    /// **The built-in has no window to open.** Same gesture either way, and it
+    /// has to be: "click the slot to see the instrument" is one thing a user
+    /// learns, not two. A VST3 shows its editor; the built-in shows the patch
+    /// picker, which IS its editor.
+    ///
+    /// Public because the host's `IVORY_OPEN_EDITOR` hook drives it too, and a
+    /// dev hook that took a different path would exercise a path no user has.
+    pub fn open_slot_editor(&mut self, slot: usize) {
+        if self.chosen_plugin(slot) == Some(dialogs::BUILTIN_PATH) {
+            self.open_patch_picker(slot);
+        } else {
+            self.request_recorder(recorder::RecorderRequest::OpenPluginEditor(slot));
+        }
+    }
+
+    /// Open the patch picker for the built-in in `slot`.
+    fn open_patch_picker(&mut self, slot: usize) {
+        let selected = (!self.cartridge.voices.is_empty()
+            && self.settings.dx7_patch < self.cartridge.voices.len())
+            .then_some(self.settings.dx7_patch);
+        self.dialog = Some(dialogs::Dialog::patch_picker(
+            slot,
+            self.cartridge.bank.clone(),
+            self.cartridge.bad_checksum,
+            self.cartridge.voices.clone(),
+            selected,
+        ));
+    }
+
     /// What the audio path is doing, from the host that owns the devices.
     ///
     /// Pushed every frame rather than pulled, for the same reason the recorder
@@ -1916,8 +2021,17 @@ impl IvoryApp {
                     self.save_settings();
                 }
             }
-            Hit::OpenSlotEditor(slot) => {
-                self.request_recorder(recorder::RecorderRequest::OpenPluginEditor(slot));
+            Hit::OpenSlotEditor(slot) => self.open_slot_editor(slot),
+            // Both knobs write to settings and are pushed to the engine after
+            // the frame, the same shape as a fader: `save_settings_soon`
+            // because a drag is a hundred of these and each one is a file.
+            Hit::SetReverb(v) => {
+                self.settings.reverb_mix = f64::from(v.clamp(0.0, 1.0));
+                self.save_settings_soon();
+            }
+            Hit::SetDelay(v) => {
+                self.settings.delay_mix = f64::from(v.clamp(0.0, 1.0));
+                self.save_settings_soon();
             }
             Hit::SetSlotGain(slot, p) => {
                 if let Some(g) = self.settings.plugin_gains.get_mut(slot) {
@@ -2278,6 +2392,10 @@ impl IvoryApp {
                 .map(|g| Hit::SetMetronomeGain(recorder::gain_to_fader(g))),
             F::Input => recorder::parse_gain(&edit.text)
                 .map(|g| Hit::SetInputGain(recorder::gain_to_fader(g))),
+            // A PERCENT, not a gain: these are not faders and there is no dB
+            // curve to invert. "40" is four tenths wet.
+            F::Reverb => recorder::parse_percent(&edit.text).map(Hit::SetReverb),
+            F::Delay => recorder::parse_percent(&edit.text).map(Hit::SetDelay),
         };
         if let Some(hit) = hit {
             self.apply_recorder_hit(hit);
@@ -3304,6 +3422,33 @@ impl IvoryApp {
                 // The host notices the change by watching `chosen_plugin()`.
                 self.settings.plugin_slots[slot] = path;
                 self.save_settings();
+            }
+            DialogAction::ChoosePatch { slot, index } => {
+                // `usize::MAX` is the built-in row: no cartridge patch, the one
+                // compiled in. A sentinel rather than an `Option` because it
+                // rides the same request the real indices do, and the host has
+                // one arm to read instead of two.
+                self.settings.dx7_patch = if index == usize::MAX { 0 } else { index };
+                self.save_settings_soon();
+                self.request_recorder(recorder::RecorderRequest::ChoosePatch { slot, index });
+            }
+            DialogAction::LoadCartridge => {
+                if !self.caps.native_file_dialogs {
+                    return;
+                }
+                self.file_request = Some(crate::ports::FileRequest {
+                    // Where the last one came from, which is where the next one
+                    // almost certainly is: people keep cartridges in one folder
+                    // ten thousand files deep.
+                    start_at: std::path::Path::new(&self.settings.dx7_cartridge)
+                        .parent()
+                        .filter(|p| p.is_dir())
+                        .map(std::path::Path::to_path_buf),
+                    title: "Choose a DX7 cartridge".to_owned(),
+                    extensions: vec!["syx".to_owned(), "SYX".to_owned()],
+                    extension_label: "DX7 cartridge".to_owned(),
+                    purpose: crate::ports::FilePurpose::Cartridge,
+                });
             }
             DialogAction::ChooseDevice { kind, uid } => {
                 // Written to settings AND pushed to the device object. The
@@ -4561,7 +4706,6 @@ impl IvoryApp {
                 // Only once it IS a drag. A press that has not moved yet sets
                 // nothing, so that letting go of it can mean something else.
                 if self.grabbed.is_some_and(|g| g.moved) {
-                    let probe = Pos2::new(pos.x.clamp(rect.left(), rect.right() - 0.5), grab.from.y);
                     let view = self.recorder.view(
                         self.settings.record_take_name.as_deref().unwrap_or_default(),
                         self.name_focused,
@@ -4569,6 +4713,21 @@ impl IvoryApp {
                         self.settings.knobs(),
                         self.settings.record_hide_elapsed,
                     );
+                    // **The free axis is the one the control travels on**, and
+                    // the other is pinned to where the grab started. Pinning
+                    // the wrong one does not merely make a control fussy: every
+                    // probe reports the same value and the knob cannot be moved
+                    // at all.
+                    let probe = match recorder_panel::drag_axis(rect, &view, grab.hit) {
+                        Some(recorder_panel::DragAxis::Vertical) => Pos2::new(
+                            grab.from.x,
+                            pos.y.clamp(rect.top(), rect.bottom() - 0.5),
+                        ),
+                        _ => Pos2::new(
+                            pos.x.clamp(rect.left(), rect.right() - 0.5),
+                            grab.from.y,
+                        ),
+                    };
                     if let Some(now) = recorder_panel::hit_test(rect, &view, probe) {
                         // Same CONTROL, not the same value: the whole point is
                         // that the value changed.
@@ -4951,6 +5110,139 @@ mod tests {
         let ctx = egui::Context::default();
         let app = IvoryApp::new(&ctx, settings, caps);
         (ctx, app)
+    }
+
+    // ── the built-in's patch picker ─────────────────────────────────────────
+
+    /// **One gesture, two instruments.** Clicking a slot opens the VST3's own
+    /// editor; the built-in has no window, so the same click has to open the
+    /// patch picker instead. If this ever sends `OpenPluginEditor` for the
+    /// built-in, the click does nothing at all and the built-in becomes an
+    /// instrument with no way to change its sound.
+    #[test]
+    fn opening_the_builtin_shows_patches_and_a_vst_shows_its_own_editor() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.settings.plugin_slots[0] = Some(dialogs::BUILTIN_PATH.to_owned());
+        app.settings.plugin_slots[1] = Some("/x/Pianoteq 8.vst3".to_owned());
+
+        app.apply_recorder_hit(recorder_panel::Hit::OpenSlotEditor(0));
+        assert!(
+            matches!(app.dialog, Some(dialogs::Dialog::PatchPicker { slot: 0, .. })),
+            "the built-in did not open its patches"
+        );
+        // And nothing was asked of the host: there is no window to open.
+        assert!(app.take_recorder_request().is_none());
+
+        app.dialog = None;
+        app.apply_recorder_hit(recorder_panel::Hit::OpenSlotEditor(1));
+        assert!(app.dialog.is_none(), "a VST3 does not use the patch picker");
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::OpenPluginEditor(1))
+        );
+    }
+
+    /// A cartridge arriving updates the OPEN picker rather than replacing it,
+    /// and clears a selection that belonged to the bank before it.
+    #[test]
+    fn loading_a_cartridge_refills_the_open_picker() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.settings.plugin_slots[0] = Some(dialogs::BUILTIN_PATH.to_owned());
+        app.apply_recorder_hit(recorder_panel::Hit::OpenSlotEditor(0));
+
+        app.set_cartridge(crate::ports::CartridgeInfo {
+            bank: "ROM1A".to_owned(),
+            bad_checksum: true,
+            voices: (0..32).map(|i| format!("PATCH {i}")).collect(),
+            error: String::new(),
+        });
+        let Some(dialogs::Dialog::PatchPicker {
+            bank,
+            bad_checksum,
+            voices,
+            selected,
+            error,
+            ..
+        }) = &app.dialog
+        else {
+            panic!("the picker closed when a cartridge loaded")
+        };
+        assert_eq!(bank, "ROM1A");
+        assert!(*bad_checksum, "a bad checksum has to be shown, not hidden");
+        assert_eq!(voices.len(), 32);
+        assert!(error.is_empty());
+        // Nothing is selected: patch 12 of the old bank is a different sound.
+        assert_eq!(*selected, None);
+    }
+
+    /// **A file that will not parse must not cost you the one that did.** The
+    /// error goes into the dialog and the working cartridge stays loaded —
+    /// somebody browsing a folder of ten thousand `.syx` will hit a bad one.
+    #[test]
+    fn a_cartridge_that_fails_leaves_the_good_one_alone() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.settings.plugin_slots[0] = Some(dialogs::BUILTIN_PATH.to_owned());
+        app.apply_recorder_hit(recorder_panel::Hit::OpenSlotEditor(0));
+        app.set_cartridge(crate::ports::CartridgeInfo {
+            bank: "ROM1A".to_owned(),
+            voices: (0..32).map(|i| format!("PATCH {i}")).collect(),
+            ..Default::default()
+        });
+        app.set_cartridge(crate::ports::CartridgeInfo {
+            error: "this is a single-voice dump, not a 32-voice cartridge".to_owned(),
+            ..Default::default()
+        });
+        let Some(dialogs::Dialog::PatchPicker {
+            bank, voices, error, ..
+        }) = &app.dialog
+        else {
+            panic!("the picker closed")
+        };
+        assert_eq!(bank, "ROM1A", "the working cartridge was thrown away");
+        assert_eq!(voices.len(), 32);
+        assert!(error.contains("single-voice"), "the reason was not shown");
+    }
+
+    /// Picking a patch asks the host for it and remembers it, and the built-in
+    /// row asks for the patch compiled in.
+    #[test]
+    fn picking_a_patch_plays_it_and_is_remembered() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.apply_dialog_action(dialogs::DialogAction::ChoosePatch { slot: 1, index: 12 });
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::ChoosePatch { slot: 1, index: 12 })
+        );
+        assert_eq!(app.settings.dx7_patch, 12);
+
+        // The built-in row. `usize::MAX` is not an index into anything, so it
+        // must not be written to the settings as one.
+        app.apply_dialog_action(dialogs::DialogAction::ChoosePatch {
+            slot: 1,
+            index: usize::MAX,
+        });
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::ChoosePatch {
+                slot: 1,
+                index: usize::MAX
+            })
+        );
+        assert_eq!(app.settings.dx7_patch, 0);
+    }
+
+    /// A plugin host never raises a file panel, so it never asks for one.
+    #[test]
+    fn a_plugin_does_not_ask_for_a_cartridge_file() {
+        let (_, mut app) = headless(Caps::PLUGIN);
+        app.apply_dialog_action(dialogs::DialogAction::LoadCartridge);
+        assert!(app.take_file_request().is_none());
+
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.apply_dialog_action(dialogs::DialogAction::LoadCartridge);
+        let r = app.take_file_request().expect("the desktop asks");
+        assert_eq!(r.purpose, crate::ports::FilePurpose::Cartridge);
+        assert!(r.extensions.iter().any(|e| e.eq_ignore_ascii_case("syx")));
     }
 
     /// The cog opens the take-settings popup, and the popup can be dismissed.

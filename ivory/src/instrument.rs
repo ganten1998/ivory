@@ -220,7 +220,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -858,6 +858,10 @@ struct Shared {
     /// one constant rather than a fourth field in four structs.
     slot_gains: [AtomicU32; SLOTS],
     metro_gain: AtomicU32,
+    /// The two effect knobs, 0..=1. On the instrument bus only — see
+    /// `effects.rs` for what that includes and what it deliberately does not.
+    reverb_mix: AtomicU32,
+    delay_mix: AtomicU32,
     metro_on: AtomicBool,
     metro_in_take: AtomicBool,
     /// The COUNT-IN's clicks belong in the take, whatever `metro_in_take` says.
@@ -911,6 +915,19 @@ struct Shared {
     /// words are chosen by the reader on the UI thread, because building a
     /// `String` here would allocate on the audio thread.
     slot_faulted: [AtomicBool; SLOTS],
+    /// Which slot holds the built-in instrument, or -1 for none.
+    ///
+    /// An `i32` because it is read on the audio thread every block and an
+    /// `Option<usize>` is not atomic. -1 does not mean "silent": with no slot
+    /// claiming it, the built-in still plays when nothing else does, which is
+    /// what makes a fresh install audible.
+    builtin_slot: AtomicI32,
+    /// A patch waiting to be picked up by the renderer.
+    ///
+    /// A mutex, and the audio thread only ever `try_lock`s it: a patch change
+    /// that has to wait one block is imperceptible, and a block that has to
+    /// wait for a patch change is a dropout.
+    pending_voice: std::sync::Mutex<Option<crate::dx7::Voice>>,
     running: AtomicBool,
     callbacks: AtomicU64,
     swaps: AtomicU64,
@@ -921,6 +938,11 @@ impl Shared {
         Self {
             slot_gains: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             metro_gain: AtomicU32::new(0.7f32.to_bits()),
+            // Both effects OFF by default. A first launch has to sound like the
+            // instrument and not like a room, and `Effects::process` skips its
+            // whole cost at zero.
+            reverb_mix: AtomicU32::new(0.0f32.to_bits()),
+            delay_mix: AtomicU32::new(0.0f32.to_bits()),
             metro_on: AtomicBool::new(false),
             // THE default the owner called out: the click is a monitor signal,
             // not a take signal.
@@ -944,6 +966,8 @@ impl Shared {
             midi_dropped: AtomicU64::new(0),
             pedal_dropped: AtomicU64::new(0),
             slot_faulted: std::array::from_fn(|_| AtomicBool::new(false)),
+            builtin_slot: AtomicI32::new(-1),
+            pending_voice: std::sync::Mutex::new(None),
             running: AtomicBool::new(false),
             callbacks: AtomicU64::new(0),
             swaps: AtomicU64::new(0),
@@ -961,6 +985,16 @@ impl Shared {
         if let Some(cell) = self.slot_gains.get(slot) {
             cell.store(sane_gain(linear).to_bits(), Ordering::Relaxed);
         }
+    }
+
+    /// Both effect knobs at once, 0..=1.
+    ///
+    /// Sanitised here rather than at the point of use, for the same reason the
+    /// gains are: a NaN reaching a feedback loop does not stay in one sample.
+    fn set_effects(&self, reverb: f32, delay: f32) {
+        let sane = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+        self.reverb_mix.store(sane(reverb).to_bits(), Ordering::Relaxed);
+        self.delay_mix.store(sane(delay).to_bits(), Ordering::Relaxed);
     }
 
     /// The instrument fault line, naming the slots so the other two are not
@@ -1139,12 +1173,19 @@ struct Renderer {
     /// belongs to a later block lives here rather than being pushed back.
     pending: Option<MidiEvent>,
     notes: Vec<Note>,
-    /// The instrument this app has when it has no instrument.
+    /// The instrument this app ships with.
     ///
-    /// Rendered only when every slot is empty, so it is the sound of a fresh
-    /// install and steps aside the moment a real plugin is loaded. See
-    /// `builtin.rs` for why it is synthesised rather than sampled.
-    builtin: crate::builtin::Builtin,
+    /// Rendered when a slot has asked for it, and when NO slot has anything at
+    /// all — so a fresh install makes a sound, and choosing "Tangent DX7" in
+    /// the picker keeps making one after a real plugin has been tried and
+    /// removed. See `dx7/` for the synth and `builtin.rs` for what it grew out
+    /// of.
+    builtin: crate::dx7::Dx7,
+    /// Reverb and delay on the instrument sum. Costs nothing at rest.
+    effects: crate::effects::Effects,
+    /// Whether a slot has asked for the built-in by name. When none has, it
+    /// still plays if nothing else does; when one has, it plays regardless.
+    builtin_slot: Option<usize>,
     /// Control changes for this block — the sustain pedal, above all.
     ///
     /// Preallocated beside `notes` and for the same reason: `process` runs on
@@ -1373,6 +1414,22 @@ impl Renderer {
             self.sum_slots(n, &widths, &slot_targets);
             self.render_builtin(n, &widths);
 
+            // **Here, and this position is the feature.** Downstream of every
+            // instrument, so a VST3 and the built-in FM are treated alike;
+            // upstream of the tap, so what is recorded is what was heard;
+            // upstream of the click and the input monitor, so neither of those
+            // ends up in a room they were never in.
+            if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
+                self.effects.process(
+                    mix,
+                    n,
+                    TAP_CHANNELS,
+                    Shared::f32_of(&self.shared.reverb_mix),
+                    Shared::f32_of(&self.shared.delay_mix),
+                    f64::from_bits(self.shared.bpm.load(Ordering::Relaxed)),
+                );
+            }
+
             for i in 0..n {
                 let frame_index = done + i;
 
@@ -1471,7 +1528,18 @@ impl Renderer {
     /// honest test — a slot holding a faulted plugin is an empty slot as far as
     /// the bus is concerned.
     fn render_builtin(&mut self, frames: usize, widths: &[usize; SLOTS]) {
-        if widths.iter().any(|w| *w > 0) {
+        // Asked for by name, or nothing else is playing. The second is what
+        // makes a fresh install audible; the first is what makes the picker's
+        // top entry mean something once a plugin has been loaded elsewhere.
+        // A patch change, if one is waiting and the lock is free this block.
+        if let Ok(mut g) = self.shared.pending_voice.try_lock() {
+            if let Some(v) = g.take() {
+                self.builtin.set_voice(v);
+            }
+        }
+        let wanted = self.shared.builtin_slot.load(Ordering::Relaxed);
+        self.builtin_slot = (wanted >= 0).then_some(wanted as usize);
+        if self.builtin_slot.is_none() && widths.iter().any(|w| *w > 0) {
             // Something real is playing. Keep the built-in silent AND clear, so
             // unloading a plugin mid-note does not resurrect a stale one.
             if self.builtin.active() {
@@ -1480,10 +1548,15 @@ impl Renderer {
             return;
         }
         for n in &self.notes {
+            // `Note::pitch` is the VST3 shape, an `i16`; anything outside a
+            // MIDI key is not a note this instrument can sound.
+            let Ok(pitch) = u8::try_from(n.pitch) else {
+                continue;
+            };
             if n.on {
-                self.builtin.note_on(n.pitch, n.velocity);
+                self.builtin.note_on(pitch, n.velocity);
             } else {
-                self.builtin.note_off(n.pitch);
+                self.builtin.note_off(pitch);
             }
         }
         // CC 64 is the damper. Half scale is the switch point every synth
@@ -1956,7 +2029,9 @@ impl Engine {
             midi: midi_rx,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
-            builtin: crate::builtin::Builtin::new(rate as f32),
+            builtin: crate::dx7::Dx7::new(rate as f32),
+            effects: crate::effects::Effects::new(rate as f32),
+            builtin_slot: None,
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
             tap: tap_tx,
             tap_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
@@ -2421,6 +2496,27 @@ impl Engine {
     /// The take-source decision: a take records the instruments when there is an
     /// instrument to record, and one full slot out of three is enough. Asking
     /// per slot would make "record the plugin" mean "record slot 0".
+    /// Put the built-in instrument in a slot, or take it out.
+    ///
+    /// A slot holding it is not a plugin: nothing is opened, nothing can fail,
+    /// and it is playing on the next block.
+    pub fn set_builtin_slot(&mut self, slot: Option<usize>) {
+        self.shared
+            .builtin_slot
+            .store(slot.map_or(-1, |s| s as i32), Ordering::Relaxed);
+    }
+
+    /// Load a patch into the built-in.
+    ///
+    /// Sent as a message rather than written through, because the renderer owns
+    /// it and it is on the audio thread. A voice is 155 small numbers and this
+    /// happens when somebody clicks a name in a list, so the cost is nothing.
+    pub fn set_builtin_voice(&mut self, voice: crate::dx7::Voice) {
+        if let Ok(mut g) = self.shared.pending_voice.lock() {
+            *g = Some(voice);
+        }
+    }
+
     pub fn any_plugin_loaded(&self) -> bool {
         self.loaded.iter().any(Option::is_some)
     }
@@ -2634,6 +2730,11 @@ impl Engine {
     /// from the UI, and a panic here reaches the user as a dialog and `exit(1)`.
     pub fn set_slot_gain(&self, slot: usize, linear: f32) {
         self.shared.set_slot_gain(slot, linear);
+    }
+
+    /// The two effect knobs, 0..=1.
+    pub fn set_effects(&self, reverb: f32, delay: f32) {
+        self.shared.set_effects(reverb, delay);
     }
 
     pub fn set_metronome_gain(&self, linear: f32) {
@@ -4130,7 +4231,9 @@ mod tests {
             midi,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
-            builtin: crate::builtin::Builtin::new(RATE as f32),
+            builtin: crate::dx7::Dx7::new(RATE as f32),
+            effects: crate::effects::Effects::new(RATE as f32),
+            builtin_slot: None,
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
             tap,
             tap_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
@@ -4197,6 +4300,98 @@ mod tests {
             "a note with no plugin loaded produced {peak}, which is silence"
         );
         assert!(peak <= 1.0, "the built-in clipped the device at {peak}");
+    }
+
+    /// **A patch you pick has to be the patch you hear.** The picker is a list
+    /// of names and a list of names is easy to get right while the voice behind
+    /// it never reaches the audio thread — the whole chain is a `Mutex` the
+    /// renderer checks once a block, and a chain that silently does nothing
+    /// looks exactly like a cartridge full of similar patches.
+    ///
+    /// Two patches chosen to be unmistakably different: an organ (algorithm 32,
+    /// six carriers, no modulation) against the tine piano.
+    #[test]
+    fn choosing_a_patch_changes_what_comes_out() {
+        use crate::dx7::{Op, Voice};
+
+        let sound = |r: &mut Renderer, tx: &mut rtrb::Producer<MidiEvent>| {
+            queue(tx, 0, [0x90, 60, 100]);
+            let mut out = vec![0.0_f32; 2 * 4096];
+            r.render(&mut out, 0, 0);
+            queue(tx, 0, [0x80, 60, 0]);
+            let mut quiet = vec![0.0_f32; 2 * 4096];
+            r.render(&mut quiet, 0, 0);
+            out
+        };
+
+        let (mut r, mut tx, _) = renderer_with_midi(2);
+        let piano = sound(&mut r, &mut tx);
+
+        // An organ: every operator a carrier, so it holds where the piano
+        // decays and its spectrum is nothing like one.
+        let mut organ = Voice::default();
+        organ.algorithm = 31;
+        organ.feedback = 0;
+        organ.ops = [Op {
+            rate: [99, 99, 99, 80],
+            level: [99, 99, 99, 0],
+            output_level: 80,
+            coarse: 1,
+            detune: 7,
+            ..Op::default()
+        }; 6];
+        // The path a click takes: through `Shared`, picked up by the renderer.
+        if let Ok(mut g) = r.shared.pending_voice.lock() {
+            *g = Some(organ);
+        }
+        let after = sound(&mut r, &mut tx);
+
+        let peak = |v: &[f32]| v.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(peak(&piano) > 0.01 && peak(&after) > 0.01, "one of them was silent");
+        // Not "the buffers differ" — two renders of the SAME patch differ, on
+        // free-running phase alone. The organ sustains and the piano does not,
+        // so the end of the block is where they cannot be confused.
+        let tail = |v: &[f32]| peak(&v[v.len() * 3 / 4..]);
+        assert!(
+            tail(&after) > tail(&piano) * 2.0,
+            "the patch never reached the audio thread: the tine piano ended at \
+             {:.4} and the organ at {:.4}, and an organ does not decay",
+            tail(&piano),
+            tail(&after)
+        );
+    }
+
+    /// **The knobs reach the audio, and they reach the FILE.**
+    ///
+    /// The effects sit on the instrument sum, upstream of the tap, so a take
+    /// carries what was heard. Asserted through the real renderer because the
+    /// position in the chain is the whole feature: `effects.rs` proves the DSP
+    /// against an impulse, and none of that says whether it is wired in.
+    #[test]
+    fn the_effect_knobs_reach_both_the_device_and_the_take() {
+        let tail = |reverb: f32| {
+            let (mut r, mut tx, _) = renderer_with_midi(2);
+            r.shared.set_effects(reverb, 0.0);
+            queue(&mut tx, 0, [0x90, 60, 100]);
+            let mut out = vec![0.0_f32; 2 * 4096];
+            r.render(&mut out, 0, 0);
+            queue(&mut tx, 0, [0x80, 60, 0]);
+            // Long after the note is released and the built-in has decayed:
+            // anything here is a room, because nothing else is left to make it.
+            for _ in 0..6 {
+                let mut quiet = vec![0.0_f32; 2 * 4096];
+                r.render(&mut quiet, 0, 0);
+            }
+            let mut last = vec![0.0_f32; 2 * 4096];
+            r.render(&mut last, 0, 0);
+            last.iter().fold(0.0_f32, |m, s| m.max(s.abs()))
+        };
+        let dry = tail(0.0);
+        let wet = tail(1.0);
+        assert!(
+            wet > dry * 4.0 && wet > 1.0e-5,
+            "the reverb knob is not wired in: dry tail {dry:e}, wet tail {wet:e}"
+        );
     }
 
     #[test]

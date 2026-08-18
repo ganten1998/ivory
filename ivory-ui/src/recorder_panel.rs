@@ -319,6 +319,14 @@ struct Layout {
     input_row: Rect,
     click: Rect,
 
+    /// The two effect knobs, stacked between the faders and the meters.
+    ///
+    /// The whole CELL, label included, and the whole cell is the drag target:
+    /// a knob is thirty points across and a control you can only grab by its
+    /// own diameter is a control you keep missing.
+    reverb: Rect,
+    delay: Rect,
+
     /// The supporter heart, bottom-right of the band.
     ///
     /// **Not a hit** as far as this module is concerned: the band knows where
@@ -593,6 +601,8 @@ impl Layout {
             metronome_row: Rect::NOTHING,
             input_row: Rect::NOTHING,
             click: Rect::NOTHING,
+            reverb: Rect::NOTHING,
+            delay: Rect::NOTHING,
             setup: Rect::NOTHING,
             dest: Rect::NOTHING,
             reveal: Rect::NOTHING,
@@ -801,7 +811,29 @@ impl Layout {
         // in it: two rows in the middle of a tall column rather than two rows
         // pinned to the bottom of the band, which is what made the bottom of
         // the window read as empty.
-        let col = slice_h(m, 0.00, 0.43);
+        // **The width comes out of the faders, not the meters.** The meters are
+        // sized by their own height against a fixed aspect and then capped by
+        // the width they are given, so a narrower meter column is a smaller
+        // FACE — and the faces are the thing this band was rebuilt around.
+        //
+        // 0.34 rather than the 0.43 the faders had to themselves: measured
+        // against `a_gain_reading_fits_the_box_reserved_for_it_at_the_smallest_
+        // band`, which is where the dB reading stops fitting. At 0.31 it does
+        // not, at the narrowest band this app will draw.
+        let col = slice_h(m, 0.00, 0.34);
+        let knobs = slice_h(m, 0.36, 0.45);
+        // Stacked, because the column that was available is tall and narrow.
+        // The gaps are inside the cells: each is a knob with a word over it,
+        // and `draw_knob` centres the pair in what it is handed.
+        let (reverb, delay) = (slice_v(knobs, 0.06, 0.50), slice_v(knobs, 0.52, 0.96));
+        // **A control nobody can see is not a control.** `draw_knob` refuses a
+        // cell too small to be a knob rather than drawing a smudge, so the
+        // layout has to refuse it too — otherwise the band keeps a live drag
+        // target over blank panel. One predicate, asked by both.
+        if knob_fits(reverb) && knob_fits(delay) {
+            self.reverb = reverb;
+            self.delay = delay;
+        }
         // Tall rows in a narrow column. Moving the pair off the meters bought
         // width to give away and none to spare, so the legibility comes back
         // out of the HEIGHT: the two rows take nearly the whole column, which
@@ -1022,8 +1054,8 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 37] {
-        use Produces::{Along, Fixed, SlotGain};
+    fn targets(&self) -> [(Rect, Produces); 39] {
+        use Produces::{Along, AlongV, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
         let s = &self.slots;
         [
@@ -1058,6 +1090,10 @@ impl Layout {
             (s[4].clear, Fixed(Hit::ClearSlot(4))),
             (track(self.metronome_row), Along(Hit::SetMetronomeGain)),
             (track(self.input_row), Along(Hit::SetInputGain)),
+            // Up the cell for more, which is the direction every knob in every
+            // studio turns and the direction the two faders beside them move.
+            (self.reverb, AlongV(Hit::SetReverb)),
+            (self.delay, AlongV(Hit::SetDelay)),
             (self.click, Fixed(Hit::ToggleMetronome)),
             (self.dest, Fixed(Hit::ChooseFolder)),
             (self.reveal, Fixed(Hit::RevealFolder)),
@@ -1170,6 +1206,9 @@ pub enum Hit {
     /// and it lives there so that the fader's travel and the audio path's
     /// scaling cannot disagree.
     SetMetronomeGain(f32),
+    /// The two effect sends, 0..=1.
+    SetReverb(f32),
+    SetDelay(f32),
     SetInputGain(f32),
     /// Tempo dragged, already clamped to `MIN_BPM..=MAX_BPM`.
     SetTempo(f64),
@@ -1194,7 +1233,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 38] = [
+    pub const ALL: [Hit; 40] = [
         Hit::Record,
         Hit::Stop,
         Hit::OpenSetup,
@@ -1230,6 +1269,8 @@ impl Hit {
         Hit::SetSlotGain(3, Hit::MIDWAY),
         Hit::SetSlotGain(4, Hit::MIDWAY),
         Hit::SetMetronomeGain(Hit::MIDWAY),
+        Hit::SetReverb(Hit::MIDWAY),
+        Hit::SetDelay(Hit::MIDWAY),
         Hit::SetInputGain(Hit::MIDWAY),
         Hit::SetTempo((MIN_BPM + MAX_BPM) * 0.5),
         Hit::EditTimeSignature,
@@ -1297,6 +1338,8 @@ impl Hit {
             Hit::ToggleMetronomeInTake => "Record the click into takes",
             Hit::SetSlotGain(i, _) => GAIN[n(i)],
             Hit::SetMetronomeGain(_) => "Click level",
+            Hit::SetReverb(_) => "Reverb, on every instrument",
+            Hit::SetDelay(_) => "Delay, in time with the tempo",
             Hit::SetInputGain(_) => "Input level",
             Hit::SetTempo(_) => "Tempo",
             Hit::EditTimeSignature => "Time signature",
@@ -1313,6 +1356,8 @@ impl Hit {
             self,
             Hit::SetSlotGain(_, _)
                 | Hit::SetMetronomeGain(_)
+                | Hit::SetReverb(_)
+                | Hit::SetDelay(_)
                 | Hit::SetInputGain(_)
                 | Hit::SetTempo(_)
         )
@@ -1359,6 +1404,8 @@ pub fn num_field(hit: Hit) -> Option<NumField> {
         Hit::EditTimeSignature => Some(NumField::Meter),
         Hit::SetSlotGain(i, _) => Some(NumField::Slot(i)),
         Hit::SetMetronomeGain(_) => Some(NumField::Metronome),
+        Hit::SetReverb(_) => Some(NumField::Reverb),
+        Hit::SetDelay(_) => Some(NumField::Delay),
         Hit::SetInputGain(_) => Some(NumField::Input),
         Hit::SetTempo(_) => Some(NumField::Tempo),
         _ => None,
@@ -1378,6 +1425,10 @@ enum Produces {
     Fixed(Hit),
     /// A hit carrying how far along the rect the press landed, 0..=1.
     Along(fn(f32) -> Hit),
+    /// The same, measured UP the rect: 0 at the bottom, 1 at the top. For
+    /// round knobs, where left-to-right would be a control that goes the wrong
+    /// way half the time depending on which side of it you grabbed.
+    AlongV(fn(f32) -> Hit),
     /// The same, for a knob that also has to say which slot it belongs to. Its
     /// own variant rather than a closure so that [`Layout::targets`] stays a
     /// plain `Copy` array with no allocation and no lifetime.
@@ -1385,12 +1436,28 @@ enum Produces {
 }
 
 impl Produces {
-    fn hit(self, t: f32) -> Hit {
+    /// The hit for a press at `pos` inside `r`.
+    ///
+    /// Takes the rect and the point rather than a fraction, because the two
+    /// travelling controls measure different axes and a caller that computed
+    /// the fraction would have to know which — the one thing this enum exists
+    /// to keep it from knowing.
+    fn hit(self, r: Rect, pos: Pos2) -> Hit {
         match self {
             Produces::Fixed(h) => h,
-            Produces::Along(f) => f(t),
-            Produces::SlotGain(i) => Hit::SetSlotGain(i, t.clamp(0.0, 1.0)),
+            Produces::Along(f) => f(along(r, pos)),
+            Produces::AlongV(f) => f(up(r, pos)),
+            Produces::SlotGain(i) => Hit::SetSlotGain(i, along(r, pos).clamp(0.0, 1.0)),
         }
+    }
+
+    /// A representative hit, for asking a producer WHICH CONTROL it is.
+    ///
+    /// The value it carries is meaningless and every caller ignores it:
+    /// `label` and `is_same_control` are both about identity. A unit rect at
+    /// the origin, so the answer does not depend on where anything is.
+    fn control(self) -> Hit {
+        self.hit(Rect::from_min_size(Pos2::ZERO, Vec2::splat(1.0)), Pos2::ZERO)
     }
 }
 
@@ -1416,6 +1483,46 @@ fn along(r: Rect, pos: Pos2) -> f32 {
         return 0.0;
     }
     ((pos.x - r.left()) / r.width()).clamp(0.0, 1.0)
+}
+
+/// Which way a control travels.
+///
+/// A caller dragging one has to hold the OTHER axis still — see
+/// [`drag_axis`] — or a fader loses the gesture the moment the hand drifts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// Which way the control under `hit` travels, if it travels at all.
+///
+/// **Read off the same table [`hit_test`] uses**, rather than matched on the
+/// `Hit` variants here. A second list would be a second thing to update, and
+/// the failure it produces is a knob that cannot be dragged at all: the caller
+/// pins the axis the control actually moves along, and every pointer position
+/// reports the same value.
+pub fn drag_axis(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<DragAxis> {
+    Layout::new(rect, view)
+        .targets()
+        .into_iter()
+        .find(|(r, k)| r.is_positive() && (*k).control().is_same_control(hit))
+        .and_then(|(_, k)| match k {
+            Produces::Along(_) | Produces::SlotGain(_) => Some(DragAxis::Horizontal),
+            Produces::AlongV(_) => Some(DragAxis::Vertical),
+            Produces::Fixed(_) => None,
+        })
+}
+
+/// How far UP `r` the point `pos` fell, 0..=1 from its bottom edge to its top.
+///
+/// Screen y grows downward and knobs do not, so this is [`along`] inverted on
+/// the other axis. Clamped for the same reason: both ends have to be reachable.
+fn up(r: Rect, pos: Pos2) -> f32 {
+    if r.height() <= 0.0 {
+        return 0.0;
+    }
+    ((r.bottom() - pos.y) / r.height()).clamp(0.0, 1.0)
 }
 
 /// What is under `pos`, if anything.
@@ -1473,7 +1580,7 @@ pub fn hit_test(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<Hit> {
         .targets()
         .into_iter()
         .find(|(r, _)| r.contains(pos))
-        .map(|(r, k)| k.hit(along(r, pos)))
+        .map(|(r, k)| k.hit(r, pos))
 }
 
 /// The next count-in length in the cycle, in beats.
@@ -1775,6 +1882,13 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
         ),
     ] {
         draw_fader(painter, row, icon, ink, gain, typing_for(view, field), p);
+    }
+    // The two effect sends, beside the faders they belong with.
+    for (cell, v, label, field) in [
+        (l.reverb, view.reverb, "REVERB", NumField::Reverb),
+        (l.delay, view.delay, "DELAY", NumField::Delay),
+    ] {
+        draw_knob(painter, cell, v, label, typing_for(view, field), p);
     }
     // **Whether the click ends up in the FILE has no control of its own.** It
     // is set once a year and it was sitting in the busiest row of the band
@@ -2971,6 +3085,131 @@ fn draw_cog(painter: &Painter, r: Rect, p: &Palette) {
     painter.circle_filled(c, rad * 0.30, p.bg);
 }
 
+// ── the effect knobs ────────────────────────────────────────────────────────
+
+/// The knob's sweep, in radians, centred on straight up.
+///
+/// 270 degrees, which is what a panel knob with an end stop turns and what
+/// leaves the gap at the bottom that tells you where the ends are.
+const KNOB_SWEEP: f32 = std::f32::consts::TAU * 0.75;
+
+/// Tick marks around the skirt. Eleven on the 388, and eleven here.
+const KNOB_TICKS: usize = 11;
+
+/// The blue cap on a Tascam 388's effect returns.
+///
+/// A real colour off the reference photograph rather than the band's accent,
+/// because the whole point of these two controls is that they look like a
+/// piece of hardware and not like the rest of the panel.
+const KNOB_CAP: Color32 = Color32::from_rgb(0x1c, 0x6f, 0xd6);
+
+/// The smallest knob face worth drawing, as a radius.
+///
+/// Below this the body, the cap and the slot land inside a few points of each
+/// other and it is three grey rings, not a control.
+const KNOB_MIN_R: f32 = 7.0;
+
+/// The label's share of a knob cell, and its bounds in points.
+const KNOB_LABEL: (f32, f32, f32) = (0.26, 5.0, 11.0);
+
+/// The face a knob would get in `cell`, or `None` if there is not room for one.
+///
+/// **The layout and the painter both ask this**, which is what keeps them from
+/// disagreeing about whether a knob is there — the failure that leaves a drag
+/// target on blank panel.
+fn knob_face(cell: Rect) -> Option<(Rect, f32)> {
+    if !cell.is_positive() {
+        return None;
+    }
+    let (share, lo, hi) = KNOB_LABEL;
+    let cap_h = (cell.height() * share).clamp(lo, hi);
+    let face = Rect::from_min_max(
+        Pos2::new(cell.left(), cell.top() + cap_h),
+        Pos2::new(cell.right(), cell.bottom()),
+    );
+    let rad = face.width().min(face.height()) * 0.5;
+    (rad >= KNOB_MIN_R).then_some((face, rad))
+}
+
+fn knob_fits(cell: Rect) -> bool {
+    knob_face(cell).is_some()
+}
+
+/// One knob, modelled on the Tascam 388's effect returns.
+///
+/// Black body, blue cap, and a pale slot across the cap that IS the pointer —
+/// the 388 has no separate indicator line, the moulding is slotted and the slot
+/// tells you where it is. A word over the top, and tick marks around the skirt
+/// so a glance can tell a quarter turn from a half.
+///
+/// `value` is 0..=1 and the caller owns what that means.
+fn draw_knob(
+    painter: &Painter,
+    cell: Rect,
+    value: f32,
+    label: &str,
+    typing: Option<&str>,
+    p: &Palette,
+) {
+    if !cell.is_positive() {
+        return;
+    }
+    // The label takes the top and the knob gets a square out of what is left.
+    // Sized off the CELL rather than measured off the text, because a knob that
+    // changed size with the length of the word over it would leave these two
+    // different sizes.
+    let Some((face, rad)) = knob_face(cell) else {
+        return;
+    };
+    let (share, lo, hi) = KNOB_LABEL;
+    let cap_h = (cell.height() * share).clamp(lo, hi);
+    let words = FontId::new((cap_h * 0.86).max(5.0), fonts::courier_bold());
+    // **The name gives way to the number while somebody is typing one.** There
+    // is nowhere else on a knob to put characters, and a field that shows
+    // nothing while it is being typed into is a field that looks broken. The
+    // caret is drawn rather than implied, for the same reason.
+    let (text, ink) = match typing {
+        Some(typed) => (format!("{typed}_"), p.ink),
+        None => (label.to_owned(), p.faint),
+    };
+    painter.text(
+        Pos2::new(cell.center().x, cell.top()),
+        Align2::CENTER_TOP,
+        &text,
+        words,
+        ink,
+    );
+    let c = Pos2::new(face.center().x, face.top() + rad);
+    let t = value.clamp(0.0, 1.0);
+    // Straight down is the middle of the missing quarter, so the sweep runs
+    // from half of it past one side to half of it past the other.
+    let angle = std::f32::consts::PI + (t - 0.5) * KNOB_SWEEP;
+    let dir = |a: f32| Vec2::new(a.sin(), -a.cos());
+
+    // The skirt's ticks, outside the body. Drawn first so the body covers
+    // their inner ends and they read as marks on the panel.
+    let tick = Stroke::new((rad * 0.07).max(0.7), p.faint);
+    for i in 0..KNOB_TICKS {
+        let a = std::f32::consts::PI
+            + (i as f32 / (KNOB_TICKS - 1) as f32 - 0.5) * KNOB_SWEEP;
+        let d = dir(a);
+        painter.line_segment([c + d * (rad * 0.86), c + d * (rad * 1.06)], tick);
+    }
+    // The body: near-black, like the moulding.
+    painter.circle_filled(c, rad * 0.78, Color32::from_rgb(0x14, 0x12, 0x12));
+    // The cap, inset, in the blue.
+    let cap = rad * 0.50;
+    painter.circle_filled(c, cap, KNOB_CAP);
+    // The slot. Across the whole cap and through the centre, which is what a
+    // screwdriver slot looks like and what makes the angle readable at
+    // fourteen points: a short pointer at one edge is a dot at this size.
+    let d = dir(angle);
+    painter.line_segment(
+        [c - d * cap * 0.92, c + d * cap * 0.92],
+        Stroke::new((cap * 0.30).max(1.0), Color32::from_rgb(0xd8, 0xe4, 0xf2)),
+    );
+}
+
 /// The tempo box, with a hairline of travel along its bottom.
 ///
 /// It is the only thing in this column that is dragged rather than clicked, and
@@ -3394,13 +3633,70 @@ mod tests {
         RecordState::Finishing,
     ];
 
+    /// **A knob drags up, a fader drags across.** The caller pins the axis a
+    /// control does NOT travel on, so an answer of Horizontal for the knobs
+    /// would freeze the only axis they move on — the control would be dead
+    /// rather than fussy, and nothing about the picture would say so.
+    #[test]
+    fn each_control_reports_the_axis_it_actually_travels_on() {
+        let r = band(1300.0);
+        // A full rack: an empty slot has no gain knob, and asking for the axis
+        // of a control that is not there is correctly answered with None.
+        let v = with_rack(RecordState::Idle, racks()[1]);
+        for (hit, want) in [
+            (Hit::SetReverb(0.0), DragAxis::Vertical),
+            (Hit::SetDelay(0.0), DragAxis::Vertical),
+            (Hit::SetMetronomeGain(0.0), DragAxis::Horizontal),
+            (Hit::SetInputGain(0.0), DragAxis::Horizontal),
+            (Hit::SetSlotGain(0, 0.0), DragAxis::Horizontal),
+            (Hit::SetTempo(120.0), DragAxis::Horizontal),
+        ] {
+            assert_eq!(
+                drag_axis(r, &v, hit),
+                Some(want),
+                "{} travels the other way",
+                hit.label()
+            );
+        }
+        // A button is not dragged at all, and a caller that treated one as a
+        // fader would set a value every time the pointer moved over it.
+        assert_eq!(drag_axis(r, &v, Hit::Record), None);
+        assert_eq!(drag_axis(r, &v, Hit::Stop), None);
+    }
+
+    /// Both ends of a knob's travel are reachable, and up is more.
+    #[test]
+    fn a_knob_reads_zero_at_the_bottom_and_one_at_the_top() {
+        let r = band(1300.0);
+        let v = idle();
+        let cell = Layout::new(r, &v).reverb;
+        assert!(cell.is_positive(), "the knob has no rectangle to drag in");
+        let at = |y: f32| hit_test(r, &v, Pos2::new(cell.center().x, y));
+        // Half a point in from the bottom edge, which is the last point inside
+        // the rect — so this is "as low as the pointer can get", not exactly 0.
+        let Some(Hit::SetReverb(low)) = at(cell.bottom() - 0.5) else {
+            panic!("the bottom of the knob is not the knob")
+        };
+        assert!(low < 0.02, "the bottom of the travel reads {low}");
+        assert_eq!(at(cell.top()), Some(Hit::SetReverb(1.0)));
+        // And the middle is the middle, not an end.
+        let Some(Hit::SetReverb(mid)) = at(cell.center().y) else {
+            panic!("the middle of the knob is not the knob")
+        };
+        assert!((mid - 0.5).abs() < 0.05, "the centre reads {mid}");
+    }
+
     /// The controls that stay reachable once a take is live, with a full rack.
     ///
     /// The three editor buttons are in the list and the three PICKERS are not,
     /// which is the whole distinction: reaching a preset in a plugin's own
     /// window between two passes is a real thing, and loading a plugin blocks
     /// the main thread for seconds and would cost the take.
-    const SURVIVORS: [Hit; 14] = [
+    ///
+    /// The two effect knobs are in it for the same reason the faders are: they
+    /// are a mix, they cost the audio thread nothing to move, and riding the
+    /// reverb through a take is a thing a person does on purpose.
+    const SURVIVORS: [Hit; 16] = [
         Hit::Stop,
         Hit::SetSlotGain(0, 0.0),
         Hit::SetSlotGain(1, 0.0),
@@ -3414,6 +3710,8 @@ mod tests {
         Hit::OpenSlotEditor(4),
         Hit::SetMetronomeGain(0.0),
         Hit::SetInputGain(0.0),
+        Hit::SetReverb(0.0),
+        Hit::SetDelay(0.0),
         Hit::ToggleMetronome,
     ];
 
@@ -3481,7 +3779,7 @@ mod tests {
                         assert!(
                             !r.is_positive() || band(w).contains_rect(r),
                             "{} escaped the band at {w}pt in {state:?}",
-                            k.hit(0.0).label()
+                            k.control().label()
                         );
                     }
                 }
@@ -3726,8 +4024,8 @@ mod tests {
                                     assert!(
                                         !t[i].0.intersects(t[j].0),
                                         "{} and {} overlap at {w}pt in {state:?}: {:?} {:?}",
-                                        t[i].1.hit(0.0).label(),
-                                        t[j].1.hit(0.0).label(),
+                                        t[i].1.control().label(),
+                                        t[j].1.control().label(),
                                         t[i].0,
                                         t[j].0
                                     );
@@ -3878,7 +4176,7 @@ mod tests {
                 {
                     assert!(
                         l.targets().into_iter().all(|(rect, k)| {
-                            !k.hit(Hit::MIDWAY).is_same_control(want) || !rect.is_positive()
+                            !k.control().is_same_control(want) || !rect.is_positive()
                         }),
                         "{} grew a rectangle in the band again",
                         want.label()
@@ -3888,7 +4186,7 @@ mod tests {
                 let (rect, _) = l
                     .targets()
                     .into_iter()
-                    .find(|(_, k)| k.hit(Hit::MIDWAY).is_same_control(want))
+                    .find(|(_, k)| k.control().is_same_control(want))
                     .expect("every variant is in `targets`");
                 assert!(
                     rect.is_positive(),
@@ -4773,6 +5071,11 @@ mod tests {
                                     metronome: 0.0,
                                     input: 0.5,
                                 },
+                                // Both ends of each knob's travel, so a slot or
+                                // a pointer that escapes at one extreme is
+                                // caught rather than only being drawn mid-way.
+                                reverb: 0.0,
+                                delay: 1.0,
                                 metronome_on: true,
                                 metronome_in_take: dark,
                                 tempo_bpm: 92.5,
@@ -5196,3 +5499,4 @@ pub fn draw_setup(
         draw_tick(painter, r, cap, on, &p);
     }
 }
+

@@ -107,11 +107,6 @@ pub const FEEDBACK_OP: [u8; 32] = [
     6, 6, // 31-32
 ];
 
-/// Whether operator `i + 1` is heard directly under algorithm `a`.
-pub fn is_carrier(algorithm: usize, op: usize) -> bool {
-    DEST[algorithm][op] == OUT
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,8 +171,5 @@ mod tests {
     #[test]
     fn algorithm_thirty_two_is_six_carriers() {
         assert!(DEST[31].iter().all(|d| *d == OUT));
-        for op in 0..6 {
-            assert!(is_carrier(31, op));
-        }
     }
 }

@@ -17,4 +17,4 @@ pub mod voice;
 
 pub use synth::Dx7;
 pub use sysex::Cartridge;
-pub use voice::Voice;
+pub use voice::{Op, Voice};

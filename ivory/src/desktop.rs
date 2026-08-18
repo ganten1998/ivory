@@ -234,6 +234,25 @@ pub struct DesktopApp {
     recorder: Recorder,
     /// The launch splash, until it has been earned and faded. `None` after.
     splash: Option<Splash>,
+    /// The DX7 cartridge the built-in is playing out of, if one is loaded.
+    ///
+    /// **The host holds the voices; the UI holds the names.** Kept here rather
+    /// than in `IvoryApp` because a `Voice` is a synthesizer's business and
+    /// `ivory-ui` is not allowed to know what one is — the same split as the
+    /// plugin picker's paths-not-modules.
+    #[cfg(feature = "recorder")]
+    cartridge: Option<crate::dx7::Cartridge>,
+}
+
+/// A parsed cartridge as the picker wants it: names and a bank, no voices.
+#[cfg(feature = "recorder")]
+fn cartridge_info(cart: &crate::dx7::Cartridge, error: &str) -> ivory_ui::ports::CartridgeInfo {
+    ivory_ui::ports::CartridgeInfo {
+        bank: cart.name.clone(),
+        bad_checksum: !cart.checksum_ok,
+        voices: cart.names(),
+        error: error.to_owned(),
+    }
 }
 
 #[cfg(feature = "recorder")]
@@ -436,6 +455,27 @@ impl DesktopApp {
         let engine = self.recorder.engine.as_ref();
         let slots: [ivory_ui::recorder::SlotState; ivory_ui::recorder::SLOTS] =
             std::array::from_fn(|i| {
+                // **The built-in is never "missing".** It is compiled in, so
+                // there is no `plugin(i)` behind it and every test below would
+                // otherwise conclude that the instrument failed to load — which
+                // is what the band said, in red, about the one instrument that
+                // cannot fail.
+                if self.app.chosen_plugin(i) == Some(ivory_ui::dialogs::BUILTIN_PATH) {
+                    return ivory_ui::recorder::SlotState {
+                        // The PATCH, not the instrument. "Tangent DX7" in a
+                        // slot says what it is; "E.PIANO 1" says what it
+                        // sounds like, which is the thing being chosen.
+                        name: Some(self.builtin_patch_name()),
+                        missing: false,
+                        // Its editor is the patch picker, and the app opens
+                        // that itself — but the row has to offer the gesture.
+                        has_editor: true,
+                        editor_open: matches!(
+                            self.app.open_dialog(),
+                            Some(ivory_ui::dialogs::Dialog::PatchPicker { slot, .. }) if *slot == i
+                        ),
+                    };
+                }
                 let loaded = engine.and_then(|e| e.plugin(i));
                 ivory_ui::recorder::SlotState {
                     // The instrument's own name when it loaded; the bundle's
@@ -513,12 +553,12 @@ impl DesktopApp {
                 .get_or_insert_with(|| std::time::Instant::now() + DEV_EDITOR_DELAY);
             if std::time::Instant::now() >= *due {
                 self.recorder.dev_editor_done = true;
-                if let Some(e) = self.recorder.engine.as_mut() {
-                    match e.open_editor(0) {
-                        Ok(()) => eprintln!("IVORY_OPEN_EDITOR: slot 1 editor opened"),
-                        Err(err) => eprintln!("IVORY_OPEN_EDITOR: {err}"),
-                    }
-                }
+                // Through the app's own gesture and not `Engine::open_editor`,
+                // so the hook opens whatever a CLICK would open — the built-in's
+                // patch picker as readily as a VST3's window. A hook that called
+                // the engine directly could only ever reproduce half the bugs.
+                self.app.open_slot_editor(0);
+                eprintln!("IVORY_OPEN_EDITOR: opened slot 1");
             }
             ctx.request_repaint();
         }
@@ -640,6 +680,7 @@ impl DesktopApp {
                 }
             }
         }
+        self.take_cartridge_request();
         // Scanning reads directories, so it belongs out here with the other
         // things the UI is not allowed to do — and it runs AFTER the folder
         // picker above, so a folder added this frame is in the list this frame
@@ -754,6 +795,23 @@ impl DesktopApp {
                         }
                     }
                 }
+                R::ChoosePatch { slot: _, index } => {
+                    // `usize::MAX` is the built-in row. Anything else indexes
+                    // the cartridge, and a stale index from a settings file
+                    // written against a cartridge that has since been replaced
+                    // simply finds nothing and leaves the sound alone.
+                    let voice = if index == usize::MAX {
+                        Some(crate::dx7::Voice::default())
+                    } else {
+                        self.cartridge
+                            .as_ref()
+                            .and_then(|c| c.voices.get(index))
+                            .copied()
+                    };
+                    if let (Some(v), Some(e)) = (voice, self.recorder.engine.as_mut()) {
+                        e.set_builtin_voice(v);
+                    }
+                }
                 R::OpenPluginEditor(slot) => {
                     // The plugin's own window, created here rather than in the
                     // frame: VST3 requires the main thread and AppKit will not
@@ -774,6 +832,80 @@ impl DesktopApp {
                 }
             }
             ctx.request_repaint();
+        }
+    }
+
+    /// What the built-in is playing, for its slot row.
+    ///
+    /// The patch's own name when a cartridge is loaded, and the instrument's
+    /// otherwise — a fresh install has no cartridge and "E.PIANO 1" alone would
+    /// look like a VST3 nobody remembers installing.
+    fn builtin_patch_name(&self) -> String {
+        let (_, patch) = self.app.dx7_choice();
+        self.cartridge
+            .as_ref()
+            .and_then(|c| c.voices.get(patch))
+            .map(crate::dx7::Voice::display_name)
+            .unwrap_or_else(|| ivory_ui::dialogs::BUILTIN_NAME.to_owned())
+    }
+
+    /// Read the cartridge named in the settings, if it is still there.
+    ///
+    /// Failure is not reported: see the call site. The built-in patch always
+    /// sounds, so the worst case is the sound somebody would have had on a
+    /// fresh install.
+    fn load_cartridge_at_launch(&mut self) {
+        let (path, patch) = self.app.dx7_choice();
+        let (path, patch) = (path.to_owned(), patch);
+        if path.is_empty() {
+            return;
+        }
+        let Ok(cart) = crate::dx7::Cartridge::load(std::path::Path::new(&path)) else {
+            return;
+        };
+        self.app.set_cartridge(cartridge_info(&cart, ""));
+        if let Some(v) = cart.voices.get(patch).copied() {
+            if let Some(e) = self.recorder.engine.as_mut() {
+                e.set_builtin_voice(v);
+            }
+        }
+        self.cartridge = Some(cart);
+    }
+
+    /// Raise the file panel for a cartridge and load what comes back.
+    ///
+    /// Out here with the folder picker and for the same reason: `rfd` runs a
+    /// nested run loop, and raising one inside an egui frame re-enters the
+    /// frame already on the stack.
+    fn take_cartridge_request(&mut self) {
+        let Some(request) = self.app.take_file_request() else {
+            return;
+        };
+        match request.purpose {
+            ivory_ui::ports::FilePurpose::Cartridge => {}
+        }
+        let mut dialog = rfd::FileDialog::new().set_title(&request.title);
+        if let Some(start) = request.start_at.filter(|p| p.exists()) {
+            dialog = dialog.set_directory(start);
+        }
+        if !request.extensions.is_empty() {
+            let exts: Vec<&str> = request.extensions.iter().map(String::as_str).collect();
+            dialog = dialog.add_filter(&request.extension_label, &exts);
+        }
+        let Some(file) = dialog.pick_file() else { return };
+        match crate::dx7::Cartridge::load(&file) {
+            Ok(cart) => {
+                self.app.set_cartridge(cartridge_info(&cart, ""));
+                self.app
+                    .set_dx7_cartridge(file.to_string_lossy().into_owned());
+                self.cartridge = Some(cart);
+            }
+            // Reported INTO the dialog rather than as a message box, because
+            // the dialog is still open and the next thing the user will do is
+            // pick a different file from the same folder.
+            Err(e) => self
+                .app
+                .set_cartridge(ivory_ui::ports::CartridgeInfo { error: e, ..Default::default() }),
         }
     }
 
@@ -860,6 +992,11 @@ impl DesktopApp {
             e.set_slot_gain(slot, *g);
         }
         e.set_metronome_gain(gains.metronome);
+        // Pushed every frame with the gains, and for the same reason: the
+        // settings are the one live value, so a knob dragged, a project loaded
+        // and a settings file hand-edited all arrive by the same path.
+        let (reverb, delay) = self.app.effect_sends();
+        e.set_effects(reverb, delay);
         e.set_metronome_enabled(self.app.metronome_on());
         e.set_metronome_in_take(self.app.metronome_in_take());
         e.set_tempo(self.app.tempo_bpm());
@@ -942,6 +1079,22 @@ impl DesktopApp {
         // instrument, and a window still attached to a plugin that has been
         // terminated is a use-after-free with a title bar.
         e.close_editor(slot);
+        // **The built-in is not a bundle.** Its path is a sentinel that has
+        // travelled through the picker, the settings and the saved session as
+        // if it were one, which is what kept every one of those layers from
+        // needing to know it exists. This is the one place that looks.
+        if wanted.as_deref() == Some(ivory_ui::dialogs::BUILTIN_PATH) {
+            e.unload_plugin(slot);
+            e.set_builtin_slot(Some(slot));
+            self.recorder.engine_error = None;
+            self.recorder.plugin_loaded[slot] = wanted;
+            return;
+        }
+        if self.recorder.plugin_loaded[slot].as_deref()
+            == Some(ivory_ui::dialogs::BUILTIN_PATH)
+        {
+            e.set_builtin_slot(None);
+        }
         match &wanted {
             None => {
                 e.unload_plugin(slot);
@@ -1211,7 +1364,7 @@ impl DesktopApp {
             }
         };
 
-        Self {
+        let mut me = Self {
             app,
             #[cfg(feature = "recorder")]
             recorder,
@@ -1219,7 +1372,17 @@ impl DesktopApp {
                 since: std::time::Instant::now(),
                 done_at: None,
             }),
-        }
+            #[cfg(feature = "recorder")]
+            cartridge: None,
+        };
+        // The cartridge from last time, if it is still where it was. **Silently
+        // when it is not**: cartridges live in sample folders that get
+        // reorganised, and an error dialog at launch about a file somebody
+        // loaded weeks ago is a worse outcome than quietly playing the built-in
+        // patch, which is what a fresh install plays anyway.
+        #[cfg(feature = "recorder")]
+        me.load_cartridge_at_launch();
+        me
     }
 }
 

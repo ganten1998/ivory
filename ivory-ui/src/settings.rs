@@ -424,6 +424,19 @@ pub struct Settings {
     /// Linear gain per slot. Linear because that is what the audio path
     /// multiplies by; the band converts to dB to draw.
     pub plugin_gains: [f64; crate::recorder::SLOTS],
+    /// The two effect knobs, 0..=1. Both off by default: a first launch has to
+    /// sound like the instrument, not like a room.
+    pub reverb_mix: f64,
+    pub delay_mix: f64,
+    /// The DX7 cartridge the built-in instrument last had loaded, if any.
+    ///
+    /// A path, and it may well not exist next launch: cartridges live in
+    /// people's sample folders and get moved. A missing one is not an error —
+    /// the built-in falls back to its own default patch, which always sounds.
+    pub dx7_cartridge: String,
+    /// Which of the cartridge's thirty-two patches, 0-based. Meaningless
+    /// without `dx7_cartridge`, and ignored when that does not load.
+    pub dx7_patch: usize,
     pub metronome_gain: f64,
     pub input_gain: f64,
     /// Transpose, in semitones, applied to every note the display and the
@@ -601,6 +614,10 @@ impl Default for Settings {
             record_buffer_frames: 0,
             plugin_slots: [const { None }; crate::recorder::SLOTS],
             plugin_gains: [1.0; crate::recorder::SLOTS],
+            reverb_mix: 0.0,
+            delay_mix: 0.0,
+            dx7_cartridge: String::new(),
+            dx7_patch: 0,
             metronome_gain: 0.5,
             input_gain: 1.0,
             transpose: 0,
@@ -1091,6 +1108,24 @@ impl Settings {
                 s.plugin_gains[0] = g;
             }
         }
+        for (key, dst) in [
+            ("reverb_mix", &mut s.reverb_mix),
+            ("delay_mix", &mut s.delay_mix),
+        ] {
+            if let Some(v) = map.shift_remove(key).and_then(|v| v.as_f64()) {
+                // Clamped on read: this multiplies into a feedback loop, and a
+                // NaN there is not a display glitch.
+                *dst = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+            }
+        }
+        if let Some(Value::String(path)) = map.shift_remove("dx7_cartridge") {
+            s.dx7_cartridge = path;
+        }
+        // Clamped on read, because it indexes a 32-element array the moment a
+        // cartridge loads.
+        if let Some(n) = map.shift_remove("dx7_patch").and_then(|v| v.as_u64()) {
+            s.dx7_patch = (n as usize).min(crate::dialogs::CARTRIDGE_VOICES - 1);
+        }
         // Gains are sanitised HERE rather than at the point of use, unlike the
         // tuning and the capo, because a NaN or a negative multiplied into an
         // audio buffer is not a display glitch — it is a burst of noise into
@@ -1507,6 +1542,16 @@ impl Settings {
                     .collect(),
             ),
         );
+        for (key, v) in [("reverb_mix", self.reverb_mix), ("delay_mix", self.delay_mix)] {
+            if let Some(n) = serde_json::Number::from_f64(v) {
+                map.insert(key.into(), Value::Number(n));
+            }
+        }
+        map.insert(
+            "dx7_cartridge".into(),
+            Value::String(self.dx7_cartridge.clone()),
+        );
+        map.insert("dx7_patch".into(), Value::Number(self.dx7_patch.into()));
         for (key, gain) in [
             ("metronome_gain", self.metronome_gain),
             ("input_gain", self.input_gain),
@@ -1785,6 +1830,8 @@ impl Settings {
             count_in_beats: self.count_in_beats(),
             count_in_bars: self.count_in_bars(),
             time_signature: self.time_signature(),
+            reverb: self.reverb_mix as f32,
+            delay: self.delay_mix as f32,
         }
     }
 
@@ -2184,6 +2231,10 @@ mod tests {
         s.dark_mode = true;
         s.window_size_percent = 150;
         s.fretboard_tuning = "DADGAD".to_owned();
+        s.dx7_cartridge = "/Users/x/Sysex/ROM1A.syx".to_owned();
+        s.reverb_mix = 0.35;
+        s.delay_mix = 0.2;
+        s.dx7_patch = 12;
         s.extra.insert(
             "a_key_from_a_later_build".into(),
             Value::String("kept".into()),

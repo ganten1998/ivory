@@ -10,14 +10,14 @@
 /// not, so it does not care which renderer the app is drawing with.
 #[cfg(feature = "recorder")]
 mod composite;
-/// The instrument the app has when it has no instrument, so a fresh install
-/// makes a sound. Pure synthesis, no data, no licence questions.
-#[cfg(feature = "recorder")]
-mod builtin;
-/// Six-operator FM, reading real DX7 cartridges. The instrument the built-in
-/// grows into.
+/// Six-operator FM, and real DX7 cartridges to feed it. The instrument the app
+/// has when it has no instrument, so a fresh install makes a sound. The default
+/// patch is written in the source: no samples, no data, no licence questions.
 #[cfg(feature = "recorder")]
 mod dx7;
+/// Reverb and delay, on everything the app plays.
+#[cfg(feature = "recorder")]
+mod effects;
 mod desktop;
 #[cfg(feature = "recorder")]
 mod devices;

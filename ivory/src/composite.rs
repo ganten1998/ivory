@@ -846,3 +846,124 @@ mod tests {
         assert_eq!(once, twice, "two frames of an unchanged app differ");
     }
 }
+
+#[cfg(test)]
+mod shot {
+    use super::*;
+
+    /// Render the whole window offscreen to a PNG, for a person to look at.
+    ///
+    ///   IVORY_SHOT=/tmp/x.png cargo test -p ivory --bins shot::window \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore = "writes a picture for a person to look at"]
+    fn window() {
+        let Ok(out) = std::env::var("IVORY_SHOT") else {
+            eprintln!("IVORY_SHOT not set");
+            return;
+        };
+        let (w, h) = (1600u32, 900u32);
+        let mut c = match Compositor::standalone(w, h) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("no GPU here: {e}");
+                return;
+            }
+        };
+        let mut settings = ivory_ui::settings::Settings::default();
+        settings.show_recorder = true;
+        settings.reverb_mix = 0.42;
+        settings.delay_mix = 0.18;
+        settings.metronome_gain = 0.5;
+        settings.input_gain = 1.0;
+        settings.plugin_slots[0] = Some(ivory_ui::dialogs::BUILTIN_PATH.to_owned());
+        let app = IvoryApp::new(c.context(), settings, ivory_ui::host::Caps::DESKTOP);
+        // Two frames: the first lays out and the second draws what it decided.
+        for _ in 0..2 {
+            if let Err(e) = c.frame(&app, Layout::default(), DisplayShows::default(), false, true, None) {
+                eprintln!("frame: {e}");
+                return;
+            }
+        }
+        let Some(px) = c.last_frame() else {
+            eprintln!("nothing came back");
+            return;
+        };
+        // Only the top of the frame when asked, because the band is a tenth of
+        // a 900-row window and every crop tool on this machine measures its
+        // offset from somewhere different.
+        let rows = std::env::var("IVORY_SHOT_ROWS")
+            .ok()
+            .and_then(|r| r.parse::<u32>().ok())
+            .unwrap_or(h)
+            .min(h);
+        write_png(
+            std::path::Path::new(&out),
+            &px[..(rows * w * 4) as usize],
+            w,
+            rows,
+        );
+        println!("wrote {out} ({rows} rows)");
+    }
+
+    /// A minimal RGBA PNG, so this needs no image crate.
+    fn write_png(path: &std::path::Path, rgba: &[u8], w: u32, h: u32) {
+        fn crc(bytes: &[u8]) -> u32 {
+            let mut c = 0xffff_ffffu32;
+            for b in bytes {
+                c ^= u32::from(*b);
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            !c
+        }
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc(&body).to_be_bytes());
+        }
+        // Stored (uncompressed) deflate blocks inside a zlib wrapper.
+        fn zlib_stored(raw: &[u8]) -> Vec<u8> {
+            let mut z = vec![0x78, 0x01];
+            let mut a = 1u32;
+            let mut b = 0u32;
+            for byte in raw {
+                a = (a + u32::from(*byte)) % 65521;
+                b = (b + a) % 65521;
+            }
+            for (i, part) in raw.chunks(65_535).enumerate() {
+                let last = u8::from((i + 1) * 65_535 >= raw.len());
+                z.push(last);
+                z.extend_from_slice(&(part.len() as u16).to_le_bytes());
+                z.extend_from_slice(&(!(part.len() as u16)).to_le_bytes());
+                z.extend_from_slice(part);
+            }
+            z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+            z
+        }
+        // **The readback is BGRA**, which is the surface format, and a PNG is
+        // RGBA. Writing it straight out gives a picture with the red and blue
+        // channels swapped — tan panels come out pale blue, which is subtle
+        // enough to read as a theme rather than a bug.
+        let mut raw = Vec::with_capacity((w * h * 4 + h) as usize);
+        for y in 0..h as usize {
+            raw.push(0);
+            let at = y * w as usize * 4;
+            for px in rgba[at..at + w as usize * 4].chunks_exact(4) {
+                raw.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        }
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        chunk(&mut png, b"IHDR", &ihdr);
+        chunk(&mut png, b"IDAT", &zlib_stored(&raw));
+        chunk(&mut png, b"IEND", &[]);
+        std::fs::write(path, png).expect("write the png");
+    }
+}
