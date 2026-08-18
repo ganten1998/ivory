@@ -1,107 +1,96 @@
 # Tangent 5.0 feature list
 
-Written to be lifted from. The short list is for a store page or a post; the
-long list is the reference, grouped the way somebody deciding whether to
-download it would want to read it.
+Written to be lifted from. Grouped by what somebody would be trying to DO,
+because that is how the app is now: a monitor is a thing you glance at, and
+Tangent is a thing you teach a lesson on or record a take with.
 
 Everything here is in the free build. There are no paid features.
 
 ---
 
-## The short list
+## In one sentence
 
-- Names what you play in real time, from plain triads to altered dominants,
-  rootless voicings, slash chords and scales
-- Engraves it on a staff: six clefs, all fifteen key signatures, correct
-  accidental spelling, `8va`, letter names in the noteheads
-- Names the runners-up too, so "C6, or Am7" instead of one answer to a question
-  that has two
-- Shows the same notes on a guitar neck, a circle of fifths and a Tonnetz
-- Records a take as `.wav`, `.mid` and a composited `.mp4` of the window itself
-- Runs in your DAW as a VST3 monitor
-- Works offline, with no account and no telemetry
-- macOS, Windows and Linux
-- Free, with nothing locked
+Play a MIDI keyboard, and Tangent names the chord, engraves it, explains it
+three ways, and records the whole window as a video with your camera already in
+it.
+
+## In three bullets
+
+- **See it.** All 88 keys, the chord named with its runners-up, sheet music in
+  six clefs, and three theory diagrams that show why it works.
+- **Teach from it.** Several clefs at once with every staff showing every note,
+  panels you rearrange with the number keys mid-lesson, and chord names you can
+  teach it yourself.
+- **Record it.** One press gives you the audio, the MIDI, and an `.mp4` of the
+  window itself, camera included, at 16:9, with no scene to build.
 
 ---
 
-## The long list
+## For teaching
 
-### Reading what you play
-
-- **All 88 keys**, drawn in real time from any MIDI keyboard.
-- **Chord detection** by weighted scoring rather than lookup: triads, sevenths,
-  extensions, alterations, suspensions, rootless jazz voicings, slash chords
-  and scales.
+- **Several clefs at once, every staff showing every note.** A violist and a
+  cellist read the same chord in their own clefs, side by side, from one
+  keyboard. Six are available: treble, bass, alto, tenor, and the octave-down
+  treble and bass that a guitarist and a double bassist actually read.
+- **Notation that is actually correct.** All fifteen key signatures, and
+  accidentals spelled for the key you are in, so an E flat is an E flat and not
+  a D sharp. `8va` and `8vb` when the notes go past what ledger lines can say.
+- **Letter names inside the noteheads**, on by default, off with `U` once they
+  are not needed any more.
 - **The runners-up, named.** The readout carries the winner and the next two
-  best matches.
+  best matches, so a student sees that C6 and Am7 are the same four notes. That
+  is a lesson, not a limitation.
+- **Three ways of showing why.** The circle of fifths with each key shaded by
+  how much of what you are playing fits it; a Tonnetz where left to right is
+  fifths and the diagonals are thirds, with triads lit as triangles; harmonic
+  triangles with I, IV and V pointing up and i, iv and v inverted.
+- **Rearrange the board mid-lesson.** `1` to `4` toggle the four theory panels.
+  Pressing a number for a panel that is already up moves it to the end, so the
+  same four keys choose what is showing and where it sits. All four off
+  collapses the band and gives the height back to the keyboard.
+- **A guitar neck** for a mixed-instrument class: real fingerings, playable as
+  an input, with barres, a capo and every shipped tuning plus your own.
 - **Teach it your own names.** Hold a voicing, name it, and it is yours from
   then on. Corrections are learnable too.
-- **Transpose** the readout without moving your hands.
 - **Sharps or flats**, your choice, everywhere at once.
+- **No account, no wifi.** It is entirely offline, which matters in a room with
+  a school network.
 
-### Sheet music
-
-- **Six clefs**: treble, bass, alto, tenor, and the octave-down treble and bass
-  that a guitarist and a double bassist actually read.
-- **All fifteen key signatures**, from the staff's own right-click menu.
-- **Correct spelling for the key you are in**, so an E flat is an E flat and
-  not a D sharp.
-- **`8va` and `8vb`** when the notes climb or fall further than ledger lines
-  can be counted.
-- **Letter names inside the noteheads**, on by default, off with `U`.
-- **Several clefs at once.** Stack as many as you like and every staff shows
-  every note: a violist and a cellist read the same chord in their own clefs,
-  side by side, from one keyboard.
-- **Noteheads that never overlap**, including seconds and augmented unisons.
-
-### The theory band
-
-- **Four panels**: circle of fifths, Tonnetz, harmonic triangles, sheet music.
-- **`1` to `4` arrange them.** A number toggles its panel; pressing it for a
-  panel that is already showing moves that panel to the end. Turn all four off
-  and the band collapses and gives the height back to the keyboard.
-- **Circle of fifths** with each key shaded by how much of what you are playing
-  fits it.
-- **Tonnetz**, the lattice where left to right is fifths and the diagonals are
-  thirds, with your triads lit as triangles.
-- **Harmonic triangles**, I, IV and V pointing up with i, iv and v inverted.
-- **Follows MIDI** by default, so the diagrams track what you play.
-
-### The guitar neck
-
-- **Real fingerings**, where a player would actually put their fingers, not
-  wherever the notes happen to fall.
-- **Playable as an input.** Click the neck to place notes and read the chord
-  off the piano above.
-- **Barres**, laid by holding and dragging along a fret.
-- **Every shipped tuning**, plus your own, plus a capo.
-
-### Recording
+## For recording and performing
 
 - **A take is the window.** The `.mp4` is the same panels in the same places at
   the same sizes, with your camera where the window already puts it. There is
-  no separate video layout to keep in your head, because there is not one.
+  no scene to build, no overlay to align and no second layout to keep in step
+  with the first. What you were looking at is what your audience sees.
 - **16:9**, so a take needs neither letterbox nor crop.
-- **`.wav`, `.mid` and `.mp4`** from one press.
-- **Five VST3 instrument slots**, each with its own level and its own window.
-- **A transport**: record, stop, a pair of VU meters, and metronome and input
-  faders you can reach while your hands are busy.
-- **Count-in** in any time signature including 6/8, in or out of the file.
-- **A settings panel** behind the cog for where takes go, the camera, the audio
-  input, the count-in, the export and what happens when a take finishes.
+- **One press, three files**: `.wav`, `.mid` and `.mp4`.
+- **The MIDI is real MIDI**, so a take can be re-rendered with a different
+  instrument, notated, or edited long after the video exists.
+- **Five VST3 instrument slots**, each with its own level and its own editor
+  window, so the sound in the recording is your instrument.
+- **A transport you can use while playing**: record and stop, a pair of VU
+  meters, and metronome and input faders within reach of a hand that is busy.
+- **A count-in** in any time signature including 6/8, kept out of the file or
+  recorded into it.
+- **A take-settings panel** behind the cog: where takes go, the camera, the
+  audio input, the count-in, the export, and what happens when a take finishes.
 - Video export is macOS only for now. On Windows and Linux a take still writes
   its audio and MIDI, and says so rather than failing quietly.
 
-### In your DAW
+## For playing
 
-- **VST3 plugin** with the same display, on a MIDI or instrument track.
-- **Makes no sound.** It is a monitor, not an instrument.
+- **All 88 keys** in real time from any MIDI keyboard.
+- **Chord detection by weighted scoring** rather than lookup: triads, sevenths,
+  extensions, alterations, suspensions, rootless jazz voicings, slash chords
+  and scales.
+- **Transpose the readout** without moving your hands.
+- **Click to place notes** on the piano, the neck or the diagrams, so you can
+  work something out without an instrument in front of you.
+- **Runs in your DAW.** VST3 plugin with the same display, on a MIDI or
+  instrument track. It makes no sound; it is a monitor.
 
-### The app itself
+## The app itself
 
-- **Offline.** No account, no telemetry, nothing phoned home. It works on a
-  plane.
 - **Dark mode**, and every colour in it is yours to set.
 - **Three bundled typefaces**, cycled with `F`.
 - **Panels you can tear off** into their own windows.
@@ -109,3 +98,7 @@ Everything here is in the free build. There are no paid features.
 - **macOS 11+** (Apple Silicon and Intel, signed and notarized), **Windows
   10+**, **Linux** (glibc 2.32+, ALSA, Wayland or X11).
 - **MIT licensed.** Rebuild it, modify it, redistribute it.
+- **Free, with nothing locked.** No trial, no watermark, no export limit. A
+  supporter key gates no feature; what it does is put you on the list that
+  hears about new versions, and in front of whatever gets made for supporters
+  later.

@@ -28,7 +28,7 @@ The draft assumes the first.
 
 ---
 
-**Subject:** Tangent 5.0 is in beta, and it records the window
+**Subject:** Tangent 5.0 is in beta: it writes the music down and records the room
 
 ---
 
@@ -38,45 +38,54 @@ Tangent 5.0 is in beta. Your supporter key still works: keys have no expiry and
 cover every version, including this one.
 
 **This is a beta on purpose.** It is signed and notarized, it is the build I
-use every day, and 5.0 changes the two things you look at most. So it goes out
-marked as one, and the ordinary download links on the website still point at
-the last finished release. The links below are for this beta specifically.
+use every day, and 5.0 changes what the app is for. So it goes out marked as
+one, and the ordinary download links still point at the last finished release.
+The links below are for this beta specifically.
 
-**It writes music now.** There is a sheet music panel: what you are playing,
+**Tangent is not a MIDI monitor any more.** That is the honest summary of this
+release. Two things did it.
+
+**It writes music down.** There is a sheet music panel: what you are playing,
 engraved properly. Six clefs (treble, bass, alto, tenor, and the octave-down
 treble and bass a guitarist and a double bassist actually read), all fifteen
 key signatures, accidentals spelled correctly for the key you are in, and `8va`
 when the notes climb further than ledger lines can be counted. Letter names sit
-inside the noteheads by default, so it is readable on day one.
+inside the noteheads by default.
 
-**Stack as many clefs as you like, and every staff shows every note.** A
-violist and a cellist can read the same chord in their own clefs, side by side,
-from one keyboard. That is a teaching view, and it is the reason the panel
-exists.
-
-**The chord name moved onto the staff, and it names the runners-up.** Not just
-"C6" but "C6, or Am7". A chord that is two things at once is a fact about
-harmony, and being told only one of them has always been the least honest part
-of this app.
-
-**The number keys arrange the display.** The theory band is four panels (circle
-of fifths, Tonnetz, harmonic triangles, sheet music) and `1` to `4` toggle
-them. Press a number for a panel that is already showing and it moves to the
-end, so the same four keys both choose what is up and put it where you want it.
-Turn all four off and the band collapses and gives the height back to the keys.
+Put several clefs up at once and every staff shows every note. A violist and a
+cellist read the same chord in their own clefs, side by side, off one keyboard.
+That is a teaching view, and it is the reason the panel exists. The chord name
+sits on the staff and names the runners-up too: not just "C6" but "C6, or Am7",
+because a chord that is two things at once is a fact worth showing a student
+rather than hiding from them.
 
 **And a take is now simply the window.** This is the change 5.0 is named for. A
 take used to be an arrangement of its own: the app's panels fitted into one
 pane, your camera composited into another, and a layout picker deciding which
 floated over which. That was a second design of the same picture, and the two
-disagreed with each other. Now the video is the window. The same panels in the
-same places at the same sizes, with your camera where the window already puts
-it. What you were looking at is what the file contains. The window is 16:9
-while the usual panels are up, so nothing is letterboxed or cropped.
+disagreed with each other.
 
-The recorder is a transport again, with the take's settings behind a cog:
-record and stop, a pair of VU meters, metronome and input faders you can reach
-while your hands are busy, and five instrument slots instead of three.
+Now the video is the window. The same panels in the same places at the same
+sizes, with your camera where the window already puts it, at 16:9 with no crop.
+There is no scene to build, no overlay to align and nothing to keep in step
+with anything else. One press writes the audio, the MIDI and the `.mp4`.
+
+Put those together and the app does something it could not do in 4.x: a lesson
+recorded while you give it, or a take with the theory visible in it, from one
+keypress. That is what I built the recorder for and it took until now to
+actually work the way it should have.
+
+The rest of the recorder grew up with it. The transport is a transport again,
+with the take's settings behind a cog: record and stop, a pair of VU meters,
+metronome and input faders you can reach while your hands are busy, and five
+VST3 instrument slots instead of three, so the sound in the video is your
+instrument.
+
+The theory band is four panels now (circle of fifths, Tonnetz, harmonic
+triangles, sheet music) and `1` to `4` toggle them. Press a number for a panel
+that is already showing and it moves to the end, so the same four keys both
+choose what is up and put it where you want it. That is meant to be used
+mid-lesson.
 
 **One thing worth saying plainly.** There is nothing behind a supporter key in
 this build. The heart that used to be the one thing a key switched on is drawn
@@ -89,6 +98,9 @@ the chords you have taught it, your colours, your tunings. Your settings carry
 over. One thing will look different on purpose: the chord strip under the
 theory band is off, because the sheet music carries the chord name itself.
 Right-click and choose Show Chord Strip if you want it back.
+
+Video export is still macOS only. On Windows and Linux a take writes its audio
+and its MIDI and says so, rather than failing quietly.
 
   macOS 11 or later, Apple Silicon and Intel
   https://github.com/ganten1998/ivory/releases/download/v5.0.0-beta.1/Tangent-5.0.0-beta.1-macos-universal.dmg
@@ -123,12 +135,12 @@ sed -n '/^Hello,$/,/^Ganten$/p' \
   docs/release/5.0/RELEASE-EMAIL-5.0.0-beta.1.md > /tmp/body.txt
 
 cd tools/ivory-fulfil                                        # 2. DRY RUN first
-cargo run -- announce --subject "Tangent 5.0 is in beta, and it records the window" \
+cargo run -- announce --subject "Tangent 5.0 is in beta: it writes the music down and records the room" \
   --body /tmp/body.txt --ledger ~/ledger.jsonl
 
 RESEND_API_KEY=... MAIL_FROM='Tangent <keys@ivorymidi.com>' \
   REPLY_TO='ganten7@gmail.com' \
-  cargo run -- announce --subject "Tangent 5.0 is in beta, and it records the window" \
+  cargo run -- announce --subject "Tangent 5.0 is in beta: it writes the music down and records the room" \
     --body /tmp/body.txt --ledger ~/ledger.jsonl --send      # 3. and only then
 ```
 

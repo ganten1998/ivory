@@ -1,19 +1,35 @@
 # Tangent
 
-**See every note. Understand every chord.**
+**Play. Tangent writes it down, explains it, and hands you the video.**
 
 ### [⬇ Download](https://github.com/ganten1998/ivory/releases/latest) &nbsp;·&nbsp; [♥ Support Tangent](https://ganten.gumroad.com/l/ivory)
 
 ![Tangent naming a C major 13, with the circle of fifths, a Tonnetz and the harmonic triangles above it](docs/img/screenshot-theory.png)
 
-Tangent is a MIDI keyboard monitor with advanced chord detection. Plug in a MIDI
-keyboard and Tangent renders all 88 keys (A0 to C8) in real time while a
-weighted-scoring chord engine names what you are playing, from plain triads to
-altered dominants, rootless jazz voicings, slash chords, and scales.
+Plug in a MIDI keyboard and play. Tangent renders all 88 keys (A0 to C8) in real
+time while a weighted-scoring chord engine names what you are playing, from
+plain triads to altered dominants, rootless jazz voicings, slash chords, and
+scales. It **engraves it on a staff**, shows you the same notes **on a guitar
+neck** where a player would actually put their fingers, and **as geometry**: on
+the circle of fifths, on a Tonnetz, and as the I-IV-V triangles.
 
-It also shows you the same notes **on a guitar neck**, where a player would
-actually put their fingers, and **as geometry**: on the circle of fifths, on a
-Tonnetz, and as the I-IV-V triangles.
+Then it records the whole thing. That combination is what Tangent is for, and
+it makes it two things.
+
+**A teaching tool.** Everything a student needs is on screen at once and in one
+another's terms: the notes under your hands, the name of what they make, the
+notation for it, and the geometry that explains why it sounds like that. Put
+several clefs up at the same time and every staff shows every note, so a
+violist and a cellist read the same chord in their own clefs, side by side, off
+one keyboard. The number keys rearrange the panels mid-lesson. Teach it a chord
+name it does not know and it is yours from then on.
+
+**A recording tool.** One press writes a `.wav`, a `.mid` and a composited
+`.mp4`, and the video **is the window**: the same panels in the same places,
+with your camera already placed in it, at 16:9. There is no scene to build, no
+overlay to align, no second layout to keep in step with the first. What you
+were looking at is what your audience sees. Video export is macOS only for now;
+elsewhere a take still writes its audio and MIDI and says so.
 
 ![Tangent in dark mode naming an altered dominant, on an ebony fingerboard](docs/img/screenshot-dark-alt.png)
 
