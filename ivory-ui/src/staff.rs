@@ -67,7 +67,15 @@ const STAFF_SPACES: f32 = 4.0;
 /// budgeting only for where its baseline sits paints the top half of every
 /// `8va` outside the rect the band was measured for — over whatever is above
 /// it, which in the theory band is the panel's own title.
-const OUTER_SPACES: f32 = 5.2;
+const OUTER_SPACES: f32 = 4.5;
+
+/// How far the octave sign sits beyond the notes it covers, in half-spaces.
+///
+/// Two, not three. It is the difference between a staff whose visible lines
+/// are half its band and one where they are more than half: the reserve above
+/// the top staff is the sign's distance plus its glyph, and every half-space
+/// of it is height the music does not get.
+const OCTAVE_SIGN_GAP: i32 = 2;
 
 /// The gap BETWEEN two staves of a grand staff.
 ///
@@ -784,6 +792,17 @@ pub struct Readout<'a> {
 /// any amount of idle headroom.
 const READOUT_FRACTION: f32 = 0.20;
 
+/// The name's box beside the staff, and the gap before it, in staff spaces.
+///
+/// In spaces, so the name is proportionate to the music. Sized to the gutter
+/// instead, it grew to a hundred points beside a staff a fifth of that: a
+/// chord symbol is a label on the music, not a headline over it.
+const NAME_BOX_SPACES: f32 = 13.0;
+const NAME_GAP_SPACES: f32 = 1.5;
+
+/// The tallest the winning name may be drawn, in staff spaces.
+const NAME_CAP_SPACES: f32 = 2.6;
+
 
 /// Draw the band. `readout` is `None` when chord detection is off entirely —
 /// only then does the staff take the whole rect.
@@ -867,7 +886,18 @@ pub fn draw(
     // top edge with the slack all underneath.
     let used_w = space * w_spaces;
     let used_h = space * spaces;
-    let left = staff_rect.left() + (staff_rect.width() - used_w) * 0.5;
+    // **In a wide panel the staff and the name are one block, centred.** The
+    // name sits to the RIGHT of the music, in a box reserved whether or not
+    // anything is sounding, so the staff does not shuffle sideways every time
+    // a chord starts. The box is sized in staff spaces like everything else,
+    // which is what keeps the name proportionate to the music rather than
+    // swollen to fill whatever gutter happened to be left over.
+    let name_box = if wide && readout.is_some() {
+        space * (NAME_BOX_SPACES + NAME_GAP_SPACES)
+    } else {
+        0.0
+    };
+    let left = staff_rect.left() + (staff_rect.width() - used_w - name_box) * 0.5;
     let top = staff_rect.top() + (staff_rect.height() - used_h) * 0.5;
     // A margin that grows with the staff rather than with the window, so the
     // clef sits the same distance from the edge at every size.
@@ -883,8 +913,11 @@ pub fn draw(
     if let Some(r) = readout {
         let strip = if wide {
             Rect::from_min_max(
-                Pos2::new(rect.left() + space, rect.top()),
-                Pos2::new(left - space, rect.bottom()),
+                Pos2::new(left + used_w + space * NAME_GAP_SPACES, rect.top()),
+                Pos2::new(
+                    left + used_w + space * (NAME_GAP_SPACES + NAME_BOX_SPACES),
+                    rect.bottom(),
+                ),
             )
         } else {
             Rect::from_min_max(
@@ -892,7 +925,10 @@ pub fn draw(
                 Pos2::new(rect.right(), staff_rect.top()),
             )
         };
-        draw_readout(painter, strip, r, &p);
+        // Never taller than a few staff spaces. The name is a label on the
+        // music; letting it fill its box put a hundred-point chord symbol
+        // beside a staff a fifth of that height.
+        draw_readout(painter, strip, r, space * NAME_CAP_SPACES, &p);
     }
 
     for (i, clef) in clefs.iter().enumerate() {
@@ -956,7 +992,7 @@ fn draw_brace(painter: &Painter, x: f32, top: f32, bottom: f32, space: f32, p: &
 /// two dimensions runs out first and centres the block, rather than placing
 /// each line at a fraction of the height — which spreads two lines to opposite
 /// ends of a tall gutter.
-fn draw_readout(painter: &Painter, strip: Rect, r: Readout<'_>, p: &Palette) {
+fn draw_readout(painter: &Painter, strip: Rect, r: Readout<'_>, cap: f32, p: &Palette) {
     if !strip.is_positive() {
         return;
     }
@@ -974,7 +1010,8 @@ fn draw_readout(painter: &Painter, strip: Rect, r: Readout<'_>, p: &Palette) {
     let stacked = if alts.is_some() { 1.9 } else { 1.15 };
     let main = fit(chord, strip.width())
         .min(alts.as_deref().map_or(f32::MAX, |a| fit(a, strip.width()) / 0.52))
-        .min(strip.height() / stacked);
+        .min(strip.height() / stacked)
+        .min(cap);
     if main < 5.0 {
         return;
     }
@@ -1195,9 +1232,9 @@ fn draw_octave_signs(
         // Clear of the notes it covers, and of the staff itself: above the
         // highest thing in the group, or below the lowest.
         let edge = if dir > 0 {
-            group.iter().map(|n| n.pos).max().unwrap_or(8).max(8) + 3
+            group.iter().map(|n| n.pos).max().unwrap_or(8).max(8) + OCTAVE_SIGN_GAP
         } else {
-            group.iter().map(|n| n.pos).min().unwrap_or(0).min(0) - 3
+            group.iter().map(|n| n.pos).min().unwrap_or(0).min(0) - OCTAVE_SIGN_GAP
         };
         let y = g.y(edge);
         let size = g.space * 1.15;
@@ -2123,7 +2160,7 @@ mod tests {
             // The sign's LINE, plus half its glyph: it is centre-anchored
             // text at 1.15 spaces, so the top of it reaches another 0.6 spaces
             // past where the dashes are.
-            let reach = (8 + OCTAVE_AT * 2 + 3) as f32 * 0.5 - STAFF_SPACES + 1.15 * 0.5;
+            let reach = (8 + OCTAVE_AT * 2 + OCTAVE_SIGN_GAP) as f32 * 0.5 - STAFF_SPACES + 0.5;
             assert!(
                 OUTER_SPACES >= reach,
                 "a note at the top of its range and its 8va need {reach} spaces, not {OUTER_SPACES}"

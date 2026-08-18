@@ -865,7 +865,17 @@ impl ChordDetector {
             if score > *e { *e = score; }
         }
         let mut candidates: Vec<(String, f64)> = seen.into_iter().collect();
-        candidates.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // **Score first, then NAME.** Sorting on the score alone is not a total
+        // order: `seen` is a HashMap, so equal-scoring candidates arrive in a
+        // different order on every call, and an unstable sort then leaves them
+        // in a different order on every call. Nothing changed on the keyboard
+        // and the alternates shuffled several times a second. The name is an
+        // arbitrary tie-break, and arbitrary is fine; unstable is not.
+        candidates.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         candidates.truncate(top_n);
         self.debug_mode = false;
         if candidates.is_empty() {
