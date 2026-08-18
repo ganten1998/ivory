@@ -14,6 +14,10 @@ mod composite;
 /// makes a sound. Pure synthesis, no data, no licence questions.
 #[cfg(feature = "recorder")]
 mod builtin;
+/// Six-operator FM, reading real DX7 cartridges. The instrument the built-in
+/// grows into.
+#[cfg(feature = "recorder")]
+mod dx7;
 mod desktop;
 #[cfg(feature = "recorder")]
 mod devices;
