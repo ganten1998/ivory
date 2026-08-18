@@ -10,6 +10,32 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+## [4.5.0] - 2026-08-18
+
+Tangent makes a sound out of the box, and you can hear what you are looking at.
+
+### Added
+
+- **A built-in instrument.** Out of the box the app drew a piano and made no
+  sound: every note it could name, engrave and place on a fretboard was silent
+  until a VST3 was found, installed and loaded. There is now a tine electric
+  piano behind it, and it plays whenever no plugin is loaded. It is synthesised
+  rather than sampled, which costs no bytes at all, ships on every platform,
+  cannot be missing, and raises no question about what may be redistributed. It
+  steps aside the moment a real instrument is loaded.
+- **Space sounds what is highlighted.** Notes toggled onto the neck, placed on
+  the circle of fifths, or arriving from a keyboard are the same notes by the
+  time they are drawn, and "play what I can see" is the only rule worth
+  remembering. Space still stops a take while one is rolling, which is what
+  every DAW has already trained into the key; the rest of the time "stop" means
+  nothing.
+- **Clicking a key or a fret sounds it** when keytoggle is off, and lets it go.
+  It used to do nothing at all, which is the wrong answer for a picture of a
+  piano.
+- **Letter names on the keys and on the neck's dots**, off by default, one menu
+  row each. They are a beginner's stickers: the fastest way to learn where the
+  notes are and clutter the moment you have.
+
 ## [4.4.1] - 2026-08-18
 
 A Linux fix release; the macOS and Windows builds are unchanged. Found by

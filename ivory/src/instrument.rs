@@ -1139,6 +1139,12 @@ struct Renderer {
     /// belongs to a later block lives here rather than being pushed back.
     pending: Option<MidiEvent>,
     notes: Vec<Note>,
+    /// The instrument this app has when it has no instrument.
+    ///
+    /// Rendered only when every slot is empty, so it is the sound of a fresh
+    /// install and steps aside the moment a real plugin is loaded. See
+    /// `builtin.rs` for why it is synthesised rather than sampled.
+    builtin: crate::builtin::Builtin,
     /// Control changes for this block — the sustain pedal, above all.
     ///
     /// Preallocated beside `notes` and for the same reason: `process` runs on
@@ -1365,6 +1371,7 @@ impl Renderer {
 
             let widths = self.render_slots(n);
             self.sum_slots(n, &widths, &slot_targets);
+            self.render_builtin(n, &widths);
 
             for i in 0..n {
                 let frame_index = done + i;
@@ -1455,6 +1462,46 @@ impl Renderer {
     /// Every slot is handed the *same* `&self.notes` and `&self.controls`. That
     /// is the layering invariant in one line, and it only holds because the
     /// queue was drained into those two lists before this was called.
+    /// The built-in instrument, over the bus, when nothing else is playing it.
+    ///
+    /// **Only when every slot is empty.** It is a fallback, not a layer: a
+    /// piano underneath somebody's own instrument would be a bug they could
+    /// not switch off, and the moment they load one the app has the sound they
+    /// chose. `widths` is what actually rendered this block, which is the
+    /// honest test — a slot holding a faulted plugin is an empty slot as far as
+    /// the bus is concerned.
+    fn render_builtin(&mut self, frames: usize, widths: &[usize; SLOTS]) {
+        if widths.iter().any(|w| *w > 0) {
+            // Something real is playing. Keep the built-in silent AND clear, so
+            // unloading a plugin mid-note does not resurrect a stale one.
+            if self.builtin.active() {
+                self.builtin.all_notes_off();
+            }
+            return;
+        }
+        for n in &self.notes {
+            if n.on {
+                self.builtin.note_on(n.pitch, n.velocity);
+            } else {
+                self.builtin.note_off(n.pitch);
+            }
+        }
+        // CC 64 is the damper. Half scale is the switch point every synth
+        // uses, and it is what a half-pedalled continuous controller means.
+        for c in &self.controls {
+            if c.controller == 64 {
+                self.builtin.set_pedal(c.value >= 64);
+            }
+        }
+        if !self.builtin.active() {
+            return;
+        }
+        let Some(mix) = self.mix.get_mut(..frames * TAP_CHANNELS) else {
+            return;
+        };
+        self.builtin.render(mix, frames, TAP_CHANNELS);
+    }
+
     fn render_slots(&mut self, frames: usize) -> [usize; SLOTS] {
         let notes = &self.notes;
         let controls = &self.controls;
@@ -1909,6 +1956,7 @@ impl Engine {
             midi: midi_rx,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
+            builtin: crate::builtin::Builtin::new(rate as f32),
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
             tap: tap_tx,
             tap_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
@@ -4082,6 +4130,7 @@ mod tests {
             midi,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
+            builtin: crate::builtin::Builtin::new(RATE as f32),
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
             tap,
             tap_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
@@ -4118,6 +4167,36 @@ mod tests {
             data2: bytes[2],
         })
         .expect("the test ring is large enough");
+    }
+
+    /// **A fresh install makes a sound.**
+    ///
+    /// The whole point of the built-in: no plugin loaded, a note arrives, and
+    /// audio comes out of the device. Asserted through the real renderer and
+    /// not the synth's own unit tests, because the wiring is what was missing
+    /// for every release before this one, not the DSP.
+    #[test]
+    fn a_note_sounds_with_no_plugin_loaded_at_all() {
+        let (mut r, mut tx, _) = renderer_with_midi(2);
+        let mut out = vec![0.0_f32; 2 * 2048];
+
+        // Silence before anything is played, which is what makes the assertion
+        // below mean something.
+        r.render(&mut out, 0, 0);
+        assert!(
+            out.iter().all(|s| *s == 0.0),
+            "the device was not silent before a note"
+        );
+
+        queue(&mut tx, 0, [0x90, 60, 100]);
+        let mut heard = vec![0.0_f32; 2 * 2048];
+        r.render(&mut heard, 0, 0);
+        let peak = heard.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(
+            peak > 0.01,
+            "a note with no plugin loaded produced {peak}, which is silence"
+        );
+        assert!(peak <= 1.0, "the built-in clipped the device at {peak}");
     }
 
     #[test]

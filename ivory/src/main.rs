@@ -10,6 +10,10 @@
 /// not, so it does not care which renderer the app is drawing with.
 #[cfg(feature = "recorder")]
 mod composite;
+/// The instrument the app has when it has no instrument, so a fresh install
+/// makes a sound. Pure synthesis, no data, no licence questions.
+#[cfg(feature = "recorder")]
+mod builtin;
 mod desktop;
 #[cfg(feature = "recorder")]
 mod devices;
