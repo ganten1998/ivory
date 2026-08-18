@@ -77,7 +77,9 @@ pub fn draw(painter: &Painter, rect: Rect, fade: f32) {
     // courtesy, not an announcement — and floored where the circles would
     // collapse into unreadable dots, at which point the lattice is not drawn
     // at all rather than drawn as a smudge.
-    let a = (rect.width() * 0.13).min(rect.height() * 0.22).min(72.0);
+    // Smaller than the first cut: at 13% of the width the logo was an
+    // announcement, and a splash is a courtesy. This is the whole change.
+    let a = (rect.width() * 0.09).min(rect.height() * 0.155).min(50.0);
     if a < 18.0 {
         return;
     }

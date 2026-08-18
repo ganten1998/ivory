@@ -91,6 +91,29 @@ const SCORE_GAP: f32 = 7.0;
 /// staff drawn at any size looks like the same staff.
 const SPACE_AT_1300: f64 = 7.5;
 
+/// How wide a staff needs to be, in staff spaces.
+///
+/// **Content, not the cell.** The clef, then the key signature — which is why
+/// this takes the key and is not a constant: seven flats are five spaces of
+/// accidentals that have to go somewhere — then the gap before the music, the
+/// widest chord this band draws, and a short tail so the last notehead is not
+/// against the end bar.
+///
+/// The chord allowance is three notehead columns plus three accidental
+/// columns, which is the worst case `Column::place` can produce for a hand-sized
+/// chord: a chromatic cluster with an accidental on every note.
+fn staff_w_spaces(key: i32) -> f32 {
+    let clef = 3.6;
+    let n = key.unsigned_abs().min(MAX_KEY as u32) as f32;
+    let sig = if n == 0.0 {
+        0.0
+    } else {
+        n * if key > 0 { 0.95 } else { 0.78 } + 0.95
+    };
+    let chord = 3.0 * 1.05 + 3.0 * OFFSET_STEP + 1.5;
+    clef + sig + 1.6 + chord + 2.5
+}
+
 /// The band's whole height in staff spaces, which is the one place the vertical
 /// arrangement is decided. The painter reads it back to recover the space size,
 /// so the drawing cannot disagree with the height the window was sized to.
@@ -803,17 +826,37 @@ pub fn draw(
     let per_staff = distribute(&set, &spelled);
 
     let spaces = total_spaces(clefs.len(), set.splits());
-    let space = (rect.height() / spaces).max(1.0);
+    // **The staff is as wide as what is ON it, and centred.** It used to run
+    // the full width of its cell, which put the chord in the first fifth and
+    // left four fifths of ruled emptiness after it — a page waiting for music
+    // that is never coming, since this band shows one chord at a time.
+    //
+    // Sized in SPACES, so the whole drawing scales as one thing: the width
+    // needed for the clef, the key signature (which is why this is not a
+    // constant), the chord, and a short tail after it. See `staff_w_spaces`.
+    let w_spaces = staff_w_spaces(s.staff_key);
+    // Whichever budget runs out first. The height decides in a wide cell; the
+    // WIDTH decides in a narrow one, and that is what stops a seven-flat
+    // signature being engraved over its own clef in a cell too small for it.
+    let space = (rect.height() / spaces)
+        .min(rect.width() / w_spaces)
+        .max(1.0);
     let gap = if set.splits() { GRAND_GAP } else { SCORE_GAP };
+    // Centred horizontally in whatever is left over, and vertically too — with
+    // the width capped, a tall cell would otherwise hang the staves from the
+    // top edge with the slack all underneath.
+    let used_w = space * w_spaces;
+    let used_h = space * spaces;
+    let left = rect.left() + (rect.width() - used_w) * 0.5;
+    let top = rect.top() + (rect.height() - used_h) * 0.5;
     // A margin that grows with the staff rather than with the window, so the
     // clef sits the same distance from the edge at every size.
-    let margin = space * 2.2;
+    let margin = space * 1.1;
     // The bottom line of each staff, top to bottom. One list, so the brace and
     // the staves cannot end up in different places.
     let bottoms: Vec<f32> = (0..clefs.len())
         .map(|i| {
-            rect.top()
-                + space * (OUTER_SPACES + STAFF_SPACES + i as f32 * (STAFF_SPACES + gap))
+            top + space * (OUTER_SPACES + STAFF_SPACES + i as f32 * (STAFF_SPACES + gap))
         })
         .collect();
 
@@ -821,8 +864,8 @@ pub fn draw(
         let g = Geometry {
             space,
             bottom: bottoms[i],
-            left: rect.left() + margin,
-            right: rect.right() - margin,
+            left: left + margin,
+            right: left + used_w - margin,
         };
         draw_staff(painter, g, *clef, &per_staff[i], s, &p);
     }
@@ -831,14 +874,14 @@ pub fn draw(
     // the grand staff: a stack of independent clefs is a score, and joining a
     // violist to a cellist with a piano brace would be saying something untrue.
     if set.splits() && clefs.len() == 2 {
-        let top = bottoms[0] - space * STAFF_SPACES;
+        let brace_top = bottoms[0] - space * STAFF_SPACES;
         let bottom = bottoms[1];
-        let left = rect.left() + margin;
-        let right = rect.right() - margin;
-        draw_brace(painter, left - space * 1.1, top, bottom, space, &p);
+        let left = left + margin;
+        let right = left + used_w - margin * 2.0;
+        draw_brace(painter, left - space * 1.1, brace_top, bottom, space, &p);
         for x in [left, right] {
             painter.line_segment(
-                [Pos2::new(x, top), Pos2::new(x, bottom)],
+                [Pos2::new(x, brace_top), Pos2::new(x, bottom)],
                 Stroke::new((space * 0.14).max(1.0), p.ink),
             );
         }
