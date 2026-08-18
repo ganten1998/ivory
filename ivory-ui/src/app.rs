@@ -1091,6 +1091,7 @@ impl IvoryApp {
             time_signature: self.settings.time_signature(),
             count_in_bars: self.settings.count_in_bars(),
             count_in_in_take: self.settings.record_count_in_in_take,
+            chord_strip: self.settings.show_chord_strip,
             recorder_first: self.menu_over_recorder && self.settings.show_recorder,
             staff_first: self.menu_over_staff,
             staff_key: self.settings.staff_key,
@@ -1113,6 +1114,28 @@ impl IvoryApp {
         }
     }
 
+    /// Raise the take-settings menu if the Setup button asked for it.
+    ///
+    /// **A method rather than five lines inline so it can be tested.** The
+    /// button's whole failure mode was a flag that nothing read — it set
+    /// `setup_menu_wanted` and the frame ended, so the one control that now
+    /// leads to every take setting did nothing at all, twice over: no menu and
+    /// no visible press either. Returns whether it opened one.
+    fn open_setup_menu_if_wanted(&mut self, ctx: &egui::Context, band: Rect) -> bool {
+        if !std::mem::take(&mut self.setup_menu_wanted) {
+            return false;
+        }
+        // Led by the Recorder's own categories, because that is what the
+        // button means: these are the take's settings, not the piano's.
+        self.menu_over_recorder = true;
+        self.menu_over_staff = false;
+        // Anchored on the BUTTON, not the pointer, so the list always hangs
+        // off the same corner however the button was hit.
+        let anchor = recorder_panel::setup_rect(band, &self.recorder_layout_view());
+        self.open_menu_at(ctx, self.main_inner_origin + anchor.center().to_vec2());
+        true
+    }
+
     fn open_menu_at(&mut self, ctx: &egui::Context, global_pos: Pos2) {
         self.menu_state = Some(MenuState::open(
             ctx,
@@ -1124,19 +1147,29 @@ impl IvoryApp {
 
     /// Colour of the supporter heart, or None when it should not be drawn.
     /// Derived every frame from the licence — never a cached flag.
+    /// The heart's colour IF the chord strip is the one drawing it.
+    ///
+    /// `None` whenever the recorder band is in the window, because that is
+    /// where the heart lives now — the strip is the fallback for the windows
+    /// that have no band, which is a recorder turned off and a recorder torn
+    /// off into its own window alike. The condition is `recorder_h > 0.0`'s,
+    /// and it is written out rather than derived so the two cannot drift.
+    fn strip_heart_color(&self) -> Option<egui::Color32> {
+        let band_in_window = self.settings.show_recorder && !self.settings.recorder_detached;
+        (!band_in_window).then(|| self.heart_color()).flatten()
+    }
+
     fn heart_color(&self) -> Option<egui::Color32> {
         if !self.settings.show_heart {
             return None;
         }
-        // **Always drawn, and quiet unless it has been paid for.** The heart is
-        // the way into the thanks card, and the people on that card are being
-        // thanked for the app existing rather than for anybody's purchase — so
+        // **Drawn for everybody, in the colour they chose.** The heart is the
+        // way into the thanks card, and the people on that card are being
+        // thanked for the app existing rather than for anybody's purchase, so
         // gating the credit behind a key would be a strange thing to do to
-        // them. A supporter gets the colour they chose; everybody else gets a
-        // heart the same weight as the rest of the chrome.
-        if !self.license.is_supporter() {
-            return Some(egui::Color32::from_rgb(0x4a, 0x45, 0x3c));
-        }
+        // them. It used to be dim for non-supporters and the licence check has
+        // been dropped outright: there is nothing behind a key at all, which
+        // is the point until 5.0 leaves beta.
         let n = chord_strip::HEART_COLORS.len() as i64;
         // rem_euclid so a hand-edited negative index still lands in range.
         let idx = self.settings.heart_color.rem_euclid(n) as usize;
@@ -1275,6 +1308,19 @@ impl IvoryApp {
                 // button has to work whether or not the user has turned on
                 // clicking the piano to place notes.
                 if let Some(r) = recorder_rect.filter(|r| r.contains(pos)) {
+                    // The heart takes the press before the band's own hit
+                    // test looks at it. It sits in a strip carved off the
+                    // instrument column, so the two can never contend — but
+                    // checking first is what keeps that true if the column
+                    // ever grows back into it.
+                    if self.heart_color().is_some()
+                        && recorder_panel::heart_rect(r, &self.recorder_layout_view())
+                            .contains(pos)
+                    {
+                        self.settings.heart_color = self.settings.heart_color.wrapping_add(1);
+                        self.save_settings();
+                        return;
+                    }
                     let hit = recorder_panel::hit_test(
                         r,
                         &self.recorder.view(
@@ -1315,6 +1361,14 @@ impl IvoryApp {
                             self.apply_recorder_hit(hit);
                         }
                     }
+                    // **Setup opens the menu, here, on the press that asked
+                    // for it.** The hit handler cannot: opening a menu needs
+                    // the context and an anchor, and it has neither, so it
+                    // sets a flag — and a flag nobody reads is a button that
+                    // does nothing, which is exactly how this one behaved.
+                    // Anchored on the button rather than the pointer so the
+                    // list always hangs off the same corner.
+                    self.open_setup_menu_if_wanted(ctx, r);
                     return;
                 }
                 // Clicking anywhere else also drops the field's focus, or the
@@ -1340,7 +1394,7 @@ impl IvoryApp {
                         }
                     }
                 }
-                if self.heart_color().is_some() {
+                if self.strip_heart_color().is_some() {
                     if let Some(cr) = chord_rect {
                         if chord_strip::heart_rect(cr).contains(pos) {
                             self.settings.heart_color = self
@@ -2642,6 +2696,10 @@ impl IvoryApp {
             // The take's settings that moved out of the band. Each one is the
             // SAME action the band's own hit produced, so the two can never
             // drift: one handler, two ways in.
+            MenuAction::ToggleChordStrip => {
+                self.settings.show_chord_strip = !self.settings.show_chord_strip;
+                self.save_settings();
+            }
             MenuAction::ChooseFolder => self.apply_recorder_hit(recorder_panel::Hit::ChooseFolder),
             MenuAction::RevealFolder => self.apply_recorder_hit(recorder_panel::Hit::RevealFolder),
             MenuAction::ToggleDefaultDir => {
@@ -3275,11 +3333,15 @@ fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
     // on screen it carries the chord name itself — winner and runners-up — and
     // one name in two places is two places for them to disagree. The detached
     // chord window is untouched: that one is an explicit choice.
+    // **The strip is a choice, not a consequence.** It used to switch itself
+    // off whenever the staff was in the theory band, on the argument that two
+    // places to read the chord name is one too many. That is true of the
+    // DEFAULT and false as a rule: piano plus strip and nothing else is the
+    // shape this app had for years, and some people want exactly that. So it
+    // is a setting, off by default, and the staff no longer overrules it.
     let chord_visible = settings.chord_detection_enabled
-        && !settings.chord_window_detached
-        && !settings
-            .theory_views()
-            .contains(crate::theory_panel::View::Staff);
+        && settings.show_chord_strip
+        && !settings.chord_window_detached;
     let chord_h = if chord_visible {
         (50.0 * w as f64 / 1300.0).trunc() as f32
     } else {
@@ -4016,6 +4078,8 @@ impl IvoryApp {
         };
         let piano_rect = band_at(recorder_h + theory_h + chord_h, piano_h);
         let mut chord_rect_for_hit: Option<Rect> = None;
+        // Where the thanks card hangs from, once the heart has been drawn.
+        let mut heart_rect_for_card: Option<Rect> = None;
         let fret_rect_for_hit: Option<Rect> = (fret_h > 0.0)
             .then(|| band_at(recorder_h + theory_h + chord_h + piano_h, fret_h));
         // The row, then the two halves of it. The camera pane is not a hit
@@ -4059,6 +4123,21 @@ impl IvoryApp {
                 ),
                 &self.settings,
             );
+            // **The heart.** It moved here from the chord strip, which is off
+            // by default in 5.0 — a heart that hides itself thanks nobody.
+            // Drawn by the app rather than by the band because the colour is
+            // the app's to know; the band only says where.
+            //
+            // The CARD it raises is not drawn here. It is taller than the band
+            // and hangs down over whatever is below, so it is painted after
+            // every other band — see the end of this function.
+            if let Some(c) = self.heart_color() {
+                let hr = recorder_panel::heart_rect(rect, &self.recorder_layout_view());
+                if hr.is_positive() {
+                    chord_strip::draw_heart(ui.painter(), hr, c);
+                    heart_rect_for_card = Some(hr);
+                }
+            }
         }
         // The row's own background FIRST, whatever is in it. The camera pane
         // can hold this row open with the diagrams' half empty or detached, and
@@ -4097,25 +4176,18 @@ impl IvoryApp {
                 chord_rect,
                 self.current_chord.as_deref(),
                 self.settings.chord_text_color.to_color32(),
-                self.heart_color(),
+                // **One heart, wherever it can be.** The recorder band is its
+                // home; the strip only carries it when there is no band, which
+                // is the piano-and-strip window somebody chose on purpose.
+                // Two hearts in one window is two things to click and one
+                // colour setting behind them both.
+                self.strip_heart_color(),
                 None, // attached: it already has the piano below it as an edge
                 self.transpose_view(),
             );
-            // The thanks, while the pointer is on the heart. Painted last of
-            // the band so it sits over the piano below it, and only in the
-            // live window: the compositor draws this same band into a video,
-            // where there is no pointer and a hover would be a stray card in
-            // somebody's recording.
-            if self.heart_color().is_some() {
-                let hr = chord_strip::heart_rect(chord_rect);
-                if ctx.pointer_latest_pos().is_some_and(|p| hr.contains(p)) {
-                    chord_strip::draw_thanks(
-                        ui.painter(),
-                        hr,
-                        ui.max_rect(),
-                        self.settings.chord_text_color.to_color32(),
-                    );
-                }
+            if let Some(hr) = self.strip_heart_color().map(|_| chord_strip::heart_rect(chord_rect))
+            {
+                heart_rect_for_card = Some(hr);
             }
         }
         piano::draw(
@@ -4137,6 +4209,26 @@ impl IvoryApp {
                 self.barre_to_draw(),
             );
             fretboard_panel::draw_top_edge(ui.painter(), fret_rect, &self.settings);
+        }
+
+        // **The thanks card, last of everything.** It hangs out of the recorder
+        // band and down across the theory band, so painted with its own band it
+        // went UNDER the diagrams — egui draws in call order, and the card was
+        // being called first. Nothing else in this window overlaps another
+        // band, which is why nothing else has to be here.
+        //
+        // Only in the live window: the compositor draws these same bands into
+        // a video, where there is no pointer and a hover card would be a stray
+        // note in somebody's recording.
+        if let Some(hr) = heart_rect_for_card {
+            if ctx.pointer_latest_pos().is_some_and(|p| hr.contains(p)) {
+                chord_strip::draw_thanks(
+                    ui.painter(),
+                    hr,
+                    ui.max_rect(),
+                    self.settings.chord_text_color.to_color32(),
+                );
+            }
         }
 
         self.handle_main_interaction(
@@ -4555,7 +4647,7 @@ mod tests {
     /// name lives. The detached chord window is a third place and an explicit
     /// choice; it wins over both.
     #[test]
-    fn the_chord_strip_yields_to_the_staff_and_returns_when_it_leaves() {
+    fn the_chord_strip_is_a_choice_the_staff_does_not_overrule() {
         // `first_launch`, not `default`: bare defaults leave the band empty
         // and visibility is exactly what a first launch decides.
         let mut s = Settings::first_launch();
@@ -4563,15 +4655,28 @@ mod tests {
             s.theory_views().contains(theory_panel::View::Staff),
             "a first launch no longer includes the staff; this test needs rethinking"
         );
+        // Off out of the box, because the staff prints the chord name itself
+        // and two places to read it is one too many BY DEFAULT.
         assert_eq!(
             band_sizes_at(&s, 1300.0).chord_h,
             0.0,
-            "the strip is up while the staff shows the chord"
+            "the strip is up on a first launch"
         );
+        // Asked for, it comes up — WITH the staff still there. It used to
+        // suppress itself in that case, which made piano-plus-strip, the shape
+        // this app had for years, unreachable without dismantling the theory
+        // band.
+        s.show_chord_strip = true;
+        assert!(
+            band_sizes_at(&s, 1300.0).chord_h > 0.0,
+            "the strip was asked for and the staff overruled it"
+        );
+        // And it is still there once the staff goes, which is the case that
+        // matters most: then the strip is the only place the name lives.
         s.toggle_theory_view(theory_panel::View::Staff);
         assert!(
             band_sizes_at(&s, 1300.0).chord_h > 0.0,
-            "the staff left and the strip did not come back"
+            "the staff left and took the strip with it"
         );
         // Detection off beats everything: no detector, no name anywhere.
         s.chord_detection_enabled = false;
@@ -4664,6 +4769,86 @@ mod tests {
         let ctx = egui::Context::default();
         let app = IvoryApp::new(&ctx, settings, caps);
         (ctx, app)
+    }
+
+    /// The Setup button opens the take-settings menu, and does it every time.
+    ///
+    /// **The regression this exists for**: `Hit::OpenSetup` set a flag, and
+    /// nothing anywhere read the flag. The button was the only way to reach
+    /// the settings that left the band in 5.0, and pressing it did nothing —
+    /// which is exactly what "unresponsive" looks like from the outside.
+    #[test]
+    fn the_setup_button_opens_the_take_settings_menu() {
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, Settings::first_launch());
+        let w = main_width(&app.settings);
+        let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, recorder_panel::band_height(w)));
+
+        // Fonts, which `open_menu_at` measures with. Nothing exists in an
+        // `egui::Context` until it has run once.
+        let _ = ctx.run(Default::default(), |_| {});
+
+        // Nothing pending: nothing opens. A menu that appears on its own is a
+        // worse bug than one that never appears.
+        assert!(!app.open_setup_menu_if_wanted(&ctx, band));
+        assert!(app.menu_state.is_none());
+
+        // The button is really there, and really says Setup.
+        let setup = recorder_panel::setup_rect(band, &app.recorder_layout_view());
+        assert!(setup.is_positive(), "the band has no Setup button");
+        assert_eq!(
+            recorder_panel::hit_test(band, &app.recorder_layout_view(), setup.center()),
+            Some(recorder_panel::Hit::OpenSetup),
+            "the Setup button's own centre is not a Setup hit"
+        );
+
+        // Press it, and the menu is up — led by the Recorder's categories,
+        // since these are the take's settings and not the piano's.
+        app.apply_recorder_hit(recorder_panel::Hit::OpenSetup);
+        assert!(app.setup_menu_wanted, "the press did not ask for a menu");
+        assert!(app.open_setup_menu_if_wanted(&ctx, band), "no menu opened");
+        assert!(app.menu_state.is_some());
+        assert!(app.menu_over_recorder);
+
+        // And the ask is spent, so the menu does not reopen every frame after.
+        app.menu_state = None;
+        assert!(!app.open_setup_menu_if_wanted(&ctx, band));
+        assert!(app.menu_state.is_none());
+    }
+
+    /// The heart is drawn for everybody, in the band, out of everything's way.
+    ///
+    /// It used to live in the chord strip and to be grey unless a key had been
+    /// bought. The strip is off by default in 5.0, which left it nowhere at
+    /// all — and nothing in this app is behind a key while 5.0 is in beta.
+    #[test]
+    fn the_heart_is_visible_to_everyone_and_clear_of_the_slots() {
+        let (_, app) = headless_with(Caps::DESKTOP, Settings::first_launch());
+        // **Whatever the licence says.** This runs on developer machines that
+        // hold a key and on CI machines that do not, and the answer has to be
+        // the same on both: there is nothing behind a key at all.
+        assert!(
+            app.heart_color().is_some(),
+            "the heart is hidden (supporter: {})",
+            app.license.is_supporter()
+        );
+
+        for pct in [50_i64, 100, 200] {
+            let mut s = Settings::first_launch();
+            s.window_size_percent = pct;
+            let w = main_width(&s);
+            let band =
+                Rect::from_min_size(Pos2::ZERO, Vec2::new(w, recorder_panel::band_height(w)));
+            let view = app.recorder_layout_view();
+            let heart = recorder_panel::heart_rect(band, &view);
+            assert!(heart.is_positive(), "no heart at {pct}%");
+            assert!(band.contains_rect(heart), "the heart escaped the band at {pct}%");
+            // And it takes no click that belongs to a control.
+            assert_eq!(
+                recorder_panel::hit_test(band, &view, heart.center()),
+                None,
+                "the heart is sitting on a control at {pct}%"
+            );
+        }
     }
 
     /// A desktop app with the Welcome dialog already dismissed.
@@ -4879,6 +5064,10 @@ mod tests {
             fretboard_detached: true,
             show_fretboard: true,
             chord_detection_enabled: true,
+            // Explicitly, since 5.0: the strip is off by default and this test
+            // is about a DETACHED band having nowhere to go in a plugin, which
+            // needs a strip to be attached in the first place.
+            show_chord_strip: true,
             show_welcome: false,
             ..Settings::default()
         };
@@ -6076,8 +6265,10 @@ mod tests {
         ];
         for (pct, w, piano_h, chord_h) in table {
             s.window_size_percent = pct;
+            s.show_chord_strip = true;
             assert_eq!(main_width(&s), w, "W at {pct}%");
-            // Chord strip visible (default settings): height = chordH + pianoH.
+            // Chord strip visible: height = chordH + pianoH. Asked for by hand
+            // now — 5.0 leaves it off, since the staff carries the name.
             assert_eq!(
                 initial_window_size(&s),
                 Vec2::new(w, piano_h + chord_h),

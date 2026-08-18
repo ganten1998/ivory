@@ -54,6 +54,7 @@ pub enum MenuAction {
     ToggleKeytoggle,
     ToggleNotePreference,
     ToggleChordDetection,
+    ToggleChordStrip,
     /// Cycle the built-in UI typeface (Courier Prime <-> Terminess).
     CycleFont,
     DetachChordWindow,
@@ -191,6 +192,9 @@ pub struct MenuView {
     pub keytoggle: bool,
     pub prefer_flats: bool,
     pub detection_enabled: bool,
+    /// Whether the chord strip band is up. Independent of detection: the staff
+    /// reads the same chord, so detection can be on with no strip at all.
+    pub chord_strip: bool,
     pub detached: bool,
     /// "Teach Chord Name..." and "Correct Chord Name..." are greyed when no
     /// notes are held — both act on the voicing you are playing.
@@ -754,6 +758,20 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
             },
             MenuAction::ToggleChordDetection,
         ));
+        if view.detection_enabled {
+            // **The strip, as its own line.** It is off by default in 5.0
+            // because the staff prints the chord name itself; this is how
+            // somebody gets the old piano-and-strip window back, and how
+            // anybody who wants the name in two places may have it.
+            chords.push(row(
+                if view.chord_strip {
+                    "Hide Chord Strip"
+                } else {
+                    "Show Chord Strip"
+                },
+                MenuAction::ToggleChordStrip,
+            ));
+        }
         if view.detection_enabled && view.caps.detachable {
             chords.push(row("Detach Chord Window", MenuAction::DetachChordWindow));
         }
@@ -1926,6 +1944,7 @@ mod tests {
             keytoggle: false,
             prefer_flats: true,
             detection_enabled: true,
+            chord_strip: true,
             detached: false,
             notes_held: false,
             learning_on: false,
@@ -2529,6 +2548,7 @@ mod tests {
             caps: Caps::PLUGIN,
             fretboard_on: true,
             detection_enabled: true,
+            chord_strip: true,
             detached: true,
             fretboard_detached: true,
             theory_detached: true,

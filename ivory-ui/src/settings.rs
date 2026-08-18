@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 5;
+const SETTINGS_VERSION: u64 = 6;
 
 /// Recorder backgrounds this app shipped as defaults before [`SETTINGS_VERSION`]
 /// 1, and which are therefore not evidence that anybody chose them.
@@ -94,6 +94,13 @@ pub struct Settings {
     pub sustain_color: Rgb,
     pub prefer_flats: bool,
     pub chord_detection_enabled: bool,
+    /// Whether the chord strip band is drawn under the theory band.
+    ///
+    /// **Separate from detection**, because the staff reads the same chord and
+    /// needs detection running whether or not the strip is up. Off by default
+    /// since 5.0: the sheet music panel carries the name. Turning it back on
+    /// gives you piano-plus-strip, which is what this app was for years.
+    pub show_chord_strip: bool,
     pub window_size_percent: i64,
     pub borderless_mode: bool,
     pub chord_window_detached: bool,
@@ -499,6 +506,7 @@ impl Default for Settings {
             sustain_color: Rgb::new(0xD2, 0xA3, 0x6C),
             prefer_flats: true,
             chord_detection_enabled: true,
+            show_chord_strip: false,
             window_size_percent: 100,
             borderless_mode: false,
             chord_window_detached: false,
@@ -765,6 +773,7 @@ impl Settings {
             "chord_detection_enabled",
             &mut s.chord_detection_enabled,
         );
+        take_bool(&mut map, "show_chord_strip", &mut s.show_chord_strip);
         take_bool(&mut map, "borderless_mode", &mut s.borderless_mode);
         take_bool(
             &mut map,
@@ -1173,6 +1182,17 @@ impl Settings {
             // stamped v5 file they stay off.
             self.staff_note_names = true;
         }
+        if was < 6 {
+            // **The strip stays exactly as visible as it was.** Until now it
+            // suppressed itself whenever the staff was in the theory band, so
+            // "was it on screen yesterday" is precisely "was the staff absent"
+            // — and that is what gets written down, now that it is a setting
+            // somebody can hold an opinion about. Nobody's window changes shape
+            // on this update in either direction.
+            self.show_chord_strip = !self
+                .theory_views()
+                .contains(crate::theory_panel::View::Staff);
+        }
         if was < 1 {
             if V0_RECORDER_BG.contains(&self.recorder_bg_color.to_hex().as_str()) {
                 self.recorder_bg_color = Self::default().recorder_bg_color;
@@ -1222,6 +1242,10 @@ impl Settings {
         map.insert(
             "chord_detection_enabled".into(),
             Value::Bool(self.chord_detection_enabled),
+        );
+        map.insert(
+            "show_chord_strip".into(),
+            Value::Bool(self.show_chord_strip),
         );
         map.insert(
             "window_size_percent".into(),
@@ -2297,7 +2321,10 @@ mod tests {
         let out = s.to_map();
         let keys: Vec<&str> = out.keys().map(|k| k.as_str()).collect();
         assert_eq!(keys[0], "dark_mode");
-        assert_eq!(keys[12], "keytoggle_enabled");
+        // 13, not 12: `show_chord_strip` went in ahead of it in 5.0. The
+        // index is not the point — that the order is DETERMINISTIC is, so a
+        // settings file does not churn its key order on every save.
+        assert_eq!(keys[13], "keytoggle_enabled");
         assert_eq!(*keys.last().unwrap(), "future_key");
         // custom_font_path is absent when None
         assert!(!out.contains_key("custom_font_path"));

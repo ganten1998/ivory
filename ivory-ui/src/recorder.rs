@@ -136,11 +136,16 @@ impl Meters {
 /// of slots — a variable count would make the band's height depend on how many
 /// instruments are loaded, and every band's height in this app is a function of
 /// width alone.
-/// **Six, up from three.** The two monitor faders moved into the transport
-/// group, and the column they left is what three more instruments fit in. A
-/// layered pad, a bass and a lead is three; anybody building a rig wanted more
-/// than that the first time they tried.
-pub const SLOTS: usize = 6;
+/// **Five, up from three.** The two monitor faders moved into the transport
+/// group, and the column they left is what the extra rows fit in: a layered
+/// pad, a bass and a lead is three, and anybody building a rig wanted more than
+/// that the first time they tried.
+///
+/// Not more than five, because the band lost a fifth of its height in the same
+/// change. Six rows in the shorter band put the plugin name, the gain reading
+/// and the OPEN WINDOW button at four points, which is a row nobody can read —
+/// the count is bounded by what a row can legibly hold, not by the space.
+pub const SLOTS: usize = 5;
 
 /// One instrument slot, as the band draws it.
 #[derive(Debug, Clone, Copy, PartialEq)]

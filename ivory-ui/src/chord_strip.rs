@@ -24,6 +24,10 @@ const HEART: [&str; 6] = [
 ];
 
 /// Colours the heart cycles through when clicked.
+/// The sprite's width over its height. Anything drawing the heart into a box
+/// it chose itself needs this or the heart comes out an oval.
+pub const HEART_ASPECT: f32 = HEART[0].len() as f32 / HEART.len() as f32;
+
 pub const HEART_COLORS: [Color32; 7] = [
     Color32::from_rgb(0xE8, 0x3A, 0x4E), // red
     Color32::from_rgb(0xFF, 0x8F, 0xC4), // pink
@@ -117,7 +121,12 @@ pub fn heart_rect(rect: Rect) -> Rect {
     )
 }
 
-fn draw_heart(painter: &Painter, rect: Rect, color: Color32) {
+/// Draw the heart to fill `rect`.
+///
+/// **Public because the heart no longer lives only here.** It sits in the
+/// recorder band's bottom-right corner now, since the strip is off by default
+/// in 5.0 and a heart nobody can see thanks nobody. One sprite, two homes.
+pub fn draw_heart(painter: &Painter, rect: Rect, color: Color32) {
     let hr = heart_rect(rect);
     let px = hr.height() / HEART.len() as f32;
     for (row, line) in HEART.iter().enumerate() {
