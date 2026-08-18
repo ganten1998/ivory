@@ -527,7 +527,11 @@ pub fn draw(
                 Stroke::new(1.0_f32, p.line),
             );
         }
-        let inner = cell.shrink(8.0);
+        // **A margin that scales with the pane, not eight flat points.** At a
+        // full-screen window eight points is a hairline and the diagrams ran
+        // to the edges of their cells; the three of them read as one crowded
+        // picture with rules through it rather than as three panels.
+        let inner = cell.shrink((cell.width().min(cell.height()) * 0.05).clamp(8.0, 24.0));
         match view {
             View::Circle => draw_circle(painter, inner, input, &p, s),
             View::Tonnetz => draw_tonnetz(painter, inner, input, &p, s),
@@ -593,6 +597,16 @@ fn body_rect(rect: Rect) -> Rect {
 /// same reason: sizing text to its box without laying it out first.
 const LEGEND_ADV: f32 = 0.62;
 
+/// How much of its pane a diagram fills, across its widest part.
+///
+/// **The circle and the hexagram used to fill theirs exactly** — a diameter of
+/// `min(w, h)` — while the Tonnetz is a wide lattice that runs out of width
+/// long before it runs out of height and so sat visibly smaller than both. The
+/// two round ones give up a little so the three read as one set. Not more than
+/// this: past it they stop being the biggest thing in their own panel, which
+/// is what a diagram in a panel is for.
+const DIAGRAM_FILL: f32 = 0.92;
+
 fn title(painter: &Painter, rect: Rect, text: &str, legend: &str, p: &Palette) -> Rect {
     let h = (rect.height() * 0.075).clamp(9.0, 14.0);
     painter.text(
@@ -644,7 +658,7 @@ fn draw_circle(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Set
         p,
     );
     let c = rect.center();
-    let r = rect.width().min(rect.height()) * 0.5 - 2.0;
+    let r = (rect.width().min(rect.height()) * 0.5 - 2.0) * DIAGRAM_FILL;
     if r < 20.0 {
         return;
     }
@@ -1099,7 +1113,7 @@ const HEX_DOWN_ORDER: [usize; 3] = [0, 1, 2];
 /// node radius is 0.30r, so the real extent is 1.30r and the pane has to hold
 /// 2.60r. Sizing on `r` alone put the tonic node through the pane's own title.
 fn hexagram_radius(rect: Rect) -> f32 {
-    rect.width().min(rect.height()) * 0.5 / 1.32
+    rect.width().min(rect.height()) * 0.5 * DIAGRAM_FILL / 1.32
 }
 
 fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Settings) {

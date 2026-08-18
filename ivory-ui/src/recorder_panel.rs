@@ -904,8 +904,12 @@ impl Layout {
         // above each row and one below the last. Sized the other way round,
         // the boxes were half again as tall as the icons under them and the
         // section read as two things stacked rather than one.
-        let side = (d.width() * 0.19).min(d.height() * 0.30);
-        let step = d.width() * 0.205;
+        //
+        // The three of them span the row the way the boxes above span it, one
+        // centred in each third. They used to be left-aligned with a clock
+        // filling the rest; with the clock gone, huddling them at one end
+        // would leave the section's last row half empty.
+        let side = (d.width() * 0.22).min(d.height() * 0.28);
         let space = ((d.height() - side * 3.0) / 4.0).max(0.0);
         let stack = |i: usize| {
             let top = d.top() + space * (i as f32 + 1.0) + side * i as f32;
@@ -913,10 +917,8 @@ impl Layout {
         };
         let bar = stack(2);
         let icon = |i: usize| {
-            Rect::from_min_size(
-                Pos2::new(bar.left() + step * i as f32, bar.center().y - side * 0.5),
-                Vec2::splat(side),
-            )
+            let cx = bar.left() + bar.width() * (i as f32 * 2.0 + 1.0) / 6.0;
+            Rect::from_center_size(Pos2::new(cx, bar.center().y), Vec2::splat(side))
         };
         if rolling {
             // No record button while rolling — pressing it would mean nothing,
@@ -942,12 +944,11 @@ impl Layout {
             self.timecode = slice_v(d, 0.04, 0.64);
             return;
         }
-        // At rest it says 0:00 and means nothing, so it takes what is left of
-        // the transport's own row and no more.
-        self.timecode = Rect::from_min_max(
-            Pos2::new(bar.left() + bar.width() * 0.64, bar.top()),
-            bar.max,
-        );
+        // **No clock at rest.** It read 0:00 and never anything else: every
+        // state that has a number to show — the count-in, rolling, finishing —
+        // is `is_active`, and those take the whole column above this row. A
+        // readout with one possible value is furniture, and it was the reason
+        // the three icons had to share their row with something.
         // **No filename preview here.** A running timestamp that changes
         // every second taught the naming scheme once and then spent the rest
         // of the session being a clock nobody asked for — and it was the row
@@ -4313,9 +4314,13 @@ mod tests {
             hidden(RecordState::Finishing).is_positive(),
             "'files are still being closed' is not a clock"
         );
+        // **Nothing at rest, whatever the setting says.** A clock that can
+        // only ever read 0:00 is furniture: every state with a number in it —
+        // the count-in, rolling, finishing — is `is_active`, and those take
+        // the whole column above the transport row.
         assert!(
-            hidden(RecordState::Idle).is_positive(),
-            "the setting is about recording, not about sitting there"
+            !hidden(RecordState::Idle).is_positive(),
+            "a clock at rest, with only one thing it could ever say"
         );
         // Without the setting the clock is drawn in every state, in exactly
         // the same box. **Rolling no longer rearranges the band.** The clock
@@ -4334,7 +4339,7 @@ mod tests {
         };
         let at_rest = shown(RecordState::Idle).timecode;
         let live = shown(RecordState::Rolling).timecode;
-        assert!(at_rest.is_positive() && live.is_positive());
+        assert!(!at_rest.is_positive() && live.is_positive());
 
         // The meter, the stop button and the faders are still there either way.
         for state in [RecordState::Idle, RecordState::Rolling] {
