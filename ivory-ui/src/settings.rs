@@ -357,7 +357,7 @@ pub struct Settings {
     /// `auto` means "record whatever there is", which with an instrument loaded
     /// is the instrument and the input together.
     pub record_sources: String,
-    /// The user picked "None — record MIDI only" in the audio-input picker.
+    /// The user picked "None - record MIDI only" in the audio-input picker.
     ///
     /// Its own key, because `record_audio_source` used to carry BOTH this and
     /// what a take is made of, and the two are unrelated questions: "no

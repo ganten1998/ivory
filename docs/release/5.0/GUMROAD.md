@@ -119,8 +119,10 @@ that is a finished take with the theory visible in it, from one keypress.
 - **The MIDI file is a real MIDI file**, so a take can be re-rendered, notated
   or edited long after the video is made.
 
-Video export is macOS only for now. On Windows and Linux a take still writes
-its audio and its MIDI, and says so plainly rather than failing quietly.
+Video works on macOS, Windows and Linux. macOS encodes natively with nothing
+to install; Windows and Linux use `ffmpeg`, which is one install away and which
+a take names for you if it is missing. A take without it still writes its audio
+and its MIDI rather than failing quietly.
 
 ### And it stays out of the way
 

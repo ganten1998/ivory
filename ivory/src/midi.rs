@@ -285,7 +285,7 @@ pub fn dump_raw(port: Option<String>) {
         }
     };
 
-    println!("listening on {:?} — play something; Ctrl-C to stop", conn.port_name);
+    println!("listening on {:?} - play something; Ctrl-C to stop", conn.port_name);
     println!("{:>12}  {:>10}  {:>9}  bytes", "t (ms)", "delta (ms)", "stamp");
 
     let epoch = Instant::now();

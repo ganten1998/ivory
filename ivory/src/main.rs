@@ -2,10 +2,13 @@
 //! PySide6 v1.1.0 app; UI parity per docs/spec/ui-spec.md).
 #![windows_subsystem = "windows"]
 
-/// The video compositor's offscreen surface. macOS-only because the wgpu
-/// renderer is, and inside `recorder` because a Minimal build has no camera to
-/// composite and must not link a renderer to prove it.
-#[cfg(all(feature = "recorder", target_os = "macos"))]
+/// The video compositor's offscreen surface.
+///
+/// Inside `recorder` because a Minimal build has no camera to composite and
+/// must not link a renderer to prove it. **No longer macOS-only**: it borrows
+/// the window's wgpu device when there is one and opens its own when there is
+/// not, so it does not care which renderer the app is drawing with.
+#[cfg(feature = "recorder")]
 mod composite;
 mod desktop;
 #[cfg(feature = "recorder")]

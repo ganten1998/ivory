@@ -39,10 +39,15 @@
 //!
 //! # Platforms
 //!
-//! macOS only for now (AVFoundation: VideoToolbox H.264, AAC, `.mp4`). Windows
-//! and Linux get [`Encoder::create`] returning `Err`, which is what the Export
-//! dialog's `VIDEO_EXPORT_READY` gate reads — a build that cannot encode says
-//! so rather than writing a file nobody will find.
+//! **macOS** encodes natively: AVFoundation driving VideoToolbox, H.264 and AAC
+//! in an `.mp4`, with nothing to install.
+//!
+//! **Windows and Linux** pipe raw frames into `ffmpeg`, which writes the same
+//! H.264 in the same container. See `ffmpeg.rs` for why a subprocess rather
+//! than two more native backends. The cost is that ffmpeg has to be findable,
+//! and when it is not, [`Encoder::create`] fails with a message naming the
+//! install command rather than writing a file nobody will find. A take still
+//! writes its `.wav` and its `.mid` either way.
 
 use crate::clock::Nanos;
 
@@ -52,9 +57,9 @@ mod macos;
 use macos as sys;
 
 #[cfg(not(target_os = "macos"))]
-mod stub;
+mod ffmpeg;
 #[cfg(not(target_os = "macos"))]
-use stub as sys;
+use ffmpeg as sys;
 
 /// What the video track will be.
 ///
@@ -312,7 +317,7 @@ mod tests {
             .arg(&path)
             .output()
         else {
-            eprintln!("ffprobe is not installed — the tracks were not verified");
+            eprintln!("ffprobe is not installed - the tracks were not verified");
             return;
         };
         let text = String::from_utf8_lossy(&out.stdout);
@@ -364,7 +369,7 @@ mod tests {
         );
         assert!(
             (v_dur - a_dur).abs() < 0.06,
-            "the tracks are {:.3}s apart in length — video {v_dur}, audio {a_dur}",
+            "the tracks are {:.3}s apart in length - video {v_dur}, audio {a_dur}",
             (v_dur - a_dur).abs()
         );
     }
@@ -458,7 +463,7 @@ mod tests {
         else {
             // No ffprobe on this machine: the file was still written and its
             // size checked. Saying so is better than passing silently.
-            eprintln!("ffprobe is not installed — the container was not verified");
+            eprintln!("ffprobe is not installed - the container was not verified");
             return;
         };
         let probe = String::from_utf8_lossy(&out.stdout).trim().to_owned();

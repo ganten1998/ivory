@@ -111,6 +111,33 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
 ] }
 
+# **wgpu on every platform, for the video compositor and nothing else.**
+#
+# The compositor renders an offscreen egui pass into a texture and reads it
+# back. It used to be macOS-only because that is where eframe is asked for its
+# wgpu renderer, and the compositor borrowed that device. It opens its own now
+# when the window has none, so the only thing these platforms were missing was
+# the crate, and a whole platform could not film because of it.
+#
+# The window still draws with glow here. This is a headless device for one
+# offscreen pass, so it takes whatever adapter it can find: Vulkan first, and
+# GLES for a machine without it.
+#
+# **Vulkan on Windows and not DX12**, which is not a preference. wgpu-hal's
+# dx12 backend goes through `gpu-allocator`, which pins its own `windows`
+# crate, and this crate already has one for the Win32 calls in `desktop.rs`.
+# Two versions of `windows` in one graph do not share types, and the build
+# fails inside wgpu with `expected ID3D12Device, found ID3D12Device`. Vulkan
+# has no such dependency and is on every Windows machine with a graphics
+# driver from the last decade.
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "27", default-features = false, features = ["vulkan", "gles"] }
+egui-wgpu = { version = "0.33", default-features = false }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+wgpu = { version = "27", default-features = false, features = ["vulkan", "gles"] }
+egui-wgpu = { version = "0.33", default-features = false }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # THE macOS RENDERER, and a bug fix rather than a preference.
 #

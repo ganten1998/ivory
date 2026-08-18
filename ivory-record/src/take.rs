@@ -282,8 +282,8 @@ const RESERVED: [&str; 24] = [
 /// construction, because a unit boundary that is not a char boundary is never
 /// reached: the loop adds whole characters.
 ///
-/// For an all-BMP name — every Latin, Cyrillic, Greek, Hebrew, Arabic, Chinese,
-/// Japanese and Korean name a pianist will type — this is exactly forty
+/// For an all-BMP name - every Latin, Cyrillic, Greek, Hebrew, Arabic, Chinese,
+/// Japanese and Korean name a pianist will type - this is exactly forty
 /// characters.
 pub const MAX_SLUG_UNITS: usize = 40;
 
@@ -298,7 +298,7 @@ pub const MAX_TAKE_NAME_UNITS: usize = PREFIX_UNITS + 1 + MAX_SLUG_UNITS + COLLI
 
 /// Turn something a user typed into something safe to be a path component.
 ///
-/// Returns `None` when nothing usable survives — an empty box, a string of
+/// Returns `None` when nothing usable survives - an empty box, a string of
 /// slashes, or a reserved device name. The caller then produces a
 /// timestamp-only folder, and the Recorder band's live grey preview of the
 /// resulting name (`RECORDER-PLAN.md` §5) is what stops that being silent.
@@ -329,8 +329,8 @@ pub fn sanitise_slug(raw: &str) -> Option<String> {
     }
 
     // 3. Collapse every run of non-alphanumerics to one separator. A run that
-    //    was entirely underscores stays an underscore — `nocturne_v2` is a name
-    //    somebody typed on purpose and `nocturne-v2` is a small betrayal —
+    //    was entirely underscores stays an underscore - `nocturne_v2` is a name
+    //    somebody typed on purpose and `nocturne-v2` is a small betrayal -
     //    everything else, including whitespace, becomes `-`.
     let mut collapsed = String::with_capacity(stripped.len());
     let mut run_start: Option<bool> = None; // Some(all_underscores_so_far)
@@ -349,7 +349,7 @@ pub fn sanitise_slug(raw: &str) -> Option<String> {
     // again in step 5.
 
     // 4. Trim leading separators. The plan asks for the leading `.` (a hidden
-    //    folder); step 3 has already turned that into `-`, which is worse —
+    //    folder); step 3 has already turned that into `-`, which is worse -
     //    every CLI tool in existence parses a leading `-` as an option.
     let trimmed = collapsed.trim_start_matches(['-', '_']);
 
@@ -409,7 +409,7 @@ pub fn folder_name(at: &WallTime, slug: Option<&str>) -> String {
 /// Path length reserved for everything Tangent appends below the chosen root.
 ///
 /// The number is `RECORDER-PLAN.md` §9's. The true worst case is
-/// [`worst_case_relative_units`], which is 136 — six more than this — and the
+/// [`worst_case_relative_units`], which is 136 - six more than this - and the
 /// gap is covered on purpose by [`PATH_LIMIT`] being 250 rather than Windows'
 /// 259 usable characters. The check below therefore admits roots up to 120
 /// units, and 120 + 136 = 256 still fits. That reconciliation is written down
@@ -487,7 +487,7 @@ pub fn default_root() -> Option<PathBuf> {
 ///
 /// **`XDG_VIDEOS_DIR` is almost never an environment variable.** It lives in
 /// that file, and `xdg-user-dirs-update` writes it localised: a French desktop
-/// has `$HOME/Vidéos`, a German one `$HOME/Videos` — which happens to match, and
+/// has `$HOME/Vidéos`, a German one `$HOME/Videos` - which happens to match, and
 /// is exactly why testing in English hides the bug. Code that reads only the env
 /// var creates a second, English `~/Videos` sitting next to the user's real
 /// video folder, and the user's file manager shows neither as the other.
@@ -943,7 +943,7 @@ pub struct SourceReport {
 impl SourceReport {
     /// Read everything a [`SourceClock`] knows about itself.
     ///
-    /// The anchor is `to_timebase(0)` — where stamp zero lands — which is the
+    /// The anchor is `to_timebase(0)` - where stamp zero lands - which is the
     /// offset with the latency already applied, i.e. the number actually used to
     /// place this source's events. Reporting the raw offset instead would report
     /// a number no event was ever converted with.
@@ -1014,7 +1014,7 @@ impl Default for AudioReport {
 }
 
 /// The video half, including the two fields §7 adds so that a sidecar can say
-/// what the muxed audio actually is — Linux ships LPCM in a `.mov` because there
+/// what the muxed audio actually is - Linux ships LPCM in a `.mov` because there
 /// is no permissively-licensed AAC encoder, and a report that cannot say so
 /// cannot explain a file size either.
 #[derive(Debug, Clone, Default)]
@@ -1049,7 +1049,7 @@ impl VideoReport {
 
 /// The MIDI half. `tempo_bpm` is the mark written into the SMF, and it is
 /// reported because it is an *assertion* the file makes rather than something
-/// measured — importers routinely discard it, and then nobody can tell what the
+/// measured - importers routinely discard it, and then nobody can tell what the
 /// file claimed.
 #[derive(Debug, Clone)]
 pub struct MidiReport {
@@ -1081,8 +1081,8 @@ pub struct PluginReport {
 ///
 /// It is written `false` at take **start** and flipped at clean stop. Nothing
 /// else in the design can tell a finished take from one whose process died
-/// mid-file, and the recovery path in §9 — "the next launch sees
-/// `complete: false`, finalises what is there and offers it" — has no other
+/// mid-file, and the recovery path in §9 - "the next launch sees
+/// `complete: false`, finalises what is there and offers it" - has no other
 /// input. A manifest written only at stop would be absent exactly when it is
 /// needed.
 #[derive(Debug, Clone)]
@@ -1131,7 +1131,7 @@ impl Manifest {
     /// Copy the finished [`Timeline`] into the report.
     ///
     /// Deliberately the only way these five fields get set, so that
-    /// `clock: "synthetic"` and `epsilon_ppm: 0` can never disagree — a
+    /// `clock: "synthetic"` and `epsilon_ppm: 0` can never disagree - a
     /// hand-filled manifest reporting a fitted clock with no fit behind it would
     /// make a broken pipeline look healthy.
     pub fn apply_timeline(&mut self, timeline: &Timeline) {
@@ -1154,7 +1154,7 @@ impl Manifest {
         self.aborted_reason = None;
     }
 
-    /// Stopped by something going wrong. `complete` stays `false` on purpose —
+    /// Stopped by something going wrong. `complete` stays `false` on purpose -
     /// the take is real and every byte captured is kept (§4), but it is not a
     /// take that ran to a clean stop and the recovery path must still look at it.
     pub fn abort(&mut self, reason: impl Into<String>) {
@@ -1247,7 +1247,7 @@ impl Manifest {
     ///
     /// Temp file, `sync_all`, then `rename`. Not a plain truncating write: this
     /// file is rewritten at clean stop, and a crash *during* that rewrite would
-    /// leave a truncated sidecar — destroying the crash detector at precisely
+    /// leave a truncated sidecar - destroying the crash detector at precisely
     /// the moment a crash detector is wanted. `rename` over an existing file is
     /// atomic on every filesystem this ships on, so a reader sees the old
     /// contents or the new ones and never half of either.
@@ -1255,7 +1255,7 @@ impl Manifest {
     /// What this does **not** do is fsync the containing directory, because std
     /// has no portable way to. The bounded consequence: after a power cut the
     /// entry may be missing entirely, so the recovery scan must treat *no*
-    /// `take.json` exactly as it treats `complete: false` — which
+    /// `take.json` exactly as it treats `complete: false` - which
     /// [`is_complete`] already does.
     pub fn write(&self, take_dir: &Path) -> io::Result<()> {
         let tmp = take_dir.join(MANIFEST_TMP_NAME);
@@ -1279,7 +1279,7 @@ impl Manifest {
 /// sound for a reason worth writing down: [`push_escaped`] escapes every `"`
 /// inside a string, so the needle's opening quote can only ever line up with a
 /// real key. A take named `"complete": true` renders as `\"complete\": true`,
-/// which does not match — there is a backslash where the needle wants a quote.
+/// which does not match - there is a backslash where the needle wants a quote.
 pub fn is_complete(take_dir: &Path) -> bool {
     fs::read_to_string(take_dir.join(MANIFEST_NAME))
         .is_ok_and(|s| s.contains("\n  \"complete\": true"))

@@ -74,8 +74,9 @@ it.
   recorded into it.
 - **A take-settings panel** behind the cog: where takes go, the camera, the
   audio input, the count-in, the export, and what happens when a take finishes.
-- Video export is macOS only for now. On Windows and Linux a take still writes
-  its audio and MIDI, and says so rather than failing quietly.
+- **Video on all three platforms.** macOS encodes natively. Windows and Linux
+  need `ffmpeg` on the PATH, and a take that cannot find it says so, names the
+  install command, and still writes its audio and its MIDI.
 
 ## For playing
 

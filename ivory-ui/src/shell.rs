@@ -423,7 +423,7 @@ mod tests {
         assert!(
             settled < before - 50.0,
             "the wheel moved the content from {before} to {settled} \
-             (immediately after the event: {after}) — it is not scrolling"
+             (immediately after the event: {after}) - it is not scrolling"
         );
     }
 

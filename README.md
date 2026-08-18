@@ -28,8 +28,9 @@ name it does not know and it is yours from then on.
 `.mp4`, and the video **is the window**: the same panels in the same places,
 with your camera already placed in it, at 16:9. There is no scene to build, no
 overlay to align, no second layout to keep in step with the first. What you
-were looking at is what your audience sees. Video export is macOS only for now;
-elsewhere a take still writes its audio and MIDI and says so.
+were looking at is what your audience sees. macOS encodes natively; Windows and
+Linux use `ffmpeg`, and a take that cannot find it says so and still writes its
+audio and its MIDI.
 
 ![Tangent in dark mode naming an altered dominant, on an ebony fingerboard](docs/img/screenshot-dark-alt.png)
 

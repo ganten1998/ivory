@@ -1583,7 +1583,7 @@ mod tests {
         let bytes = build_wav(WAVE_FORMAT_PCM, 24, 1, 48_000, &body, false);
         let (spec, s) = read_pcm(&bytes).unwrap();
         assert_eq!(spec.format, SampleFormat::Int24);
-        assert!(s[0] < 0.0, "-1 read as {} — the shift is missing", s[0]);
+        assert!(s[0] < 0.0, "-1 read as {} - the shift is missing", s[0]);
         assert!((s[1] + 1.0).abs() < 1e-6, "full-scale negative read as {}", s[1]);
         assert!((s[2] - 1.0).abs() < 1e-4, "full-scale positive read as {}", s[2]);
     }

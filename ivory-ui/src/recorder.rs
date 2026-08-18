@@ -2208,7 +2208,7 @@ mod layout_tests {
         let share = cam.height() / f.height();
         assert!(
             share > 0.80,
-            "the camera got {share} of a vertical frame — the keyboard does not \
+            "the camera got {share} of a vertical frame - the keyboard does not \
              need the rest"
         );
     }

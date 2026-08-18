@@ -168,7 +168,6 @@ struct Recorder {
     disk_checked_at: Option<std::time::Instant>,
     disk_bytes: Option<u64>,
     /// The take's video, while one is being filmed.
-    #[cfg(target_os = "macos")]
     video: Option<TakeVideo>,
     /// Whether this take has already tried to start filming.
     ///
@@ -176,9 +175,6 @@ struct Recorder {
     /// that would not open — retries on every window frame, and rewrites the
     /// same error sixty times a second over whatever else the band was saying.
     ///
-    /// Only read on macOS, because that is the only platform with an encoder.
-    /// Kept unconditionally so the field list does not fork.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     video_tried: bool,
     /// The newest camera frame, kept as RGBA for the compositor.
     ///
@@ -390,7 +386,7 @@ impl DesktopApp {
                 // informative thing a status line can say.
                 match self.app.chosen_plugin(slot) {
                     Some(p) => Some(format!(
-                        "loading {} — instruments warm up for a few seconds so \
+                        "loading {} - instruments warm up for a few seconds so \
                          the first take is not silent",
                         std::path::Path::new(p)
                             .file_stem()
@@ -402,7 +398,7 @@ impl DesktopApp {
             })
             .or_else(|| self.recorder.camera_opening
             .then(|| {
-                "starting the camera — this can take a few seconds on a USB \
+                "starting the camera - this can take a few seconds on a USB \
                  webcam"
                     .to_owned()
             }))
@@ -417,7 +413,7 @@ impl DesktopApp {
                         > std::time::Duration::from_secs(3)
                 }))
                 .then(|| {
-                    "the camera is open but sending no picture — check Camera \
+                    "the camera is open but sending no picture - check Camera \
                      access in System Settings > Privacy & Security"
                         .to_owned()
                 })
@@ -658,7 +654,6 @@ impl DesktopApp {
         // rolling by the time this asks, and a Stop pressed this frame is
         // already stopped — the alternative is a video that starts and ends one
         // window frame late at both ends.
-        #[cfg(target_os = "macos")]
         {
             // **`is_writing`, not `is_recording`.** The latter is true through
             // the COUNT-IN, and during a count-in there is no take folder yet —
@@ -676,9 +671,6 @@ impl DesktopApp {
                 self.recorder.video_tried = false;
             }
         }
-        #[cfg(not(target_os = "macos"))]
-        let _ = frame;
-
         if let Some(path) = self.app.take_reveal_request() {
             reveal(&path);
         }
@@ -992,7 +984,7 @@ impl DesktopApp {
         }
         self.recorder.camera_opening = false;
         // No `if wanted.is_none() { return }` guard here, and the guard that
-        // used to be here was a bug: choosing "None — record without video"
+        // used to be here was a bug: choosing "None - record without video"
         // left the selection stale forever, so the camera went on running with
         // its light on and its preview updating after the user said stop.
         // `open_camera(None)` closes it, which is what None means.
@@ -1024,7 +1016,7 @@ impl DesktopApp {
                 .recorder
                 .session
                 .open_input(&selection, self.app.buffer_frames()),
-            // The user picked "None — record MIDI only". Mapping that to the
+            // The user picked "None - record MIDI only". Mapping that to the
             // system default (which is what happened before `explicit` existed)
             // opened the built-in microphone and put its name in the band.
             None => self.recorder.session.close_input(),
@@ -1186,7 +1178,6 @@ impl DesktopApp {
                 disk_checked_at: None,
                 disk_bytes: None,
                 dev_editor_at: None,
-                #[cfg(target_os = "macos")]
                 video: None,
                 video_tried: false,
                 camera_rgba: None,
@@ -1297,7 +1288,23 @@ fn reveal(path: &std::path::Path) {
 /// because moving IT here costs 384 kB a second of audio crossing a channel,
 /// where moving the compositor to the writer thread would cost 250 MB a second
 /// of composited frames going the other way.
+/// The device the WINDOW is drawing with, when there is one to borrow.
+///
+/// eframe only exposes this when it was built with its `wgpu` feature, which is
+/// macOS here: everywhere else the window draws with glow and there is nothing
+/// to borrow. `None` is not a refusal any more, it is the compositor opening an
+/// adapter of its own, so this is a fast path rather than a gate.
 #[cfg(all(feature = "recorder", target_os = "macos"))]
+fn window_device(frame: &eframe::Frame) -> Option<&egui_wgpu::RenderState> {
+    frame.wgpu_render_state()
+}
+
+#[cfg(all(feature = "recorder", not(target_os = "macos")))]
+fn window_device(_frame: &eframe::Frame) -> Option<&egui_wgpu::RenderState> {
+    None
+}
+
+#[cfg(feature = "recorder")]
 struct TakeVideo {
     compositor: crate::composite::Compositor,
     encoder: ivory_record::encode::Encoder,
@@ -1316,7 +1323,7 @@ struct TakeVideo {
     failed: u64,
 }
 
-#[cfg(all(feature = "recorder", target_os = "macos"))]
+#[cfg(feature = "recorder")]
 impl DesktopApp {
     /// Start filming, if this take is meant to be filmed.
     ///
@@ -1368,7 +1375,7 @@ impl DesktopApp {
                 channels,
             });
         let compositor =
-            match crate::composite::Compositor::new(frame.wgpu_render_state(), video.width, video.height) {
+            match crate::composite::Compositor::new(window_device(frame), video.width, video.height) {
                 Ok(c) => c,
                 Err(e) => {
                     self.recorder.engine_error = Some(format!("no video this take: {e}"));
@@ -1466,7 +1473,7 @@ impl DesktopApp {
             Ok(()) => {
                 if dropped > 0 {
                     self.recorder.engine_error = Some(format!(
-                        "the video is complete, but {dropped} frames were dropped — \
+                        "the video is complete, but {dropped} frames were dropped - \
                          this machine could not composite and encode in real time"
                     ));
                 }

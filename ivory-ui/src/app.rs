@@ -1934,7 +1934,7 @@ impl IvoryApp {
         self.settings.record_audio_device.as_deref()
     }
 
-    /// The user explicitly chose "None — record MIDI only".
+    /// The user explicitly chose "None - record MIDI only".
     ///
     /// Distinct from `chosen_audio_uid() == None`, which is also what "has
     /// never opened the picker" looks like — and those two want opposite
@@ -3092,7 +3092,7 @@ impl IvoryApp {
                 // would hide that from someone who deliberately switched it off.
                 let switched = if turned_on {
                     "\n\nChord Learning is switched back ON, so every earlier\n\
-                     correction is active again too — not just this one."
+                     correction is active again too - not just this one."
                         .to_owned()
                 } else {
                     String::new()
@@ -3100,7 +3100,7 @@ impl IvoryApp {
                 format!(
                     "Learned. This voicing now reads {now_reads}.{tail}\n\n\
                      Corrections so far: {corrections}. Similar voicings may\n\
-                     read differently now — \"Forget Learning\" in Manage\n\
+                     read differently now - \"Forget Learning\" in Manage\n\
                      Taught Chords undoes all of it.{switched}"
                 )
             }
@@ -3118,7 +3118,7 @@ impl IvoryApp {
                 }
             }
             TrainOutcome::OutrankedByRule { wants, displays_as } => format!(
-                "{wants} is already Tangent's top-scoring reading — but the name\n\
+                "{wants} is already Tangent's top-scoring reading - but the name\n\
                  you see, \"{displays_as}\", comes from a separate rule that runs\n\
                  afterwards and overrides it.\n\n\
                  Chord learning only reorders competing chord names, so it\n\
@@ -3129,7 +3129,7 @@ impl IvoryApp {
                 "Tangent could not be nudged that far.\n\n\
                  {name} scores too far behind {still_reads} for a safe nudge\n\
                  to close the gap, so nothing was changed.\n\n\
-                 To force this name anyway, use \"Teach Chord Name...\" — it\n\
+                 To force this name anyway, use \"Teach Chord Name...\" - it\n\
                  pins the name outright."
             ),
             TrainOutcome::NotTrainable => format!(
@@ -3138,7 +3138,7 @@ impl IvoryApp {
                  Use \"Teach Chord Name...\" to pin it instead."
             ),
             TrainOutcome::NoStore => {
-                "Chord learning is unavailable — the settings folder could not\n\
+                "Chord learning is unavailable - the settings folder could not\n\
                  be opened."
                     .to_owned()
             }
@@ -5028,7 +5028,7 @@ mod tests {
                         row_h < roomy - 0.5,
                         "menu is {}pt in a {}pt editor and its rows are still \
                          {row_h}pt, the same as the unconstrained {roomy}pt \
-                         (fretboard {fret}, theory {theory}) — it did not \
+                         (fretboard {fret}, theory {theory}) - it did not \
                          squeeze at all, so the bottom rows are simply missing",
                         menu.y,
                         pane.y
@@ -5309,7 +5309,7 @@ mod tests {
         click(&ctx, &mut app, row, egui::PointerButton::Primary);
         assert_ne!(
             app.settings.dark_mode, before,
-            "clicking a menu row in a plugin did nothing — the row is dead"
+            "clicking a menu row in a plugin did nothing - the row is dead"
         );
         assert!(
             app.menu_state.is_none(),
@@ -5502,7 +5502,7 @@ mod tests {
         assert_eq!(
             band_sizes_at(&s, 1300.0).recorder_h,
             0.0,
-            "off by default — the band is 200pt tall and a window that grows \
+            "off by default - the band is 200pt tall and a window that grows \
              on its own after an update is a geometry surprise"
         );
         s.show_recorder = true;

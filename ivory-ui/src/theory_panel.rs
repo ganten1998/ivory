@@ -2154,7 +2154,7 @@ mod tests {
                 let in_row = (0..l.cols).filter(|&u| l.shows(pane, u, v)).count();
                 assert!(
                     in_row >= 3,
-                    "row {v} of {} has only {in_row} whole nodes in {pane:?} — \
+                    "row {v} of {} has only {in_row} whole nodes in {pane:?} - \
                      the lattice is clipped",
                     l.rows
                 );
@@ -3087,7 +3087,7 @@ mod tests {
                         .count();
                     assert!(
                         texts > 0,
-                        "{views:?} at {size:?} painted no text at all — a \
+                        "{views:?} at {size:?} painted no text at all - a \
                          blank window reads as a crash, not as a choice"
                     );
                     if !views.any() {

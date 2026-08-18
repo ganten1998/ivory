@@ -99,8 +99,10 @@ over. One thing will look different on purpose: the chord strip under the
 theory band is off, because the sheet music carries the chord name itself.
 Right-click and choose Show Chord Strip if you want it back.
 
-Video export is still macOS only. On Windows and Linux a take writes its audio
-and its MIDI and says so, rather than failing quietly.
+**And video is no longer macOS only.** Windows and Linux encode through
+`ffmpeg`, which they need on the PATH; a take that cannot find it tells you the
+install command and still writes its audio and its MIDI. That was the last
+thing in this app that only worked on one platform.
 
   macOS 11 or later, Apple Silicon and Intel
   https://github.com/ganten1998/ivory/releases/download/v5.0.0-beta.1/Tangent-5.0.0-beta.1-macos-universal.dmg

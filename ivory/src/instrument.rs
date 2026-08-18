@@ -2286,8 +2286,8 @@ impl Engine {
         // are otherwise character-for-character identical, and the user has to
         // be able to tell which fader belongs to the one they are editing.
         let title = match self.loaded.get(slot).and_then(Option::as_ref) {
-            Some(l) => format!("{} — Tangent, instrument {}", l.class, slot + 1),
-            None => format!("Instrument {} — Tangent", slot + 1),
+            Some(l) => format!("{} - Tangent, instrument {}", l.class, slot + 1),
+            None => format!("Instrument {} - Tangent", slot + 1),
         };
         let editor =
             ivory_host::Editor::open_handle(handle, &title).map_err(|e| e.to_string())?;
@@ -3051,7 +3051,7 @@ pub fn plugin_test(filter: Option<String>) {
             if w.heard {
                 ""
             } else {
-                " — NEVER MADE A SOUND, declared ready by timeout"
+                " - NEVER MADE A SOUND, declared ready by timeout"
             }
         );
     }
@@ -3228,7 +3228,7 @@ pub fn plugin_test(filter: Option<String>) {
         let db = if one > 0.0 && *in_tap > 0.0 {
             format!("{:+.1} dB", 20.0 * (in_tap / one).log10())
         } else {
-            "—".to_string()
+            "-".to_string()
         };
         let cpu = match cores {
             Some(c) => format!("{c:.2} cores"),
@@ -3239,7 +3239,7 @@ pub fn plugin_test(filter: Option<String>) {
     println!(
         "  two slots must be about +6.0 dB on one and three about +9.5 dB: the same\n  \
          instrument playing the same notes sums coherently, so a peak that did not\n  \
-         move is a slot that never got the note. Read the TAP column for that —\n  \
+         move is a slot that never got the note. Read the TAP column for that -\n  \
          the device column is what you hear, which includes the click."
     );
 
@@ -3316,7 +3316,7 @@ pub fn plugin_test(filter: Option<String>) {
             std::thread::sleep(Duration::from_millis(16));
         }
         println!(
-            "after the editor: {} more callbacks, peak {after_peak:.4} — the instruments \
+            "after the editor: {} more callbacks, peak {after_peak:.4} - the instruments \
              are running instruments, not windows",
             engine.callbacks() - before
         );
@@ -3356,7 +3356,7 @@ pub fn plugin_test(filter: Option<String>) {
             ivory_host::editor::pump(Duration::from_millis(16));
         }
         println!(
-            "\nslot 2 unloaded: peak {after:.4} from the other two — unloading one \
+            "\nslot 2 unloaded: peak {after:.4} from the other two - unloading one \
              instrument must not silence its neighbours"
         );
         println!(
@@ -3375,7 +3375,7 @@ pub fn plugin_test(filter: Option<String>) {
         tap.sample_rate()
     );
     println!(
-        "click in tap:    peak {click_in_tap:.4} during the count-in — must be 0.0000, \
+        "click in tap:    peak {click_in_tap:.4} during the count-in - must be 0.0000, \
          because metronome_in_take is off"
     );
     println!(
@@ -3386,14 +3386,14 @@ pub fn plugin_test(filter: Option<String>) {
     println!("midi dropped:    {}", engine.midi_dropped());
     println!("tap frames lost: {}", tap.dropped());
     println!(
-        "pedal messages:  {} seen and NOT delivered — see instrument.rs",
+        "pedal messages:  {} seen and NOT delivered - see instrument.rs",
         engine.pedal_dropped()
     );
     if let Some(why) = engine.fault() {
         println!("fault:           {why}");
     }
     if peak < 1e-4 {
-        println!("\nSILENT — nothing reached the output.");
+        println!("\nSILENT - nothing reached the output.");
         std::process::exit(2);
     }
 }

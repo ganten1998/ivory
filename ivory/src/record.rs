@@ -868,7 +868,7 @@ impl Summary {
             return if self.folder.is_empty() {
                 p.clone()
             } else {
-                format!("{p}  —  what was recorded is in {}", self.folder)
+                format!("{p}  -  what was recorded is in {}", self.folder)
             };
         }
         let mins = ivory_ui::recorder::timecode(self.seconds);
@@ -880,12 +880,12 @@ impl Summary {
         };
         let mut s = format!("Recorded {mins} of {what} to {}", self.folder);
         if self.silent {
-            s.push_str("  —  WARNING: the audio is silent");
+            s.push_str("  -  WARNING: the audio is silent");
         } else if self.clipped {
-            s.push_str("  —  the audio clipped");
+            s.push_str("  -  the audio clipped");
         }
         if let Some(n) = &self.note {
-            s.push_str("  —  ");
+            s.push_str("  -  ");
             s.push_str(n);
         }
         s
@@ -1941,7 +1941,7 @@ pub fn record_test(seconds: Option<String>) {
             eprintln!(
                 "no audio inputs found.\n\
                  If an interface is connected, this build may be missing the\n\
-                 microphone entitlement — run the probe from the signed .app:\n\
+                 microphone entitlement - run the probe from the signed .app:\n\
                  dist/Tangent.app/Contents/MacOS/tangent --record-test"
             );
             return;
@@ -1975,7 +1975,7 @@ pub fn record_test(seconds: Option<String>) {
             return;
         }
         (None, None) => {
-            eprintln!("no input opened and no error reported — that is a bug");
+            eprintln!("no input opened and no error reported - that is a bug");
             return;
         }
     }
@@ -1983,7 +1983,7 @@ pub fn record_test(seconds: Option<String>) {
     // Meter for a moment BEFORE arming, which is the behaviour that kills the
     // "I recorded silence" failure class — so it is the behaviour the probe
     // shows you rather than one it takes on trust.
-    println!("\nlevel check (2s) — play something:");
+    println!("\nlevel check (2s) - play something:");
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(100));
         let m = session.meters();
@@ -2006,7 +2006,7 @@ pub fn record_test(seconds: Option<String>) {
     session.stop();
 
     let Some(summary) = session.last_summary() else {
-        eprintln!("the take produced no summary — that is a bug");
+        eprintln!("the take produced no summary - that is a bug");
         return;
     };
     println!("\n{}", summary.message());
@@ -2195,7 +2195,7 @@ mod tests {
         let overflowed = w.tap.as_ref().expect("tap").dropped();
         assert_eq!(
             overflowed, 0,
-            "the ring overflowed {overflowed} times while idle — it is not \
+            "the ring overflowed {overflowed} times while idle - it is not \
              being drained, so the next take inherits the loss"
         );
     }
@@ -2272,7 +2272,7 @@ mod tests {
         assert_eq!(
             report.frames,
             (BLOCK * BLOCKS) as u64,
-            "the file must hold exactly the frames the device produced — \
+            "the file must hold exactly the frames the device produced - \
              double this number is the write_plan doubling bug"
         );
         assert!(report.error.is_none(), "{:?}", report.error);
@@ -2361,7 +2361,7 @@ mod tests {
         assert_eq!(
             overflowed, 0,
             "the instrument's ring overflowed {overflowed} times during a take \
-             that does not record it — it is not being drained, so it backs up \
+             that does not record it - it is not being drained, so it backs up \
              and every later take inherits the loss"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2536,7 +2536,7 @@ mod tests {
         );
         assert!(
             s.is_recording(),
-            "a count-in IS active — this is the half that misleads"
+            "a count-in IS active - this is the half that misleads"
         );
         assert!(
             !s.state().is_writing(),
@@ -2584,7 +2584,7 @@ mod tests {
         );
         assert!(
             !dir.exists(),
-            "nothing may be created until the countdown finishes — a cancelled \
+            "nothing may be created until the countdown finishes - a cancelled \
              count-in must leave no empty folder behind"
         );
         s.toggle(&dir, None, 3, ExportSpec::default());

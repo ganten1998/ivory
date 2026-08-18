@@ -81,9 +81,9 @@ impl LicenseError {
             LicenseError::Empty => "No key entered.",
             LicenseError::Malformed => "That does not look like an Ivory supporter key.",
             LicenseError::Checksum => {
-                "That key looks mistyped — check for a missing or altered character."
+                "That key looks mistyped - check for a missing or altered character."
             }
-            LicenseError::Truncated => "That key looks incomplete — some of it may be missing.",
+            LicenseError::Truncated => "That key looks incomplete - some of it may be missing.",
             LicenseError::FutureVersion(_) => {
                 "That key was made for a newer version of Ivory. Updating should accept it."
             }
@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(PUBLIC_KEYS.len(), 2, "k1 + cold successor k2");
         assert!(
             PUBLIC_KEYS.iter().all(|k| k != &[0u8; 32]),
-            "all-zero is the identity point — a placeholder must never ship"
+            "all-zero is the identity point - a placeholder must never ship"
         );
         assert_ne!(PUBLIC_KEYS[0], PUBLIC_KEYS[1], "successor must differ");
     }

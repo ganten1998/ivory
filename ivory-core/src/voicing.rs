@@ -488,7 +488,7 @@ impl Weights {
 
     /// Lower bound on the same terms. Only the open-string bonus and the
     /// hysteresis pair can go negative, and the prune below depends on that
-    /// staying true — `tests::every_positive_term_really_is_positive` says so.
+    /// staying true - `tests::every_positive_term_really_is_positive` says so.
     pub fn min_shape_cost(&self, strings: usize) -> i32 {
         let s = strings.min(MAX_STRINGS) as i32;
         self.open_min
@@ -550,7 +550,7 @@ pub fn spec_fingerprint(spec: &FretboardSpec) -> u64 {
 /// Stateless, deterministic, total. The test entry point.
 ///
 /// `held` may be unsorted and may contain duplicates: this sorts and dedups at
-/// the door. That is not politeness — `app.rs::display_notes()` builds a FRESH
+/// the door. That is not politeness - `app.rs::display_notes()` builds a FRESH
 /// `HashSet<u8>` on every call and `RandomState` is seeded per instance, so
 /// iteration order genuinely varies call to call.
 pub fn solve_cold(spec: &FretboardSpec, held: &[u8]) -> Voicing {
@@ -652,7 +652,7 @@ fn run(
     };
     let strings = spec.tuning.strings().min(MAX_STRINGS);
 
-    // Step 0 — normalise. Sorted and deduped, always, whatever the caller did.
+    // Step 0 - normalise. Sorted and deduped, always, whatever the caller did.
     let mut pitches: Vec<u8> = held.to_vec();
     pitches.sort_unstable();
     pitches.dedup();
@@ -672,7 +672,7 @@ fn run(
         return (blank(Vec::new(), Shape::default()), SolveStats::default(), Vec::new());
     }
 
-    // Step 1 — spec sanity. Never panics, and never consults `range()`, which
+    // Step 1 - spec sanity. Never panics, and never consults `range()`, which
     // returns min > max at capo >= 47 and would underflow on subtraction.
     if strings == 0 || spec.capo > spec.frets {
         let notes = pitches
@@ -686,7 +686,7 @@ fn run(
         return (blank(notes, shape), SolveStats::default(), Vec::new());
     }
 
-    // Step 2 — fold each pitch to ONE target, up preferred on ties. A too-low
+    // Step 2 - fold each pitch to ONE target, up preferred on ties. A too-low
     // bass is the common case and folding it up reads better than down. The
     // sweep runs to +-21 rather than a comfortable +-10 because
     // `IVORY_DEMO_NOTES` parses with `parse::<u8>()` and can inject 200.
@@ -722,7 +722,7 @@ fn run(
         }
     }
 
-    // Step 3 — merge collisions. The unfolded note beats a ghost that landed
+    // Step 3 - merge collisions. The unfolded note beats a ghost that landed
     // on it, and the smaller fold beats the larger.
     let mut order: Vec<usize> = (0..entries.len())
         .filter(|&i| entries[i].state != PreState::Unreachable)
@@ -744,7 +744,7 @@ fn run(
     // Back to ascending target order for the monotone search.
     live.sort_by_key(|&i| entries[i].target);
 
-    // Steps 4 and 5 — static drop costs, then the pre-cap. Drop cost never
+    // Steps 4 and 5 - static drop costs, then the pre-cap. Drop cost never
     // depends on the assignment, which is what makes both the pre-cap and the
     // search's prune sound.
     let keep = strings.saturating_add(w.note_slack).min(MAX_NOTES);
@@ -800,7 +800,7 @@ fn run(
         s.drop_suffix[k] = s.drop_suffix[k + 1].saturating_add(s.drop_cost[k]);
     }
 
-    // Step 6 — the candidate table. One fret per (note, string) at most.
+    // Step 6 - the candidate table. One fret per (note, string) at most.
     for st in 0..strings {
         let open = spec.tuning.open[st];
         for k in 0..n {
@@ -851,12 +851,12 @@ fn run(
         }
     }
 
-    // Step 7 — the search, UNLESS the user has already made every choice.
+    // Step 7 - the search, UNLESS the user has already made every choice.
     //
     // When every held note is pinned there is nothing to search: the answer is
     // what the player clicked. Placing them directly also sidesteps the
     // monotone constraint, which is not optional inside `rec` and which
-    // ordinary guitar shapes really do violate — low E at fret 6 sounds Bb2
+    // ordinary guitar shapes really do violate - low E at fret 6 sounds Bb2
     // (46) against an open A (45), a higher pitch on a lower string, entirely
     // playable and structurally undrawable by the search. Narrowing candidates
     // was not enough: the search simply dropped one of them.
@@ -924,7 +924,7 @@ fn run(
 ///
 /// Static: it depends on the note's place in the held chord, not on the
 /// assignment. That is exactly what makes both the pre-cap and the search's
-/// prune sound — a bound computed from committed drops stays a bound.
+/// prune sound - a bound computed from committed drops stays a bound.
 ///
 /// The resulting hierarchy IS the whole drop policy, in one line:
 /// `folded 6000 < doubled 8000 < plain 20000 < melody 26000 < bass 30000`.
@@ -967,7 +967,7 @@ fn drop_cost_of(
     // Unclamped they could reach -5000, and the drop tiers are only 2000 apart
     // (folded 6000, doubled 8000, plain 20000, melody 26000, bass 30000). A
     // folded note's 6000 fell to 1000 and a doubled note's 8000 to 3000, both
-    // under the 6290 spread of the shape terms — so the length of the pause
+    // under the 6290 spread of the shape terms - so the length of the pause
     // before a chord decided whether it was drawn with four notes or five.
     // Same held set, two pictures, the difference being a clock. Clamping to
     // half a tier gap makes crossing one impossible.
@@ -982,7 +982,7 @@ fn drop_cost_of(
     }
     // Stickiness is a hysteresis term, so it only exists once there is a
     // previous solve to be sticky about. With no history it is silent, not
-    // "everything was unplaced" — otherwise a cold solve would quietly shed
+    // "everything was unplaced" - otherwise a cold solve would quietly shed
     // notes a warm one keeps.
     if let Some(prev) = hist.prev {
         let was_placed = prev
@@ -1032,7 +1032,7 @@ impl Search<'_> {
         // Or sound one of the remaining notes on it. Taking note `j` and
         // moving the cursor to `j + 1` is what makes the assignment monotone:
         // one note per string, ascending pitch on ascending strings, and
-        // skipping a note means dropping it — all three by construction, with
+        // skipping a note means dropping it - all three by construction, with
         // no checks anywhere.
         let mut skipped = 0i32;
         for j in i..self.n {
@@ -1064,7 +1064,7 @@ impl Search<'_> {
 
     /// The fret sounding on each string, `MUTED` where silent. Injective over
     /// shapes, because targets are distinct and each (note, string) pair has
-    /// one fret — so the argmin under `(cost, tie)` is unique, and a later
+    /// one fret - so the argmin under `(cost, tie)` is unique, and a later
     /// refactor of the DFS cannot silently change which shape ships.
     fn tie_key(&self) -> [u8; MAX_STRINGS] {
         let mut t = [MUTED; MAX_STRINGS];
@@ -1313,7 +1313,7 @@ fn anchor_and_span(sel: &[u8; MAX_STRINGS], strings: usize, capo: u8) -> (Option
 /// strings at the lowest fret is only a barre if they are ADJACENT (otherwise
 /// open D's `x-x-0-2-3-2` reads as a two-string barre it is not), and a
 /// sounding OPEN string strictly inside the span rules one out (a flat finger
-/// would stop it) — but an open string OUTSIDE the span is fine, which is what
+/// would stop it) - but an open string OUTSIDE the span is fine, which is what
 /// makes Dm7's `x-x-0-2-1-1` the mini-barre it really is.
 fn barre_and_fingers(sel: &[u8; MAX_STRINGS], strings: usize, capo: u8) -> (Option<Barre>, u8) {
     let fretted = |st: usize| sel[st] != MUTED && sel[st] != capo;
@@ -1368,7 +1368,7 @@ fn shape_cost_of(
         // Every step saturating, and the parentheses matter: a method call
         // binds tighter than `/`, so `x / 1000 .saturating_mul(y)` would have
         // multiplied 1000 by y instead. The last plain `*` here was the one
-        // arithmetic hole left — the upstream saturation pins the product at
+        // arithmetic hole left - the upstream saturation pins the product at
         // i32::MAX, and any scale past ~1000 then overflowed it.
         let reach = w.stretch[(span as usize).min(8)]
             .saturating_mul(REACH_MILLI[(a as usize).min(24)])
@@ -2117,7 +2117,7 @@ mod tests {
         // and this needs two. `stretch` saturating against REACH_MILLI pins the
         // product at i32::MAX; dividing by 1000 leaves 2_147_483; multiplying
         // that by any scale past ~1000 overflowed. Debug panicked. Release,
-        // which is what ships, wrapped — and a wrapped stretch cost is NEGATIVE,
+        // which is what ships, wrapped - and a wrapped stretch cost is NEGATIVE,
         // so the dial whose whole job is to make stretching expensive became a
         // large reward for it.
         let spec = std_spec();
@@ -2171,7 +2171,7 @@ mod tests {
     fn fret_255_does_not_collide_with_the_muted_sentinel() {
         // `MUTED` is `u8::MAX`, and 255 is a legal `frets`. A note playable
         // only at fret 255 was therefore indistinguishable from a muted string
-        // and came out `Dropped { Excess }` — reported as a choice when it was
+        // and came out `Dropped { Excess }` - reported as a choice when it was
         // a collision. The board is capped at 254 so the note is genuinely out
         // of range and folds, which is the truth rather than a shrug.
         let zero: Tuning = Tuning { name: std::borrow::Cow::Borrowed("Zero"), open: std::borrow::Cow::Borrowed(&[0]) };
@@ -2287,7 +2287,7 @@ mod tests {
         let g4 = v.notes.iter().find(|n| n.pitch == 67).unwrap();
         // G4 is above this board and folds down onto the G3 already held. That
         // G3 is then itself dropped for want of a string, so "merged onto
-        // another note" would be a lie — G is still sounding (as G2), and that
+        // another note" would be a lie - G is still sounding (as G2), and that
         // is what it says.
         assert_eq!(g4.outcome, Outcome::Dropped { reason: DropReason::Doubled });
         assert!(v.placed().count() <= 4);
@@ -2573,7 +2573,7 @@ mod tests {
     fn clearing_the_pins_and_the_notes_together_empties_the_board() {
         // The exact sequence behind "R only resets the piano". `set_pins`
         // invalidates the cache by clearing `solved_for`, and the empty-set
-        // branch used to ask `solved_for` whether anything needed doing — so
+        // branch used to ask `solved_for` whether anything needed doing - so
         // clearing pins first and notes second left the neck untouched.
         let spec = std_spec();
         let mut s = VoicingSession::new(spec.clone(), Weights::DEFAULT);
@@ -2662,7 +2662,7 @@ mod tests {
         // fixed seed this used to run was a false pass: a reviewer re-ran the
         // identical generator under 40 other seeds and found one that failed.
         // Carried state really could shed a note, and one seed's silence hid
-        // it. Releases matter too — they are what makes `idle_decay_ms` fire,
+        // it. Releases matter too - they are what makes `idle_decay_ms` fire,
         // and the sharpest form of that bug was the SAME held set giving two
         // answers depending only on how long the preceding rest was.
         for seed in 0..40u64 {
@@ -2720,7 +2720,7 @@ mod tests {
         // `solve` takes `&[u8]` and `IVORY_DEMO_NOTES` parses with
         // `parse::<u8>()`, so 242 is reachable. The arrival and previous-
         // position arrays were indexed `% 128`, which aliased 242 onto 114 and
-        // — worse — meant the expiry pass wiped 242's ordinal in the same call
+        // - worse - meant the expiry pass wiped 242's ordinal in the same call
         // that issued it. A brand new session therefore disagreed with a cold
         // solve on its very first tick.
         let spec = std_spec();

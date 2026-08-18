@@ -670,17 +670,14 @@ fn confirm(name: &str, strings: &[TuningString]) -> Result<Tuning, Problem> {
 /// than eleven scattered conditions, and that is how it turned out — this line
 /// is the edit.
 ///
-/// Windows and Linux have no encoder (`ivory_record::encode::stub`) and no
-/// compositor, and they refuse at the moment a take starts with a message
-/// saying so. That refusal is not the same as this flag: this decides whether
-/// the DIALOG offers video at all, and on those platforms it still does,
-/// because the alternative is a dialog that silently loses the settings a user
-/// carried over from a Mac. A take says what it cannot do; a dialog should not
-/// forget what was asked for.
-#[cfg(target_os = "macos")]
+/// **True everywhere since 5.0.** Windows and Linux encode through `ffmpeg`
+/// (see `ivory_record::encode::ffmpeg`) and the compositor was never
+/// platform-specific: it is wgpu and egui, the same two things that draw the
+/// window. What is left is a runtime question rather than a build-time one, so
+/// it is answered at the moment a take starts: if ffmpeg cannot be found, the
+/// take says so, names the install command, and still writes its audio and its
+/// MIDI. A dialog that greys the controls cannot say any of that.
 pub const VIDEO_EXPORT_READY: bool = true;
-#[cfg(not(target_os = "macos"))]
-pub const VIDEO_EXPORT_READY: bool = false;
 
 /// What the Welcome card says.
 ///
@@ -696,7 +693,7 @@ const WELCOME_LINES: [&str; 13] = [
     "nothing is sent anywhere.",
     "",
     "If it earns a place in your setup, a donation",
-    "is welcome and genuinely helps — but it buys",
+    "is welcome and genuinely helps - but it buys",
     "you nothing you do not already have.",
     "",
     "Everything lives in the right-click menu.",
@@ -847,7 +844,7 @@ pub fn rederivable(post_take: bool, had_camera: bool) -> Rederivable {
         tempo: true,
         why: Some(if had_camera {
             "This take's camera was composited and encoded as it ran, in the layout chosen \
-             then, and the frames were never kept — Tangent has no decoder to read them back. \
+             then, and the frames were never kept - Tangent has no decoder to read them back. \
              So the camera and the layout are settled now. The tempo mark, and a display-only \
              video in any panel selection, can still be re-made from the recorded MIDI."
         } else {
@@ -901,7 +898,7 @@ fn parse_bpm(text: &str) -> Result<f64, String> {
     if !v.is_finite() || !(MIN_BPM..=MAX_BPM).contains(&v) {
         return Err(format!(
             "A tempo mark runs from {MIN_BPM:.0} to {MAX_BPM:.0} BPM. It does not move a single \
-             note — it decides where a DAW's bar lines land."
+             note - it decides where a DAW's bar lines land."
         ));
     }
     Ok(v)
@@ -998,7 +995,7 @@ fn encoder_note() -> &'static str {
 
 /// Said out loud under the video modes while [`VIDEO_EXPORT_READY`] is false.
 const VIDEO_PENDING_NOTE: &str =
-    "Video export is not written yet — it arrives with the encoder. This take will write the \
+    "Video export is not written yet - it arrives with the encoder. This take will write the \
      audio and the MIDI. The controls below are the finished design and are greyed until then.";
 
 /// The dialog's left column: a label of a fixed width.
@@ -1154,8 +1151,8 @@ impl DeviceKind {
     /// output device's own clock.
     fn none_row(self) -> &'static str {
         match self {
-            DeviceKind::Camera => "None  —  record without video",
-            DeviceKind::AudioInput => "None  —  record the instrument, not an input",
+            DeviceKind::Camera => "None  -  record without video",
+            DeviceKind::AudioInput => "None  -  record the instrument, not an input",
         }
     }
 
@@ -1163,12 +1160,12 @@ impl DeviceKind {
         match self {
             DeviceKind::Camera => {
                 "No cameras found. If one is connected, Tangent may not have \
-                 been granted camera access yet — check System Settings > \
+                 been granted camera access yet - check System Settings > \
                  Privacy & Security."
             }
             DeviceKind::AudioInput => {
                 "No audio inputs found. If an interface is connected, Tangent \
-                 may not have been granted microphone access yet — check \
+                 may not have been granted microphone access yet - check \
                  System Settings > Privacy & Security."
             }
         }
@@ -1217,7 +1214,7 @@ const PLUGIN_FOOTER_H: f32 = 60.0;
 
 /// What the None row says. Not just "None": what choosing it DOES is the part
 /// worth spelling out, exactly as on [`DeviceKind::none_row`].
-const PLUGIN_NONE_ROW: &str = "None  —  no instrument; unloads the one that is loaded";
+const PLUGIN_NONE_ROW: &str = "None  -  no instrument; unloads the one that is loaded";
 
 /// Said under the list, every time, in full-strength text rather than the faint
 /// grey the other note gets.
@@ -1228,7 +1225,7 @@ const PLUGIN_NONE_ROW: &str = "None  —  no instrument; unloads the one that is
 /// and the sentence is short enough that they will actually read it.
 const PLUGIN_TRUST_NOTE: &str =
     "A plugin is somebody else's code, running inside Tangent. It shares this process, so one that \
-     crashes takes Tangent with it — which is also why this build ships with macOS library \
+     crashes takes Tangent with it - which is also why this build ships with macOS library \
      validation disabled. Load ones you trust.";
 
 /// Said under that: why the vendor column is mostly blank.
@@ -1237,7 +1234,7 @@ const PLUGIN_TRUST_NOTE: &str =
 /// deliberate choice described in this section's header.
 const PLUGIN_SCAN_NOTE: &str =
     "Names come from the files on disk. Tangent opens a plugin, and asks it what it really is, only \
-     when it loads it — asking all of them would mean starting all of them.";
+     when it loads it - asking all of them would mean starting all of them.";
 
 /// One installed VST3, as a directory listing knows it.
 ///
@@ -1411,7 +1408,7 @@ fn vst3_locations() -> &'static str {
          and /Library/Audio/Plug-Ins/VST3 for everybody. An installer that offered you AU or VST2 \
          and took the default put nothing in either."
     } else if cfg!(target_os = "windows") {
-        "No VST3 instruments found. Windows keeps them in %COMMONPROGRAMFILES%\\VST3 — usually \
+        "No VST3 instruments found. Windows keeps them in %COMMONPROGRAMFILES%\\VST3 - usually \
          C:\\Program Files\\Common Files\\VST3. An installer that offered you VST2 and took the \
          default put nothing there."
     } else {
@@ -2186,7 +2183,7 @@ pub fn show(
                             ui.label(
                                 RichText::new(match status.round_trip_ms() {
                                     Some(ms) => format!("Round trip, at least  {ms:.1} ms"),
-                                    None => "Round trip  —".to_owned(),
+                                    None => "Round trip  -".to_owned(),
                                 })
                                 .font(bold(11.0))
                                 .color(t.text),
@@ -2846,7 +2843,7 @@ pub fn show(
                                 // "ON (0 corrections)" reads as a failed undo.
                                 ui.label(
                                     RichText::new(if learning_view.on {
-                                        "Nothing learned — chord names are stock.\n\
+                                        "Nothing learned - chord names are stock.\n\
                                          Use \"Correct Chord Name...\" to teach a leaning."
                                     } else {
                                         "Nothing learned yet. Play a chord, then use\n\
@@ -4134,7 +4131,7 @@ mod tests {
         assert_eq!(
             clamped.video,
             VideoMode::Composite,
-            "a display-only video IS re-derivable — replayed from the recorded .mid"
+            "a display-only video IS re-derivable - replayed from the recorded .mid"
         );
         assert!(clamped.is_valid());
 

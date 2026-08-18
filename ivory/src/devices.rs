@@ -38,7 +38,7 @@ pub struct Selection {
     /// **Read it together with [`explicit`](Self::explicit).** `None` alone is
     /// ambiguous and the ambiguity was a real bug: "the user has never opened
     /// the picker, give them the system default so the meter is live" and "the
-    /// user chose *None — record MIDI only*" are opposite instructions, and
+    /// user chose *None - record MIDI only*" are opposite instructions, and
     /// mapping both to `None` meant picking None opened the built-in
     /// microphone and showed its name in the band.
     pub wanted: Option<String>,
@@ -288,7 +288,7 @@ pub fn selection(shared: &Shared) -> Selection {
 /// look like it had forgotten the choice.
 pub fn restore(shared: &Shared, uid: Option<&str>, explicitly_off: bool) {
     let mut sel = lock(shared);
-    // `explicitly_off` is what makes "None — record MIDI only" survive a
+    // `explicitly_off` is what makes "None - record MIDI only" survive a
     // restart. Deriving `explicit` from `uid.is_some()` alone would turn an
     // explicit no into a never-asked on every launch, and open the system
     // microphone for somebody who said not to.

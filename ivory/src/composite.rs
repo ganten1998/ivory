@@ -64,6 +64,30 @@ struct CameraTexture {
     size: (u32, u32),
 }
 
+/// Drive a future to completion on this thread.
+///
+/// Two `wgpu` calls in this file are async and there is no runtime here. A
+/// short poll loop is the whole of what an executor would be used for, so this
+/// is that loop rather than a dependency.
+fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn noop(_: *const ()) {}
+    fn clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    // Safety: `f` lives on this stack frame and is never moved again.
+    let mut f = unsafe { std::pin::Pin::new_unchecked(&mut f) };
+    loop {
+        if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+            return v;
+        }
+        std::thread::yield_now();
+    }
+}
+
 impl Compositor {
     /// Build a compositor for a frame of `width` x `height`.
     ///
@@ -76,11 +100,38 @@ impl Compositor {
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
-        let state = state.ok_or(
-            "this build draws with OpenGL, which cannot composite video — \
-             unset IVORY_RENDERER to use Metal",
-        )?;
-        Self::on(state.device.clone(), state.queue.clone(), width, height)
+        match state {
+            // The window's own device, which costs nothing to borrow.
+            Some(s) => Self::on(s.device.clone(), s.queue.clone(), width, height),
+            // **A device of its own, rather than a refusal.** `None` means the
+            // app is drawing with OpenGL, which is every Windows and Linux
+            // build and `IVORY_RENDERER=glow` on a Mac. That used to end the
+            // video, on the reasoning that a compositor needs the renderer the
+            // window is using. It does not: it paints an OFFSCREEN egui pass
+            // into a texture nothing else ever sees, so any adapter will do.
+            // Making the video depend on the window's renderer meant a whole
+            // platform could not film, for a reason that was never true.
+            None => Self::standalone(width, height),
+        }
+    }
+
+    /// A compositor on an adapter it finds for itself.
+    ///
+    /// Blocking, and deliberately: it is called once, at the moment a take
+    /// starts filming, on a thread that is about to do something expensive
+    /// anyway. Bringing an executor into this crate to await two futures at
+    /// startup would be a dependency bought for one line.
+    pub fn standalone(width: u32, height: u32) -> Result<Self, String> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .map_err(|e| format!("no graphics adapter this build can composite with: {e}"))?;
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .map_err(|e| format!("the graphics adapter would not open a device: {e}"))?;
+        Self::on(device, queue, width, height)
     }
 
     /// The same, from a device this code was handed rather than one it found.
@@ -472,36 +523,17 @@ mod tests {
     /// A headless device, so the GPU path can be tested without a window.
     fn headless() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = pollster_block(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             force_fallback_adapter: false,
             compatible_surface: None,
         }))
         .ok()?;
-        pollster_block(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
     }
 
     /// The smallest possible executor. `pollster` is not a dependency of this
     /// crate and adding one for two `await`s in a test would be a poor trade.
-    fn pollster_block<F: std::future::Future>(mut f: F) -> F::Output {
-        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-        fn noop(_: *const ()) {}
-        fn clone(p: *const ()) -> RawWaker {
-            RawWaker::new(p, &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-        let mut cx = Context::from_waker(&waker);
-        // Safety: `f` is on this stack frame and never moved again.
-        let mut f = unsafe { std::pin::Pin::new_unchecked(&mut f) };
-        loop {
-            if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
-                return v;
-            }
-            std::thread::yield_now();
-        }
-    }
-
     /// **The camera survives the round trip with its colours intact.**
     ///
     /// Upload BGRA, composite, read back BGRA, and check the middle pixel is
@@ -513,7 +545,7 @@ mod tests {
     #[ignore = "needs a GPU"]
     fn a_camera_frame_comes_back_the_colour_it_went_in() {
         let Some((device, queue)) = headless() else {
-            eprintln!("no GPU adapter — the compositor was not exercised");
+            eprintln!("no GPU adapter - the compositor was not exercised");
             return;
         };
         const W: u32 = 320;
@@ -600,7 +632,7 @@ mod tests {
     #[ignore = "needs a GPU, and writes a real video"]
     fn the_whole_pipeline_writes_a_video_in_the_default_layout() {
         let Some((device, queue)) = headless() else {
-            eprintln!("no GPU adapter — the pipeline was not exercised");
+            eprintln!("no GPU adapter - the pipeline was not exercised");
             return;
         };
         use ivory_record::encode::{AudioSpec, Encoder, VideoSpec};
@@ -692,7 +724,7 @@ mod tests {
             .arg(&path)
             .output()
         else {
-            eprintln!("ffprobe is not installed — the file was not verified");
+            eprintln!("ffprobe is not installed - the file was not verified");
             return;
         };
         let probe = String::from_utf8_lossy(&out.stdout);
@@ -718,7 +750,7 @@ mod tests {
     #[ignore = "needs a GPU"]
     fn a_frame_with_no_camera_yet_is_the_window_and_not_garbage() {
         let Some((device, queue)) = headless() else {
-            eprintln!("no GPU adapter — the compositor was not exercised");
+            eprintln!("no GPU adapter - the compositor was not exercised");
             return;
         };
         const W: u32 = 64;
