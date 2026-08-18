@@ -784,6 +784,11 @@ pub struct Readout<'a> {
 /// any amount of idle headroom.
 const READOUT_FRACTION: f32 = 0.20;
 
+/// The readout's share of the width when it sits BESIDE the staff. The staff
+/// keeps the larger share: it is the subject, and the name is the thing that
+/// can grow to fill whatever it is given.
+const READOUT_COLUMN: f32 = 0.42;
+
 /// Draw the band. `readout` is `None` when chord detection is off entirely —
 /// only then does the staff take the whole rect.
 pub fn draw(
@@ -799,16 +804,35 @@ pub fn draw(
     let p = palette(s);
     painter.rect_filled(rect, 0.0, p.bg);
 
-    let rect = match readout {
-        Some(r) => {
+    // **Where the readout goes depends on the shape of the panel.**
+    //
+    // A grand staff needs twenty-two units of height and seventeen of width,
+    // so it is a TALL object: in a wide, short panel it is limited by the
+    // height and can never fill the width however it is placed. Stacking the
+    // readout on top of it there takes a quarter of the only dimension that
+    // was scarce and leaves the width, which was abundant, still empty.
+    //
+    // So in a wide panel the readout moves into the gutter beside the staff —
+    // where there is room for it to be genuinely large — and the staff keeps
+    // the full height and is centred in the whole width. In a narrow one, a
+    // cell of the four-panel band, there is no gutter and it stacks as before.
+    let wide = rect.width() > rect.height() * 2.0;
+    // Two columns when wide, so the panel reads as a balanced pair rather than
+    // as a caption, a staff and a stretch of nothing. The staff takes the
+    // larger share because it is the subject; the name takes the rest because
+    // it is the one thing that can usefully grow to fill it.
+    let staff_rect = match readout {
+        Some(_) if wide => Rect::from_min_max(
+            Pos2::new(rect.left() + rect.width() * READOUT_COLUMN, rect.top()),
+            rect.max,
+        ),
+        Some(_) => {
             let h = (rect.height() * READOUT_FRACTION).clamp(24.0, 64.0);
-            let strip = Rect::from_min_size(rect.min, egui::vec2(rect.width(), h));
-            draw_readout(painter, strip, r, &p);
-            Rect::from_min_max(Pos2::new(rect.min.x, strip.max.y), rect.max)
+            Rect::from_min_max(Pos2::new(rect.min.x, rect.min.y + h), rect.max)
         }
         None => rect,
     };
-    if !rect.is_positive() {
+    if !staff_rect.is_positive() {
         return;
     }
 
@@ -838,8 +862,8 @@ pub fn draw(
     // Whichever budget runs out first. The height decides in a wide cell; the
     // WIDTH decides in a narrow one, and that is what stops a seven-flat
     // signature being engraved over its own clef in a cell too small for it.
-    let space = (rect.height() / spaces)
-        .min(rect.width() / w_spaces)
+    let space = (staff_rect.height() / spaces)
+        .min(staff_rect.width() / w_spaces)
         .max(1.0);
     let gap = if set.splits() { GRAND_GAP } else { SCORE_GAP };
     // Centred horizontally in whatever is left over, and vertically too — with
@@ -847,8 +871,8 @@ pub fn draw(
     // top edge with the slack all underneath.
     let used_w = space * w_spaces;
     let used_h = space * spaces;
-    let left = rect.left() + (rect.width() - used_w) * 0.5;
-    let top = rect.top() + (rect.height() - used_h) * 0.5;
+    let left = staff_rect.left() + (staff_rect.width() - used_w) * 0.5;
+    let top = staff_rect.top() + (staff_rect.height() - used_h) * 0.5;
     // A margin that grows with the staff rather than with the window, so the
     // clef sits the same distance from the edge at every size.
     let margin = space * 1.1;
@@ -859,6 +883,21 @@ pub fn draw(
             top + space * (OUTER_SPACES + STAFF_SPACES + i as f32 * (STAFF_SPACES + gap))
         })
         .collect();
+
+    if let Some(r) = readout {
+        let strip = if wide {
+            Rect::from_min_max(
+                Pos2::new(rect.left() + space, rect.top()),
+                Pos2::new(staff_rect.left() - space * 0.5, rect.bottom()),
+            )
+        } else {
+            Rect::from_min_max(
+                rect.min,
+                Pos2::new(rect.right(), staff_rect.top()),
+            )
+        };
+        draw_readout(painter, strip, r, &p);
+    }
 
     for (i, clef) in clefs.iter().enumerate() {
         let g = Geometry {
@@ -914,45 +953,53 @@ fn draw_brace(painter: &Painter, x: f32, top: f32, bottom: f32, space: f32, p: &
 }
 
 /// The winner, large, and up to two runners-up under it.
+///
+/// **Shape-agnostic**, because it is handed two very different rectangles: a
+/// wide short strip above the staff in a narrow panel, and a tall narrow
+/// gutter beside it in a wide one. So it sizes the type to whichever of the
+/// two dimensions runs out first and centres the block, rather than placing
+/// each line at a fraction of the height — which spreads two lines to opposite
+/// ends of a tall gutter.
 fn draw_readout(painter: &Painter, strip: Rect, r: Readout<'_>, p: &Palette) {
-    // Sized to fit: chord names run from "C" to "C7(b9,#11)/E", and a name
-    // that clipped would be worse than a small one. 0.62 is the bundled
-    // monospace advance, the same number every other band uses.
-    let fit = |text: &str, nominal: f32| -> f32 {
-        let n = text.chars().count().max(1) as f32;
-        nominal.min(strip.width() * 0.94 / (n * 0.62))
-    };
+    if !strip.is_positive() {
+        return;
+    }
     let Some(chord) = r.chord else {
         return;
     };
-    let main_size = fit(chord, strip.height() * 0.52);
-    if main_size < 5.0 {
+    let names: Vec<&str> = r.alternates.iter().take(2).map(String::as_str).collect();
+    let alts = (!names.is_empty()).then(|| format!("or  {}", names.join("   ")));
+
+    // 0.62 is the bundled monospace advance, the same number every other band
+    // uses to size text to a box without laying it out first.
+    let fit = |text: &str, w: f32| w * 0.94 / (text.chars().count().max(1) as f32 * 0.62);
+    // The two lines together must fit the height: the alternates are just over
+    // half the main size, and there is a gap between them.
+    let stacked = if alts.is_some() { 1.9 } else { 1.15 };
+    let main = fit(chord, strip.width())
+        .min(alts.as_deref().map_or(f32::MAX, |a| fit(a, strip.width()) / 0.52))
+        .min(strip.height() / stacked);
+    if main < 5.0 {
         return;
     }
-    let two_lines = !r.alternates.is_empty();
-    let main_y = if two_lines {
-        strip.min.y + strip.height() * 0.34
-    } else {
-        strip.center().y
-    };
+    let alt_size = main * 0.52;
+    let block = if alts.is_some() { main + alt_size * 1.5 } else { main };
+    let top = strip.center().y - block * 0.5;
     painter.text(
-        Pos2::new(strip.center().x, main_y),
+        Pos2::new(strip.center().x, top + main * 0.5),
         Align2::CENTER_CENTER,
         chord,
-        FontId::new(main_size, fonts::courier_bold()),
+        FontId::new(main, fonts::courier_bold()),
         p.ink,
     );
-    if two_lines {
-        // "or", because that is what an alternate reading IS — not a second
+    if let Some(a) = alts {
+        // "or", because that is what an alternate reading IS: not a second
         // answer, a second way of hearing the first one.
-        let names: Vec<&str> = r.alternates.iter().take(2).map(String::as_str).collect();
-        let line = format!("or  {}", names.join("   "));
-        let size = fit(&line, main_size * 0.52).max(5.0);
         painter.text(
-            Pos2::new(strip.center().x, strip.min.y + strip.height() * 0.78),
+            Pos2::new(strip.center().x, top + main + alt_size * 0.75),
             Align2::CENTER_CENTER,
-            &line,
-            FontId::new(size, fonts::courier()),
+            &a,
+            FontId::new(alt_size, fonts::courier()),
             p.faint,
         );
     }
@@ -1801,6 +1848,39 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// **The readout goes where there is room for it.**
+    ///
+    /// A grand staff wants twenty-two units of height and seventeen of width,
+    /// so in a wide short panel it is limited by the height and can never fill
+    /// the width. Stacking the readout above it there spends a quarter of the
+    /// scarce dimension and leaves the abundant one empty; beside it, the name
+    /// grows to fill the space that was going to waste and the staff keeps its
+    /// full height. This pins which way round that decision goes, because it
+    /// is invisible in a passing paint test.
+    #[test]
+    fn the_readout_sits_beside_the_staff_only_when_there_is_a_gutter_for_it() {
+        // A cell of the four-panel band: taller than it is wide, so the
+        // readout stacks and the staff gets what is left.
+        let narrow = Rect::from_min_size(Pos2::ZERO, egui::vec2(320.0, 280.0));
+        assert!(!(narrow.width() > narrow.height() * 2.0));
+        // The solo panel: five times wider than tall, so it splits in two.
+        let wide = Rect::from_min_size(Pos2::ZERO, egui::vec2(1250.0, 258.0));
+        assert!(wide.width() > wide.height() * 2.0);
+        // And the staff's share of a wide panel is the larger one.
+        assert!(READOUT_COLUMN < 0.5, "the name took more width than the music");
+        // Whichever way it lands, the staff has to be able to fit: the width
+        // budget must not starve the space below what the height would give.
+        for r in [narrow, wide] {
+            let staff_w = if r.width() > r.height() * 2.0 {
+                r.width() * (1.0 - READOUT_COLUMN)
+            } else {
+                r.width()
+            };
+            let space = (r.height() / total_spaces(2, true)).min(staff_w / staff_w_spaces(0));
+            assert!(space > 4.0, "{r:?} leaves a {space}pt staff space");
         }
     }
 
