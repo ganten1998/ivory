@@ -327,6 +327,18 @@ pub struct IvoryApp {
     geometry_save_at: Option<Instant>,
 
     menu_state: Option<MenuState>,
+
+    /// The Welcome card, held back until the launch splash has gone.
+    ///
+    /// **It is its own OS window, and the splash is a LAYER.** The splash is
+    /// painted on the foreground layer of the main window, which covers every
+    /// band and every inline panel — and nothing at all of a separate
+    /// viewport. So the card opened on the first frame and sat on top of the
+    /// wordmark for the whole of the launch wait.
+    pending_welcome: Option<dialogs::Dialog>,
+    /// Whether the host says its launch splash is still up. Always false in
+    /// hosts that have no splash, which is every host but the desktop app.
+    splash_up: bool,
     dialog: Option<Dialog>,
 
     last_sent_size: Option<Vec2>,
@@ -543,7 +555,9 @@ impl IvoryApp {
             startup_detach_at,
             geometry_save_at: None,
             menu_state: None,
-            dialog: welcome,
+            dialog: None,
+            pending_welcome: welcome,
+            splash_up: false,
             last_sent_size: None,
             decorations_sent: None,
             main_inner_origin: Pos2::ZERO,
@@ -1681,6 +1695,15 @@ impl IvoryApp {
     ///
     /// Pushed every frame rather than pulled, for the same reason the recorder
     /// view is: this crate must not be able to ask a device anything.
+    /// Tell the app whether the host's launch splash is still on screen.
+    ///
+    /// Pushed every frame, like the recorder's state, and for the same reason:
+    /// the splash belongs to the host and this crate must not be able to ask
+    /// it anything. Hosts with no splash never call it and it stays false.
+    pub fn set_splash_up(&mut self, up: bool) {
+        self.splash_up = up;
+    }
+
     pub fn set_audio_status(&mut self, status: recorder::AudioStatus) {
         // Also refreshed into an OPEN panel, or it would show whatever was true
         // at the moment it was opened and never change.
@@ -3817,6 +3840,16 @@ impl IvoryApp {
 
     fn paint(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+
+        // **The Welcome card waits for the splash.** It is a separate OS
+        // window and the splash is a layer inside this one, so the layer
+        // cannot cover it: the card opened on the first frame and sat on the
+        // wordmark for the whole launch wait. Promoted the moment the host
+        // stops reporting a splash, and only into an empty dialog slot so it
+        // can never displace something the user opened first.
+        if !self.splash_up && self.dialog.is_none() {
+            self.dialog = self.pending_welcome.take();
+        }
 
         // Dev hook, alongside IVORY_DEMO_NOTES: open the menu on the first
         // frame so the in-canvas version can be photographed without anyone

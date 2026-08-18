@@ -1029,11 +1029,39 @@ fn draw_tonnetz(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Se
 
     // The three axes as edges. Every edge is an interval: horizontal a fifth,
     // up-right a major third, up-left a minor third.
-    for v in 0..=rows {
-        for u in -1..=cols {
-            let from = at(u, v);
-            for (du, dv) in [(1, 0), (0, 1), (-1, 1)] {
-                painter.line_segment([from, at(u + du, v + dv)], Stroke::new(1.3_f32, p.line));
+    //
+    // **Drawn across the WHOLE pane, not just across the nodes.** The loop ran
+    // `0..=rows`, and all three directions go up or sideways from a node — so
+    // the lattice bled off the top and the sides and stopped dead under the
+    // bottom row, which left a bar of empty pane under the diagram and made a
+    // centred thing look like it had sagged.
+    //
+    // A Tonnetz IS unbounded; what the pane holds is a crop of it. Lines with
+    // no nodes on them are not lines you cannot use — they are the rest of the
+    // lattice, and drawing them is what makes the crop read as a crop rather
+    // than as a diagram that ran out of paper. The splash's wordmark has done
+    // this since 4.2 for exactly the same reason.
+    //
+    // The range is solved from the pane rather than guessed: invert `at` at
+    // each corner and take a row and a column of margin, so every segment that
+    // could cross the pane is emitted and the clip rect does the rest.
+    {
+        let v_lo = ((l.y0 - rect.bottom()) / l.h).floor() as i32 - 1;
+        let v_hi = ((l.y0 - rect.top()) / l.h).ceil() as i32 + 1;
+        // A guard, not a policy: `fit` already refuses to build a lattice with
+        // a spacing under sixteen points, so these counts are small. It is
+        // here because the one thing worse than an ugly diagram is a frame
+        // that never finishes drawing.
+        let stroke = Stroke::new(1.3_f32, p.line);
+        for v in v_lo.max(-64)..=v_hi.min(64) {
+            let shear = v as f32 * l.a * 0.5;
+            let u_lo = ((rect.left() - l.x0 - shear) / l.a).floor() as i32 - 1;
+            let u_hi = ((rect.right() - l.x0 - shear) / l.a).ceil() as i32 + 1;
+            for u in u_lo.max(-64)..=u_hi.min(64) {
+                let from = at(u, v);
+                for (du, dv) in [(1, 0), (0, 1), (-1, 1)] {
+                    painter.line_segment([from, at(u + du, v + dv)], stroke);
+                }
             }
         }
     }
@@ -1113,7 +1141,11 @@ const HEX_DOWN_ORDER: [usize; 3] = [0, 1, 2];
 /// node radius is 0.30r, so the real extent is 1.30r and the pane has to hold
 /// 2.60r. Sizing on `r` alone put the tonic node through the pane's own title.
 fn hexagram_radius(rect: Rect) -> f32 {
-    rect.width().min(rect.height()) * 0.5 * DIAGRAM_FILL / 1.32
+    // The 1.27 is `1 + node_r/r` from `draw_triangles`: the circles stand
+    // proud of the hexagram by their own radius, so the pane has to hold the
+    // figure PLUS one node either side. Change one and change the other, or
+    // the vertices are clipped at the edges.
+    rect.width().min(rect.height()) * 0.5 * DIAGRAM_FILL / 1.27
 }
 
 fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Settings) {
@@ -1155,7 +1187,12 @@ fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &
         }
     }
 
-    let node_r = r * 0.30;
+    // **A quarter of the hexagram, not three tenths.** The six vertices are
+    // where the chords are, but the SHAPE is what the diagram is teaching —
+    // which triads sit a third apart and which a fifth — and at 0.30 the
+    // circles were heavy enough that the hexagram read as six buttons with
+    // lines between them rather than as a figure with its chords marked.
+    let node_r = r * 0.25;
     let draw_vertex = |pos: Pos2, root: u8, minor: bool, numeral: &str| {
         let mask = if minor {
             minor_triad(root)

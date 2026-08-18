@@ -1220,6 +1220,10 @@ impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         #[cfg(feature = "recorder")]
         self.fill_recorder_state(ctx);
+        // Before the frame, not after: the app decides whether to raise the
+        // Welcome card while it paints, and a flag set afterwards would be one
+        // frame stale — which is exactly one frame of card over wordmark.
+        self.app.set_splash_up(self.splash.is_some());
         self.app.frame(ctx);
         #[cfg(feature = "recorder")]
         self.after_frame(ctx, frame);
