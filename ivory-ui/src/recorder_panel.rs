@@ -515,7 +515,14 @@ fn rule_x(r: Rect, x: f32) -> Rect {
 /// eight hundredths come off the destination, which is the group set once at the
 /// start of a session — and the destination gets a row of its own height back in
 /// the same change, since its INSTRUMENT picker is now each slot's name box.
-const MONITOR_W: f32 = 0.36;
+/// **0.30 in 5.0**, down from 0.36. The full-height camera preview took its
+/// points from somewhere, and a slot row is four things on one line while the
+/// VU pair is the thing anybody actually watches while a take runs.
+const MONITOR_W: f32 = 0.30;
+
+/// The camera preview's width over its height. The commonest sensor shape, and
+/// the shape of the file a take writes.
+const PREVIEW_ASPECT: f32 = 16.0 / 9.0;
 
 /// The three zones of a fader row: icon, track, value.
 ///
@@ -537,9 +544,13 @@ fn fader_zones(row: Rect) -> (Rect, Rect, Rect) {
     if !row.is_positive() {
         return (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING);
     }
+    // The icon gets a wider share than it looks like it needs. It is drawn
+    // inscribed in a SQUARE, so at seven hundredths of a narrow column it was
+    // width-bound at four points however tall the row was — a metronome that
+    // small is a blot, and `draw_fader_icon` refuses to draw one at all.
     (
-        slice_h(row, 0.00, 0.07),
-        slice_h(row, 0.09, 0.73),
+        slice_h(row, 0.00, 0.11),
+        slice_h(row, 0.13, 0.73),
         slice_h(row, 0.755, 1.00),
     )
 }
@@ -704,30 +715,31 @@ impl Layout {
         // load into it (the slots). The middle group is more than twice the
         // width it had, which is where the bigger meters and the reachable
         // faders come from.
+        // The picture on the far left, full height; the words in their own
+        // column beside it. They used to be stacked in one narrow column,
+        // which made the preview short AND the type small — the two were
+        // fighting over the same points and both lost.
         let pv_w = Self::preview_w(body);
-        let left = Rect::from_min_max(body.min, Pos2::new(body.left() + pv_w, body.bottom()));
-        // The preview keeps a landscape box at the top; the name and the
-        // Setup button take the rest of the column.
-        // A little over a third to the picture, the rest to the words. The
-        // preview is a framing check you glance at twice a session; the name,
-        // the tempo and the way into every other take setting are read every
-        // time, and at 0.56 to the picture they were four-point type.
-        self.preview = slice_v(left, 0.00, 0.44);
-        self.fill_setup(slice_v(left, 0.48, 1.00));
+        self.preview = Rect::from_min_max(body.min, Pos2::new(body.left() + pv_w, body.bottom()));
+        let sw = Self::setup_w(body);
+        self.fill_setup(Rect::from_min_max(
+            Pos2::new(self.preview.right() + gap, body.top()),
+            Pos2::new(self.preview.right() + gap + sw, body.bottom()),
+        ));
 
         let monitor = Self::monitor_of(body);
         self.fill_heart(body, monitor);
         self.fill_monitor(monitor, view);
         self.rules[1] = rule_x(body, monitor.left() - gap * 0.5);
 
-        let middle = Rect::from_min_max(
-            Pos2::new(left.right() + gap, body.top()),
-            Pos2::new(monitor.left() - gap, body.bottom()),
-        );
+        // One source for the middle, shared with the rolling layout and with
+        // `fill_faders`, so the faders cannot drift from the meters beside
+        // them. See `Layout::middle_of`.
+        let middle = Self::middle_of(body, gap);
         if !middle.is_positive() {
             return;
         }
-        self.rules[0] = rule_x(body, left.right() + gap * 0.5);
+        self.rules[0] = rule_x(body, middle.left() - gap * 0.5);
         self.fill_transport(middle);
         self.fill_faders(body, gap);
     }
@@ -748,10 +760,10 @@ impl Layout {
     /// still want to touch would be half a survivor. Same argument the monitor
     /// column has always made; the faders took it with them when they moved.
     fn middle_of(body: Rect, gap: f32) -> Rect {
-        let pv_w = Self::preview_w(body);
+        let left = Self::preview_w(body) + gap + Self::setup_w(body);
         let monitor = Self::monitor_of(body);
         Rect::from_min_max(
-            Pos2::new(body.left() + pv_w + gap, body.top()),
+            Pos2::new(body.left() + left + gap, body.top()),
             Pos2::new(monitor.left() - gap, body.bottom()),
         )
     }
@@ -759,7 +771,21 @@ impl Layout {
     /// The left column's width, which is the same in both layouts because the
     /// faders are placed against it. See [`Layout::middle_of`].
     fn preview_w(body: Rect) -> f32 {
-        (body.height() * 1.05).clamp(body.width() * 0.13, body.width() * 0.20)
+        // **The whole height of the band, in landscape.** A take records the
+        // window, so this box is not a framing check somebody glances at — it
+        // is the camera inset the audience will see, and at a fifth of the
+        // band's height it was a postage stamp in a 1080p file. It takes every
+        // point the band is tall and as much width as 16:9 asks for, capped so
+        // it can never crowd out the transport it sits beside.
+        (body.height() * PREVIEW_ASPECT).min(body.width() * 0.17)
+    }
+
+    /// The column of words beside the preview: name, folder, tempo, Setup.
+    ///
+    /// A share of the width rather than of what the preview leaves, so the
+    /// Setup button is the same size whatever the camera is doing.
+    fn setup_w(body: Rect) -> f32 {
+        (body.width() * 0.12).clamp(60.0, 150.0)
     }
 
     /// The two fader rows, from the at-rest middle. See [`Layout::middle_of`].
@@ -772,7 +798,7 @@ impl Layout {
         // in it: two rows in the middle of a tall column rather than two rows
         // pinned to the bottom of the band, which is what made the bottom of
         // the window read as empty.
-        let col = slice_h(m, 0.19, 0.63);
+        let col = slice_h(m, 0.23, 0.56);
         // Tall rows in a narrow column. Moving the pair off the meters bought
         // width to give away and none to spare, so the legibility comes back
         // out of the HEIGHT: the two rows take nearly the whole column, which
@@ -800,8 +826,8 @@ impl Layout {
         // was. The faders are beside them rather than under them for the same
         // reason — the height they were taking was the height the meters
         // needed.
-        let top = slice_h(t, 0.00, 0.15);
-        self.meter = slice_h(t, 0.65, 1.00);
+        let top = slice_h(t, 0.00, 0.20);
+        self.meter = slice_h(t, 0.58, 1.00);
         // **The same size, both of them.** Stop used to be 0.66 of record, and
         // then its glyph was shrunk another 30% inside that — so the square
         // read as less than half the circle. Two transport buttons of different
@@ -815,9 +841,14 @@ impl Layout {
         // Stacked, and smaller: two round controls in a narrow column read as
         // a transport, and side by side they were claiming a third of the
         // group for two buttons pressed once a take.
-        let d = (top.height() * 0.24).min(top.width() * 0.62);
-        self.record = Rect::from_center_size(slice_v(top, 0.06, 0.36).center(), Vec2::splat(d));
-        self.stop = Rect::from_center_size(slice_v(top, 0.40, 0.70).center(), Vec2::splat(d));
+        // **Side by side on one line, centred.** Stacked, they read as two
+        // unrelated buttons down the edge of the band; a transport is a ROW,
+        // and the pair is one gesture with two ends.
+        let pair = slice_v(top, 0.08, 0.68);
+        let d = (pair.height() * 0.62).min(pair.width() * 0.40);
+        let dx = d * 0.72;
+        self.record = Rect::from_center_size(pair.center() - Vec2::new(dx, 0.0), Vec2::splat(d));
+        self.stop = Rect::from_center_size(pair.center() + Vec2::new(dx, 0.0), Vec2::splat(d));
         // A quarter of the transport rather than an eighteenth. The meter is a
         // pair of VU faces now, and a dial needs HEIGHT in a way a bar never
         // did: the same 34 points that made a perfectly good bar make a face
@@ -902,12 +933,12 @@ impl Layout {
     /// the two things worth reading from two metres away take most of the rest,
     /// and the monitor column stays exactly where it was.
     fn fill_rolling(&mut self, body: Rect, gap: f32, view: &RecorderView<'_>) {
-        // Never wider than the preview at rest: this box only ever COLLAPSES
-        // when a take starts, and a rolling preview that grew would run under
-        // the faders, which are pinned to the at-rest geometry.
-        let pv_w = (body.height() * 1.1)
-            .min(body.width() * 0.15)
-            .min(Self::preview_w(body));
+        // **The same preview, at the same size.** It used to collapse to a
+        // strip when a take started, back when it was a framing check. It is
+        // the camera inset the recording will carry now, so the moment a take
+        // starts is the moment it matters most — and the band does not
+        // rearrange itself under the eye either way.
+        let pv_w = Self::preview_w(body);
         self.preview = Rect::from_min_max(body.min, Pos2::new(body.left() + pv_w, body.bottom()));
         let monitor = Self::monitor_of(body);
         self.fill_heart(body, monitor);
@@ -933,15 +964,20 @@ impl Layout {
         // moment for the band to move under the eye. The only thing that
         // changes now is that the record button becomes the steady dot, which
         // is the one difference that means something.
-        let top = slice_h(t, 0.00, 0.15);
-        self.meter = slice_h(t, 0.65, 1.00);
+        let top = slice_h(t, 0.00, 0.20);
+        self.meter = slice_h(t, 0.58, 1.00);
 
         // The dot stands exactly where the record button stood, at exactly its
         // size. There is no record button while rolling — pressing it would
         // mean nothing, and a dead control is worse than no control.
-        let d = (top.height() * 0.24).min(top.width() * 0.62);
-        self.dot = Rect::from_center_size(slice_v(top, 0.06, 0.36).center(), Vec2::splat(d));
-        self.stop = Rect::from_center_size(slice_v(top, 0.40, 0.70).center(), Vec2::splat(d));
+        // **Side by side on one line, centred.** Stacked, they read as two
+        // unrelated buttons down the edge of the band; a transport is a ROW,
+        // and the pair is one gesture with two ends.
+        let pair = slice_v(top, 0.08, 0.68);
+        let d = (pair.height() * 0.62).min(pair.width() * 0.40);
+        let dx = d * 0.72;
+        self.dot = Rect::from_center_size(pair.center() - Vec2::new(dx, 0.0), Vec2::splat(d));
+        self.stop = Rect::from_center_size(pair.center() + Vec2::new(dx, 0.0), Vec2::splat(d));
 
         // The one thing `hide_elapsed` suppresses is a CLOCK. The count-in beat
         // is the number the player is counting, and "FINISHING" is the reason
@@ -2066,8 +2102,7 @@ fn draw_gain_value(painter: &Painter, r: Rect, gain: f32, typing: Option<&str>, 
         draw_typed_value(painter, r, typed, p);
         return;
     }
-    let reading = gain_text(gain);
-    let size = fit_text(r, &reading, r.height() * FADER_TEXT);
+    let (reading, size) = fader_reading(r, gain);
     if size < MIN_TEXT {
         return;
     }
@@ -2081,6 +2116,29 @@ fn draw_gain_value(painter: &Painter, r: Rect, gain: f32, typing: Option<&str>, 
         // get to look like a number.
         if gain <= 0.0 { p.faint } else { p.ink },
     );
+}
+
+/// The gain reading a box can actually hold, and the size to draw it at.
+///
+/// **The unit is the first thing to go.** "+12.0 dB" is eight characters, and
+/// in the fader column of a band at the smallest window this app opens they
+/// come out at three points — which is not a number, it is a grey mark where a
+/// number should be. Dropping " dB" is worth 60% more height for the digits,
+/// and the digits are the reading; a fader with a dB scale printed the length
+/// of it does not need the unit repeated at the end. It is only dropped when
+/// the full form will not do, so nothing changes at any ordinary size.
+///
+/// Shared with the test that proves the smallest band still reads, so the two
+/// cannot disagree about what is actually drawn.
+fn fader_reading(r: Rect, gain: f32) -> (String, f32) {
+    let full = gain_text(gain);
+    let size = fit_text(r, &full, r.height() * FADER_TEXT);
+    if size >= MIN_TEXT {
+        return (full, size);
+    }
+    let short = full.strip_suffix(" dB").map(str::to_owned).unwrap_or(full);
+    let size = fit_text(r, &short, r.height() * FADER_TEXT);
+    (short, size)
 }
 
 /// What a right-aligned numeric box shows while it is being typed into: the
@@ -2379,6 +2437,14 @@ fn vu_frac(level: f32) -> f32 {
 /// be no more than the face is tall, so the sweep is the only thing left that
 /// decides how much of the window the arc spans. At 35 degrees the arc covered
 /// half the card and the meter read as a small dial adrift on a large blank.
+/// A VU window's width over its height.
+///
+/// Half again as wide as it is tall, which is what the movement behind the
+/// glass needs and what every meter anybody has looked at is. The face is
+/// fitted to this and CENTRED in whatever box it was given, rather than
+/// stretched to fill it.
+const VU_ASPECT: f32 = 1.45;
+
 const VU_SWEEP: f32 = 0.80;
 
 /// The level meter: one analogue VU per channel, modelled on the one in a
@@ -2419,16 +2485,20 @@ fn draw_meter(painter: &Painter, r: Rect, m: Meters, p: &Palette) {
     // apiece is what put two 65-point meters at either end of a 600-point strip
     // while a take was rolling, which reads as two instruments on opposite
     // walls rather than as the left and right of one signal.
-    let fw = ((r.width() - gap * (n - 1.0)) / n).min(r.height() * 1.35);
-    if fw <= 0.0 {
+    // **Whichever of the two runs out first sets BOTH.** Capping the width at
+    // the height's worth and then drawing the face down the full height is how
+    // a landscape meter came out portrait and cut off: the aspect was written
+    // down, the height ignored it, and the arc ran off the top of a tall card.
+    let cell = (r.width() - gap * (n - 1.0)) / n;
+    let fh = r.height().min(cell / VU_ASPECT);
+    let fw = fh * VU_ASPECT;
+    if fw <= 0.0 || fh <= 0.0 {
         return;
     }
+    let top = r.center().y - fh * 0.5;
     let mut left = r.center().x - (fw * n + gap * (n - 1.0)) * 0.5;
     for lv in faces {
-        let face = Rect::from_min_max(
-            Pos2::new(left, r.top()),
-            Pos2::new(left + fw, r.bottom()),
-        );
+        let face = Rect::from_min_size(Pos2::new(left, top), Vec2::new(fw, fh));
         draw_vu(painter, face, *lv, m.clipped, p);
         left += fw + gap;
     }
@@ -4194,9 +4264,14 @@ mod tests {
         assert!(at_rest.record.is_positive() && !at_rest.dot.is_positive());
         let live = Layout::new(r, &rolling());
         assert!(live.dot.is_positive() && !live.record.is_positive());
-        assert!(
-            live.preview.width() < at_rest.preview.width(),
-            "the preview did not collapse for the rolling layout"
+        // **And the preview does NOT collapse.** It used to, back when it was
+        // a framing check somebody glanced at before a take. A take records
+        // the window now, so this box is the camera inset the recording will
+        // carry, and the moment it matters most is the moment it used to
+        // shrink.
+        assert_eq!(
+            live.preview, at_rest.preview,
+            "the preview moved when the take started"
         );
         // **The meter no longer has to grow, and asserting that it does would
         // be asserting the old band.** It was tiny at rest when the transport
@@ -4295,11 +4370,16 @@ mod tests {
     /// widest thing it can say is eight characters wide.
     #[test]
     fn a_gain_reading_fits_the_box_reserved_for_it_at_the_smallest_band() {
-        let widest = (0..=100)
-            .map(|i| gain_text(fader_to_gain(i as f32 / 100.0)))
-            .max_by_key(|t| t.chars().count())
+        // The worst case on the whole sweep, found rather than assumed.
+        let (worst, longest) = (0..=100)
+            .map(|i| {
+                let f = i as f32 / 100.0;
+                (f, gain_text(fader_to_gain(f)))
+            })
+            .max_by_key(|(_, t)| t.chars().count())
             .expect("the sweep is not empty");
-        assert_eq!(widest.chars().count(), 8, "{widest} is a new worst case");
+        assert_eq!(longest.chars().count(), 8, "{longest} is a new worst case");
+        let worst_gain = fader_to_gain(worst);
 
         for r in [
             band(500.0),
@@ -4311,7 +4391,9 @@ mod tests {
                 let l = Layout::new(r, &v);
                 for (which, row) in [("click", l.metronome_row), ("input", l.input_row)] {
                     let (icon, _, val) = fader_zones(row);
-                    let size = fit_text(val, &widest, val.height() * FADER_TEXT);
+                    // Through `fader_reading`, which is what the painter uses:
+                    // the box may drop the unit rather than the number.
+                    let (widest, size) = fader_reading(val, worst_gain);
                     assert!(
                         size >= MIN_TEXT,
                         "'{widest}' draws at {size}pt in {r:?}, which is a smudge"

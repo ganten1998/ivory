@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 6;
+const SETTINGS_VERSION: u64 = 7;
 
 /// Recorder backgrounds this app shipped as defaults before [`SETTINGS_VERSION`]
 /// 1, and which are therefore not evidence that anybody chose them.
@@ -1192,6 +1192,14 @@ impl Settings {
             self.show_chord_strip = !self
                 .theory_views()
                 .contains(crate::theory_panel::View::Staff);
+        }
+        if was < 7 {
+            // **The camera pane beside the diagrams is retired.** The camera
+            // has one home: the full-height preview at the recorder band's
+            // top-left, which is the inset a recording carries. Nothing in the
+            // UI reaches this any more, so a file that still says `true` would
+            // hold a pane open that could never be closed.
+            self.show_camera_pane = false;
         }
         if was < 1 {
             if V0_RECORDER_BG.contains(&self.recorder_bg_color.to_hex().as_str()) {

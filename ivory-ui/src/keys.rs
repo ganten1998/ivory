@@ -131,10 +131,11 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     (Key::K, "K", KeyAction::ToggleKeytoggle, true),
     (Key::R, "R", KeyAction::ClearNotes, true),
     (Key::G, "G", KeyAction::ToggleFretboard, true),
-    // `W` for webcam. `C` is the chord detector's and `V` is the Recorder
-    // band's, both of them for years — a shortcut that moves is worse than one
-    // that is not the first letter of the thing it does.
-    (Key::W, "W", KeyAction::ToggleCameraPane, true),
+    // **No `W`.** It toggled a second camera pane beside the theory diagrams;
+    // the camera has one home now, the full-height preview at the recorder
+    // band's top-left, which is the inset a recording carries. The pane's code
+    // is still here and switched off — it comes out after the beta — but
+    // nothing reaches it, so the letter is free again.
     // **U I O, in that order, are the sheet music.** Not one of them is the
     // first letter of what it does, and there was no letter left that was:
     // `S` is the supporter key, `C` the chord detector, `N` the chord namer.
@@ -638,7 +639,6 @@ mod tests {
         for (key, want) in [
             (Key::K, KeyAction::ToggleKeytoggle),
             (Key::G, KeyAction::ToggleFretboard),
-            (Key::W, KeyAction::ToggleCameraPane),
             (Key::U, KeyAction::ToggleNoteNames),
             (Key::I, KeyAction::CycleClef),
         ] {

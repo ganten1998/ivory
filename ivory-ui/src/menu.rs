@@ -1159,17 +1159,12 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 },
                 MenuAction::ToggleCountInInTake,
             ));
-            recorder.push(row(
-                // The camera lives in the WINDOW now, beside the theory
-                // diagrams, and what the window shows is what the video shows.
-                // So this row is not "preview the camera" — it is the camera.
-                if view.camera_pane_on {
-                    "Hide Camera (W)"
-                } else {
-                    "Show Camera (W)"
-                },
-                MenuAction::ToggleCameraPane,
-            ));
+            // **No camera row.** The camera has one home: the full-height
+            // preview at the band's top-left, which is the inset the recording
+            // carries. A second one beside the theory diagrams was two places
+            // for the same picture to be, and the diagrams are what the theory
+            // band is for. The pane's code is still here and switched off; it
+            // comes out after the beta.
             // **The take's settings, which used to be nine controls in the
             // middle of the band.** They are all set once at the start of a
             // session and most of them already opened a picker, so a menu row
@@ -3059,7 +3054,6 @@ mod tests {
                 "Start the Click",
                 "Record the Click Into Takes",
                 "Record the Count-in Into the Take",
-                "Show Camera (W)",
                 "Where Takes Go...",
                 "Show the Folder",
                 "Use This Folder by Default",
@@ -3176,7 +3170,6 @@ mod tests {
                 "Start the Click",
                 "Record the Click Into Takes",
                 "Record the Count-in Into the Take",
-                "Show Camera (W)",
                 "Where Takes Go...",
                 "Show the Folder",
                 "Use This Folder by Default",
