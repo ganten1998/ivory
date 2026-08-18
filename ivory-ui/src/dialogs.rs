@@ -3337,24 +3337,21 @@ pub fn show(
                                             "Performance audio",
                                         );
                                     });
-                                    for (i, l) in VideoLayout::ALL.into_iter().enumerate() {
-                                        ui.horizontal(|ui| {
-                                            export_label(
-                                                ui,
-                                                &t,
-                                                if i == 0 { "Layout" } else { "" },
-                                                true,
-                                            );
-                                            export_radio(
-                                                ui,
-                                                &t,
-                                                composite_on && can.layout,
-                                                &mut spec.composite.layout,
-                                                l,
-                                                l.label(),
-                                            );
-                                        });
-                                    }
+                                    // **No layout picker.** A take is the
+                                    // window: the same bands in the same
+                                    // order, with the camera where the window
+                                    // already puts it — full height at the
+                                    // top-left of the recorder band. There is
+                                    // nothing left to arrange, and five radio
+                                    // buttons offering arrangements that no
+                                    // longer happen would be five ways to be
+                                    // told the video will look like something
+                                    // it will not.
+                                    //
+                                    // `VideoLayout` still exists and is still
+                                    // stored; nothing reads it. It comes out
+                                    // after the beta.
+                                    let _ = &can.layout;
                                     // Said here rather than at the bottom,
                                     // because it is the answer to "why can I
                                     // not click these".

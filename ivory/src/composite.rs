@@ -188,23 +188,23 @@ impl Compositor {
             egui::vec2(self.width as f32, self.height as f32),
         );
         let camera_id = self.camera.as_ref().map(|c| (c.id, c.size));
-        // The band's height comes from what is IN it, asked of the app rather
-        // than assumed here; the inset's shape comes from the SENSOR, so a
-        // camera keeps its whole picture instead of being centre-cropped into
-        // whatever box the layout felt like. See `Layout::split`.
-        let camera_aspect = camera_id
-            .filter(|(_, (w, h))| *w > 0 && *h > 0)
-            .map_or(Layout::DEFAULT_CAMERA_ASPECT, |(_, (w, h))| {
-                w as f32 / h as f32
-            });
-        let panes = layout.split(
-            frame_rect,
-            want_camera.then_some(camera_aspect),
-            want_display.then(|| app.composite_aspect(shows)),
-        );
-        let overlays = layout.overlays();
-        let camera_on_top = layout.camera_on_top();
-
+        // **The frame IS the window.** No split, no inset, no layer order.
+        //
+        // A take used to be an arrangement of its own: the app's bands fitted
+        // into one pane, the camera composited into another, and a `Layout`
+        // deciding which floated over which. That was a second design of the
+        // same picture, and the two disagreed — the recorder band was dropped
+        // from the video, so the camera had to be put back by a route that
+        // could place it somewhere the window never does.
+        //
+        // The window already has the camera in it, full height at the top-left
+        // of the recorder band. So the display fills the frame, the camera
+        // texture goes to the app, and what the video shows is what the person
+        // recording it was looking at. `layout`, `want_camera` and
+        // `want_display` are still taken so the call sites and the settings
+        // file do not have to change in the same release; nothing reads them.
+        let _ = (layout, want_camera, want_display, shows);
+        let display_pane = frame_rect;
         let input = egui::RawInput {
             screen_rect: Some(frame_rect),
             // One physical pixel per point. The compositor is painting into a
@@ -219,57 +219,20 @@ impl Compositor {
                 .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
                 .show(ctx, |ui| {
                     let painter = ui.painter();
-                    // **Which layer is on top depends on the layout.**
-                    // `CameraFull` floats the display over the camera;
-                    // `DisplayFull` floats the camera over the display. Painting
-                    // the camera first unconditionally put the inset UNDER the
-                    // app it is supposed to sit on, which is the same as not
-                    // drawing it at all.
-                    if !camera_on_top {
-                        if let (Some(pane), Some((id, size))) = (panes.camera, camera_id) {
-                            paint_camera(painter, pane, id, size);
-                        }
-                    }
-                    if let Some(pane) = panes.display {
-                        if overlays && !camera_on_top {
-                            // A scrim under an overlaid band, or a white key on
-                            // a pale wall is a keyboard nobody can see. Only
-                            // when it IS overlaid: a stacked band already has
-                            // its own background.
-                            painter.rect_filled(
-                                pane,
-                                0.0,
-                                egui::Color32::from_black_alpha(190),
-                            );
-                        }
-                        // The camera as THIS context knows it. With the camera
-                        // pane on, the app draws the camera itself as one of
-                        // its own bands — so what the video shows is what the
-                        // window shows, and there is no second arrangement for
-                        // the two to disagree about.
-                        app.paint_composite(
-                            painter,
-                            pane,
-                            shows,
-                            camera_id.map(|(texture, (w, h))| ivory_ui::recorder::Preview {
-                                texture,
-                                size: egui::vec2(w as f32, h as f32),
-                            }),
-                        );
-                    }
-                    if camera_on_top {
-                        if let (Some(pane), Some((id, size))) = (panes.camera, camera_id) {
-                            // A hairline round the inset, so a dark webcam does
-                            // not look like a hole cut in the app.
-                            paint_camera(painter, pane, id, size);
-                            painter.rect_stroke(
-                                pane,
-                                0.0,
-                                egui::Stroke::new(2.0, egui::Color32::from_gray(0x20)),
-                                egui::StrokeKind::Outside,
-                            );
-                        }
-                    }
+                    app.paint_composite(
+                        painter,
+                        display_pane,
+                        shows,
+                        // The camera as THIS context knows it. The window's
+                        // texture handle means nothing here — they are
+                        // different `egui::Context`s with different atlases,
+                        // so it would draw whatever else happened to carry
+                        // that id, or nothing at all.
+                        camera_id.map(|(texture, (w, h))| ivory_ui::recorder::Preview {
+                            texture,
+                            size: egui::vec2(w as f32, h as f32),
+                        }),
+                    );
                 });
         });
 
@@ -566,34 +529,62 @@ mod tests {
             .take((W * H) as usize)
             .flatten()
             .collect();
+        // **`first_launch`, not `default`.** A take is the window, and the
+        // camera's only home in the window is the recorder band's preview —
+        // so with the band switched off there is no camera in the video, which
+        // is correct and makes this test measure nothing. Bare defaults have
+        // the recorder off; a first launch has it on, which is the state
+        // anybody recording is actually in.
+        // And `DESKTOP` caps, not `MINIMAL`. A host that cannot open a capture
+        // device has its recorder band forced off at construction — correctly,
+        // since it would be two hundred points of transport it can never
+        // populate — and a camera frame is not something such a host can have
+        // in the first place.
         let app = IvoryApp::new(
             c.context(),
-            ivory_ui::settings::Settings::default(),
-            ivory_ui::host::Caps::MINIMAL,
+            ivory_ui::settings::Settings::first_launch(),
+            ivory_ui::host::Caps::DESKTOP,
         );
         let out = c
             .frame(
                 &app,
-                Layout::CameraFull,
+                Layout::default(),
                 DisplayShows::default(),
                 true,
-                false,
+                true,
                 Some((&cam, W, H)),
             )
             .expect("composite");
         assert_eq!(out.len(), (W * H * 4) as usize, "the frame is the wrong size");
-
-        let mid = ((H / 2 * W + W / 2) * 4) as usize;
-        let px = &out[mid..mid + 4];
+        // **Searched for, not sampled at a known point.** The camera has no
+        // pane of its own any more — it is drawn inside the recorder band's
+        // preview, wherever the band puts it — so the thing to assert is that
+        // the colour is IN the frame and its mirror is not.
+        //
         // Tolerant by a couple of levels: the image goes through a linear
-        // blend against white, and exact equality would be asserting the
-        // rasteriser's rounding rather than the channel order.
+        // blend, and exact equality would be asserting the rasteriser's
+        // rounding rather than the channel order.
         let close = |a: u8, b: u8| a.abs_diff(b) <= 2;
+        let mut right = 0usize;
+        let mut swapped = 0usize;
+        for px in out.chunks_exact(4) {
+            if close(px[0], 0x20) && close(px[1], 0x80) && close(px[2], 0xF0) {
+                right += 1;
+            }
+            if close(px[0], 0xF0) && close(px[1], 0x80) && close(px[2], 0x20) {
+                swapped += 1;
+            }
+        }
         assert!(
-            close(px[0], 0x20) && close(px[1], 0x80) && close(px[2], 0xF0),
-            "RGBA F0,80,20 came back as {px:02X?} rather than BGRA 20,80,F0 — red and blue are swapped"
+            right > 0,
+            "RGBA F0,80,20 is nowhere in the frame as BGRA 20,80,F0 \
+             ({swapped} pixels came back with red and blue swapped)"
         );
-        assert!(close(px[3], 0xFF), "the frame is not opaque: {px:02X?}");
+        assert_eq!(swapped, 0, "red and blue are swapped in {swapped} pixels");
+        assert!(
+            out.chunks_exact(4).all(|px| px[3] == 0xFF),
+            "the frame is not opaque"
+        );
     }
 
     /// **The whole pipeline, in one test, producing a file a person can watch.**
@@ -715,12 +706,17 @@ mod tests {
         assert!(W > H);
     }
 
-    /// A frame with no camera in it is still a frame, and it is black rather
-    /// than uninitialised memory. The first seconds of every take look like
-    /// this, because a camera takes up to four seconds to wake up.
+    /// A frame with no camera in it is still the window, not garbage.
+    ///
+    /// The first seconds of every take look like this, because a camera takes
+    /// up to four seconds to wake up. It used to be asserted BLACK, back when
+    /// the camera had a pane of its own and an empty pane was black. A take is
+    /// the window now, so a camera that has not woken up yet costs the video
+    /// one small box inside the recorder band and nothing else — the rest of
+    /// the app is there from the first frame.
     #[test]
     #[ignore = "needs a GPU"]
-    fn a_frame_with_no_camera_yet_is_black_and_not_garbage() {
+    fn a_frame_with_no_camera_yet_is_the_window_and_not_garbage() {
         let Some((device, queue)) = headless() else {
             eprintln!("no GPU adapter — the compositor was not exercised");
             return;
@@ -733,12 +729,27 @@ mod tests {
             ivory_ui::settings::Settings::default(),
             ivory_ui::host::Caps::MINIMAL,
         );
-        let out = c
-            .frame(&app, Layout::CameraAbove, DisplayShows::default(), true, false, None)
-            .expect("composite");
+        let once = c
+            .frame(&app, Layout::default(), DisplayShows::default(), true, true, None)
+            .expect("composite")
+            .to_vec();
+        assert_eq!(once.len(), (W * H * 4) as usize);
+        // Opaque everywhere: an uninitialised readback shows up here first.
         assert!(
-            out.iter().step_by(4).all(|b| *b == 0),
-            "a camera-less frame should be black"
+            once.chunks_exact(4).all(|px| px[3] == 0xFF),
+            "the frame is not opaque"
         );
+        // Something was actually drawn — the app's own bands, which are not
+        // black — so this is not the old empty pane wearing a new name.
+        assert!(
+            once.chunks_exact(4).any(|px| px[..3] != [0, 0, 0]),
+            "a camera-less frame is entirely black, so nothing was painted"
+        );
+        // And it is DETERMINISTIC. Garbage is what differs between two frames
+        // of the same unchanged app.
+        let twice = c
+            .frame(&app, Layout::default(), DisplayShows::default(), true, true, None)
+            .expect("composite");
+        assert_eq!(once, twice, "two frames of an unchanged app differ");
     }
 }

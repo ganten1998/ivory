@@ -3414,13 +3414,14 @@ fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
     // flat fraction instead would make the pane a different shape at every
     // window size, and a preview whose aspect wanders is one you cannot frame
     // a shot in.
-    let camera_w = if settings.show_camera_pane {
-        let k = theory_panel::BAND_H_AT_1300 / 1300.0;
-        let ak = f64::from(CAMERA_PANE_ASPECT) * k;
-        (w as f64 * ak / (1.0 + ak)).trunc() as f32
-    } else {
-        0.0
-    };
+    // **Always zero: the pane beside the diagrams is retired.** The camera has
+    // one home, the full-height preview at the top-left of the recorder band,
+    // which is the inset a take carries. Nothing in the UI can turn this on —
+    // no menu row, no `W`, and settings version 7 migrates a stale `true` to
+    // false — and leaving the arithmetic live meant a dead feature was still
+    // deciding how much height the theory band was allowed to have.
+    let _ = settings.show_camera_pane;
+    let camera_w = 0.0_f32;
     // Zero while popped out, exactly like the chord strip and the neck above.
     // Without this the diagrams render in BOTH places at once, and the main
     // window keeps 300pt of height for a band that is somewhere else.
@@ -3454,6 +3455,28 @@ fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
         recorder_panel::band_height(w)
     } else {
         0.0
+    };
+    // **Sixteen by nine, paid for out of the theory band.**
+    //
+    // Every band's height is a fixed fraction of the width, and the sum of
+    // those fractions came to 1.740 — close enough to 16:9 to look like an
+    // accident and far enough to letterbox a video. A take is the window now,
+    // so the window's shape IS the video's shape, and a standard one costs
+    // almost nothing: at 100% the theory band gives up sixteen of its three
+    // hundred points, five per cent of the one band whose contents are
+    // diagrams that scale to whatever they are given.
+    //
+    // **Clamped, and the clamp is the point.** It holds while the usual set of
+    // bands is up and lets go the moment somebody turns one off: a window with
+    // no fretboard would need a theory band half again as tall to stay 16:9,
+    // and that is a stretched diagram rather than a standard shape. Then the
+    // window is simply what its bands come to, as it always was.
+    let theory_h = if theory_h > 0.0 {
+        let rest = recorder_h + chord_h + piano_h + fret_h;
+        let want = (w * 9.0 / 16.0).trunc() - rest;
+        want.clamp(theory_h * 0.75, theory_h * 1.25).trunc()
+    } else {
+        theory_h
     };
     Bands {
         w,
@@ -3692,11 +3715,26 @@ impl IvoryApp {
     /// second copy of this would be the two of them drawing different videos.
     fn composite_settings(&self, shows: recorder::DisplayShows) -> Settings {
         let mut s = self.settings.clone();
-        s.show_recorder = false;
+        // **A take is the window.** Every band appears in the video exactly
+        // when it appears on screen, in the order it appears there, and the
+        // ticks in the Export dialog can only take one AWAY. What they cannot
+        // do is add one back: a band torn off into its own window is not in
+        // the window a take records, and one that is switched off is not there
+        // to record.
+        //
+        // The recorder used to be forced off here, back when the video was an
+        // arrangement of its own with the camera floated over it as an inset.
+        // It is the band the camera lives in, so leaving it out was leaving
+        // the performer out — and putting the camera back by a second route
+        // gave two arrangements of one picture to disagree about.
+        s.show_recorder = self.settings.show_recorder && !self.settings.recorder_detached;
         s.recorder_detached = false;
-        s.chord_detection_enabled = shows.chord;
+        s.chord_detection_enabled = shows.chord && self.settings.chord_detection_enabled;
+        s.show_chord_strip =
+            self.settings.show_chord_strip && !self.settings.chord_window_detached;
         s.chord_window_detached = false;
-        s.show_fretboard = shows.fretboard;
+        s.show_fretboard =
+            shows.fretboard && self.settings.show_fretboard && !self.settings.fretboard_detached;
         s.fretboard_detached = false;
         // **Unticking the piano has to remove its HEIGHT, not just its ink.**
         // Every other flag here maps onto a setting that zeroes a band; the
@@ -3707,15 +3745,12 @@ impl IvoryApp {
         // The theory band has no "show theory" bool — it exists exactly when
         // something is in it — so the override has to work in both directions
         // by hand.
-        if shows.theory {
-            // Asked for and nothing selected: show everything, which is what a
-            // fresh install shows. Forcing it off was symmetric and wrong —
-            // ticking "theory" in the Export dialog and getting no theory is
-            // the tick doing nothing.
-            if !s.theory_views().any() {
-                s.set_theory_views(&crate::theory_panel::Views::all());
-            }
-        } else {
+        // It only ever takes away: a band torn off into its own window is not
+        // in the window a take records, and one the number keys collapsed is
+        // not there to record either. The old code filled an EMPTY band with
+        // all four diagrams when the tick asked for theory, which was the
+        // video inventing a layout nobody had on screen.
+        if !shows.theory || self.settings.theory_detached {
             s.theory_order = String::new();
         }
         s
@@ -3758,12 +3793,44 @@ impl IvoryApp {
             |top: f32, h: f32| Rect::from_min_size(Pos2::new(origin.x, origin.y + top), Vec2::new(w, h));
 
         let display = self.display_notes();
+        // **The recorder band, first, exactly as the window stacks it.** It
+        // was never painted here at all: `composite_settings` forced it off
+        // and every offset below counted from the theory band. So a take was
+        // the window minus its top band — and the camera, whose only home is
+        // that band's preview, had to be composited in by a second route that
+        // could put it somewhere the window never does.
+        if bands.recorder_h > 0.0 {
+            recorder_panel::draw(
+                painter,
+                band_at(0.0, bands.recorder_h),
+                &recorder::RecorderView {
+                    // **The compositor's texture, not the window's.** They are
+                    // different `egui::Context`s with different atlases, so the
+                    // handle the live preview holds means nothing here: it
+                    // would draw whatever else carried that id, or nothing.
+                    preview: camera,
+                    // Nothing is focused and nothing is being typed into a
+                    // video: a caret blinking in a recording is a control the
+                    // viewer will try to click.
+                    name_focused: false,
+                    editing: None,
+                    ..self.recorder.view(
+                        s.record_take_name.as_deref().unwrap_or_default(),
+                        false,
+                        None,
+                        s.knobs(),
+                        s.record_hide_elapsed,
+                    )
+                },
+                &s,
+            );
+        }
         if bands.theory_h > 0.0 {
             // The same cut as the live window, from the same function — this
             // is the point of the whole change. What the video shows is what
             // the window shows, camera included, because there is only one
             // arrangement and both paths read it.
-            let (theory, pane) = bands.theory_row(band_at(0.0, bands.theory_h), s.camera_pane_left);
+            let (theory, pane) = bands.theory_row(band_at(bands.recorder_h, bands.theory_h), s.camera_pane_left);
             if s.theory_views().count() > 0 && !s.theory_detached {
                 theory_panel::draw(
                     painter,
@@ -3794,7 +3861,7 @@ impl IvoryApp {
         if bands.chord_h > 0.0 && shows.chord {
             chord_strip::draw(
                 painter,
-                band_at(bands.theory_h, bands.chord_h),
+                band_at(bands.recorder_h + bands.theory_h, bands.chord_h),
                 self.current_chord.as_deref(),
                 s.chord_text_color.to_color32(),
                 // No heart and no transpose arrows in the video. Both are
@@ -3809,7 +3876,7 @@ impl IvoryApp {
         if shows.piano {
             piano::draw(
                 painter,
-                band_at(bands.theory_h + bands.chord_h, bands.piano_h),
+                band_at(bands.recorder_h + bands.theory_h + bands.chord_h, bands.piano_h),
                 &display,
                 self.notes.sustain_down(),
                 &s,
@@ -3818,7 +3885,7 @@ impl IvoryApp {
         if bands.fret_h > 0.0 {
             let spec = s.fretboard_spec();
             let r = band_at(
-                bands.theory_h + bands.chord_h + bands.piano_h,
+                bands.recorder_h + bands.theory_h + bands.chord_h + bands.piano_h,
                 bands.fret_h,
             );
             fretboard_panel::draw(
@@ -4681,47 +4748,6 @@ impl IvoryApp {
 mod tests {
     use super::*;
 
-    /// `nih_plug_egui::create_egui_editor` requires its state to be
-    /// `'static + Send`. Asserted HERE rather than discovered in the plugin
-    /// crate, where the same mistake arrives as a wall of trait errors
-    /// pointing at a macro. Send only, NOT Sync: `mpsc::Receiver` is not Sync,
-    /// and the 0.7 adapter does not ask for it.
-    /// **The pane stays 16:9 after the fullscreen stretch, too.**
-    ///
-    /// `fill_bands` scales every band's HEIGHT by one factor to fill the
-    /// screen; a pane whose width did not follow that factor stops being the
-    /// shape a camera frame is and starts putting bars round the picture. This
-    /// was found by rendering a real composited frame and measuring the pane in
-    /// it — 1.32:1 in a 16:9 video — which no assertion in this file was asking
-    /// about at the time.
-    #[test]
-    fn the_camera_pane_keeps_its_shape_when_the_layout_is_stretched_to_fill() {
-        let mut s = Settings::default();
-        s.set_theory_views(&theory_panel::Views::of(vec![theory_panel::View::Circle]));
-        s.show_camera_pane = true;
-        for avail in [
-            Vec2::new(1920.0, 1080.0),
-            Vec2::new(1080.0, 1920.0),
-            Vec2::new(960.0, 540.0),
-            Vec2::new(1600.0, 1200.0),
-        ] {
-            let b = fill_bands(&s, avail);
-            let row = Rect::from_min_size(Pos2::ZERO, Vec2::new(b.w, b.theory_h));
-            let (t, c) = b.theory_row(row, false);
-            let pane = c.width() / c.height();
-            assert!(
-                (pane - CAMERA_PANE_ASPECT).abs() < 0.01,
-                "the pane is {pane}:1 in a {avail:?} frame"
-            );
-            assert!(row.contains_rect(c), "the pane left the row in {avail:?}");
-            assert!(!t.intersects(c.shrink(0.02)), "the pane is over the diagrams");
-            assert!(
-                c.width() < avail.x * 0.5,
-                "the pane took {} of a {avail:?} frame",
-                c.width() / avail.x
-            );
-        }
-    }
 
     /// **One chord name on screen, not two.**
     ///
@@ -4767,78 +4793,11 @@ mod tests {
         assert_eq!(band_sizes_at(&s, 1300.0).chord_h, 0.0);
     }
 
-    /// **The camera pane and the theory band share one row and both fit.**
-    ///
-    /// The two constrain each other — the pane's width is set by the row's
-    /// height and the row's height by whatever width the pane leaves — so this
-    /// checks the solved answer against its own definition rather than against
-    /// a number somebody typed. If the arithmetic drifts, the pane stops being
-    /// 16:9 and a preview you cannot frame a shot in is the symptom.
-    #[test]
-    fn the_camera_pane_is_sixteen_by_nine_and_the_diagrams_fit_beside_it() {
-        for views in [1_u32, 2, 3] {
-            let mut on = Settings::default();
-            on.set_theory_views(&theory_panel::Views::of(
-                theory_panel::View::ALL
-                    .into_iter()
-                    .take(views as usize)
-                    .collect(),
-            ));
-            on.show_camera_pane = true;
-            let mut off = on.clone();
-            off.show_camera_pane = false;
-
-            for w in [900.0_f32, 1300.0, 2600.0] {
-                let b = band_sizes_at(&on, w);
-                assert!(b.camera_w > 0.0, "no pane at {w}");
-                let pane = b.camera_w / b.theory_h;
-                assert!(
-                    (pane - CAMERA_PANE_ASPECT).abs() < 0.03,
-                    "the pane is {pane}:1 at {w} with {views} diagrams"
-                );
-                // The diagrams get everything else, and they get SHORTER for
-                // it rather than being clipped — which is what makes any
-                // configuration of the theory window fit beside the camera.
-                let bare = band_sizes_at(&off, w);
-                assert!(
-                    b.theory_h < bare.theory_h,
-                    "the row did not shrink to make room at {w}"
-                );
-                assert!(
-                    b.camera_w < w * 0.4,
-                    "the pane took {} of the window",
-                    b.camera_w / w
-                );
-
-                // And the row really does divide in two, on either side.
-                let row = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, b.theory_h));
-                for left in [false, true] {
-                    let (t, c) = b.theory_row(row, left);
-                    assert!(row.contains_rect(c), "the pane left the row");
-                    assert!(row.contains_rect(t), "the diagrams left the row");
-                    assert!(!t.intersects(c.shrink(0.02)), "the pane is over the diagrams");
-                    assert_eq!(c.left() > t.left(), !left, "the pane is on the wrong side");
-                    // At the natural size the pane IS its column: the width was
-                    // solved from the row's height precisely so that it would
-                    // be, and only a stretch or the cap pulls them apart.
-                    assert!(
-                        (c.height() - row.height()).abs() < 1.5,
-                        "the pane is {} tall in a {} row",
-                        c.height(),
-                        row.height()
-                    );
-                }
-            }
-        }
-        // With the diagrams off entirely the pane still has its row, or `T`
-        // would take the camera away with the circle of fifths.
-        let mut only_camera = Settings::default();
-        only_camera.theory_order = String::new();
-        only_camera.show_camera_pane = true;
-        let b = band_sizes_at(&only_camera, 1300.0);
-        assert!(b.camera_w > 0.0 && b.theory_h > 0.0, "the camera lost its row");
-    }
-
+    /// `nih_plug_egui::create_egui_editor` requires its state to be
+    /// `'static + Send`. Asserted HERE rather than discovered in the plugin
+    /// crate, where the same mistake arrives as a wall of trait errors
+    /// pointing at a macro. Send only, NOT Sync: `mpsc::Receiver` is not Sync,
+    /// and the 0.7 adapter does not ask for it.
     #[test]
     fn the_app_can_be_handed_to_a_plugin_editor() {
         fn assert_send<T: 'static + Send>() {}
@@ -6419,3 +6378,4 @@ mod geometry_tests {
         assert!(wm_overrode_size(Vec2::new(700.0, 150.0), asked));
     }
 }
+
