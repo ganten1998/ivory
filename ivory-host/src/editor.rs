@@ -77,6 +77,12 @@ use mac::Window as Inner;
 #[cfg(not(target_os = "macos"))]
 use stub::Window as Inner;
 
+/// Whether this build can host a plugin's own window at all.
+///
+/// macOS today. See `stub::Window::open`, which is what the other platforms
+/// compile, and [`EditorError::Unsupported`].
+pub const EDITORS_SUPPORTED: bool = cfg!(target_os = "macos");
+
 /// Why an editor could not be opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorError {
@@ -170,11 +176,23 @@ impl EditorHandle {
         }
     }
 
-    /// Whether this plugin offers an editor at all. Main thread only.
+    /// Whether an editor for this plugin can actually be OPENED here.
     ///
-    /// The first call builds a view and releases it, because VST3 has no
-    /// `hasEditor`; the answer is then remembered for the handle's life.
+    /// Two questions, and both have to be yes: does the plugin offer a view,
+    /// and can this build host one? The first is asked by building a view and
+    /// releasing it, because VST3 has no `hasEditor`; the answer is then
+    /// remembered for the handle's life.
+    ///
+    /// **The second was missing, and a tester found it.** On Windows the row
+    /// offered an OPEN WINDOW button for a plugin that had a view, pressing it
+    /// answered "plugin editors are only implemented on macOS so far", and the
+    /// button stayed there offering to do it again. `EditorError::Unsupported`
+    /// says in its own documentation that the UI should grey the row rather
+    /// than offer something that will fail — this is what makes that true.
     pub fn has_editor(&self) -> bool {
+        if !EDITORS_SUPPORTED {
+            return false;
+        }
         if let Some(known) = self.probed.get() {
             return known;
         }
@@ -789,6 +807,10 @@ mod tests {
     fn every_failure_has_a_sentence_a_user_could_read() {
         // These reach the UI verbatim, so "kResultFalse" is not an acceptable
         // answer for any of them.
+        // And the platform gate agrees with the platform: a build that returns
+        // `Unsupported` from `open` must not advertise editors, or the UI
+        // offers a button whose only outcome is that message.
+        assert_eq!(EDITORS_SUPPORTED, cfg!(target_os = "macos"));
         for e in [
             EditorError::Unsupported,
             EditorError::NoEditor,
