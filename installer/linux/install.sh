@@ -46,6 +46,13 @@ USAGE
 
 WANT_APP=1
 WANT_VST3=1
+# Whether the plugin was ASKED for, as opposed to being on because the default
+# is "both". The two artifacts are not the same shape: the full release carries
+# `Tangent.vst3` beside this script, and the plain cross-built tarball is the
+# application on its own. Treating "no plugin in this archive" as a failure
+# made the default invocation exit 1 on the app-only tarball — which is the
+# tarball most people have.
+VST3_EXPLICIT=0
 DRY=0
 UNINSTALL=0
 MODE=user
@@ -54,8 +61,8 @@ PREFIX=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --app)       WANT_APP=1; WANT_VST3=0 ;;
-        --vst3)      WANT_APP=0; WANT_VST3=1 ;;
-        --both)      WANT_APP=1; WANT_VST3=1 ;;
+        --vst3)      WANT_APP=0; WANT_VST3=1; VST3_EXPLICIT=1 ;;
+        --both)      WANT_APP=1; WANT_VST3=1; VST3_EXPLICIT=1 ;;
         --system)    MODE=system ;;
         --user)      MODE=user ;;
         --prefix)    shift; [ $# -gt 0 ] || { echo "--prefix needs a directory" >&2; exit 2; }
@@ -190,11 +197,20 @@ if [ "$WANT_APP" = "1" ]; then
     esac
 fi
 
-if [ "$WANT_VST3" = "1" ]; then
-    if [ ! -d "$SELF_DIR/$NAME.vst3" ]; then
+if [ "$WANT_VST3" = "1" ] && [ ! -d "$SELF_DIR/$NAME.vst3" ]; then
+    if [ "$VST3_EXPLICIT" = "1" ]; then
         echo "no '$NAME.vst3' next to this script" >&2
         exit 1
     fi
+    # Asked for by the default rather than by name, and it is not here: say so
+    # once and carry on with the application. This archive is the app on its
+    # own, and refusing to install it because a thing it never contained is
+    # absent helps nobody.
+    echo "  plugin      -> not in this archive (application only)"
+    WANT_VST3=0
+fi
+
+if [ "$WANT_VST3" = "1" ]; then
     echo "  plugin      -> $VST3_DIR/$NAME.vst3"
     run mkdir -p "$VST3_DIR"
     # Remove the old bundle first. Copying over it leaves behind any file that

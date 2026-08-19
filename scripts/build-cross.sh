@@ -314,6 +314,25 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   # The same user-facing readme the macOS and Windows artifacts carry.
   cp docs/ARTIFACT-README.md "$stage/README.txt" \
     || { rm -rf "$stage"; return 1; }
+  # **The installer the README tells them to run.**
+  #
+  # `build-installer.sh` copied this in and this path never did, so every
+  # tarball built here shipped a readme whose Linux section says
+  # `./install.sh` next to a directory that did not contain one. The script
+  # handles an app-only archive: the plugin is added by the installer path,
+  # and its absence here is a note rather than a failure.
+  cp installer/linux/install.sh "$stage/install.sh" || { rm -rf "$stage"; return 1; }
+  chmod 0755 "$stage/install.sh" || { rm -rf "$stage"; return 1; }
+  # **Everything the readme promises is actually here.** The readme is one
+  # file shared by three platforms, so a name in it is a claim this stage has
+  # to be able to meet — and the way that breaks is silently, one release at a
+  # time, on the platform nobody packs by hand.
+  for promised in tangent install.sh README.txt LICENSE; do
+    if [ ! -e "$stage/$promised" ]; then
+      echo "!! the readme promises $promised and the stage has no such file"
+      rm -rf "$stage"; return 1
+    fi
+  done
   # **Readable by somebody other than the person who packed it.** A root
   # install of a tarball whose files are 0600 gives every other user on the
   # box an app they cannot read. Directories need the bit too, or nobody can
