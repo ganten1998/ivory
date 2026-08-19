@@ -884,24 +884,45 @@ impl Layout {
         let bar = slice_v(col, 0.60, 1.00);
         // **The tempo is a knob at the head of the transport**, and that is
         // what makes the transport one thing rather than three buttons and a
-        // number that happened to be nearby. It takes the first quarter; the
-        // three buttons share the rest.
+        // number that happened to be nearby.
         //
-        // Its own cell, not an icon slot: a knob wants a word over it and the
-        // buttons do not, so they are sized separately and centred on the same
-        // line.
+        // **The same cell as an effect knob, to the point.** They are the same
+        // control and the eye reads them as a set; a tempo knob a few points
+        // off the size of the three beside it looks like a mistake nobody can
+        // name. Sized from `self.reverb`, which `fill_transport` has already
+        // placed — not from a fraction of this row, which would agree with it
+        // only by luck and only at one window size.
+        //
         // **And the clock takes its place while a take runs.** The tempo
         // cannot be changed mid-take — the `.mid`'s tempo map is already
         // written — so leaving a live knob there would be a control that lies.
         // What goes in its place is the one number anybody looks at from a
         // piano bench, in the row their hand is already on.
-        let head = slice_h(bar, 0.00, 0.28);
+        let head = if self.reverb.is_positive() {
+            let size = Vec2::new(
+                self.reverb.width().min(bar.width() * 0.5),
+                self.reverb.height().min(bar.height()),
+            );
+            Rect::from_center_size(
+                Pos2::new(bar.left() + size.x * 0.5, bar.center().y),
+                size,
+            )
+        } else {
+            slice_h(bar, 0.00, 0.28)
+        };
         if rolling {
             self.timecode = head;
         } else {
             self.tempo = head;
         }
-        let buttons = slice_h(bar, 0.32, 1.00);
+        // **The buttons start where the knob's CELL ends**, not at a fraction
+        // of the row. The knob's ticks stand outside its body but inside its
+        // cell, so a gap measured from the row left a hole that looked like
+        // something was missing from it.
+        let buttons = Rect::from_min_max(
+            Pos2::new(head.right() + bar.width() * 0.02, bar.top()),
+            bar.max,
+        );
         // **Sized and lined up against the KNOB, not against the row.** They
         // are one group with it, and a group whose parts are measured from
         // different things is a group that only looks like one by accident:
@@ -1038,8 +1059,12 @@ impl Layout {
         // The faders survive a take for the same reason they always did: the
         // click is turned down mid-performance more than any other control
         // here. They keep the bottom of the group, where they are at rest.
-        self.fill_faders(body, gap, true);
+        // **Transport first, faders second**, the same way round as at rest.
+        // The tempo knob is sized from the effect knobs, and those are placed
+        // in `fill_transport` — so asking for them the other way round would
+        // measure against a rectangle that is still `NOTHING`.
         self.fill_transport(t);
+        self.fill_faders(body, gap, true);
 
         // **The identical band, with the record button become the dot.** The
         // transport sits at the foot of the faders in both layouts, so the
