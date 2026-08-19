@@ -996,13 +996,6 @@ impl IvoryApp {
         transposed(&set, self.settings.transpose)
     }
 
-    /// The notes keytoggle is holding, in display pitches.
-    fn latched_notes(&self) -> HashSet<u8> {
-        if !self.settings.keytoggle_enabled {
-            return HashSet::new();
-        }
-        transposed(&self.manual_notes, self.settings.transpose)
-    }
 
     /// What the theory band draws, from the notes already on screen.
     ///
@@ -1122,6 +1115,23 @@ impl IvoryApp {
         let all_present = pcs
             .iter()
             .all(|pc| self.manual_notes.iter().any(|n| n % 12 == *pc));
+
+        // **A vertex REPLACES what is showing, rather than adding to it.**
+        //
+        // The harmonic triangles are the one view where the thing you point at
+        // is a whole chord, and the thing anybody does with them is compare:
+        // press C, then F, then G. Adding each to the last builds a nine-note
+        // cluster and calls it a chord — so a second vertex clears the first.
+        //
+        // Pressing the SAME one again still takes it off, which is what makes
+        // it a toggle rather than a radio button you can never switch off.
+        // And this is deliberately not done for a pitch CLASS: the circle and
+        // the lattice are how a chord is built up one note at a time, which is
+        // the opposite gesture.
+        if matches!(hit, theory_panel::Hit::Triad { .. }) && !all_present {
+            self.manual_notes.clear();
+            self.manual_positions.clear();
+        }
         for pc in pcs {
             self.manual_notes.retain(|n| n % 12 != pc);
             self.manual_positions.retain(|n, _| n % 12 != pc);
@@ -2459,6 +2469,12 @@ impl IvoryApp {
             // Both knobs write to settings and are pushed to the engine after
             // the frame, the same shape as a fader: `save_settings_soon`
             // because a drag is a hundred of these and each one is a file.
+            // A press opens the field and sets nothing. The value arrives when
+            // it is committed, through `NumField::Tempo`.
+            Hit::EditTempo => {
+                self.num_edit = Some(recorder::NumEdit::new(recorder::NumField::Tempo));
+                self.name_focused = false;
+            }
             Hit::SetReverb(v) => {
                 self.settings.reverb_mix = f64::from(v.clamp(0.0, 1.0));
                 self.save_settings_soon();
@@ -5863,6 +5879,57 @@ mod tests {
         app.take_recorder_request()
     }
 
+    /// **A vertex of the harmonic triangles SWITCHES chords.**
+    ///
+    /// What anybody does with that view is compare: press C, then F, then G.
+    /// Adding each to the last builds a nine-note cluster and calls it a
+    /// chord. Pressing the same one again still takes it off, which is what
+    /// keeps it a toggle rather than a radio button with no way out.
+    #[test]
+    fn a_chord_vertex_replaces_the_chord_before_it() {
+        let (_, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = true;
+        let pcs = |app: &IvoryApp| {
+            let mut v: Vec<u8> = app.manual_notes.iter().map(|n| n % 12).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+
+        app.toggle_theory_hit(theory_panel::Hit::Triad {
+            root: 0,
+            minor: false,
+        });
+        assert_eq!(pcs(&app), vec![0, 4, 7], "C major did not go in");
+
+        app.toggle_theory_hit(theory_panel::Hit::Triad {
+            root: 5,
+            minor: false,
+        });
+        assert_eq!(pcs(&app), vec![0, 5, 9], "F major did not replace C major");
+
+        // The same one again comes off, and leaves nothing behind.
+        app.toggle_theory_hit(theory_panel::Hit::Triad {
+            root: 5,
+            minor: false,
+        });
+        assert!(pcs(&app).is_empty(), "pressing F again did not clear it");
+    }
+
+    /// **And a pitch class does not**, because that is the opposite gesture:
+    /// the circle and the lattice are how a chord is built one note at a time.
+    #[test]
+    fn a_lattice_node_adds_rather_than_replacing() {
+        let (_, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = true;
+        for pc in [0, 4, 7] {
+            app.toggle_theory_hit(theory_panel::Hit::Pc(pc));
+        }
+        let mut got: Vec<u8> = app.manual_notes.iter().map(|n| n % 12).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 4, 7], "the notes replaced each other");
+    }
+
     /// **The staff is an instrument now.** It was a readout, and said so in a
     /// comment: a note on it is a note you are already holding. That stopped
     /// being true when every other view became playable — a pianist reading a
@@ -7410,7 +7477,9 @@ mod tests {
         };
 
         app.num_edit = Some(typed());
-        app.commit_number_unless(Some(recorder_panel::Hit::SetTempo(90.0)));
+        // `EditTempo`, because that is the box now: `SetTempo` carries a
+        // committed value and is not a thing on screen to press.
+        app.commit_number_unless(Some(recorder_panel::Hit::EditTempo));
         assert!(app.num_edit.is_some(), "clicking the same field committed it");
         assert!(
             (app.settings.record_export.tempo_bpm - 144.0).abs() > 1e-9,

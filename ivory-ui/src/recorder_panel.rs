@@ -602,7 +602,12 @@ fn fader_zones(row: Rect) -> (Rect, Rect, Rect) {
 
 /// Text height in a fader row, as a fraction of the row. Shared by the painter
 /// and by the test that asserts the dB reading fits.
-const FADER_TEXT: f32 = 0.62;
+///
+/// A sixth down from where it was. The reading is a check, not a headline: it
+/// grew with the row when the faders took the words column's width, and a
+/// number the size of the chord name is a number claiming to matter more than
+/// the fader it belongs to.
+const FADER_TEXT: f32 = 0.53;
 
 impl Layout {
     /// Nothing at all, for a rect too small to hold a band. Every field absent
@@ -787,13 +792,6 @@ impl Layout {
         // column beside it. They used to be stacked in one narrow column,
         // which made the preview short AND the type small — the two were
         // fighting over the same points and both lost.
-        // The preview was placed in `new`, in the band's own margin. The words
-        // column starts at the left of what it left.
-        let sw = Self::setup_w(body);
-        self.fill_setup(
-            Rect::from_min_max(body.min, Pos2::new(body.left() + sw, body.bottom())),
-            false,
-        );
 
         let monitor = Self::monitor_of(body);
         self.fill_heart(body, monitor);
@@ -809,7 +807,7 @@ impl Layout {
         }
         self.rules[0] = rule_x(body, middle.left() - gap * 0.5);
         self.fill_transport(middle);
-        self.fill_faders(body, gap);
+        self.fill_faders(body, gap, false);
     }
 
     /// The transport column: the round record button, a stop beside it, the
@@ -828,23 +826,25 @@ impl Layout {
     /// still want to touch would be half a survivor. Same argument the monitor
     /// column has always made; the faders took it with them when they moved.
     fn middle_of(body: Rect, gap: f32) -> Rect {
+        // **There is no words column any more.** The take name moved into the
+        // take-settings popup, the tempo became a small typed box at the head
+        // of the faders, and the transport went to the foot of them — so the
+        // fifth of the band that column was using is width the faders and the
+        // meters now have.
         let monitor = Self::monitor_of(body);
-        Rect::from_min_max(
-            Pos2::new(body.left() + Self::setup_w(body) + gap, body.top()),
-            Pos2::new(monitor.left() - gap, body.bottom()),
-        )
+        Rect::from_min_max(body.min, Pos2::new(monitor.left() - gap, body.bottom()))
     }
 
-    /// The column of words beside the preview: name, folder, tempo, Setup.
+
+    /// The left column of the middle group: tempo, two faders, transport.
     ///
-    /// A share of the width rather than of what the preview leaves, so the
-    /// Setup button is the same size whatever the camera is doing.
-    fn setup_w(body: Rect) -> f32 {
-        (body.width() * 0.12).clamp(60.0, 150.0)
-    }
-
-    /// The two fader rows, from the at-rest middle. See [`Layout::middle_of`].
-    fn fill_faders(&mut self, body: Rect, gap: f32) {
+    /// **Four rows in one column, and they belong together.** They were three
+    /// separate things — a words column with the name and the tempo in it, a
+    /// fader pair, and a transport bar at the foot of the words — which is
+    /// three columns' worth of margin for two faders and three buttons. What
+    /// is here now is the strip a hand rests on during a take: how loud the
+    /// click is, how loud the input is, how fast, and go.
+    fn fill_faders(&mut self, body: Rect, gap: f32, rolling: bool) {
         let m = Self::middle_of(body, gap);
         if !m.is_positive() {
             return;
@@ -858,15 +858,58 @@ impl Layout {
         // the meters. What they were was a stack ten points wide, which is a
         // knob you cannot read and cannot land on.
         let col = slice_h(m, 0.00, FADER_COL);
+
+        // **The tempo sits over the metronome's own icon**, which is the one
+        // place in the band where it says what it is without a caption: the
+        // number and the thing it counts, one above the other. Typed, never
+        // dragged — see `Hit::EditTempo`.
+        //
+        // While a take runs the elapsed time takes the same box. Nothing else
+        // could go there: the tempo cannot be changed mid-take, and the clock
+        // is the one number anybody looks at from a piano bench.
+        let head = slice_v(col, 0.00, TEMPO_ROW);
+        let head = slice_h(head, 0.00, 0.30);
+        if rolling {
+            self.timecode = head;
+        } else {
+            self.tempo = head;
+        }
         // Tall rows in a narrow column. Moving the pair off the meters bought
         // width to give away and none to spare, so the legibility comes back
         // out of the HEIGHT: the two rows take nearly the whole column, which
         // was dead space above and below them, and the dB reading at the end
         // of each track stays a number rather than a smudge at the smallest
         // band this app will draw.
-        self.metronome_row = slice_v(col, 0.18, 0.47);
-        self.input_row = slice_v(col, 0.53, 0.82);
+        self.metronome_row = slice_v(col, 0.22, 0.44);
+        self.input_row = slice_v(col, 0.48, 0.70);
         self.click = fader_zones(self.metronome_row).0;
+
+        // **The transport, under the faders it belongs with.** Three squares
+        // of one size, one centred in each third of the row: they are one
+        // group, and a stop bigger than the cog beside it reads as more
+        // important than it is.
+        let bar = slice_v(col, 0.76, 1.00);
+        // A sixth off what the row would allow. With the words column gone the
+        // bar is nearly three hundred points wide, and three buttons sized to
+        // fill it read as the loudest thing in the band — which they are not:
+        // the meters are.
+        let side = (bar.height() * TRANSPORT_SIDE).min(bar.width() * 0.20 * TRANSPORT_SIDE);
+        let icon = |i: usize| {
+            let cx = bar.left() + bar.width() * (i as f32 * 2.0 + 1.0) / 6.0;
+            Rect::from_center_size(Pos2::new(cx, bar.center().y), Vec2::splat(side))
+        };
+        if rolling {
+            // No record button while rolling — pressing it would mean nothing,
+            // and a dead control is worse than no control. The steady dot
+            // stands exactly where it stood. No cog either: none of what it
+            // opens can be changed with an encoder running.
+            self.dot = icon(0);
+            self.stop = icon(1);
+        } else {
+            self.record = icon(0);
+            self.stop = icon(1);
+            self.setup = icon(2);
+        }
     }
 
     fn fill_transport(&mut self, t: Rect) {
@@ -935,112 +978,6 @@ impl Layout {
         }
     }
 
-    /// The destination column: seven small rows of things set once.
-    ///
-    /// Small on purpose. Every one of these is decided before the first take of
-    /// a session and then left alone, and the band only has 200 points; giving
-    /// the folder path the same weight as the record button is what made the
-    /// old one read as a wall.
-    ///
-    /// **Seven rows, not eight.** The INSTRUMENT row that used to sit between
-    /// the folder preview and the camera is gone: it was a picker for the one
-    /// instrument, and there are three now, each with its own name box in the
-    /// slot rows. Every remaining row is a little taller for it, which is most
-    /// of what pays for the narrower column.
-    /// What is left of the destination group: a button that opens the menu it
-    /// moved into, and the one control in it that has to be TYPED.
-    ///
-    /// **Everything else went to the right-click menu.** Folder, camera, audio,
-    /// count-in, signature, tempo, export, show-when-done: nine controls set
-    /// once at the start of a session, sitting in the middle of the band in
-    /// front of the transport, which is touched every take. Most of them
-    /// already opened a picker or cycled a value, so a menu row is the same
-    /// interaction with less furniture — and the space they leave is what
-    /// makes room for a bigger meter and a fader you can actually hit.
-    ///
-    /// The take name stays because it is the only one somebody types, and a
-    /// menu cannot hold a text field.
-    fn fill_setup(&mut self, d: Rect, rolling: bool) {
-        if !d.is_positive() {
-            return;
-        }
-        // **The transport lives at the foot of this column now.** It had a
-        // column of its own in the middle of the band, which is the width the
-        // faders and the meters wanted — and three small icons say exactly
-        // what two large ones and a word said. Nothing above them is set
-        // mid-take, so while a take runs the column is the transport and the
-        // clock and nothing else.
-        // **The ICON decides the row height, and the rows decide nothing.**
-        //
-        // Three squares of one size sit in the bottom row — one size because
-        // they are one group, and a stop bigger than the cog beside it reads
-        // as more important than it is. Their side comes from the column's
-        // WIDTH, since three of them and their gaps have to fit across it with
-        // room left for the clock; at the row's height they did not, and the
-        // clock was left twenty-two points to say "FINISHING" in.
-        //
-        // Then the name and the tempo take that same height, and all three
-        // rows are spread evenly down the column — four equal spaces, one
-        // above each row and one below the last. Sized the other way round,
-        // the boxes were half again as tall as the icons under them and the
-        // section read as two things stacked rather than one.
-        //
-        // The three of them span the row the way the boxes above span it, one
-        // centred in each third. They used to be left-aligned with a clock
-        // filling the rest; with the clock gone, huddling them at one end
-        // would leave the section's last row half empty.
-        let side = (d.width() * 0.22).min(d.height() * 0.28);
-        let space = ((d.height() - side * 3.0) / 4.0).max(0.0);
-        let stack = |i: usize| {
-            let top = d.top() + space * (i as f32 + 1.0) + side * i as f32;
-            Rect::from_min_size(Pos2::new(d.left(), top), Vec2::new(d.width(), side))
-        };
-        let bar = stack(2);
-        let icon = |i: usize| {
-            let cx = bar.left() + bar.width() * (i as f32 * 2.0 + 1.0) / 6.0;
-            Rect::from_center_size(Pos2::new(cx, bar.center().y), Vec2::splat(side))
-        };
-        if rolling {
-            // No record button while rolling — pressing it would mean nothing,
-            // and a dead control is worse than no control. The steady dot
-            // stands exactly where it stood. No cog either: none of what it
-            // opens can be changed with an encoder running.
-            self.dot = icon(0);
-            self.stop = icon(1);
-        } else {
-            self.record = icon(0);
-            self.stop = icon(1);
-            self.setup = icon(2);
-        }
-        if rolling {
-            // **The clock takes the whole column while a take runs.** Nothing
-            // above the bar is set mid-take — a take name you cannot type into
-            // and a tempo you cannot drag are two boxes teaching the wrong
-            // thing — so the elapsed time gets the room they were using, which
-            // is the one number anybody looks at from a piano bench.
-            // Stopping short of the bar, not at it: `Rect::contains` is
-            // inclusive at both edges, so two rows that merely touch share a
-            // line of pixels and the overlap test is right to fail there.
-            self.timecode = slice_v(d, 0.04, 0.64);
-            return;
-        }
-        // **No clock at rest.** It read 0:00 and never anything else: every
-        // state that has a number to show — the count-in, rolling, finishing —
-        // is `is_active`, and those take the whole column above this row. A
-        // readout with one possible value is furniture, and it was the reason
-        // the three icons had to share their row with something.
-        // **No filename preview here.** A running timestamp that changes
-        // every second taught the naming scheme once and then spent the rest
-        // of the session being a clock nobody asked for — and it was the row
-        // making the other three different sizes from each other. It is in the
-        // popup, beside the folder it belongs to.
-        self.name = stack(0);
-        // **The tempo stays.** It is the one thing in this group that is
-        // DRAGGED, and a menu row cannot be dragged; it is also per-take
-        // rather than per-session, since it sets the count-in's speed. The
-        // rest of the group is behind the cog.
-        self.tempo = stack(1);
-    }
 
     /// Rolling: readable from the bench. The preview collapses to a strip that
     /// is enough to see somebody has walked in front of the camera and no more,
@@ -1070,22 +1007,14 @@ impl Layout {
         // The faders survive a take for the same reason they always did: the
         // click is turned down mid-performance more than any other control
         // here. They keep the bottom of the group, where they are at rest.
-        self.fill_faders(body, gap);
+        self.fill_faders(body, gap, true);
         self.fill_transport(t);
 
         // **The identical band, with the record button become the dot.** The
-        // transport sits at the foot of the words column in both layouts, so
-        // the stop button is under the same pixel at 0:00 and at 4:12. What
-        // leaves is everything above it: a take name you cannot type into and
-        // a tempo you cannot drag are two boxes teaching the wrong thing.
-        let sw = Self::setup_w(body);
-        self.fill_setup(
-            Rect::from_min_max(
-                Pos2::new(self.preview.right() + gap, body.top()),
-                Pos2::new(self.preview.right() + gap + sw, body.bottom()),
-            ),
-            true,
-        );
+        // transport sits at the foot of the faders in both layouts, so the
+        // stop button is under the same pixel at 0:00 and at 4:12 — see
+        // `fill_faders`, which places both. What leaves is the tempo, which
+        // cannot be changed mid-take; the clock takes its box.
 
         // The one thing `hide_elapsed` suppresses is a CLOCK. The count-in beat
         // is the number the player is counting, and "FINISHING" is the reason
@@ -1101,7 +1030,7 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 40] {
+    fn targets(&self) -> [(Rect, Produces); 39] {
         use Produces::{Along, AlongV, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
         let s = &self.slots;
@@ -1147,11 +1076,12 @@ impl Layout {
             (self.reveal, Fixed(Hit::RevealFolder)),
             (self.default_tick, Fixed(Hit::ToggleDefaultDir)),
             (self.open_when_done, Fixed(Hit::ToggleOpenWhenDone)),
-            (self.name, Fixed(Hit::NameField)),
             (self.camera, Fixed(Hit::PickCamera)),
             (self.audio, Fixed(Hit::PickAudio)),
             (self.count_in, Fixed(Hit::CycleCountIn)),
-            (self.tempo, Along(tempo_at)),
+            // **Typed, not dragged.** A press opens the field; there is no
+            // travel along it to sweep. See `draw_tempo`.
+            (self.tempo, Fixed(Hit::EditTempo)),
             (self.time_sig, Fixed(Hit::EditTimeSignature)),
             (self.export, Fixed(Hit::Export)),
         ]
@@ -1254,6 +1184,9 @@ pub enum Hit {
     /// and it lives there so that the fader's travel and the audio path's
     /// scaling cannot disagree.
     SetMetronomeGain(f32),
+    /// Open the tempo box for typing. It carries no value: a tempo is a
+    /// number somebody knows, and the box is where they write it.
+    EditTempo,
     /// The three effect sends, 0..=1.
     SetReverb(f32),
     SetDelay(f32),
@@ -1301,7 +1234,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 41] = [
+    pub const ALL: [Hit; 42] = [
         Hit::Record,
         Hit::Stop,
         Hit::OpenSetup,
@@ -1337,6 +1270,7 @@ impl Hit {
         Hit::SetSlotGain(3, Hit::MIDWAY),
         Hit::SetSlotGain(4, Hit::MIDWAY),
         Hit::SetMetronomeGain(Hit::MIDWAY),
+        Hit::EditTempo,
         Hit::SetReverb(Hit::MIDWAY),
         Hit::SetDelay(Hit::MIDWAY),
         Hit::SetChorus(Hit::MIDWAY),
@@ -1407,6 +1341,7 @@ impl Hit {
             Hit::ToggleMetronomeInTake => "Record the click into takes",
             Hit::SetSlotGain(i, _) => GAIN[n(i)],
             Hit::SetMetronomeGain(_) => "Click level",
+            Hit::EditTempo => "Tempo",
             Hit::SetReverb(_) => "Reverb, on every instrument",
             Hit::SetDelay(_) => "Delay, in time with the tempo",
             Hit::SetChorus(_) => "Chorus, in true stereo",
@@ -1430,7 +1365,6 @@ impl Hit {
                 | Hit::SetDelay(_)
                 | Hit::SetChorus(_)
                 | Hit::SetInputGain(_)
-                | Hit::SetTempo(_)
         )
     }
 
@@ -1475,11 +1409,13 @@ pub fn num_field(hit: Hit) -> Option<NumField> {
         Hit::EditTimeSignature => Some(NumField::Meter),
         Hit::SetSlotGain(i, _) => Some(NumField::Slot(i)),
         Hit::SetMetronomeGain(_) => Some(NumField::Metronome),
+        Hit::EditTempo => Some(NumField::Tempo),
         Hit::SetReverb(_) => Some(NumField::Reverb),
         Hit::SetDelay(_) => Some(NumField::Delay),
         Hit::SetChorus(_) => Some(NumField::Chorus),
         Hit::SetInputGain(_) => Some(NumField::Input),
-        Hit::SetTempo(_) => Some(NumField::Tempo),
+        // NOT `SetTempo`: that carries a committed value and has no box of
+        // its own any more. `EditTempo` is the box.
         _ => None,
     }
 }
@@ -1533,16 +1469,6 @@ impl Produces {
     }
 }
 
-/// A tempo from a position along its control, clamped to what the SMF writer
-/// and every DAW's bar ruler will accept.
-///
-/// Linear across the whole legal range, and absolute rather than relative,
-/// because a relative drag needs to remember where the drag started and this
-/// function is not allowed to remember anything. The number is drawn beside the
-/// control for exactly that reason.
-fn tempo_at(t: f32) -> Hit {
-    Hit::SetTempo(MIN_BPM + f64::from(t.clamp(0.0, 1.0)) * (MAX_BPM - MIN_BPM))
-}
 
 /// How far along `r` the point `pos` fell, 0..=1 from its left edge to its
 /// right.
@@ -1707,8 +1633,16 @@ pub fn draw(painter: &Painter, rect: Rect, view: &RecorderView<'_>, s: &Settings
     draw_readout(painter, &l, view, &p);
     draw_monitor(painter, &l, view, &p);
     if !l.rolling {
-        draw_destination(painter, &l, view, s, &p);
         draw_cog(painter, l.setup, &p);
+        // Over the metronome's own icon, which says what the number is for
+        // better than a caption would.
+        draw_tempo(
+            painter,
+            l.tempo,
+            view.tempo_bpm,
+            typing_for(view, NumField::Tempo),
+            &p,
+        );
     }
     for r in l.rules {
         if r.is_positive() {
@@ -3007,135 +2941,6 @@ fn tempo_text(bpm: f64) -> String {
     }
 }
 
-fn draw_destination(
-    painter: &Painter,
-    l: &Layout,
-    view: &RecorderView<'_>,
-    s: &Settings,
-    p: &Palette,
-) {
-    labelled(painter, l.dest, "FOLDER", view.dest, p.ink, p);
-    // The "Choose..." affordance lives INSIDE the folder box, right-aligned,
-    // because the box itself is the target: two adjacent controls that both
-    // open the same picker is one control too many.
-    if l.dest.is_positive() {
-        let size = fit_text(l.dest, "Choose...", l.dest.height() * 0.45);
-        if size >= MIN_TEXT {
-            painter.text(
-                Pos2::new(l.dest.right() - label_inset(l.dest), l.dest.center().y),
-                Align2::RIGHT_CENTER,
-                "Choose...",
-                font_light(size),
-                p.faint,
-            );
-        }
-    }
-    // A button, in the same shape as the slots' OPEN WINDOW: a filled box with
-    // a border and a centred word, which in this band is what a pressable thing
-    // looks like and nothing else is. Every other box in this column carries a
-    // caption and a value, and this one has no value to carry.
-    //
-    // It says SHOW rather than OPEN for the reason the tick beside Export does:
-    // nothing is opened, a folder is shown.
-    draw_word_button(painter, l.reveal, &["SHOW FOLDER", "SHOW"], p);
-    draw_tick(
-        painter,
-        l.default_tick,
-        "Default",
-        s.record_dir_is_default,
-        p,
-    );
-
-    // The take name is not required and does not have to be unique: the
-    // timestamp guarantees that. Type "nocturne" once, press record five
-    // times, and get five adjacent folders with no overwrite dialog ever.
-    let empty = view.take_name.is_empty();
-    let shown = if empty { "(optional)" } else { view.take_name };
-    labelled(
-        painter,
-        l.name,
-        "NAME",
-        shown,
-        if empty { p.faint } else { p.ink },
-        p,
-    );
-    if view.name_focused {
-        draw_caption_caret(
-            painter,
-            l.name,
-            "NAME",
-            shown,
-            view.take_name.chars().count(),
-            p,
-        );
-    }
-    text_line(painter, l.folder, view.folder_preview, p.faint, false);
-
-    // Disk as a DURATION. "214 GB free" means nothing to a pianist and "~58
-    // min" means everything, which is why the view carries minutes and not
-    // bytes in the first place.
-    let disk = match view.disk_minutes {
-        Some(m) => format!("{} left", disk_text(m)),
-        None => "measuring free space".to_owned(),
-    };
-    text_line(painter, l.disk, &disk, p.faint, true);
-
-    // The instruments are NOT here any more. They have three rows of their own
-    // in the group that survives a take; a fourth picker in the column that
-    // vanishes at `T0` would have been the same control in two places, only one
-    // of which works.
-    for (r, cap, dev, missing) in [
-        (l.camera, "CAMERA", view.camera, "  (not connected)"),
-        (l.audio, "AUDIO", view.audio, "  (not connected)"),
-    ] {
-        let value = format!("{}{}", dev.text(), device_note(dev, missing));
-        labelled(painter, r, cap, &value, device_ink(dev, p), p);
-    }
-
-    labelled(
-        painter,
-        l.count_in,
-        "COUNT-IN",
-        &count_in_text(view.count_in_bars),
-        p.ink,
-        p,
-    );
-    // The signature, typed rather than dragged. `labelled` with a caret when it
-    // is being edited, exactly like the take name.
-    {
-        let typing = typing_for(view, NumField::Meter);
-        let shown = typing.map_or_else(|| view.time_signature.label(), str::to_owned);
-        labelled(painter, l.time_sig, "SIG", &shown, p.ink, p);
-        if let Some(typed) = typing {
-            draw_caption_caret(painter, l.time_sig, "SIG", &shown, typed.chars().count(), p);
-        }
-    }
-    draw_tempo(
-        painter,
-        l.tempo,
-        view.tempo_bpm,
-        typing_for(view, NumField::Tempo),
-        p,
-    );
-    labelled(
-        painter,
-        l.export,
-        "EXPORT",
-        &export_summary(&s.record_export),
-        p.ink,
-        p,
-    );
-    // "Show when done" and not "Open": the folder is shown in the file manager,
-    // nothing is opened, and somebody who reads "Open" and expects the take to
-    // start playing has been told the wrong thing.
-    draw_tick(
-        painter,
-        l.open_when_done,
-        "Show when done",
-        s.record_open_when_done,
-        p,
-    );
-}
 
 /// The settings cog: the way into the take-settings popup.
 ///
@@ -3192,12 +2997,24 @@ const KNOB_TICKS: usize = 11;
 /// piece of hardware and not like the rest of the panel.
 const KNOB_CAP: Color32 = Color32::from_rgb(0x1c, 0x6f, 0xd6);
 
+/// How much of the room it is given a transport button takes.
+///
+/// The bar grew when the words column went, and three buttons that filled it
+/// read as the loudest thing in the band. They are not: the meters are.
+const TRANSPORT_SIDE: f32 = 0.85;
+
+/// The tempo box's share of the fader column's height.
+///
+/// It is a three-digit number over a metronome icon, so it wants to be square
+/// enough to read and no taller: the height it does not take is fader.
+const TEMPO_ROW: f32 = 0.18;
+
 /// The faders' share of the middle group's width.
 ///
 /// The rest, less a gap, is the meters with the knob row under them. Named
 /// because three places have to agree about it and the failure when they do
 /// not is a knob drawn over a meter.
-const FADER_COL: f32 = 0.40;
+const FADER_COL: f32 = 0.46;
 
 /// The meters' share of the height of the column they share with the knobs.
 ///
@@ -3206,7 +3023,7 @@ const FADER_COL: f32 = 0.40;
 /// width-limited before, so a shorter column costs it less than the number
 /// suggests — and the band is taller now than it was, which pays for most of
 /// it. See `BAND_H_AT_1300`.
-const METER_SHARE: f32 = 0.63;
+const METER_SHARE: f32 = 0.62;
 
 /// The smallest knob face worth drawing, as a radius.
 ///
@@ -3374,25 +3191,28 @@ fn draw_knob(
 /// where in `MIN_BPM..=MAX_BPM` the number sits — the same mapping [`tempo_at`]
 /// inverts, which is what makes the picture and the drag agree.
 fn draw_tempo(painter: &Painter, r: Rect, bpm: f64, typing: Option<&str>, p: &Palette) {
-    // While it is being typed into, the box shows the characters rather than
-    // the stored tempo — otherwise there is nothing on screen to tell somebody
-    // their keystrokes are going anywhere.
-    let shown = typing.map_or_else(|| tempo_text(bpm), str::to_owned);
-    labelled(painter, r, "TEMPO", &shown, p.ink, p);
-    if let Some(typed) = typing {
-        draw_caption_caret(painter, r, "TEMPO", &shown, typed.chars().count(), p);
-    }
+    // **A number in a box, and nothing else.**
+    //
+    // It carried a TEMPO caption and a hairline of travel along its bottom,
+    // because it used to be dragged. It sits directly over the metronome's own
+    // icon now, which says what it is better than a word does, and it is typed
+    // rather than swept: a tempo is a number somebody already knows, not a
+    // position they hunt for along sixty points of track.
     if !r.is_positive() {
         return;
     }
-    let t = ((bpm - MIN_BPM) / (MAX_BPM - MIN_BPM)).clamp(0.0, 1.0) as f32;
-    let h = (r.height() * 0.14).max(1.0);
-    let bar = Rect::from_min_max(
-        Pos2::new(r.left(), r.bottom() - h),
-        Pos2::new(r.left() + r.width() * t, r.bottom()),
-    );
-    if bar.is_positive() {
-        painter.rect_filled(bar, 1.0, p.accent);
+    // While it is being typed into, the box shows the characters rather than
+    // the stored tempo — otherwise there is nothing on screen to tell somebody
+    // their keystrokes are going anywhere. A trailing caret, for the same
+    // reason: an empty box mid-edit looks like a box that ate the keystroke.
+    let shown = match typing {
+        Some(typed) => format!("{typed}_"),
+        None => tempo_text(bpm),
+    };
+    control(painter, r, p);
+    let size = fit_text(r.shrink(r.width() * 0.08), &shown, r.height() * 0.58);
+    if size >= MIN_TEXT {
+        painter.text(r.center(), Align2::CENTER_CENTER, &shown, font(size), p.ink);
     }
 }
 
@@ -3806,7 +3626,6 @@ mod tests {
             (Hit::SetMetronomeGain(0.0), DragAxis::Horizontal),
             (Hit::SetInputGain(0.0), DragAxis::Horizontal),
             (Hit::SetSlotGain(0, 0.0), DragAxis::Horizontal),
-            (Hit::SetTempo(120.0), DragAxis::Horizontal),
         ] {
             assert_eq!(
                 drag_axis(r, &v, hit),
@@ -4378,7 +4197,12 @@ mod tests {
                 // rectangle in the band any more. Their reachability is the
                 // menu's to prove, not the layout's — the same bargain the
                 // in-take toggle already made.
-                const IN_THE_MENU: [Hit; 9] = [
+                // Everything the band no longer carries itself. The take
+                // NAME joined them when the words column went: it is set once
+                // a session, and the band is what your hands are on while a
+                // take runs. `SetTempo` is here because the tempo BOX is a
+                // control and the value is not — see `Hit::EditTempo`.
+                const IN_THE_MENU: [Hit; 11] = [
                     Hit::ChooseFolder,
                     Hit::RevealFolder,
                     Hit::ToggleDefaultDir,
@@ -4388,6 +4212,8 @@ mod tests {
                     Hit::CycleCountIn,
                     Hit::Export,
                     Hit::EditTimeSignature,
+                    Hit::NameField,
+                    Hit::SetTempo(0.0),
                 ];
                 if IN_THE_MENU.iter().any(|m| m.is_same_control(want))
                     || want == Hit::ToggleMetronomeInTake
@@ -4744,33 +4570,6 @@ mod tests {
         }
     }
 
-    /// The tempo is dragged along its box, and a drag that could reach 0.001
-    /// BPM would draw a DAW a bar ruler several centuries long.
-    #[test]
-    fn the_tempo_drag_covers_the_legal_range_and_no_more() {
-        let r = band(1300.0);
-        let v = idle();
-        let l = Layout::new(r, &v);
-        let at = |x: f32| match hit_test(r, &v, Pos2::new(x, l.tempo.center().y)) {
-            Some(Hit::SetTempo(b)) => b,
-            other => panic!("that was not the tempo: {other:?}"),
-        };
-        assert!((at(l.tempo.left()) - MIN_BPM).abs() < 1e-9);
-        assert!((at(l.tempo.right()) - MAX_BPM).abs() < 1e-9);
-        let mid = at(l.tempo.center().x);
-        assert!(
-            (mid - (MIN_BPM + MAX_BPM) * 0.5).abs() < 1.0,
-            "the middle of the box is {mid} BPM"
-        );
-        // Monotonic across the whole box, or a rightward drag could slow down.
-        let mut last = f64::MIN;
-        for i in 0..=50 {
-            let bpm = at(l.tempo.left() + l.tempo.width() * i as f32 / 50.0);
-            assert!(bpm >= last, "the tempo went backwards at {i}");
-            assert!((MIN_BPM..=MAX_BPM).contains(&bpm), "{bpm} is out of range");
-            last = bpm;
-        }
-    }
 
     /// The clock the setting hides is a CLOCK. The count-in beat is the number
     /// the player is counting on, and a performance setting that swallowed it
@@ -5158,7 +4957,10 @@ mod tests {
             .into_iter()
             .filter(|h| num_field(*h).is_some() && !h.is_draggable())
             .collect();
-        assert_eq!(typed_only, vec![Hit::EditTimeSignature]);
+        // The two that are typed and never dragged: a time signature has no
+        // continuum between 4/4 and 7/8 to sweep along, and a tempo is a
+        // number somebody already knows.
+        assert_eq!(typed_only, vec![Hit::EditTempo, Hit::EditTimeSignature]);
     }
 
     /// The four fields are four fields, not one used four times.
@@ -5378,13 +5180,17 @@ const SETUP_W: (f32, f32, f32) = (0.24, 290.0, 430.0);
 /// Its height over its width.
 const SETUP_ASPECT: f32 = 0.72;
 /// Rows of controls under the title.
-const SETUP_ROWS: usize = 7;
+const SETUP_ROWS: usize = 8;
 
 /// Every rectangle in the popup.
 struct SetupLayout {
     panel: Rect,
     title: Rect,
     close: Rect,
+    /// What the next take is called. It was a box in the band, at the top of a
+    /// column that no longer exists; it is set once a session and belongs with
+    /// the rest of what a take is.
+    name: Rect,
     dest: Rect,
     reveal: Rect,
     default_tick: Rect,
@@ -5407,6 +5213,7 @@ impl SetupLayout {
         panel: Rect::NOTHING,
         title: Rect::NOTHING,
         close: Rect::NOTHING,
+        name: Rect::NOTHING,
         dest: Rect::NOTHING,
         reveal: Rect::NOTHING,
         default_tick: Rect::NOTHING,
@@ -5478,22 +5285,26 @@ impl SetupLayout {
         };
 
         let r0 = row(0);
+        let r1 = row(1);
         let note = {
-            let r = row(1);
+            let r = row(2);
             Rect::from_center_size(r.center(), Vec2::new(r.width(), r.height() * 0.60))
         };
-        let r3 = row(3);
         let r4 = row(4);
         let r5 = row(5);
         let r6 = row(6);
+        let r7 = row(7);
         Self {
             panel,
             title,
             close,
+            // What the take is called: the first thing about it, and the first
+            // row here.
+            name: r0,
             // Where takes go, how to see it, and whether it is the default.
-            dest: slice_h(r0, 0.00, 0.54),
-            reveal: slice_h(r0, 0.57, 0.74),
-            default_tick: slice_h(r0, 0.77, 1.00),
+            dest: slice_h(r1, 0.00, 0.54),
+            reveal: slice_h(r1, 0.57, 0.74),
+            default_tick: slice_h(r1, 0.77, 1.00),
             // What the next take will be called, and whether it will fit.
             // Answers rather than questions, so they carry no box — and a
             // HALF-HEIGHT row, because `text_line` sizes itself to whatever it
@@ -5501,26 +5312,27 @@ impl SetupLayout {
             // biggest thing in the panel.
             folder: slice_h(note, 0.00, 0.60),
             disk: slice_h(note, 0.62, 1.00),
-            camera: row(2),
-            audio: slice_h(r3, 0.00, 0.74),
-            audio_status: slice_h(r3, 0.77, 1.00),
+            camera: row(3),
+            audio: slice_h(r4, 0.00, 0.74),
+            audio_status: slice_h(r4, 0.77, 1.00),
             // How long a bar is, how many of them you get, and what comes out
             // at the end. The three that describe the take itself.
-            count_in: slice_h(r4, 0.00, 0.30),
-            time_sig: slice_h(r4, 0.33, 0.55),
-            export: slice_h(r4, 0.58, 1.00),
+            count_in: slice_h(r5, 0.00, 0.30),
+            time_sig: slice_h(r5, 0.33, 0.55),
+            export: slice_h(r5, 0.58, 1.00),
             // The four questions with yes-or-no answers, in two rows of two, so
             // a tick is never the only thing on a line.
-            open_when_done: slice_h(r5, 0.00, 0.49),
-            click_in_take: slice_h(r5, 0.51, 1.00),
-            count_in_in_take: slice_h(r6, 0.00, 0.49),
-            hide_elapsed: slice_h(r6, 0.51, 1.00),
+            open_when_done: slice_h(r6, 0.00, 0.49),
+            click_in_take: slice_h(r6, 0.51, 1.00),
+            count_in_in_take: slice_h(r7, 0.00, 0.49),
+            hide_elapsed: slice_h(r7, 0.51, 1.00),
         }
     }
 
     /// Every clickable region and what it means. The popup's [`Layout::targets`].
-    fn targets(&self) -> [(Rect, Hit); 12] {
+    fn targets(&self) -> [(Rect, Hit); 13] {
         [
+            (self.name, Hit::NameField),
             (self.close, Hit::CloseSetup),
             (self.dest, Hit::ChooseFolder),
             (self.reveal, Hit::RevealFolder),
@@ -6003,6 +5815,38 @@ pub fn draw_setup(
         }
     }
     draw_word_button(painter, l.close, &["DONE", "OK"], &p);
+
+    // **The take name lives here now.** It was a box at the top of a column in
+    // the band that no longer exists — and it belongs here anyway: it is set
+    // once a session, beside everything else that describes a take, and the
+    // band is what your hands are on while one is running.
+    //
+    // Not required and not unique: the timestamp guarantees that. Type
+    // "nocturne" once, press record five times, and get five adjacent folders
+    // with no overwrite dialog ever.
+    control(painter, l.name, &p);
+    {
+        let empty = view.take_name.is_empty();
+        let shown = if empty { "(optional)" } else { view.take_name };
+        label_text(
+            painter,
+            l.name,
+            "NAME",
+            shown,
+            if empty { p.faint } else { p.ink },
+            &p,
+        );
+        if view.name_focused {
+            draw_caption_caret(
+                painter,
+                l.name,
+                "NAME",
+                shown,
+                view.take_name.chars().count(),
+                &p,
+            );
+        }
+    }
 
     // "Choose..." lives INSIDE the folder box, right-aligned, because the box
     // itself is the target: two adjacent controls that open the same picker is
