@@ -889,11 +889,35 @@ mod shot {
         settings.hpf_mix = 0.30;
         settings.lpf_mix = 0.55;
         settings.limiter_mix = 0.75;
+        settings.master_gain = 0.7;
         settings.metronome_gain = 0.5;
         settings.input_gain = 1.0;
         settings.plugin_slots[0] = Some(ivory_ui::dialogs::BUILTIN_PATH.to_owned());
         let mut app = IvoryApp::new(c.context(), settings, ivory_ui::host::Caps::DESKTOP);
         app.set_effect_defaults(crate::desktop::effect_defaults_for_shot());
+        if std::env::var("IVORY_SHOT_METER").is_ok() {
+            use ivory_ui::recorder::{Level, Meters};
+            app.set_master_for_shot(
+                Meters {
+                    // -2 dBFS left, -11 right, with the hold a little above
+                    // each: enough to be into the red on one and amber on the
+                    // other, which is the only way to see all three colours.
+                    left: Level {
+                        peak: 0.79,
+                        rms: 0.5,
+                        hold: 0.9,
+                    },
+                    right: Level {
+                        peak: 0.28,
+                        rms: 0.2,
+                        hold: 0.35,
+                    },
+                    mono: false,
+                    clipped: false,
+                },
+                4.5,
+            );
+        }
         let mut shoot = |app: &IvoryApp| {
             c.frame(app, Layout::default(), DisplayShows::default(), false, true, None)
                 .map(|_| ())

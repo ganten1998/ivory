@@ -858,6 +858,17 @@ struct Shared {
     /// one constant rather than a fourth field in four structs.
     slot_gains: [AtomicU32; SLOTS],
     metro_gain: AtomicU32,
+    /// The master, as a LINEAR gain. The last thing on the instrument bus,
+    /// after the limiter, reaching both the device mix and the take — the same
+    /// rule the effects follow.
+    ///
+    /// **Not the click.** The click has its own fader and is added to the
+    /// device mix after this, which is why the master and the click behave
+    /// like two faders on a desk rather than one inside the other.
+    master_gain: AtomicU32,
+    /// Decibels of gain reduction the limiter has applied since the UI last
+    /// looked — a positive number, zero for none. Read and reset.
+    gr_db: AtomicU32,
     /// The six effect knobs, 0..=1. On the instrument bus only — see
     /// `effects.rs` for what that includes and what it deliberately does not.
     reverb_mix: AtomicU32,
@@ -954,6 +965,8 @@ impl Shared {
             // Both effects OFF by default. A first launch has to sound like the
             // instrument and not like a room, and `Effects::process` skips its
             // whole cost at zero.
+            master_gain: AtomicU32::new(1.0f32.to_bits()),
+            gr_db: AtomicU32::new(0),
             reverb_mix: AtomicU32::new(0.0f32.to_bits()),
             hpf_mix: AtomicU32::new(0.0f32.to_bits()),
             lpf_mix: AtomicU32::new(0.0f32.to_bits()),
@@ -1492,6 +1505,24 @@ impl Renderer {
                     &self.effect_params,
                     f64::from_bits(self.shared.bpm.load(Ordering::Relaxed)),
                 );
+                // **The master, last on the bus and after the limiter.** A
+                // master that fed the limiter would be a second drive control;
+                // this one is what leaves, which is what a master fader is.
+                // Turning it above unity CAN go past the limiter's ceiling,
+                // exactly as it does on a desk, and the master meter shows it.
+                let master = Shared::f32_of(&self.shared.master_gain);
+                if (master - 1.0).abs() > 1.0e-6 {
+                    for v in mix.iter_mut() {
+                        *v *= master;
+                    }
+                }
+                // How hard the limiter worked, for the meter beside it. Kept
+                // as the WORST since the UI last looked: it asks sixty times a
+                // second and the moment worth showing is a few samples long.
+                let gr = self.effects.gain_reduction_db();
+                if gr > 0.0 {
+                    self.shared.gr_db.fetch_max(gr.to_bits(), Ordering::Relaxed);
+                }
             }
 
             for i in 0..n {
@@ -2805,6 +2836,22 @@ impl Engine {
     /// What each effect is set to.
     pub fn set_effect_params(&self, params: crate::effects::Params) {
         self.shared.set_effect_params(params);
+    }
+
+    /// The master, as a linear gain. See [`Shared::master_gain`].
+    pub fn set_master_gain(&self, linear: f32) {
+        self.shared
+            .master_gain
+            .store(sane_gain(linear).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Decibels the limiter has taken off since this was last asked.
+    ///
+    /// **Read and reset**, like the meter peaks and for the same reason: gain
+    /// reduction is a transient a few samples long, and a UI that asks sixty
+    /// times a second would otherwise miss the moment the meter exists for.
+    pub fn gain_reduction_db(&self) -> f32 {
+        f32::from_bits(self.shared.gr_db.swap(0, Ordering::Relaxed))
     }
 
     pub fn set_metronome_gain(&self, linear: f32) {

@@ -234,6 +234,12 @@ pub struct RecorderView<'a> {
     /// pre-roll.
     pub elapsed_s: f64,
     pub meters: Meters,
+    /// The OUTPUT's levels — after the effects, after the limiter, after the
+    /// master, click included. Not the same signal as `meters`, which is what
+    /// is being recorded.
+    pub master: Meters,
+    /// Decibels the limiter is taking off right now, zero for none.
+    pub gr_db: f32,
     /// The output directory, already shortened for display (`~/Movies/Tangent`).
     pub dest: &'a str,
     /// The typed take name. May be empty — the timestamp guarantees uniqueness.
@@ -256,6 +262,9 @@ pub struct RecorderView<'a> {
     pub gains: Gains,
     /// The six effect knobs, 0..=1, as they are drawn.
     pub fx: FxSends,
+    /// What each of those numbers MEANS, in [`crate::recorder_panel::Fx::ALL`]
+    /// order. Told by the host; see [`crate::ports::KnobUnit`].
+    pub fx_units: [crate::ports::KnobUnit; 6],
     /// The control a hand is on right now, if any. A knob shows its number
     /// while it is being turned and its name the rest of the time: there is
     /// nowhere on a knob to keep both, and the number is only wanted while it
@@ -307,6 +316,8 @@ impl RecorderView<'_> {
             state: RecordState::Idle,
             elapsed_s: 0.0,
             meters: Meters::SILENT,
+            master: Meters::SILENT,
+            gr_db: 0.0,
             dest: "",
             take_name: "",
             name_focused: false,
@@ -315,6 +326,7 @@ impl RecorderView<'_> {
             slots: [SlotView::EMPTY; SLOTS],
             gains: Gains::default(),
             fx: FxSends { reverb: 0.0, delay: 0.0, chorus: 0.0, hpf: 0.0, lpf: 0.0, limiter: 0.0 },
+            fx_units: [crate::ports::KnobUnit::Percent; 6],
             turning: None,
             metronome_on: false,
             metronome_in_take: false,
@@ -353,6 +365,9 @@ pub struct Gains {
     pub metronome: f32,
     /// The audio input being recorded.
     pub input: f32,
+    /// **The master.** Last on the instrument bus, after the limiter, on both
+    /// what you hear and what is written. Not the click, which has its own.
+    pub master: f32,
 }
 
 impl Default for Gains {
@@ -366,6 +381,7 @@ impl Default for Gains {
             slots: [1.0; SLOTS],
             metronome: 0.5,
             input: 1.0,
+            master: 1.0,
         }
     }
 }
@@ -385,6 +401,10 @@ pub struct RecorderState {
     pub state: RecordState,
     pub elapsed_s: f64,
     pub meters: Meters,
+    /// The output's levels and the limiter's reduction. See the same two
+    /// fields on [`RecorderView`].
+    pub master: Meters,
+    pub gr_db: f32,
     /// The output directory, shortened for display.
     pub dest: String,
     /// What the next take's folder will be called, from `ivory_record::take`.
@@ -445,6 +465,8 @@ impl RecorderState {
             state: self.state,
             elapsed_s: self.elapsed_s,
             meters: self.meters,
+            master: self.master,
+            gr_db: self.gr_db,
             dest: &self.dest,
             take_name,
             name_focused,
@@ -465,6 +487,10 @@ impl RecorderState {
             count_in_bars: knobs.count_in_bars,
             time_signature: knobs.time_signature,
             fx: knobs.fx,
+            // Percent until the caller says otherwise: what each knob's number
+            // MEANS is the host describing its own sweeps, not a preference,
+            // so it is set over the top rather than threaded through here.
+            fx_units: [crate::ports::KnobUnit::Percent; 6],
             turning,
             camera: label(&self.camera_name, self.camera_missing),
             audio: label(&self.audio_name, self.audio_missing),
@@ -1486,6 +1512,9 @@ pub enum NumField {
     Slot(usize),
     Metronome,
     Input,
+    /// The master, typed in **decibels** like the faders it shares a curve
+    /// with — not a percentage. It is a level.
+    Master,
     /// One of the six effect knobs, typed as a PERCENT. Every other field
     /// here is typed in the unit it is displayed in, and "40" for four tenths
     /// wet is the only reading of a send anybody has ever wanted to write.
@@ -1975,9 +2004,6 @@ mod tests {
         }
     }
 
-    /// The camera question decides what a *finished* take can be re-exported
-    /// as, so getting it wrong offers the user an option that cannot work.
-    #[test]
     /// The bug this exists to stop coming back: record a take on a machine
     /// with no webcam, get a `.wav` and a `.mid` and no video, and have
     /// nothing anywhere explain that video was a setting.
@@ -2018,6 +2044,8 @@ mod tests {
         assert!(!cam_only.produces_video(false));
     }
 
+    /// The camera question decides what a *finished* take can be re-exported
+    /// as, so getting it wrong offers the user an option that cannot work.
     #[test]
     fn needing_a_camera_follows_the_video_mode_and_the_tick() {
         let no_cam = Composite {

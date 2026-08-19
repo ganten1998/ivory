@@ -300,6 +300,50 @@ fn the_host_offers_a_choice_for_every_stepped_row() {
     }
 }
 
+/// **What a filter knob SAYS is where the filter actually is.**
+///
+/// The readout is computed in `ivory-ui` from two numbers this file hands it,
+/// using the same exponential the DSP uses — so the only way they can disagree
+/// is if one of the two ends is wrong. That would put a confident, precise,
+/// incorrect frequency under the knob, which is worse than the percentage it
+/// replaced.
+#[cfg(all(test, feature = "recorder"))]
+#[test]
+fn a_filter_knob_reads_out_where_its_filter_actually_is() {
+    use ivory_ui::ports::KnobUnit;
+    let d = effect_defaults();
+    for (key, range) in [
+        ("hpf_mix", crate::effects::HPF_HZ),
+        ("lpf_mix", crate::effects::LPF_HZ),
+    ] {
+        let (_, unit) = d
+            .units
+            .iter()
+            .find(|(k, _)| k == key)
+            .unwrap_or_else(|| panic!("{key} has no unit and would read as a percentage"));
+        let KnobUnit::Hertz { low, high } = *unit else {
+            panic!("{key} does not read in hertz")
+        };
+        assert!(
+            (low - range.0).abs() < 1.0e-3 && (high - range.1).abs() < 1.0e-3,
+            "{key} advertises {low}..{high} Hz and sweeps {}..{} Hz",
+            range.0,
+            range.1
+        );
+        // And the readout agrees with the DSP at both ends and the middle.
+        for t in [0.0_f32, 0.5, 1.0] {
+            let said = ivory_ui::recorder_panel::knob_reading(*unit, t);
+            let actual = range.0 * (range.1 / range.0).powf(t);
+            let shown: f32 = said.split_whitespace().next().unwrap().parse().unwrap();
+            let shown = if said.contains('k') { shown * 1_000.0 } else { shown };
+            assert!(
+                (shown - actual).abs() / actual < 0.02,
+                "{key} at {t} reads {said} and the filter is at {actual:.0} Hz"
+            );
+        }
+    }
+}
+
 /// [`effect_defaults`], for the offscreen screenshot test.
 #[cfg(all(test, feature = "recorder"))]
 pub fn effect_defaults_for_shot() -> ivory_ui::ports::EffectDefaults {
@@ -336,6 +380,25 @@ fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
     }
     ivory_ui::ports::EffectDefaults {
         values,
+        // The filters read in hertz. "48%" on a corner frequency is a number
+        // about the knob rather than about the sound, and the one thing
+        // anybody wants to know from a filter is where it is.
+        units: vec![
+            (
+                "hpf_mix".to_owned(),
+                ivory_ui::ports::KnobUnit::Hertz {
+                    low: crate::effects::HPF_HZ.0,
+                    high: crate::effects::HPF_HZ.1,
+                },
+            ),
+            (
+                "lpf_mix".to_owned(),
+                ivory_ui::ports::KnobUnit::Hertz {
+                    low: crate::effects::LPF_HZ.0,
+                    high: crate::effects::LPF_HZ.1,
+                },
+            ),
+        ],
         choices: vec![
             ivory_ui::ports::ChoiceParam {
                 key: "delay_division".to_owned(),
@@ -694,6 +757,16 @@ impl DesktopApp {
         state.state = self.recorder.session.state();
         state.elapsed_s = self.recorder.session.elapsed();
         state.meters = self.recorder.session.meters();
+        // The output, which is a different signal: the VU shows what is being
+        // recorded and this shows what leaves. On a machine with an interface
+        // plugged in those are not the same thing at all.
+        if let Some(e) = self.recorder.engine.as_ref() {
+            state.master = e.meters();
+            state.gr_db = e.gain_reduction_db();
+        } else {
+            state.master = ivory_ui::recorder::Meters::SILENT;
+            state.gr_db = 0.0;
+        }
         state.dest = shorten_home(&root);
         state.folder_preview = take::folder_name(
             &take::WallTime::now_utc(),
@@ -1360,6 +1433,7 @@ impl DesktopApp {
             e.set_slot_gain(slot, *g);
         }
         e.set_metronome_gain(gains.metronome);
+        e.set_master_gain(gains.master);
         // Pushed every frame with the gains, and for the same reason: the
         // settings are the one live value, so a knob dragged, a project loaded
         // and a settings file hand-edited all arrive by the same path.

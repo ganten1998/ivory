@@ -1,8 +1,9 @@
 # Ivory 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-19. **The app is now called TANGENT.** Newest work is
-§2h: six effect knobs, the true-peak limiter, and video that happens without a
-camera. Before it, §2g: the six-operator FM built-in and its patch picker.
+§2i: the master column, its gain-reduction meter, and filters that read in
+hertz. Before it, §2h: six effect knobs, the true-peak limiter, and video that
+happens without a camera.
 Before it, §2d: the fretboard voicing solver and the guitar view. §2c before it has the
 rename, the 2.2.0 tester-report UI fixes, the egui 0.33 downgrade and the
 MIT/GPLv3 split. Read §2c then §2d FIRST; everything above them still says
@@ -846,6 +847,78 @@ checked with the same filter that made it is the detector agreeing with itself.
   audio engine owns neither its sample rate, its buffer, nor its thread
   priority, and a failed stream open is silent. That is where the 5.0 audit
   starts.
+
+---
+
+## 2i. 2026-08-19 (later) — the master column
+
+Shipped as **4.13.0**, on top of 2h in the same session.
+
+### Filters read in hertz
+
+"48%" on a corner frequency is a number about the knob rather than about the
+sound. The blocker was the firewall — `HPF_HZ` and `LPF_HZ` are DSP constants
+and `ivory-ui` cannot name them — so the host now hands over a
+`ports::KnobUnit` per knob (`Percent`, or `Hertz { low, high }`) and the UI
+does the exponential itself. That is a display mapping, not a filter.
+
+Typing works in the same unit: `knob_typed` accepts `480`, `1.2k`, `800hz`,
+clamps a wish that is off the end of the dial to the nearest thing the dial
+has, and refuses nonsense rather than reading it as zero.
+
+`a_filter_knob_reads_out_where_its_filter_actually_is` (in `desktop.rs`) checks
+the advertised ends against the DSP's own constants **and** the rendered string
+against the frequency the sweep produces, at both ends and the middle. A
+readout that is confidently, precisely wrong is worse than the percentage it
+replaced.
+
+### The master column
+
+To the right of the VU and the knobs: two output ladders, the limiter's gain
+reduction beside them, dB readouts under both, and a master knob at the foot.
+
+**It is a different signal from the VU.** `record.rs::meters()` shows what is
+being RECORDED — the input when there is one. The new column reads
+`Engine::meters()`, which meters the device mix after the effects, after the
+limiter and after the master. That method existed and was called from nothing
+but tests, so there is no contention over the read-and-clear peaks.
+
+The ladders are segmented rather than smooth on purpose: a lit segment count is
+a number you read without reading, and a continuous fill is a length you have
+to measure against a scale. Green below -18 dBFS (the digital home of +4 dBu),
+amber to -6, red above. **The gain-reduction ladder hangs DOWN from the top**,
+in one colour all the way — reduction is not a level and no amount of it is
+"good", so colouring the first few decibels green would be a claim about
+somebody's music.
+
+`Effects::gain_reduction_db()` is read-and-reset, like the meter peaks and for
+the same reason: reduction is a transient a few samples long and the UI asks
+sixty times a second.
+
+### The master knob
+
+`master_gain`, unity by default, **last on the instrument bus after the
+limiter**, reaching both the device mix and the take — the same rule the
+effects follow. Not the click, which has its own fader. It is a fader wearing a
+knob: same `fader_to_gain` curve as the other four levels, reads in dB, types
+in dB.
+
+Turning it above unity CAN put the output past the ceiling the limiter just
+guaranteed. That is what a master fader does on a desk, the meter shows it, and
+the alternative — a master that feeds the limiter — is just a second drive
+control.
+
+The limiter's cap went red → **bottle green**; red is the master's now, alone,
+because the master is the one control here that can undo what the other six
+did. `the_limiter_and_the_master_are_told_apart_by_colour` asserts no effect
+wears it.
+
+### Two lints that were real
+
+`clippy` flagged an orphaned doc block and a dangling `[`CLICK_SWITCHES`]`
+intra-doc link — both left behind when that constant was removed in earlier
+work, both predating this branch (checked against `HEAD` rather than assumed).
+Removed, along with `TEMPO_ROW`, dead since the tempo became a knob.
 
 ---
 

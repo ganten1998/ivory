@@ -115,10 +115,15 @@ pub struct FileRequest {
 /// symptom of them drifting is a panel that reads 62% while the audio does
 /// something else. So the host hands them over once, the same way it hands
 /// over the device list.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EffectDefaults {
     /// Parameter key to its default, as the settings file would store it.
     pub values: serde_json::Map<String, serde_json::Value>,
+    /// How a knob's position reads out, keyed by its mix key (`hpf_mix`).
+    ///
+    /// Anything not named here reads as a percentage, which is what a wet/dry
+    /// send is and what a filter corner is not.
+    pub units: Vec<(String, KnobUnit)>,
     /// Every parameter that is a list of names rather than a number.
     ///
     /// **General, because there are three of them now.** The delay's time was
@@ -126,6 +131,23 @@ pub struct EffectDefaults {
     /// same shape of thing — a short list a row steps through — and a second
     /// and third copy of "divisions / default_division" is how the two drift.
     pub choices: Vec<ChoiceParam>,
+}
+
+/// What a knob's number means, for the one line of text under its name.
+///
+/// **The host decides, because the host owns the sweep.** `ivory-ui` cannot
+/// name `HPF_HZ` — it is a DSP constant on the other side of the firewall —
+/// but it can be handed two ends and told the shape between them, which is a
+/// display mapping and not a filter.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum KnobUnit {
+    /// 0..=1 as a whole-number percentage. The default for everything.
+    #[default]
+    Percent,
+    /// A frequency, swept **exponentially** from `low` to `high` — which is
+    /// what a frequency control is, and why an octave is the same distance
+    /// everywhere on the dial.
+    Hertz { low: f32, high: f32 },
 }
 
 /// One parameter whose values are named rather than continuous.

@@ -453,6 +453,9 @@ pub struct Settings {
     pub dx7_patch: usize,
     pub metronome_gain: f64,
     pub input_gain: f64,
+    /// The master, linear. Unity by default: it is a master, and a master that
+    /// ships anywhere else is one every user has to put back.
+    pub master_gain: f64,
     /// Transpose, in semitones, applied to every note the display and the
     /// chord detector see.
     ///
@@ -639,6 +642,7 @@ impl Default for Settings {
             dx7_patch: 0,
             metronome_gain: 0.5,
             input_gain: 1.0,
+            master_gain: 1.0,
             transpose: 0,
             show_transpose: true,
             metronome_on: false,
@@ -1219,6 +1223,7 @@ impl Settings {
         };
         take_gain(&mut map, "metronome_gain", &mut s.metronome_gain);
         take_gain(&mut map, "input_gain", &mut s.input_gain);
+        take_gain(&mut map, "master_gain", &mut s.master_gain);
         if let Some(v) = map.shift_remove("transpose") {
             if let Some(n) = v.as_i64() {
                 s.transpose = n.clamp(-TRANSPOSE_MAX, TRANSPOSE_MAX);
@@ -1657,6 +1662,7 @@ impl Settings {
         for (key, gain) in [
             ("metronome_gain", self.metronome_gain),
             ("input_gain", self.input_gain),
+            ("master_gain", self.master_gain),
         ] {
             if let Some(n) = serde_json::Number::from_f64(gain) {
                 map.insert(key.into(), Value::Number(n));
@@ -1923,6 +1929,7 @@ impl Settings {
                 slots: std::array::from_fn(|i| self.plugin_gains[i] as f32),
                 metronome: self.metronome_gain as f32,
                 input: self.input_gain as f32,
+                master: self.master_gain as f32,
             },
             metronome_on: self.metronome_on,
             metronome_in_take: self.metronome_in_take,

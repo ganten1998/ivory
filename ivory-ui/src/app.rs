@@ -1206,19 +1206,23 @@ impl IvoryApp {
     /// sites, which is seven places to forget a new one — and the one being
     /// forgotten silently is a band that draws from stale state.
     fn recorder_layout_view(&self) -> recorder::RecorderView<'_> {
-        self.recorder.view(
+        recorder::RecorderView {
+            fx_units: self.fx_units(),
+            ..self.recorder.view(
             self.settings.record_take_name.as_deref().unwrap_or_default(),
             self.name_focused,
             self.num_edit.as_ref(),
-            self.settings.knobs(),
-            self.settings.record_hide_elapsed,
-            // Which control is being turned right now, so a knob can show its
-            // number while a hand is on it. `moved`, not merely grabbed: a
-            // press that has not travelled yet is on its way to being a tap.
-            self.grabbed
-                .filter(|g| g.moved)
-                .and_then(|g| recorder_panel::num_field(g.hit)),
-        )
+                self.settings.knobs(),
+                self.settings.record_hide_elapsed,
+                // Which control is being turned right now, so a knob can show
+                // its number while a hand is on it. `moved`, not merely
+                // grabbed: a press that has not travelled yet is on its way to
+                // being a tap.
+                self.grabbed
+                    .filter(|g| g.moved)
+                    .and_then(|g| recorder_panel::num_field(g.hit)),
+            )
+        }
     }
 
     fn staff_readout(&self, s: &Settings) -> Option<staff::Readout<'_>> {
@@ -2157,6 +2161,14 @@ impl IvoryApp {
         self.save_settings_soon();
     }
 
+    /// Put a level on the master meter and a reduction on the limiter, so the
+    /// screenshot hook can show a meter that is doing something. A silent
+    /// picture of a meter says nothing about whether it reads.
+    pub fn set_master_for_shot(&mut self, master: recorder::Meters, gr_db: f32) {
+        self.recorder.master = master;
+        self.recorder.gr_db = gr_db;
+    }
+
     /// Open the patch editor with a patch in it. For the screenshot hook,
     /// which has no host to fill it in.
     pub fn open_patch_editor_for_shot(&mut self) {
@@ -2274,6 +2286,26 @@ impl IvoryApp {
 
     /// What a value-carrying control reads right now, 0..=1.
     ///
+    /// What each of the six knobs' numbers mean, in `Fx::ALL` order.
+    ///
+    /// Percent unless the host said otherwise, which is the right answer for
+    /// a build talking to an older host and for the four that really are
+    /// percentages.
+    fn fx_units(&self) -> [crate::ports::KnobUnit; 6] {
+        let mut out = [crate::ports::KnobUnit::Percent; 6];
+        for (fx, slot) in recorder_panel::Fx::ALL.into_iter().zip(&mut out) {
+            if let Some((_, u)) = self
+                .fx_defaults
+                .units
+                .iter()
+                .find(|(k, _)| k == fx.mix_key())
+            {
+                *slot = *u;
+            }
+        }
+        out
+    }
+
     /// Where one effect knob's value lives in the settings.
     ///
     /// **One place, reached by both the reader and the writer.** Six knobs
@@ -2315,6 +2347,7 @@ impl IvoryApp {
             H::SetFx(fx, _) => self.fx_value(fx),
             H::SetMetronomeGain(_) => fader(self.settings.metronome_gain),
             H::SetInputGain(_) => fader(self.settings.input_gain),
+            H::SetMaster(_) => fader(self.settings.master_gain),
             H::SetSlotGain(i, _) => self
                 .settings
                 .plugin_gains
@@ -2629,6 +2662,10 @@ impl IvoryApp {
             }
             Hit::SetInputGain(p) => {
                 self.settings.input_gain = f64::from(recorder::fader_to_gain(p));
+                self.save_settings_soon();
+            }
+            Hit::SetMaster(p) => {
+                self.settings.master_gain = f64::from(recorder::fader_to_gain(p));
                 self.save_settings_soon();
             }
             Hit::SetTempo(bpm) => {
@@ -2965,9 +3002,14 @@ impl IvoryApp {
                 .map(|g| Hit::SetMetronomeGain(recorder::gain_to_fader(g))),
             F::Input => recorder::parse_gain(&edit.text)
                 .map(|g| Hit::SetInputGain(recorder::gain_to_fader(g))),
+            // Decibels, like the faders it shares a curve with.
+            F::Master => recorder::parse_gain(&edit.text)
+                .map(|g| Hit::SetMaster(recorder::gain_to_fader(g))),
             // A PERCENT, not a gain: these are not faders and there is no dB
             // curve to invert. "40" is four tenths wet.
-            F::Fx(fx) => recorder::parse_percent(&edit.text).map(|v| Hit::SetFx(fx, v)),
+            // In the knob's OWN unit: a filter is typed in hertz.
+            F::Fx(fx) => recorder_panel::knob_typed(self.fx_units()[fx.index()], &edit.text)
+                .map(|v| Hit::SetFx(fx, v)),
         };
         if let Some(hit) = hit {
             self.apply_recorder_hit(hit);
@@ -4700,6 +4742,7 @@ impl IvoryApp {
                     // viewer will try to click.
                     name_focused: false,
                     editing: None,
+                    fx_units: self.fx_units(),
                     // The composite's own copy: nothing is focused, nothing
                     // is being typed into and no hand is on a knob, because
                     // there is no pointer in a video frame.
@@ -6670,6 +6713,22 @@ mod tests {
     fn headless_with_fx(caps: Caps) -> (egui::Context, IvoryApp) {
         let (ctx, mut app) = headless_with_band(caps);
         app.set_effect_defaults(crate::ports::EffectDefaults {
+            units: vec![
+                (
+                    "hpf_mix".to_owned(),
+                    crate::ports::KnobUnit::Hertz {
+                        low: 20.0,
+                        high: 1_200.0,
+                    },
+                ),
+                (
+                    "lpf_mix".to_owned(),
+                    crate::ports::KnobUnit::Hertz {
+                        low: 20_000.0,
+                        high: 200.0,
+                    },
+                ),
+            ],
             values: [
                 ("reverb_size", 0.62),
                 ("reverb_damp", 0.35),
@@ -6703,6 +6762,36 @@ mod tests {
             ],
         });
         (ctx, app)
+    }
+
+    /// **The master knob is a fader wearing a knob**, and it lands in the
+    /// settings as a linear gain like every other level in this band.
+    #[test]
+    fn the_master_knob_sets_the_master_gain() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        assert!(
+            (app.settings.master_gain - 1.0).abs() < 1.0e-9,
+            "the master does not ship at unity"
+        );
+        // Unity is where a knob at unity reads, so the round trip has to hold.
+        assert!(
+            (app.control_value(recorder_panel::Hit::SetMaster(0.0))
+                - recorder::gain_to_fader(1.0))
+            .abs()
+                < 1.0e-6
+        );
+        app.apply_recorder_hit(recorder_panel::Hit::SetMaster(recorder::gain_to_fader(0.5)));
+        assert!(
+            (app.settings.master_gain - 0.5).abs() < 1.0e-3,
+            "the master came out at {}",
+            app.settings.master_gain
+        );
+        // And it reaches the band, which is what the host reads to push it at
+        // the engine.
+        assert!((app.settings.knobs().gains.master - 0.5).abs() < 1.0e-3);
+        // All the way down is silence, not a floor.
+        app.apply_recorder_hit(recorder_panel::Hit::SetMaster(0.0));
+        assert_eq!(app.settings.master_gain, 0.0);
     }
 
     /// **Right-clicking a knob opens the effect behind it**, and the right one.

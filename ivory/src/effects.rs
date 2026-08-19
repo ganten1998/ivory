@@ -706,11 +706,11 @@ impl Chorus {
 /// The top is 1.2 kHz rather than anything higher because past that a
 /// high-pass on a piano stops being "take the rumble out" and starts being an
 /// effect, and this is the knob people reach for to do the first thing.
-const HPF_HZ: (f32, f32) = (20.0, 1_200.0);
+pub const HPF_HZ: (f32, f32) = (20.0, 1_200.0);
 
 /// Where the low-pass knob sweeps, in Hz — **backwards**: knob up is down in
 /// frequency. See [`Sends::lpf`].
-const LPF_HZ: (f32, f32) = (20_000.0, 200.0);
+pub const LPF_HZ: (f32, f32) = (20_000.0, 200.0);
 
 /// How much the resonance row can lift the corner, in dB of Q.
 ///
@@ -1128,6 +1128,14 @@ pub struct Effects {
     /// Everything was off last block, so the tails are already flushed and do
     /// not need flushing again.
     idle: bool,
+    /// The lowest gain the limiter applied since anybody last asked, as a
+    /// linear multiplier. 1.0 is "it did nothing".
+    ///
+    /// **Read and reset**, like the meter peaks, because gain reduction is a
+    /// transient: the moment worth showing is a few samples long and the UI
+    /// asks sixty times a second. An average would read as almost nothing on
+    /// exactly the material the limiter is there for.
+    gr: f32,
 }
 
 impl Effects {
@@ -1145,6 +1153,7 @@ impl Effects {
             built_width: p.reverb_width,
             sample_rate: sr,
             idle: true,
+            gr: 1.0,
         }
     }
 
@@ -1348,10 +1357,26 @@ impl Effects {
                 out = self
                     .limiter
                     .process(out, drive, ceiling, knee_db, p.limiter_release);
+                if self.limiter.gain < self.gr {
+                    self.gr = self.limiter.gain;
+                }
             }
 
             buf[at] = out[0];
             buf[at + 1] = out[1];
+        }
+    }
+
+    /// How hard the limiter has been working since this was last called, in
+    /// **decibels of reduction** — a positive number, 0.0 for none.
+    ///
+    /// Resets on read. See [`Effects::gr`].
+    pub fn gain_reduction_db(&mut self) -> f32 {
+        let g = std::mem::replace(&mut self.gr, 1.0);
+        if g >= 1.0 {
+            0.0
+        } else {
+            -20.0 * g.max(1.0e-6).log10()
         }
     }
 
@@ -1366,6 +1391,7 @@ impl Effects {
             f.clear();
         }
         self.limiter.clear();
+        self.gr = 1.0;
     }
 }
 
@@ -1436,6 +1462,52 @@ mod tests {
             v[f * 2 + 1] = x;
         }
         v
+    }
+
+    /// **The gain-reduction readout is the reduction that happened.**
+    ///
+    /// It is what the meter beside the limiter shows, so a number that drifts
+    /// from what the DSP actually did is a meter that lies about the one thing
+    /// it exists to report.
+    #[test]
+    fn the_gain_reduction_readout_matches_the_gain_applied() {
+        let p = Params::default();
+        let sends = Sends {
+            limiter: 1.0,
+            ..Sends::default()
+        };
+        let mut fx = Effects::new(SR);
+        // Nothing in: nothing reduced.
+        let mut quiet = vec![0.0; 2_048 * 2];
+        fx.process(&mut quiet, 2_048, 2, sends, &p, 120.0);
+        assert_eq!(fx.gain_reduction_db(), 0.0, "silence was limited");
+
+        // A full-scale sine driven 12 dB into a -1 dB ceiling: the reduction
+        // is whatever it takes to get 12 dB of drive down to the ceiling.
+        for block in 0..40 {
+            let mut buf = sine(2_048, 1_000.0, 1.0, block * 2_048);
+            fx.process(&mut buf, 2_048, 2, sends, &p, 120.0);
+        }
+        let mut last = vec![0.0; 2_048 * 2];
+        for (f, v) in last.chunks_mut(2).enumerate() {
+            let x = (std::f32::consts::TAU * 1_000.0 * (40 * 2_048 + f) as f32 / SR).sin();
+            v[0] = x;
+            v[1] = x;
+        }
+        let before = last.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+        fx.process(&mut last, 2_048, 2, sends, &p, 120.0);
+        let after = last.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+        let reported = fx.gain_reduction_db();
+        // What actually happened: 12 dB of drive, then whatever the limiter
+        // took back off. `after / before` is the whole chain.
+        let measured = -20.0 * (after / before).log10() + DRIVE_DB;
+        assert!(
+            (reported - measured).abs() < 0.5,
+            "it reported {reported:.2} dB of reduction and applied {measured:.2}"
+        );
+        assert!(reported > 6.0, "it barely reduced at all: {reported:.2} dB");
+        // And reading it clears it.
+        assert_eq!(fx.gain_reduction_db(), 0.0, "the reading did not reset");
     }
 
     /// **The ceiling is a guarantee, not an average.**
