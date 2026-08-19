@@ -445,21 +445,8 @@ struct Grab {
     from_value: f32,
 }
 
-/// Points of vertical travel for a knob's whole sweep.
-///
-/// **A knob is dragged relatively, unlike every fader in this band.** A fader
-/// is a picture of a thing at a position and dragging it means putting it
-/// where the pointer is; its track is a couple of hundred points long, so that
-/// is precise enough. A knob is thirty points across, and mapping its own
-/// height to the full range gives about three percent per pixel — the control
-/// the owner described as hard to land on a number.
-///
-/// So the pointer's DISTANCE from where it grabbed drives the value, and this
-/// is how far it has to move for the full sweep. Wider than the knob by a
-/// factor of ten, and unbounded by the knob's rectangle: the hand can leave
-/// the control entirely and keep turning, which is what every mixer's plugin
-/// does and what makes a small knob usable at all.
-const KNOB_TRAVEL: f32 = 260.0;
+/// Points of travel for a knob's whole sweep. See the panel's own constant.
+use crate::recorder_panel::KNOB_TRAVEL;
 
 /// The pitches a theory-panel hit means, in the octave above middle C.
 ///
@@ -2220,10 +2207,25 @@ impl IvoryApp {
     /// and need somewhere to start from. Everything else returns zero and does
     /// not use it.
     fn control_value(&self, hit: recorder_panel::Hit) -> f32 {
+        use recorder_panel::Hit as H;
+        let fader = |g: f64| recorder::gain_to_fader(g as f32);
         match hit {
-            recorder_panel::Hit::SetReverb(_) => self.settings.reverb_mix as f32,
-            recorder_panel::Hit::SetDelay(_) => self.settings.delay_mix as f32,
-            recorder_panel::Hit::SetChorus(_) => self.settings.chorus_mix as f32,
+            H::SetReverb(_) => self.settings.reverb_mix as f32,
+            H::SetDelay(_) => self.settings.delay_mix as f32,
+            H::SetChorus(_) => self.settings.chorus_mix as f32,
+            H::SetMetronomeGain(_) => fader(self.settings.metronome_gain),
+            H::SetInputGain(_) => fader(self.settings.input_gain),
+            H::SetSlotGain(i, _) => self
+                .settings
+                .plugin_gains
+                .get(i)
+                .copied()
+                .map_or(0.0, fader),
+            H::SetTempo(_) => recorder_panel::tempo_knob_position(
+                self.settings.record_export.tempo_bpm,
+            ),
+            // Nothing else is dragged, so nothing else needs somewhere to
+            // start from.
             _ => 0.0,
         }
     }
@@ -2469,12 +2471,6 @@ impl IvoryApp {
             // Both knobs write to settings and are pushed to the engine after
             // the frame, the same shape as a fader: `save_settings_soon`
             // because a drag is a hundred of these and each one is a file.
-            // A press opens the field and sets nothing. The value arrives when
-            // it is committed, through `NumField::Tempo`.
-            Hit::EditTempo => {
-                self.num_edit = Some(recorder::NumEdit::new(recorder::NumField::Tempo));
-                self.name_focused = false;
-            }
             Hit::SetReverb(v) => {
                 self.settings.reverb_mix = f64::from(v.clamp(0.0, 1.0));
                 self.save_settings_soon();
@@ -5168,9 +5164,22 @@ impl IvoryApp {
                 // Released without ever moving: a TAP, which opens the control
                 // for typing rather than setting it to wherever the pointer is.
                 if !grab.moved {
-                    if let Some(field) = recorder_panel::num_field(grab.hit) {
-                        self.num_edit = Some(recorder::NumEdit::new(field));
-                        self.name_focused = false;
+                    // **A tap opens the field — except on the tempo, which
+                    // wants a DOUBLE click.** It is turned far more often than
+                    // it is typed, and a text box that opened every time a hand
+                    // brushed the knob would be in the way of the gesture it is
+                    // mostly used for.
+                    let needs_double =
+                        matches!(grab.hit, recorder_panel::Hit::SetTempo(_));
+                    let opened = !needs_double
+                        || ctx.input(|i| {
+                            i.pointer.button_double_clicked(egui::PointerButton::Primary)
+                        });
+                    if opened {
+                        if let Some(field) = recorder_panel::num_field(grab.hit) {
+                            self.num_edit = Some(recorder::NumEdit::new(field));
+                            self.name_focused = false;
+                        }
                     }
                 }
             } else if let Some(pos) = pos {
@@ -5187,33 +5196,31 @@ impl IvoryApp {
                 // nothing, so that letting go of it can mean something else.
                 if self.grabbed.is_some_and(|g| g.moved) {
                     let view = self.recorder_layout_view();
-                    match recorder_panel::drag_axis(rect, &view, grab.hit) {
-                        // **A knob turns by how far the hand has MOVED**, not
-                        // by where it ended up — see `KNOB_TRAVEL`. The pointer
-                        // is free to leave the control, and leave the band, and
-                        // go on turning it.
-                        Some(recorder_panel::DragAxis::Vertical) => {
-                            let moved = (grab.from.y - pos.y) / KNOB_TRAVEL;
-                            let v = (grab.from_value + moved).clamp(0.0, 1.0);
-                            self.apply_recorder_hit(grab.hit.with_value(v));
-                        }
-                        // A fader goes where the pointer is, along its own
-                        // track. The other axis is pinned to where the grab
-                        // started, so a hand that drifts up keeps the gesture
-                        // instead of dropping it.
-                        _ => {
-                            let probe = Pos2::new(
-                                pos.x.clamp(rect.left(), rect.right() - 0.5),
-                                grab.from.y,
-                            );
-                            if let Some(now) = recorder_panel::hit_test(rect, &view, probe) {
-                                // Same CONTROL, not the same value: the whole
-                                // point is that the value changed.
-                                if now.is_same_control(grab.hit) {
-                                    self.apply_recorder_hit(now);
-                                }
-                            }
-                        }
+                    // **Every control travels by how far the hand has MOVED**,
+                    // not by where it ended up. The pointer is free to leave
+                    // the control, leave the band, and go on turning it — and
+                    // a press never makes a handle jump to meet it.
+                    //
+                    // A fader's travel is its own track, so it still feels
+                    // one-to-one; a knob's is `KNOB_TRAVEL`, which is far wider
+                    // than the knob. Holding the fine modifier makes either six
+                    // times slower, which is what puts every readable decibel
+                    // within reach of a hand.
+                    let axis = recorder_panel::drag_axis(rect, &view, grab.hit);
+                    if let Some(axis) = axis {
+                        let travel = recorder_panel::drag_travel(rect, &view, grab.hit)
+                            .unwrap_or(KNOB_TRAVEL);
+                        let moved = match axis {
+                            recorder_panel::DragAxis::Vertical => grab.from.y - pos.y,
+                            recorder_panel::DragAxis::Horizontal => pos.x - grab.from.x,
+                        };
+                        let fine = if ctx.input(|i| i.modifiers.shift) {
+                            recorder_panel::FINE_DRAG
+                        } else {
+                            1.0
+                        };
+                        let v = (grab.from_value + moved / travel * fine).clamp(0.0, 1.0);
+                        self.apply_recorder_hit(grab.hit.with_value(v));
                     }
                 }
             }
@@ -6222,6 +6229,121 @@ mod tests {
             app.recorder_layout_view().turning,
             Some(recorder::NumField::Reverb),
             "a knob being turned does not show its reading"
+        );
+    }
+
+    /// **Every readable decibel is reachable by hand.** A fader spans seventy-
+    /// two decibels and reads to a tenth of one; over its own track that is
+    /// four tenths of a decibel per point, so half the numbers it can display
+    /// could not be landed on. The fine modifier is what closes that.
+    #[test]
+    fn a_fader_can_be_landed_on_any_tenth_of_a_decibel() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let from = {
+            let band = app.last_band;
+            let v = app.recorder_layout_view();
+            let (_, track, _) = recorder_panel::fader_zones(
+                recorder_panel::metronome_row(band, &v).expect("the click fader is there"),
+            );
+            track.center()
+        };
+        press(&ctx, &mut app, from);
+        let travel = {
+            let v = app.recorder_layout_view();
+            recorder_panel::drag_travel(
+                app.last_band,
+                &v,
+                recorder_panel::Hit::SetMetronomeGain(0.0),
+            )
+            .expect("the fader travels")
+        };
+
+        // Past the tap slop first — under it a press is still on its way to
+        // being a tap and sets nothing, which is the point of the slop.
+        move_to_fine(&ctx, &mut app, Pos2::new(from.x + TAP_SLOP + 6.0, from.y));
+        // Now one more point, held fine. The step it produces has to be smaller
+        // than the tenth of a decibel the reading shows, or there are values on
+        // screen no hand can reach.
+        let before = app.settings.metronome_gain;
+        move_to_fine(&ctx, &mut app, Pos2::new(from.x + TAP_SLOP + 7.0, from.y));
+        let db = |g: f64| 20.0 * (g as f32).max(1e-9).log10();
+        let step = (db(app.settings.metronome_gain) - db(before)).abs();
+        assert!(
+            step > 0.0 && step < 0.1,
+            "one fine point moved the fader {step:.3} dB, and it reads to 0.1"
+        );
+
+        // And the ordinary gesture still crosses the whole track in a track's
+        // width, or a fader has stopped feeling like a fader.
+        let (_, mut app) = (0, app);
+        app.settings.metronome_gain = 0.0;
+        app.grabbed = Some(Grab {
+            hit: recorder_panel::Hit::SetMetronomeGain(0.0),
+            from,
+            moved: true,
+            from_value: 0.0,
+        });
+        move_to(&ctx, &mut app, Pos2::new(from.x + travel, from.y));
+        assert!(
+            app.settings.metronome_gain > 3.9,
+            "a full track's drag reached only {}",
+            app.settings.metronome_gain
+        );
+    }
+
+    /// The tempo is a knob now, turned like the sends, and typed into on a
+    /// double click rather than a tap — it is turned far more often than it is
+    /// typed.
+    #[test]
+    fn the_tempo_knob_turns_and_opens_on_a_double_click() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.record_export.tempo_bpm = 120.0;
+        let from = knob_cell(&app, recorder_panel::Hit::SetTempo(0.0)).center();
+
+        press(&ctx, &mut app, from);
+        assert!(
+            app.grabbed
+                .is_some_and(|g| g.hit.is_same_control(recorder_panel::Hit::SetTempo(0.0))),
+            "pressing the tempo knob did not grab it"
+        );
+        // A single tap does NOT open the field.
+        release(&ctx, &mut app, from);
+        assert!(app.num_edit.is_none(), "a tap opened the tempo box");
+
+        // Turning it up a tenth of the travel raises the tempo.
+        press(&ctx, &mut app, from);
+        move_to(&ctx, &mut app, Pos2::new(from.x, from.y - KNOB_TRAVEL * 0.1));
+        assert!(
+            app.settings.record_export.tempo_bpm > 140.0,
+            "a tenth of the travel gave {}",
+            app.settings.record_export.tempo_bpm
+        );
+    }
+
+    /// One frame with the pointer released at `pos`.
+    fn release(ctx: &egui::Context, app: &mut IvoryApp, pos: Pos2) {
+        pointer_frame(
+            ctx,
+            app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+    }
+
+    /// A move with the fine modifier held.
+    fn move_to_fine(ctx: &egui::Context, app: &mut IvoryApp, pos: Pos2) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                modifiers: egui::Modifiers::SHIFT,
+                events: vec![egui::Event::PointerMoved(pos)],
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
         );
     }
 
@@ -7479,7 +7601,7 @@ mod tests {
         app.num_edit = Some(typed());
         // `EditTempo`, because that is the box now: `SetTempo` carries a
         // committed value and is not a thing on screen to press.
-        app.commit_number_unless(Some(recorder_panel::Hit::EditTempo));
+        app.commit_number_unless(Some(recorder_panel::Hit::SetTempo(90.0)));
         assert!(app.num_edit.is_some(), "clicking the same field committed it");
         assert!(
             (app.settings.record_export.tempo_bpm - 144.0).abs() > 1e-9,

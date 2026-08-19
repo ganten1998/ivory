@@ -327,6 +327,9 @@ struct Layout {
     reverb: Rect,
     delay: Rect,
     chorus: Rect,
+    /// Where a typed tempo goes: a small box under the knob, drawn only while
+    /// one is being typed.
+    tempo_entry: Rect,
 
     /// The supporter heart, bottom-right of the band.
     ///
@@ -569,7 +572,7 @@ const PREVIEW_ASPECT: f32 = 16.0 / 9.0;
 /// bench. The zone is a SQUARE's worth of row rather than a caption's worth,
 /// and the eighth of the row it gave up is what pays for the two click
 /// switches now sitting in the click's own row. See [`CLICK_SWITCHES`].
-fn fader_zones(row: Rect) -> (Rect, Rect, Rect) {
+pub fn fader_zones(row: Rect) -> (Rect, Rect, Rect) {
     if !row.is_positive() {
         return (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING);
     }
@@ -630,6 +633,7 @@ impl Layout {
             reverb: Rect::NOTHING,
             delay: Rect::NOTHING,
             chorus: Rect::NOTHING,
+            tempo_entry: Rect::NOTHING,
             setup: Rect::NOTHING,
             dest: Rect::NOTHING,
             reveal: Rect::NOTHING,
@@ -859,45 +863,72 @@ impl Layout {
         // knob you cannot read and cannot land on.
         let col = slice_h(m, 0.00, FADER_COL);
 
-        // **The tempo sits over the metronome's own icon**, which is the one
-        // place in the band where it says what it is without a caption: the
-        // number and the thing it counts, one above the other. Typed, never
-        // dragged — see `Hit::EditTempo`.
-        //
-        // While a take runs the elapsed time takes the same box. Nothing else
-        // could go there: the tempo cannot be changed mid-take, and the clock
-        // is the one number anybody looks at from a piano bench.
-        let head = slice_v(col, 0.00, TEMPO_ROW);
-        let head = slice_h(head, 0.00, 0.30);
-        if rolling {
-            self.timecode = head;
-        } else {
-            self.tempo = head;
-        }
         // Tall rows in a narrow column. Moving the pair off the meters bought
         // width to give away and none to spare, so the legibility comes back
         // out of the HEIGHT: the two rows take nearly the whole column, which
         // was dead space above and below them, and the dB reading at the end
         // of each track stays a number rather than a smudge at the smallest
         // band this app will draw.
-        self.metronome_row = slice_v(col, 0.22, 0.44);
-        self.input_row = slice_v(col, 0.48, 0.70);
+        // **The transport row carries a knob now, so it needs a knob's
+        // height.** The faders lose a little of theirs to pay for it: a fader
+        // is a bar and a number and reads at any height, and a knob below a
+        // certain size is three grey rings.
+        self.metronome_row = slice_v(col, 0.06, 0.28);
+        self.input_row = slice_v(col, 0.32, 0.54);
         self.click = fader_zones(self.metronome_row).0;
 
         // **The transport, under the faders it belongs with.** Three squares
         // of one size, one centred in each third of the row: they are one
         // group, and a stop bigger than the cog beside it reads as more
         // important than it is.
-        let bar = slice_v(col, 0.76, 1.00);
-        // A sixth off what the row would allow. With the words column gone the
-        // bar is nearly three hundred points wide, and three buttons sized to
-        // fill it read as the loudest thing in the band — which they are not:
-        // the meters are.
-        let side = (bar.height() * TRANSPORT_SIDE).min(bar.width() * 0.20 * TRANSPORT_SIDE);
+        let bar = slice_v(col, 0.60, 1.00);
+        // **The tempo is a knob at the head of the transport**, and that is
+        // what makes the transport one thing rather than three buttons and a
+        // number that happened to be nearby. It takes the first quarter; the
+        // three buttons share the rest.
+        //
+        // Its own cell, not an icon slot: a knob wants a word over it and the
+        // buttons do not, so they are sized separately and centred on the same
+        // line.
+        // **And the clock takes its place while a take runs.** The tempo
+        // cannot be changed mid-take — the `.mid`'s tempo map is already
+        // written — so leaving a live knob there would be a control that lies.
+        // What goes in its place is the one number anybody looks at from a
+        // piano bench, in the row their hand is already on.
+        let head = slice_h(bar, 0.00, 0.28);
+        if rolling {
+            self.timecode = head;
+        } else {
+            self.tempo = head;
+        }
+        let buttons = slice_h(bar, 0.32, 1.00);
+        // **Sized and lined up against the KNOB, not against the row.** They
+        // are one group with it, and a group whose parts are measured from
+        // different things is a group that only looks like one by accident:
+        // the knob's circle hangs in its own face, under a label the buttons
+        // do not have, so a row-centred button sat visibly below it.
+        //
+        // Their side comes off the knob's body diameter — the thing you see —
+        // and smaller than it, because the transport's job is Record and the
+        // tempo is what you set once.
+        let (line, from_knob) = knob_centre(head).map_or((buttons.center().y, None), |c| {
+            (c.y, knob_face(head).map(|k| k.radius * 2.0))
+        });
+        let side = from_knob
+            .map_or(buttons.height() * TRANSPORT_SIDE, |d| d * TRANSPORT_SIDE)
+            .min(buttons.width() * 0.26);
         let icon = |i: usize| {
-            let cx = bar.left() + bar.width() * (i as f32 * 2.0 + 1.0) / 6.0;
-            Rect::from_center_size(Pos2::new(cx, bar.center().y), Vec2::splat(side))
+            let cx = buttons.left() + buttons.width() * (i as f32 * 2.0 + 1.0) / 6.0;
+            Rect::from_center_size(Pos2::new(cx, line), Vec2::splat(side))
         };
+        // The typing box, under the knob and only ever drawn while somebody is
+        // typing into it. Allowed to hang below the column: it is an overlay
+        // for as long as a number takes to enter, and the alternative is a
+        // permanent gap under the transport reserved for nothing.
+        self.tempo_entry = Rect::from_min_size(
+            Pos2::new(self.tempo.center().x - self.tempo.width() * 0.44, self.tempo.bottom()),
+            Vec2::new(self.tempo.width() * 0.88, self.tempo.height() * 0.42),
+        );
         if rolling {
             // No record button while rolling — pressing it would mean nothing,
             // and a dead control is worse than no control. The steady dot
@@ -1079,9 +1110,10 @@ impl Layout {
             (self.camera, Fixed(Hit::PickCamera)),
             (self.audio, Fixed(Hit::PickAudio)),
             (self.count_in, Fixed(Hit::CycleCountIn)),
-            // **Typed, not dragged.** A press opens the field; there is no
-            // travel along it to sweep. See `draw_tempo`.
-            (self.tempo, Fixed(Hit::EditTempo)),
+            // Turned like the sends, and typed into on a DOUBLE click — see
+            // `draw_tempo`. `SetTempo` carries beats rather than 0..=1, so the
+            // producer converts on the way out.
+            (self.tempo, AlongV(|t| Hit::SetTempo(knob_to_tempo(t)))),
             (self.time_sig, Fixed(Hit::EditTimeSignature)),
             (self.export, Fixed(Hit::Export)),
         ]
@@ -1184,9 +1216,6 @@ pub enum Hit {
     /// and it lives there so that the fader's travel and the audio path's
     /// scaling cannot disagree.
     SetMetronomeGain(f32),
-    /// Open the tempo box for typing. It carries no value: a tempo is a
-    /// number somebody knows, and the box is where they write it.
-    EditTempo,
     /// The three effect sends, 0..=1.
     SetReverb(f32),
     SetDelay(f32),
@@ -1234,7 +1263,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 42] = [
+    pub const ALL: [Hit; 41] = [
         Hit::Record,
         Hit::Stop,
         Hit::OpenSetup,
@@ -1270,7 +1299,6 @@ impl Hit {
         Hit::SetSlotGain(3, Hit::MIDWAY),
         Hit::SetSlotGain(4, Hit::MIDWAY),
         Hit::SetMetronomeGain(Hit::MIDWAY),
-        Hit::EditTempo,
         Hit::SetReverb(Hit::MIDWAY),
         Hit::SetDelay(Hit::MIDWAY),
         Hit::SetChorus(Hit::MIDWAY),
@@ -1341,7 +1369,6 @@ impl Hit {
             Hit::ToggleMetronomeInTake => "Record the click into takes",
             Hit::SetSlotGain(i, _) => GAIN[n(i)],
             Hit::SetMetronomeGain(_) => "Click level",
-            Hit::EditTempo => "Tempo",
             Hit::SetReverb(_) => "Reverb, on every instrument",
             Hit::SetDelay(_) => "Delay, in time with the tempo",
             Hit::SetChorus(_) => "Chorus, in true stereo",
@@ -1365,6 +1392,7 @@ impl Hit {
                 | Hit::SetDelay(_)
                 | Hit::SetChorus(_)
                 | Hit::SetInputGain(_)
+                | Hit::SetTempo(_)
         )
     }
 
@@ -1409,7 +1437,9 @@ pub fn num_field(hit: Hit) -> Option<NumField> {
         Hit::EditTimeSignature => Some(NumField::Meter),
         Hit::SetSlotGain(i, _) => Some(NumField::Slot(i)),
         Hit::SetMetronomeGain(_) => Some(NumField::Metronome),
-        Hit::EditTempo => Some(NumField::Tempo),
+        // The knob IS the box: a double click on it opens the field. There is
+        // no separate control to press.
+        Hit::SetTempo(_) => Some(NumField::Tempo),
         Hit::SetReverb(_) => Some(NumField::Reverb),
         Hit::SetDelay(_) => Some(NumField::Delay),
         Hit::SetChorus(_) => Some(NumField::Chorus),
@@ -1512,6 +1542,45 @@ pub fn drag_axis(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<DragAx
         })
 }
 
+/// How far the pointer must move to sweep `hit` end to end, in points.
+///
+/// **Every control here is dragged RELATIVELY**, knobs and faders alike: the
+/// value follows how far the hand has moved rather than where it ended up. A
+/// fader's travel is its own track, so it still feels one-to-one under the
+/// pointer; what it gains is that the hand can leave the track and keep going,
+/// and that pressing it never makes the handle jump.
+///
+/// `None` for anything that does not travel.
+pub fn drag_travel(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<f32> {
+    let l = Layout::new(rect, view);
+    let (r, k) = l
+        .targets()
+        .into_iter()
+        .find(|(r, k)| r.is_positive() && (*k).control().is_same_control(hit))?;
+    match k {
+        Produces::AlongV(_) => Some(KNOB_TRAVEL),
+        Produces::Along(_) => Some(r.width().max(1.0)),
+        Produces::SlotGain(_) => Some(r.width().max(1.0)),
+        Produces::Fixed(_) => None,
+    }
+}
+
+/// How far the pointer must move to sweep a knob end to end, in points.
+///
+/// **Wider than the knob, by a lot.** A knob's cell is a few tens of points;
+/// mapping that to the whole range is a control nobody can land on a number
+/// with. The hand can leave the knob, leave the band, and go on turning.
+pub const KNOB_TRAVEL: f32 = 260.0;
+
+/// How much finer a drag is with the fine modifier held.
+///
+/// **Any readable value has to be reachable by hand.** A fader spans seventy-
+/// two decibels and reads to a tenth of one; over its own track that is four
+/// tenths of a decibel per point, so half the numbers it can display cannot be
+/// landed on. Six times finer puts every one of them within reach without
+/// making the ordinary gesture sluggish.
+pub const FINE_DRAG: f32 = 1.0 / 6.0;
+
 /// How far UP `r` the point `pos` fell, 0..=1 from its bottom edge to its top.
 ///
 /// Screen y grows downward and knobs do not, so this is [`along`] inverted on
@@ -1576,8 +1645,15 @@ pub fn knob_rect(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<Rect> 
         Hit::SetReverb(_) => l.reverb,
         Hit::SetDelay(_) => l.delay,
         Hit::SetChorus(_) => l.chorus,
+        Hit::SetTempo(_) => l.tempo,
         _ => return None,
     };
+    r.is_positive().then_some(r)
+}
+
+/// The click fader's whole row, for a caller reasoning about the gesture.
+pub fn metronome_row(rect: Rect, view: &RecorderView<'_>) -> Option<Rect> {
+    let r = Layout::new(rect, view).metronome_row;
     r.is_positive().then_some(r)
 }
 
@@ -1638,9 +1714,10 @@ pub fn draw(painter: &Painter, rect: Rect, view: &RecorderView<'_>, s: &Settings
         // better than a caption would.
         draw_tempo(
             painter,
-            l.tempo,
+            &l,
             view.tempo_bpm,
             typing_for(view, NumField::Tempo),
+            view.turning == Some(NumField::Tempo),
             &p,
         );
     }
@@ -1910,8 +1987,19 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
         (l.delay, view.delay, "DELAY", NumField::Delay),
         (l.chorus, view.chorus, "CHORUS", NumField::Chorus),
     ] {
-        let turning = view.turning == Some(field);
-        draw_knob(painter, cell, v, label, typing_for(view, field), turning, p);
+        draw_knob(
+            painter,
+            cell,
+            &Knob {
+                value: v,
+                label,
+                typing: typing_for(view, field),
+                turning: view.turning == Some(field),
+                reading: format!("{:.0}%", v.clamp(0.0, 1.0) * 100.0),
+                cap: KNOB_CAP,
+            },
+            p,
+        );
     }
     // **Whether the click ends up in the FILE has no control of its own.** It
     // is set once a year and it was sitting in the busiest row of the band
@@ -2990,6 +3078,13 @@ const KNOB_SWEEP: f32 = std::f32::consts::TAU * 0.75;
 /// Tick marks around the skirt. Eleven on the 388, and eleven here.
 const KNOB_TICKS: usize = 11;
 
+/// The tempo knob's cap.
+///
+/// A darkened orange against the effects' blue. They are the same control and
+/// deliberately so; the colour is what says this one moves the CLICK rather
+/// than the sound.
+const TEMPO_CAP: Color32 = Color32::from_rgb(0xb5, 0x5c, 0x18);
+
 /// The blue cap on a Tascam 388's effect returns.
 ///
 /// A real colour off the reference photograph rather than the band's accent,
@@ -2997,11 +3092,13 @@ const KNOB_TICKS: usize = 11;
 /// piece of hardware and not like the rest of the panel.
 const KNOB_CAP: Color32 = Color32::from_rgb(0x1c, 0x6f, 0xd6);
 
-/// How much of the room it is given a transport button takes.
+/// A transport button's side, as a fraction of the tempo knob's diameter.
 ///
-/// The bar grew when the words column went, and three buttons that filled it
-/// read as the loudest thing in the band. They are not: the meters are.
-const TRANSPORT_SIDE: f32 = 0.85;
+/// **Measured against the knob beside them**, which is what makes the four of
+/// them one group. Smaller than it: the transport's job is Record, and three
+/// buttons the size of the thing next to them read as the loudest object in
+/// the band — which they are not; the meters are.
+const TRANSPORT_SIDE: f32 = 0.72;
 
 /// The tempo box's share of the fader column's height.
 ///
@@ -3043,6 +3140,10 @@ const KNOB_LABEL: (f32, f32, f32) = (0.24, 6.0, 15.0);
 /// how much was left for the word above it.
 struct KnobFace {
     face: Rect,
+    /// **The body's radius, not the skirt's.** The ticks stand outside it and
+    /// are deliberately not counted: sizing the knob to fit them made the
+    /// visible circle a fifth smaller than the room it had, which is a knob
+    /// that looks lost in its own cell.
     radius: f32,
     /// Points reserved for the label. **Zero means there is no room for one**,
     /// and the face takes the whole cell.
@@ -3079,6 +3180,16 @@ fn knob_face(cell: Rect) -> Option<KnobFace> {
     })
 }
 
+/// Where a knob's circle sits, for anything that has to line up with it.
+///
+/// **The centre of the FACE, both ways.** The circle used to hang from the top
+/// of its face, so a cell taller than it was wide left the slack underneath —
+/// and anything aligned to the cell's middle sat below the knob rather than
+/// beside it.
+fn knob_centre(cell: Rect) -> Option<Pos2> {
+    knob_face(cell).map(|k| k.face.center())
+}
+
 fn knob_fits(cell: Rect) -> bool {
     knob_face(cell).is_some()
 }
@@ -3091,15 +3202,30 @@ fn knob_fits(cell: Rect) -> bool {
 /// so a glance can tell a quarter turn from a half.
 ///
 /// `value` is 0..=1 and the caller owns what that means.
-fn draw_knob(
-    painter: &Painter,
-    cell: Rect,
+/// One knob's worth of state, for [`draw_knob`].
+///
+/// A struct rather than seven positional arguments: two of them are strings
+/// and two are bools, and a call site that got either pair the wrong way round
+/// would compile.
+struct Knob<'a> {
+    /// 0..=1, whatever that means to the caller.
     value: f32,
-    label: &str,
-    typing: Option<&str>,
+    /// The word over it.
+    label: &'a str,
+    /// What is being typed into it, if anything.
+    typing: Option<&'a str>,
+    /// A hand is on it right now, so show the reading rather than the name.
     turning: bool,
-    p: &Palette,
-) {
+    /// What the reading SAYS. A send is a percent and a tempo is a number of
+    /// beats; the knob does not know which it is and should not guess.
+    reading: String,
+    /// The cap. The effects share one; the tempo has its own, which is what
+    /// makes it read as part of the transport rather than a fourth send.
+    cap: Color32,
+}
+
+fn draw_knob(painter: &Painter, cell: Rect, k: &Knob<'_>, p: &Palette) {
+    let (value, label, typing, turning) = (k.value, k.label, k.typing, k.turning);
     if !cell.is_positive() {
         return;
     }
@@ -3122,10 +3248,7 @@ fn draw_knob(
     // noise moving under a moving hand.
     let (text, ink) = match (typing, turning) {
         (Some(typed), _) => (Some(format!("{typed}_")), p.ink),
-        (None, true) => (
-            Some(format!("{:.0}%", value.clamp(0.0, 1.0) * 100.0)),
-            p.ink,
-        ),
+        (None, true) => (Some(k.reading.clone()), p.ink),
         // The name only when there is a strip to put it in. See `knob_face`:
         // the word is what gives way in a short band, not the control.
         (None, false) => ((label_h > 0.0).then(|| label.to_owned()), p.faint),
@@ -3153,27 +3276,29 @@ fn draw_knob(
             );
         }
     }
-    let c = Pos2::new(face.center().x, face.top() + rad);
+    let c = face.center();
     let t = value.clamp(0.0, 1.0);
     // Straight down is the middle of the missing quarter, so the sweep runs
     // from half of it past one side to half of it past the other.
     let angle = std::f32::consts::PI + (t - 0.5) * KNOB_SWEEP;
     let dir = |a: f32| Vec2::new(a.sin(), -a.cos());
 
-    // The skirt's ticks, outside the body. Drawn first so the body covers
-    // their inner ends and they read as marks on the panel.
-    let tick = Stroke::new((rad * 0.07).max(0.7), p.faint);
+    // **The ticks stand OUTSIDE the body, and outside the cell.** They are a
+    // mark on the panel the knob is mounted through, not part of the knob, so
+    // they are not what its size is measured against — see `knob_face`. Drawn
+    // first, so the body covers their inner ends.
+    let tick = Stroke::new((rad * 0.09).max(0.7), p.faint);
     for i in 0..KNOB_TICKS {
         let a = std::f32::consts::PI
             + (i as f32 / (KNOB_TICKS - 1) as f32 - 0.5) * KNOB_SWEEP;
         let d = dir(a);
-        painter.line_segment([c + d * (rad * 0.86), c + d * (rad * 1.06)], tick);
+        painter.line_segment([c + d * (rad * 1.09), c + d * (rad * 1.26)], tick);
     }
-    // The body: near-black, like the moulding.
-    painter.circle_filled(c, rad * 0.78, Color32::from_rgb(0x14, 0x12, 0x12));
-    // The cap, inset, in the blue.
-    let cap = rad * 0.50;
-    painter.circle_filled(c, cap, KNOB_CAP);
+    // The body: near-black, like the moulding, filling the face it was given.
+    painter.circle_filled(c, rad, Color32::from_rgb(0x14, 0x12, 0x12));
+    // The cap, inset, in its own colour.
+    let cap = rad * 0.64;
+    painter.circle_filled(c, cap, k.cap);
     // The slot. Across the whole cap and through the centre, which is what a
     // screwdriver slot looks like and what makes the angle readable at
     // fourteen points: a short pointer at one edge is a dot at this size.
@@ -3184,36 +3309,73 @@ fn draw_knob(
     );
 }
 
-/// The tempo box, with a hairline of travel along its bottom.
+/// The tempo, as a knob at the head of the transport.
 ///
-/// It is the only thing in this column that is dragged rather than clicked, and
-/// nothing else in the band is shaped like it, so it has to say so. The bar is
-/// where in `MIN_BPM..=MAX_BPM` the number sits — the same mapping [`tempo_at`]
-/// inverts, which is what makes the picture and the drag agree.
-fn draw_tempo(painter: &Painter, r: Rect, bpm: f64, typing: Option<&str>, p: &Palette) {
-    // **A number in a box, and nothing else.**
-    //
-    // It carried a TEMPO caption and a hairline of travel along its bottom,
-    // because it used to be dragged. It sits directly over the metronome's own
-    // icon now, which says what it is better than a word does, and it is typed
-    // rather than swept: a tempo is a number somebody already knows, not a
-    // position they hunt for along sixty points of track.
+/// **The same knob as the three effect sends, in a different colour.** That is
+/// the whole point: a number floating beside three buttons is a number that
+/// happened to be nearby, and a knob among them is part of the transport. The
+/// cap is a darkened orange so it is not read as a fourth send.
+///
+/// Turned like the others — relatively, so the pointer can leave it and go on
+/// turning — and DOUBLE-clicked to type, which is the one gesture the sends do
+/// not have. A single tap on a send opens its field; the tempo is turned far
+/// more often than it is typed, and a tap that opened a text box every time a
+/// hand brushed it would be in the way.
+fn draw_tempo(
+    painter: &Painter,
+    l: &Layout,
+    bpm: f64,
+    typing: Option<&str>,
+    turning: bool,
+    p: &Palette,
+) {
+    draw_knob(
+        painter,
+        l.tempo,
+        &Knob {
+            value: tempo_to_knob(bpm),
+            label: "TEMPO",
+            // Never in the knob's own strip: the typed number gets a box of
+            // its own below, where there is room for digits and a caret.
+            typing: None,
+            turning: turning || typing.is_some(),
+            reading: tempo_text(bpm),
+            cap: TEMPO_CAP,
+        },
+        p,
+    );
+    // The typing box, only while somebody is typing into it. A box that was
+    // always there would be a second tempo readout under the first.
+    let Some(typed) = typing else { return };
+    let r = l.tempo_entry;
     if !r.is_positive() {
         return;
     }
-    // While it is being typed into, the box shows the characters rather than
-    // the stored tempo — otherwise there is nothing on screen to tell somebody
-    // their keystrokes are going anywhere. A trailing caret, for the same
-    // reason: an empty box mid-edit looks like a box that ate the keystroke.
-    let shown = match typing {
-        Some(typed) => format!("{typed}_"),
-        None => tempo_text(bpm),
-    };
     control(painter, r, p);
-    let size = fit_text(r.shrink(r.width() * 0.08), &shown, r.height() * 0.58);
+    let shown = format!("{typed}_");
+    let size = fit_text(r.shrink(r.width() * 0.08), &shown, r.height() * 0.72);
     if size >= MIN_TEXT {
         painter.text(r.center(), Align2::CENTER_CENTER, &shown, font(size), p.ink);
     }
+}
+
+/// Where `bpm` sits on the knob, 0..=1.
+///
+/// Linear across the legal range, which over [`KNOB_TRAVEL`] points of travel
+/// is about a beat a point — fine enough to land on a number by hand, and the
+/// reading says which one.
+pub fn tempo_knob_position(bpm: f64) -> f32 {
+    tempo_to_knob(bpm)
+}
+
+fn tempo_to_knob(bpm: f64) -> f32 {
+    ((bpm - MIN_BPM) / (MAX_BPM - MIN_BPM)).clamp(0.0, 1.0) as f32
+}
+
+/// The inverse of [`tempo_to_knob`], clamped to what the SMF writer and every
+/// DAW's bar ruler will accept.
+pub fn knob_to_tempo(t: f32) -> f64 {
+    MIN_BPM + f64::from(t.clamp(0.0, 1.0)) * (MAX_BPM - MIN_BPM)
 }
 
 /// A tick box and its caption: two line segments rather than a glyph, because
@@ -4202,7 +4364,7 @@ mod tests {
                 // a session, and the band is what your hands are on while a
                 // take runs. `SetTempo` is here because the tempo BOX is a
                 // control and the value is not — see `Hit::EditTempo`.
-                const IN_THE_MENU: [Hit; 11] = [
+                const IN_THE_MENU: [Hit; 10] = [
                     Hit::ChooseFolder,
                     Hit::RevealFolder,
                     Hit::ToggleDefaultDir,
@@ -4213,7 +4375,6 @@ mod tests {
                     Hit::Export,
                     Hit::EditTimeSignature,
                     Hit::NameField,
-                    Hit::SetTempo(0.0),
                 ];
                 if IN_THE_MENU.iter().any(|m| m.is_same_control(want))
                     || want == Hit::ToggleMetronomeInTake
@@ -4957,10 +5118,9 @@ mod tests {
             .into_iter()
             .filter(|h| num_field(*h).is_some() && !h.is_draggable())
             .collect();
-        // The two that are typed and never dragged: a time signature has no
-        // continuum between 4/4 and 7/8 to sweep along, and a tempo is a
-        // number somebody already knows.
-        assert_eq!(typed_only, vec![Hit::EditTempo, Hit::EditTimeSignature]);
+        // The one that is typed and never dragged: a time signature has no
+        // continuum between 4/4 and 7/8 to sweep along.
+        assert_eq!(typed_only, vec![Hit::EditTimeSignature]);
     }
 
     /// The four fields are four fields, not one used four times.
