@@ -7582,6 +7582,28 @@ mod tests {
             theory_panel::Views::all(),
             "a reset did not restore every theory element"
         );
+        // **And an instrument in the rack.** It sounds either way, because the
+        // renderer plays the built-in when nothing else has — but a reset that
+        // left five empty rows told somebody the app had no instrument while
+        // it was playing one, and the patch picker is reached by clicking the
+        // slot it is in.
+        assert_eq!(
+            s.plugin_slots[0].as_deref(),
+            Some(dialogs::BUILTIN_PATH),
+            "a reset left the rack empty"
+        );
+    }
+
+    /// A fresh install lands in the same place, which is the whole point of
+    /// `first_launch` being what a reset resets to.
+    #[test]
+    fn a_fresh_install_has_the_built_in_loaded() {
+        let s = crate::settings::Settings::first_launch();
+        assert_eq!(s.plugin_slots[0].as_deref(), Some(dialogs::BUILTIN_PATH));
+        // And nothing else, so the rack is not four rows of something.
+        assert!(s.plugin_slots[1..].iter().all(Option::is_none));
+        // No cartridge chosen means the one that ships. See `dx7::factory`.
+        assert!(s.dx7_cartridge.is_empty());
     }
 
     /// **One tempo, one source.**

@@ -2421,18 +2421,34 @@ pub fn show(
                                 // something long: a label sized to its own
                                 // text ran straight under "Edit...".
                                 let room = (ui.available_width() - BANK_BUTTONS_W).max(40.0);
-                                ui.add_sized(
-                                    [room, 18.0],
-                                    egui::Label::new(
-                                        RichText::new(if bank.is_empty() {
-                                            "No cartridge loaded".to_owned()
-                                        } else {
-                                            format!("Cartridge: {bank}")
-                                        })
-                                        .font(bold(12.0))
-                                        .color(t.text),
-                                    )
-                                    .truncate(),
+                                // **The width has to be ALLOCATED, not merely
+                                // asked for.** `add_sized` reserves the space
+                                // but a `Label` still lays out against the
+                                // width the row has left, so `truncate` had
+                                // nothing to truncate against and the name ran
+                                // under the buttons anyway.
+                                //
+                                // Room grows with the dialog, which is
+                                // resizable — so a wider window shows more of
+                                // the name and the ellipsis appears only when
+                                // there is genuinely nowhere to put it.
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(room, 18.0),
+                                    Layout::left_to_right(Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(if bank.is_empty() {
+                                                    "No cartridge loaded".to_owned()
+                                                } else {
+                                                    format!("Cartridge: {bank}")
+                                                })
+                                                .font(bold(12.0))
+                                                .color(t.text),
+                                            )
+                                            .truncate(),
+                                        );
+                                    },
                                 );
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if ui

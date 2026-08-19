@@ -754,12 +754,22 @@ impl Settings {
     /// visible rather than hidden behind a menu nobody opens, and it is the
     /// trade the owner chose.
     pub fn first_launch() -> Self {
-        Self {
+        let mut s = Self {
             show_fretboard: true,
             theory_order: crate::theory_panel::Views::all().keys(),
             show_recorder: true,
             ..Self::default()
-        }
+        };
+        // **The built-in is IN a slot, not merely available.**
+        //
+        // It sounds either way — the renderer plays it when nothing else has —
+        // but a rack of five empty rows says the app has no instrument, and
+        // the patch picker and the patch editor are both reached by clicking
+        // the slot it is in. Somebody who has just asked for everything to go
+        // back to how it was would find an app that plays and a rack that
+        // says it does not.
+        s.plugin_slots[0] = Some(crate::dialogs::BUILTIN_PATH.to_owned());
+        s
     }
 
     fn load_from(path: &std::path::Path) -> Self {
@@ -2231,14 +2241,26 @@ mod tests {
             first.show_recorder,
             "the recorder is invisible on a fresh install"
         );
-        // Nothing else moves: a first launch is the DEFAULTS plus visibility,
-        // not a second set of preferences to keep in step. Every flag listed
-        // here is one somebody can see; anything else appearing in this list
-        // would mean a first launch had grown a PREFERENCE of its own.
+        // **The built-in is loaded, and that is visibility too.** It sounds
+        // whether or not a slot claims it — the renderer plays it when nothing
+        // else has — so this is not a preference about the SOUND. It is about
+        // the rack saying so, and about the patch picker and the patch editor
+        // being reachable, which is done by clicking the slot it is in.
+        assert_eq!(
+            first.plugin_slots[0].as_deref(),
+            Some(crate::dialogs::BUILTIN_PATH),
+            "a fresh install has no instrument in the rack"
+        );
+
+        // Nothing else moves: a first launch is the DEFAULTS plus what somebody
+        // can SEE, not a second set of preferences to keep in step. Everything
+        // listed here is visible; anything else appearing in this list would
+        // mean a first launch had grown a preference of its own.
         let same = Settings {
             show_fretboard: false,
             theory_order: String::new(),
             show_recorder: false,
+            plugin_slots: [const { None }; crate::recorder::SLOTS],
             ..first.clone()
         };
         assert_eq!(same, Settings::default());
