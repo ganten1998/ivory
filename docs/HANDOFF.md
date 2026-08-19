@@ -1395,6 +1395,13 @@ rely on Ubuntu Light. Do not disable `default_fonts`.
   bash suppresses errexit for the entire left operand of `||`, function body
   included. `scripts/build-cross.sh` shipped empty Linux tarballs for a week
   because of it. Check each step explicitly in any such function.
+- **A `cfg`-gated module is not compiled on the host, so `cargo build` proves
+  nothing about it.** `decode.rs` reached into `encode::ffmpeg`, which is
+  `#[cfg(not(macos))]` — the mac build never compiles it, every mac check
+  passed, and the cross-build failed on `module ffmpeg is private`. Same family
+  as the icon-less Windows exe. Anything touching a `cfg`-gated path gets a
+  `cargo check --target` for a target that actually has it, before the release
+  script finds out.
 - **Verify claims about assets before repeating them.** "543-byte placeholder
   icon" was in this document for a week; the file was the original artwork all
   along. One `shasum` against the Python app settled it.

@@ -56,8 +56,11 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as sys;
 
+// `pub(crate)`, because `decode` reaches in for the same binary this module
+// runs: one place resolves where ffmpeg is, and importing audio on a machine
+// with none has to give the same advice as failing to encode video does.
 #[cfg(not(target_os = "macos"))]
-mod ffmpeg;
+pub(crate) mod ffmpeg;
 #[cfg(not(target_os = "macos"))]
 use ffmpeg as sys;
 
