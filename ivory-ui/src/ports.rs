@@ -148,6 +148,10 @@ pub enum KnobUnit {
     /// what a frequency control is, and why an octave is the same distance
     /// everywhere on the dial.
     Hertz { low: f32, high: f32 },
+    /// A level, swept **linearly in decibels** from `low` to `high`, because
+    /// decibels already are the logarithm and taking it twice would put the
+    /// useful half of a threshold in the last eighth of the travel.
+    Decibels { low: f32, high: f32 },
 }
 
 /// One parameter whose values are named rather than continuous.

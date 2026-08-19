@@ -204,9 +204,6 @@ pub struct Params {
     /// A lift right at the corner. 0 is flat Butterworth.
     pub lpf_resonance: f32,
 
-    /// The most the limiter will ever let out, mapped across
-    /// [`CEILING_DB`]. The default is -1 dBTP.
-    pub limiter_ceiling: f32,
     /// How fast it lets go, mapped across [`RELEASE_MS`].
     pub limiter_release: f32,
     /// How far below the ceiling it starts easing in, across [`KNEE_DB`].
@@ -237,10 +234,10 @@ impl Default for Params {
             hpf_resonance: 0.0,
             lpf_slope: Slope::default(),
             lpf_resonance: 0.0,
-            // **Dialled in for general use.** -1 dBTP, a release that does not
-            // pump on piano, and enough knee that the first decibel of
-            // reduction is not the one you hear arriving.
-            limiter_ceiling: CEILING_DEFAULT,
+            // **Dialled in for general use.** A release that does not pump on
+            // piano, and enough knee that the first decibel of reduction is
+            // not the one you hear arriving. Where it starts working is the
+            // knob, not a parameter.
             limiter_release: 0.40,
             limiter_knee: 0.50,
         }
@@ -264,7 +261,6 @@ impl Params {
             &mut self.chorus_tone,
             &mut self.hpf_resonance,
             &mut self.lpf_resonance,
-            &mut self.limiter_ceiling,
             &mut self.limiter_release,
             &mut self.limiter_knee,
         ] {
@@ -860,20 +856,26 @@ impl Filter {
 
 // ── the limiter ─────────────────────────────────────────────────────────────
 
-/// What the ceiling row spans, in dBFS. The default sits at -1.
-const CEILING_DB: (f32, f32) = (-6.0, -0.1);
-
-/// The knob position that lands on exactly -1.0 dBTP.
-const CEILING_DEFAULT: f32 = (-1.0 - CEILING_DB.0) / (CEILING_DB.1 - CEILING_DB.0);
+/// What the limiter knob spans, in dBFS of THRESHOLD.
+///
+/// **The knob is where the limiter starts working**, and it reads in decibels
+/// because that is the only unit the question has an answer in. Zero is the
+/// top and means the limiter is out of the circuit entirely — the same rule
+/// every other knob on this panel follows, where nothing turned is nothing
+/// applied. Turned down, the reconstructed true peak is held under whatever
+/// the dial says: -1 dB on it is the -1 dBTP delivery ceiling.
+///
+/// There is no makeup gain and deliberately so. Something that got quieter
+/// because you asked for it to be limited, and then got louder again because
+/// the limiter decided that is what you meant, is a control that cannot be
+/// reasoned about. The master knob is two inches away.
+pub const LIMITER_DB: (f32, f32) = (0.0, -30.0);
 
 /// What the release row spans, in milliseconds.
 const RELEASE_MS: (f32, f32) = (20.0, 600.0);
 
 /// What the knee row spans, in dB below the ceiling.
 const KNEE_DB: (f32, f32) = (0.0, 9.0);
-
-/// How much extra level the knob drives into the ceiling, in dB.
-const DRIVE_DB: f32 = 12.0;
 
 /// Phases the detector reconstructs between each pair of samples.
 ///
@@ -995,11 +997,11 @@ impl Limiter {
 
     /// The gain a peak demands, with a soft knee below the ceiling.
     #[inline]
-    fn wanted(peak: f32, ceiling: f32, knee_db: f32) -> f32 {
+    fn wanted(peak: f32, threshold: f32, knee_db: f32) -> f32 {
         if peak <= TINY {
             return 1.0;
         }
-        let over_db = 20.0 * (peak / ceiling).log10();
+        let over_db = 20.0 * (peak / threshold).log10();
         if over_db <= -knee_db {
             1.0
         } else if knee_db > 1.0e-3 && over_db < knee_db {
@@ -1008,24 +1010,17 @@ impl Limiter {
             let t = over_db + knee_db;
             10f32.powf(-(t * t / (4.0 * knee_db)) / 20.0)
         } else {
-            ceiling / peak
+            threshold / peak
         }
     }
 
     /// Push one stereo frame; return the frame `look + TP_CENTRE` ago,
     /// limited.
     #[inline]
-    fn process(
-        &mut self,
-        x: [f32; 2],
-        drive: f32,
-        ceiling: f32,
-        knee_db: f32,
-        release: f32,
-    ) -> [f32; 2] {
+    fn process(&mut self, x: [f32; 2], threshold: f32, knee_db: f32, release: f32) -> [f32; 2] {
         for (hist, &sample) in self.hist.iter_mut().zip(&x) {
             hist.rotate_right(1);
-            hist[0] = sample * drive;
+            hist[0] = sample;
         }
         let n = self.env.len();
         // The audio that the peak just measured belongs to: the centre tap.
@@ -1038,7 +1033,7 @@ impl Limiter {
         // then, so plan a straight line from where the gain is to where it
         // must be, and keep whichever is lower at every step — an earlier,
         // louder peak's plan is not allowed to lift this one.
-        let want = Self::wanted(self.true_peak(), ceiling, knee_db);
+        let want = Self::wanted(self.true_peak(), threshold, knee_db);
         if want < 1.0 {
             let from = self.gain;
             for k in 0..=self.look {
@@ -1290,8 +1285,8 @@ impl Effects {
                 self.lpf[ch].clear();
             }
         }
-        let ceiling = {
-            let db = CEILING_DB.0 + (CEILING_DB.1 - CEILING_DB.0) * p.limiter_ceiling;
+        let threshold = {
+            let db = LIMITER_DB.0 + (LIMITER_DB.1 - LIMITER_DB.0) * self.mix.limiter;
             10f32.powf(db / 20.0)
         };
         let knee_db = KNEE_DB.0 + (KNEE_DB.1 - KNEE_DB.0) * p.limiter_knee;
@@ -1353,10 +1348,9 @@ impl Effects {
             // stage is not a limiter; it is an effect that something else gets
             // to overshoot afterwards.
             if limiter_on {
-                let drive = 10f32.powf(DRIVE_DB * self.mix.limiter / 20.0);
                 out = self
                     .limiter
-                    .process(out, drive, ceiling, knee_db, p.limiter_release);
+                    .process(out, threshold, knee_db, p.limiter_release);
                 if self.limiter.gain < self.gr {
                     self.gr = self.limiter.gain;
                 }
@@ -1464,16 +1458,21 @@ mod tests {
         v
     }
 
+    /// A knob position that puts the threshold at `db`.
+    fn threshold_at(db: f32) -> f32 {
+        (db - LIMITER_DB.0) / (LIMITER_DB.1 - LIMITER_DB.0)
+    }
+
     /// **The gain-reduction readout is the reduction that happened.**
     ///
-    /// It is what the meter beside the limiter shows, so a number that drifts
-    /// from what the DSP actually did is a meter that lies about the one thing
-    /// it exists to report.
+    /// It is what the wash behind the master readout shows, so a number that
+    /// drifts from what the DSP actually did is a meter that lies about the
+    /// one thing it exists to report.
     #[test]
     fn the_gain_reduction_readout_matches_the_gain_applied() {
         let p = Params::default();
         let sends = Sends {
-            limiter: 1.0,
+            limiter: threshold_at(-12.0),
             ..Sends::default()
         };
         let mut fx = Effects::new(SR);
@@ -1482,84 +1481,88 @@ mod tests {
         fx.process(&mut quiet, 2_048, 2, sends, &p, 120.0);
         assert_eq!(fx.gain_reduction_db(), 0.0, "silence was limited");
 
-        // A full-scale sine driven 12 dB into a -1 dB ceiling: the reduction
-        // is whatever it takes to get 12 dB of drive down to the ceiling.
+        // A full-scale sine against a -12 dB threshold: about 12 dB of it has
+        // to come off.
         for block in 0..40 {
             let mut buf = sine(2_048, 1_000.0, 1.0, block * 2_048);
             fx.process(&mut buf, 2_048, 2, sends, &p, 120.0);
         }
-        let mut last = vec![0.0; 2_048 * 2];
-        for (f, v) in last.chunks_mut(2).enumerate() {
-            let x = (std::f32::consts::TAU * 1_000.0 * (40 * 2_048 + f) as f32 / SR).sin();
-            v[0] = x;
-            v[1] = x;
-        }
+        let mut last = sine(2_048, 1_000.0, 1.0, 40 * 2_048);
         let before = last.iter().fold(0.0f32, |a, b| a.max(b.abs()));
         fx.process(&mut last, 2_048, 2, sends, &p, 120.0);
         let after = last.iter().fold(0.0f32, |a, b| a.max(b.abs()));
         let reported = fx.gain_reduction_db();
-        // What actually happened: 12 dB of drive, then whatever the limiter
-        // took back off. `after / before` is the whole chain.
-        let measured = -20.0 * (after / before).log10() + DRIVE_DB;
+        let measured = -20.0 * (after / before).log10();
         assert!(
             (reported - measured).abs() < 0.5,
             "it reported {reported:.2} dB of reduction and applied {measured:.2}"
         );
-        assert!(reported > 6.0, "it barely reduced at all: {reported:.2} dB");
+        assert!(
+            (reported - 12.0).abs() < 1.0,
+            "a full-scale sine against -12 dB lost {reported:.2} dB"
+        );
         // And reading it clears it.
         assert_eq!(fx.gain_reduction_db(), 0.0, "the reading did not reset");
     }
 
-    /// **The ceiling is a guarantee, not an average.**
+    /// **The threshold is a guarantee, not an average.**
     ///
     /// Measured on the reconstructed waveform rather than on the samples,
     /// because that is where the claim lives: a buffer whose samples all sit
-    /// under -1 dBFS can still hand a converter a curve that goes over, and
-    /// "true peak" is exactly the promise that it does not.
+    /// under the threshold can still hand a converter a curve that goes over,
+    /// and "true peak" is exactly the promise that it does not.
     #[test]
-    fn the_limiter_holds_a_true_peak_ceiling() {
+    fn the_limiter_holds_a_true_peak_threshold() {
         // 7 kHz at 48 k is a little over six samples a cycle: the peaks land
         // between samples most of the time, which is the case a sample-peak
         // limiter gets wrong.
         for (hz, amp) in [(7_000.0, 1.0), (11_000.0, 0.9), (997.0, 1.0)] {
-            let mut fx = Effects::new(SR);
-            let p = Params::default();
-            let sends = Sends {
-                limiter: 1.0,
-                ..Sends::default()
-            };
-            // Long enough for the knob slew to arrive at full drive.
-            let mut worst = 0.0f32;
-            for block in 0..40 {
-                let mut buf = sine(2_048, hz, amp, block * 2_048);
-                fx.process(&mut buf, 2_048, 2, sends, &p, 120.0);
-                // Skip the first blocks: the mix is still sliding up and the
-                // drive with it, which is not the steady state being claimed.
-                if block >= 30 {
-                    worst = worst.max(true_peak(&buf, 2, 0));
+            for want_db in [-1.0_f32, -6.0, -18.0] {
+                let mut fx = Effects::new(SR);
+                let p = Params::default();
+                let sends = Sends {
+                    limiter: threshold_at(want_db),
+                    ..Sends::default()
+                };
+                let mut worst = 0.0f32;
+                for block in 0..40 {
+                    let mut buf = sine(2_048, hz, amp, block * 2_048);
+                    fx.process(&mut buf, 2_048, 2, sends, &p, 120.0);
+                    // Skip the first blocks: the knob is still slewing, and
+                    // the threshold slews with it.
+                    if block >= 30 {
+                        worst = worst.max(true_peak(&buf, 2, 0));
+                    }
                 }
+                let got_db = 20.0 * worst.log10();
+                assert!(
+                    got_db <= want_db + 0.35,
+                    "{hz} Hz reconstructed to {got_db:.2} dBTP against a \
+                     {want_db:.1} dB threshold"
+                );
+                // And it is passing signal, not just being quiet.
+                assert!(
+                    got_db > want_db - 3.0,
+                    "{hz} Hz only reached {got_db:.2} dBTP - nothing is getting through"
+                );
             }
-            let ceiling_db = CEILING_DB.0 + (CEILING_DB.1 - CEILING_DB.0) * p.limiter_ceiling;
-            let got_db = 20.0 * worst.log10();
-            assert!(
-                got_db <= ceiling_db + 0.35,
-                "{hz} Hz reconstructed to {got_db:.2} dBTP against a {ceiling_db:.2} dB ceiling"
-            );
-            // And it is actually working, not just quiet: driven 12 dB into a
-            // -1 dB ceiling, the output should be up near it.
-            assert!(
-                got_db > ceiling_db - 3.0,
-                "{hz} Hz only reached {got_db:.2} dBTP - the limiter is not passing signal"
-            );
         }
     }
 
-    /// The default ceiling is the one that was asked for.
+    /// **Zero on the dial is zero decibels, and zero decibels is out.**
+    ///
+    /// Every other knob here does nothing at zero. A limiter whose "off"
+    /// still took a decibel off the top would be the one control that lied
+    /// about its own resting position.
     #[test]
-    fn the_limiter_ships_at_minus_one_db() {
-        let d = Params::default();
-        let db = CEILING_DB.0 + (CEILING_DB.1 - CEILING_DB.0) * d.limiter_ceiling;
-        assert!((db + 1.0).abs() < 0.01, "the default ceiling is {db} dB");
+    fn the_limiter_at_zero_is_out_of_the_circuit() {
+        assert_eq!(LIMITER_DB.0, 0.0, "the top of the dial is not 0 dB");
+        let p = Params::default();
+        let mut fx = Effects::new(SR);
+        let mut buf = sine(2_048, 1_000.0, 1.0, 0);
+        let before = buf.clone();
+        fx.process(&mut buf, 2_048, 2, Sends::default(), &p, 120.0);
+        assert_eq!(buf, before, "the limiter did something at 0 dB");
     }
 
     /// **Three slopes, and they are the slopes they are named after.**
@@ -2052,7 +2055,6 @@ mod tests {
                         hpf_resonance: b,
                         lpf_slope: Slope::TwentyFour,
                         lpf_resonance: a,
-                        limiter_ceiling: a,
                         limiter_release: b,
                         limiter_knee: a,
                     };

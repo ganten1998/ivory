@@ -89,6 +89,7 @@
 
 use crate::fonts;
 use crate::recorder::{
+    fader_to_gain, DEFAULT_BPM,
     disk_text, gain_text, gain_to_fader, timecode, DeviceLabel, ExportSpec, Level, Meters,
     NumField, Preview, RecordState, RecorderView, SlotView, COUNT_IN_CHOICES, MAX_BPM, MIN_BPM,
     SLOTS,
@@ -330,8 +331,10 @@ struct Layout {
     /// and neither one answers the other's question.
     master_scale: Rect,
     master_bars: Rect,
-    master_gr: Rect,
-    /// The two numbers under the ladders: output peak, and reduction.
+    /// The output number under the ladders. **The limiter's gain reduction is
+    /// drawn as a wash BEHIND it** rather than in a ladder of its own: a third
+    /// column to say one number was most of the width of the master for
+    /// something that is usually zero.
     master_readout: Rect,
     master_knob: Rect,
 
@@ -630,7 +633,6 @@ impl Layout {
             click: Rect::NOTHING,
             master_scale: Rect::NOTHING,
             master_bars: Rect::NOTHING,
-            master_gr: Rect::NOTHING,
             master_readout: Rect::NOTHING,
             master_knob: Rect::NOTHING,
             fx: [Rect::NOTHING; Fx::ALL.len()],
@@ -983,7 +985,7 @@ impl Layout {
         if !knob_fits(knob) {
             return;
         }
-        let readout_h = (m.height() * MASTER_READOUT_H).clamp(8.0, 16.0);
+        let readout_h = (m.height() * MASTER_READOUT_H).clamp(13.0, 24.0);
         let readout = Rect::from_min_max(
             Pos2::new(m.left(), knob.top() - readout_h),
             Pos2::new(m.right(), knob.top()),
@@ -998,8 +1000,7 @@ impl Layout {
         // **The scale is between nothing and everything** — it is read against
         // the bars, so it goes next to them and not off in a corner.
         self.master_scale = slice_h(meter, 0.00, MASTER_SCALE_W);
-        self.master_bars = slice_h(meter, MASTER_SCALE_W, MASTER_SCALE_W + MASTER_BARS_W);
-        self.master_gr = slice_h(meter, 1.0 - MASTER_GR_W, 1.0);
+        self.master_bars = slice_h(meter, MASTER_SCALE_W, 1.0);
     }
 
     fn fill_transport(&mut self, t: Rect) {
@@ -1467,7 +1468,7 @@ impl Hit {
             Hit::SetSlotGain(i, _) => GAIN[n(i)],
             Hit::SetMetronomeGain(_) => "Click level",
             Hit::SetFx(fx, _) => fx.describe(),
-            Hit::SetMaster(_) => "Master, the last thing on the bus",
+            Hit::SetMaster(_) => "Master  -  right-click to type, double-click for 0 dB",
             Hit::SetInputGain(_) => "Input level",
             Hit::SetTempo(_) => "Tempo",
             Hit::EditTimeSignature => "Time signature",
@@ -1489,6 +1490,34 @@ impl Hit {
                 | Hit::SetInputGain(_)
                 | Hit::SetTempo(_)
         )
+    }
+
+    /// Whether this is one of the eight knobs.
+    ///
+    /// They share a gesture set the faders do not: a right-click types a
+    /// number into one, a double-click puts it back to what it ships as, and a
+    /// plain tap does NOTHING — because the first click of a double-click is a
+    /// tap, and a control that opened a text box under every double-click
+    /// could never be reset by one.
+    pub fn is_knob(self) -> bool {
+        matches!(self, Hit::SetFx(..) | Hit::SetTempo(_) | Hit::SetMaster(_))
+    }
+
+    /// What a double-click puts this control back to.
+    ///
+    /// **Nothing applied, for everything that applies something.** All six
+    /// effects go to zero, which for the filters is a corner out at the edge
+    /// of hearing and for the limiter is a threshold of 0 dB — in every case
+    /// the position where the knob is not doing anything. The two that are not
+    /// effects go to their own resting values instead: the master to unity,
+    /// which is 0 dB, and the tempo to 120.
+    pub fn reset_to(self) -> Option<Hit> {
+        Some(match self {
+            Hit::SetFx(fx, _) => Hit::SetFx(fx, 0.0),
+            Hit::SetTempo(_) => Hit::SetTempo(DEFAULT_BPM),
+            Hit::SetMaster(_) => Hit::SetMaster(gain_to_fader(1.0)),
+            _ => return None,
+        })
     }
 
     /// Which control this is, for [`Hit::is_same_control`]: the variant, plus
@@ -3221,6 +3250,7 @@ pub fn knob_reading(unit: KnobUnit, t: f32) -> String {
     let t = t.clamp(0.0, 1.0);
     match unit {
         KnobUnit::Percent => format!("{:.0}%", t * 100.0),
+        KnobUnit::Decibels { low, high } => format!("{:.1} dB", low + (high - low) * t),
         KnobUnit::Hertz { low, high } => {
             let hz = low * (high / low).powf(t);
             if hz >= 1_000.0 {
@@ -3245,6 +3275,19 @@ pub fn knob_reading(unit: KnobUnit, t: f32) -> String {
 pub fn knob_typed(unit: KnobUnit, text: &str) -> Option<f32> {
     match unit {
         KnobUnit::Percent => crate::recorder::parse_percent(text),
+        KnobUnit::Decibels { low, high } => {
+            let db = text
+                .trim()
+                .trim_end_matches(|c: char| c.is_whitespace() || c == 'b' || c == 'B')
+                .trim_end_matches(['d', 'D'])
+                .trim()
+                .parse::<f32>()
+                .ok()?;
+            if !db.is_finite() {
+                return None;
+            }
+            Some(((db - low) / (high - low)).clamp(0.0, 1.0))
+        }
         KnobUnit::Hertz { low, high } => {
             let t = text.trim().trim_end_matches(|c: char| {
                 c.is_whitespace() || c == 'z' || c == 'Z' || c == 'h' || c == 'H'
@@ -3288,11 +3331,11 @@ const MASTER_RED_DB: f32 = -6.0;
 /// Segments in each ladder.
 const MASTER_SEGMENTS: usize = 22;
 
-/// The most reduction the GR ladder shows, in dB. Past this it pins.
+/// The reduction that fills the wash behind the readout completely, in dB.
 ///
-/// Twelve, because that is the whole drive range the limiter knob offers: a
-/// meter that cannot reach the end of what the control can do is a meter that
-/// stops answering exactly when the question gets interesting.
+/// Twelve. Past this it stays full: the difference between 12 dB of reduction
+/// and 20 is not a decision anybody makes from a glance at a meter, and the
+/// wash is a glance.
 const MASTER_GR_FLOOR_DB: f32 = 12.0;
 
 /// The ladder's colours, lit. Unlit is these at a tenth.
@@ -3300,11 +3343,11 @@ const LED_GREEN: Color32 = Color32::from_rgb(0x3d, 0xc0, 0x5a);
 const LED_AMBER: Color32 = Color32::from_rgb(0xe0, 0xa8, 0x22);
 const LED_RED: Color32 = Color32::from_rgb(0xd6, 0x38, 0x28);
 
-/// The gain-reduction ladder, which is one colour all the way down.
+/// The wash behind the readout that says the limiter is working.
 ///
-/// **Not green anywhere.** Reduction is not a level and there is no amount of
-/// it that is "good"; colouring the first few decibels green would say there
-/// is a right amount to be doing, which is a claim about somebody's music.
+/// **Not green.** Reduction is not a level and there is no amount of it that
+/// is "good"; a colour that said otherwise would be a claim about somebody's
+/// music.
 const LED_GR: Color32 = Color32::from_rgb(0xe8, 0x8c, 0x2a);
 
 /// The recess the ladders sit in.
@@ -3334,19 +3377,8 @@ fn led_colour(fraction: f32) -> Color32 {
     }
 }
 
-/// One segmented ladder.
-///
-/// `filled` is 0..=1 of the ladder's length. `from_top` inverts it, which is
-/// what the gain-reduction ladder is: it hangs DOWN from unity, because that
-/// is the direction the gain went.
-fn draw_ladder(
-    painter: &Painter,
-    r: Rect,
-    filled: f32,
-    hold: Option<f32>,
-    from_top: bool,
-    solid: Option<Color32>,
-) {
+/// One segmented ladder. `filled` is 0..=1 of its length, from the bottom.
+fn draw_ladder(painter: &Painter, r: Rect, filled: f32, hold: Option<f32>) {
     if !r.is_positive() {
         return;
     }
@@ -3360,21 +3392,15 @@ fn draw_ladder(
     // room for one: below about a point a gap is the whole segment.
     let gap = (seg_h * 0.22).min(1.5);
     for i in 0..MASTER_SEGMENTS {
-        // `at` is how far along the ladder this segment's OUTER edge is, in
-        // the direction the ladder grows.
+        // How far up the ladder this segment's top edge is.
         let at = (i as f32 + 1.0) / MASTER_SEGMENTS as f32;
-        let (top, bottom) = if from_top {
-            let y = inner.top() + i as f32 * seg_h;
-            (y, y + seg_h - gap)
-        } else {
-            let y = inner.bottom() - i as f32 * seg_h;
-            (y - seg_h + gap, y)
-        };
+        let y = inner.bottom() - i as f32 * seg_h;
+        let (top, bottom) = (y - seg_h + gap, y);
         if bottom <= top {
             continue;
         }
         let lit = filled >= at - 0.5 / MASTER_SEGMENTS as f32;
-        let base = solid.unwrap_or_else(|| led_colour(at));
+        let base = led_colour(at);
         let colour = if lit {
             base
         } else {
@@ -3418,8 +3444,6 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
         left,
         master_fraction(m.left.peak.max(m.left.rms)),
         Some(master_fraction(m.left.hold)),
-        false,
-        None,
     );
     if right.is_positive() {
         draw_ladder(
@@ -3427,16 +3451,8 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
             right,
             master_fraction(m.right.peak.max(m.right.rms)),
             Some(master_fraction(m.right.hold)),
-            false,
-            None,
         );
     }
-
-    // **Reduction hangs from the top**, which is the whole idea: the ladder
-    // starts at unity and grows DOWNWARD by however much the limiter took
-    // off, so the picture is the gain going away.
-    let gr = (view.gr_db / MASTER_GR_FLOOR_DB).clamp(0.0, 1.0);
-    draw_ladder(painter, l.master_gr, gr, None, true, Some(LED_GR));
 
     // The scale, read against the bars.
     if l.master_scale.is_positive() {
@@ -3469,9 +3485,26 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
         }
     }
 
-    // The numbers: what is leaving, and what is being taken off.
+    // The number: what is leaving — over a wash that says what the limiter is
+    // taking off.
     if l.master_readout.is_positive() {
         let r = l.master_readout;
+        // **Reduction is drawn DOWNWARD, behind the number.** It starts at the
+        // top of the readout and grows down by however much the limiter took
+        // off, so the picture is of the gain going away. Behind rather than
+        // beside because it is usually zero: a whole column that says nothing
+        // most of the time is a column the meters could have had.
+        // The same recess the ladders sit in, so the readout reads as part of
+        // the meter rather than as a caption under it.
+        painter.rect_filled(r, 1.0, METER_FACE);
+        let gr = (view.gr_db / MASTER_GR_FLOOR_DB).clamp(0.0, 1.0);
+        if gr > 0.0 {
+            painter.rect_filled(
+                Rect::from_min_max(r.min, Pos2::new(r.right(), r.top() + gr * r.height())),
+                1.0,
+                LED_GR,
+            );
+        }
         let peak = m.peak();
         let out = if peak <= 0.0 {
             "-inf".to_owned()
@@ -3481,37 +3514,21 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
         let size = fit_text(
             Rect::from_min_size(r.min, Vec2::new(l.master_bars.width(), r.height())),
             "-88.8",
-            r.height() * 0.92,
+            r.height() * 0.80,
         );
         if size >= MIN_TEXT {
+            // **One colour, and it is not red.** The number sits on a recess
+            // that the reduction wash fills from above, so it has to read on
+            // near-black AND on amber; there is no red that does both. The
+            // ladder beside it already says whether this is a problem, in the
+            // place somebody is looking, and two things saying it in two
+            // colours is one of them going wrong.
             painter.text(
-                Pos2::new(l.master_bars.right(), r.center().y),
+                Pos2::new(r.right() - 2.0, r.center().y),
                 Align2::RIGHT_CENTER,
                 &out,
                 font(size),
-                // Red once it is in the red, so the number and the ladder
-                // never disagree about whether this is a problem.
-                if m.clipped || peak >= 10f32.powf(MASTER_RED_DB / 20.0) {
-                    LED_RED
-                } else {
-                    p.ink
-                },
-            );
-            // **"GR" until it is doing something, then the number.** The
-            // label is what teaches somebody what the third ladder is, and it
-            // is only needed while nothing is happening in it; once it moves,
-            // how much is the only question left.
-            let (gr_text, gr_ink) = if view.gr_db > 0.05 {
-                (format!("-{:.1}", view.gr_db.min(99.0)), LED_GR)
-            } else {
-                ("GR".to_owned(), p.faint)
-            };
-            painter.text(
-                Pos2::new(l.master_gr.right(), r.center().y),
-                Align2::RIGHT_CENTER,
-                gr_text,
-                font(size),
-                gr_ink,
+                Color32::from_rgb(0xff, 0xf4, 0xe0),
             );
         }
     }
@@ -3519,10 +3536,13 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
 
 /// The filters' caps.
 ///
-/// Off-white rather than white: a pure `#ffffff` cap is the brightest thing on
-/// the panel by a distance, and these are two knobs that mostly sit at zero.
-/// This is the colour of an ivory-capped pot, which is the reference.
-const FILTER_CAP: Color32 = Color32::from_rgb(0xe6, 0xe1, 0xd6);
+/// **Violet, and it is the one hue nothing else here uses.** They were ivory,
+/// which made two of the eight knobs read as blank caps with no colour at all
+/// — the odd ones out rather than a pair. Violet sits opposite the panel's
+/// warm brown, so it separates cleanly without competing with the sends'
+/// blue, the limiter's green or the master's red, and it takes the same white
+/// slot every other cap has.
+const FILTER_CAP: Color32 = Color32::from_rgb(0x7b, 0x5c, 0xc9);
 
 /// The limiter's cap.
 ///
@@ -3570,15 +3590,17 @@ const METER_SHARE: f32 = 0.46;
 const MASTER_COL: f32 = 0.78;
 
 
-/// The numbers under the ladders, as a share of the column's height, clamped
-/// into points. A share alone makes them enormous on a tall band.
-const MASTER_READOUT_H: f32 = 0.06;
+/// The readout strip under the ladders, as a share of the column's height,
+/// clamped into points.
+///
+/// **Taller than the number needs**, because the number is not the only thing
+/// in it: the limiter's reduction fills this box downward from the top, and a
+/// box the height of its own text can only ever show that as a hairline.
+const MASTER_READOUT_H: f32 = 0.11;
 
-/// The three parts of the master meter, as shares of its width: the dB scale,
-/// the pair of bars, and the gain-reduction bar. The gap is what is left.
-const MASTER_SCALE_W: f32 = 0.28;
-const MASTER_BARS_W: f32 = 0.42;
-const MASTER_GR_W: f32 = 0.20;
+/// The dB scale's share of the master column's width. The ladders take the
+/// rest — all of it, since the reduction stopped needing a column of its own.
+const MASTER_SCALE_W: f32 = 0.26;
 
 /// The smallest knob face worth drawing, as a radius.
 ///
@@ -4262,6 +4284,57 @@ mod tests {
 
     /// Both ends of a knob's travel are reachable, and up is more.
     /// **A filter knob reads in hertz, and a send still reads in percent.**
+    /// **Every knob resets to the position where it is doing nothing** —
+    /// except the two that are not effects, which have a resting value of
+    /// their own.
+    #[test]
+    fn a_double_click_puts_every_knob_back() {
+        for fx in Fx::ALL {
+            assert_eq!(
+                Hit::SetFx(fx, 0.77).reset_to(),
+                Some(Hit::SetFx(fx, 0.0)),
+                "{} does not reset to nothing applied",
+                fx.title()
+            );
+        }
+        assert_eq!(Hit::SetTempo(180.0).reset_to(), Some(Hit::SetTempo(120.0)));
+        // The master goes to UNITY, which is 0 dB, not to the bottom of its
+        // travel — a master that reset to silence would be a reset nobody
+        // could use.
+        let Some(Hit::SetMaster(back)) = Hit::SetMaster(0.1).reset_to() else {
+            panic!("the master does not reset")
+        };
+        assert!(
+            (fader_to_gain(back) - 1.0).abs() < 1.0e-4,
+            "the master resets to {} dB",
+            20.0 * fader_to_gain(back).log10()
+        );
+
+        // Only knobs. A fader's tap still opens its box, so a double click on
+        // one must not silently mean something else.
+        assert_eq!(Hit::SetInputGain(0.3).reset_to(), None);
+        assert_eq!(Hit::SetSlotGain(1, 0.3).reset_to(), None);
+        assert_eq!(Hit::Record.reset_to(), None);
+    }
+
+    /// The eight knobs are exactly the controls with the knob gesture set.
+    #[test]
+    fn the_knobs_are_the_ones_that_look_like_knobs() {
+        let knobs: Vec<Hit> = Hit::ALL.into_iter().filter(|h| h.is_knob()).collect();
+        assert_eq!(knobs.len(), Fx::ALL.len() + 2, "{knobs:?}");
+        for fx in Fx::ALL {
+            assert!(knobs.iter().any(|h| h.is_same_control(Hit::SetFx(fx, 0.0))));
+        }
+        assert!(knobs.iter().any(|h| h.is_same_control(Hit::SetTempo(0.0))));
+        assert!(knobs.iter().any(|h| h.is_same_control(Hit::SetMaster(0.0))));
+        // And every one of them can be typed into, which is what the
+        // right-click does.
+        for h in knobs {
+            assert!(num_field(h).is_some(), "{h:?} cannot be typed into");
+            assert!(h.reset_to().is_some(), "{h:?} cannot be reset");
+        }
+    }
+
     /// **The master ladder is linear in decibels**, which is the only scale
     /// on which the bottom half of a meter ever moves.
     #[test]
@@ -4302,14 +4375,12 @@ mod tests {
                 // passes on a layout that simply never placed the master.
                 if w >= 900.0 {
                     assert!(l.master_bars.is_positive(), "no master ladder at {w}");
-                    assert!(l.master_gr.is_positive(), "no reduction ladder at {w}");
                     assert!(l.master_knob.is_positive(), "no master knob at {w}");
                     assert!(l.master_readout.is_positive(), "no master readout at {w}");
                 }
                 let master = [
                     ("scale", l.master_scale),
                     ("bars", l.master_bars),
-                    ("gr", l.master_gr),
                     ("readout", l.master_readout),
                     ("knob", l.master_knob),
                 ];
@@ -4379,6 +4450,17 @@ mod tests {
         // the whole reason a filter dial is logarithmic: sqrt(20 * 1200).
         assert_eq!(knob_reading(hp, 0.5), "155 Hz");
 
+        // The limiter is a threshold, linear in decibels: taking the log of
+        // something that already is one would put the useful half of the dial
+        // in the last eighth of the travel.
+        let th = KnobUnit::Decibels {
+            low: 0.0,
+            high: -30.0,
+        };
+        assert_eq!(knob_reading(th, 0.0), "0.0 dB");
+        assert_eq!(knob_reading(th, 0.5), "-15.0 dB");
+        assert_eq!(knob_reading(th, 1.0), "-30.0 dB");
+
         // The low-pass runs backwards - up is darker - and still reads right.
         let lp = KnobUnit::Hertz {
             low: 20_000.0,
@@ -4418,6 +4500,22 @@ mod tests {
                 "{text} came back as {back}"
             );
         }
+        // A threshold is typed in decibels, with or without the unit.
+        let th = KnobUnit::Decibels {
+            low: 0.0,
+            high: -30.0,
+        };
+        for text in ["-6", "-6 dB", "-6dB", " -6 "] {
+            let t = knob_typed(th, text).unwrap_or_else(|| panic!("{text} was refused"));
+            assert_eq!(knob_reading(th, t), "-6.0 dB", "{text}");
+        }
+        assert_eq!(knob_typed(th, "0"), Some(0.0));
+        // Past either end it pins, and a positive threshold is not a thing
+        // this dial has.
+        assert_eq!(knob_typed(th, "-90"), Some(1.0));
+        assert_eq!(knob_typed(th, "+6"), Some(0.0));
+        assert_eq!(knob_typed(th, "loud"), None);
+
         // Off the ends, a real wish gets the nearest thing this dial has
         // rather than a refusal.
         assert_eq!(knob_typed(hp, "5"), Some(0.0));
@@ -5944,7 +6042,7 @@ mod tests {
                                     KnobUnit::Percent,
                                     KnobUnit::Hertz { low: 20.0, high: 1_200.0 },
                                     KnobUnit::Hertz { low: 20_000.0, high: 200.0 },
-                                    KnobUnit::Percent,
+                                    KnobUnit::Decibels { low: 0.0, high: -30.0 },
                                 ],
                                 // A knob mid-turn, so the sweep also covers a
                                 // knob showing a number instead of its name.
@@ -6254,7 +6352,7 @@ impl Fx {
             Fx::Chorus => "true stereo, after the Boss CE-1",
             Fx::Hpf => "takes the bottom off, after everything",
             Fx::Lpf => "takes the top off - up is darker",
-            Fx::Limiter => "true peak, 6 samples of latency",
+            Fx::Limiter => "true peak, held under the threshold",
         }
     }
 
@@ -6287,12 +6385,12 @@ impl Fx {
     /// What the status line says while a hand is on it.
     pub fn describe(self) -> &'static str {
         match self {
-            Fx::Reverb => "Reverb, on every instrument",
-            Fx::Delay => "Delay, in time with the tempo",
-            Fx::Chorus => "Chorus, in true stereo",
-            Fx::Hpf => "High-pass, on everything that leaves",
-            Fx::Lpf => "Low-pass, on everything that leaves",
-            Fx::Limiter => "Limiter, true peak, last in the chain",
+            Fx::Reverb => "Reverb  -  shift right-click for its parameters",
+            Fx::Delay => "Delay  -  shift right-click for its parameters",
+            Fx::Chorus => "Chorus  -  shift right-click for its parameters",
+            Fx::Hpf => "High-pass  -  shift right-click for its parameters",
+            Fx::Lpf => "Low-pass  -  shift right-click for its parameters",
+            Fx::Limiter => "Limiter threshold  -  shift right-click for more",
         }
     }
 
@@ -6354,9 +6452,9 @@ impl Fx {
                 FxRow::NONE,
             ],
             Fx::Limiter => [
-                slide("limiter_ceiling", "Ceiling"),
                 slide("limiter_release", "Release"),
                 slide("limiter_knee", "Knee"),
+                FxRow::NONE,
                 FxRow::NONE,
             ],
         }

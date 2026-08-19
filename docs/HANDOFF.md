@@ -1,9 +1,9 @@
 # Ivory 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-19. **The app is now called TANGENT.** Newest work is
-§2i: the master column, its gain-reduction meter, and filters that read in
-hertz. Before it, §2h: six effect knobs, the true-peak limiter, and video that
-happens without a camera.
+§2j: one gesture set across all eight knobs, and the limiter as a threshold.
+Before it, §2i (the master column) and §2h (six effect knobs, the true-peak
+limiter, video without a camera).
 Before it, §2d: the fretboard voicing solver and the guitar view. §2c before it has the
 rename, the 2.2.0 tester-report UI fixes, the egui 0.33 downgrade and the
 MIT/GPLv3 split. Read §2c then §2d FIRST; everything above them still says
@@ -919,6 +919,69 @@ wears it.
 intra-doc link — both left behind when that constant was removed in earlier
 work, both predating this branch (checked against `HEAD` rather than assumed).
 Removed, along with `TEMPO_ROW`, dead since the tempo became a knob.
+
+---
+
+## 2j. 2026-08-19 (later still) — one gesture set for eight knobs
+
+Shipped as **4.14.0**.
+
+### Right-click types, double-click resets, a tap does nothing
+
+All eight knobs (six effects, tempo, master) now share one set:
+
+| gesture | what it does |
+| --- | --- |
+| drag | sets the value, relatively, as before |
+| right-click | opens the knob for typing, in the knob's own unit |
+| double-click | puts it back to its resting value |
+| tap | **nothing** |
+
+A tap has to do nothing, and that is not an oversight: the first click of a
+double-click is a tap, so a knob that opened a text box under every tap could
+never be reset by one. Faders keep tap-to-type — a fader is a long thin thing
+you can put a pointer on exactly, and it has no second gesture to protect.
+
+Resting values are "nothing applied" wherever that means something: all six
+effects to zero, which for the filters is a corner out at the edge of hearing
+and for the limiter is a threshold of 0 dB. The master goes to unity (0 dB) and
+the tempo to 120.
+
+**The effect parameter panels moved to shift + right-click.** They were the
+plain right-click and there is no third button; between the two, typing a value
+is what somebody does mid-take and the panel is what they open once and leave
+alone. Each knob's status line says so while a hand is on it. This is the one
+judgement call in this batch and it is easy to move.
+
+### The limiter knob is a threshold
+
+`LIMITER_DB = (0.0, -30.0)`, read in decibels, typed in decibels. Zero is the
+top and means the limiter is out of the circuit — the same rule every other
+knob follows. `limiter_ceiling` is gone from `Params`: the knob IS the ceiling
+now, and two ceilings would have been one of them wrong.
+
+**No makeup gain, deliberately.** Something that got quieter because you asked
+for it to be limited, then louder again because the limiter decided that is
+what you meant, is a control that cannot be reasoned about. The master is two
+inches away.
+
+`ports::KnobUnit` gained `Decibels { low, high }` — **linear** in dB, where
+`Hertz` is exponential, because decibels already are the logarithm and taking
+it twice would put the useful half of a threshold in the last eighth of the
+travel.
+
+### The filters are violet, and the GR ladder is gone
+
+The filter caps were ivory, which made two of the eight read as blank caps with
+no colour rather than as a pair. Violet sits opposite the panel's warm brown
+and competes with nothing else on it.
+
+The gain-reduction ladder had a column of its own for a number that is usually
+zero. It is now a wash that fills the master's readout **downward from the
+top**, over the same dark recess the ladders sit in, with the output number in
+cream on top of it. The number is one colour and it is not red: it has to read
+on near-black AND on amber, and the ladder beside it already says whether the
+level is a problem. The ladders got the freed width.
 
 ---
 

@@ -1428,13 +1428,14 @@ impl IvoryApp {
         if self.dialog.is_some() {
             return; // Qt dialogs are modal: main window ignores input.
         }
-        let (primary_pressed, pointer_down, pointer_released, pointer, ctrl) = ctx.input(|i| {
+        let (primary_pressed, pointer_down, pointer_released, pointer, ctrl, shift) = ctx.input(|i| {
             (
                 i.pointer.primary_pressed(),
                 i.pointer.primary_down(),
                 i.pointer.primary_released(),
                 i.pointer.interact_pos(),
                 i.modifiers.ctrl,
+                i.modifiers.shift,
             )
         });
         let ctrl_as_context = cfg!(target_os = "macos") && ctrl;
@@ -1449,14 +1450,30 @@ impl IvoryApp {
                 // reaching the sixteenth meant a right-click anywhere else
                 // followed by a hunt down a list of subjects that are mostly
                 // about the piano.
-                // **Right-clicking a knob opens the effect behind it.** The
-                // knob is one number, how much, because during a take that is
-                // the only one anybody reaches for; everything that shapes the
-                // sound is in the panel. Checked before the band's own menu,
-                // which is what a right-click anywhere else means.
-                if let Some(fx) = self.fx_under(recorder_rect, pos) {
-                    self.fx_open = Some(fx);
-                    self.fx_drag = None;
+                // **Right-clicking a knob types a number into it**, on every
+                // one of the eight, which is the gesture a knob has on every
+                // desk-shaped thing anybody has used. Checked before the
+                // band's own menu, which is what a right-click anywhere else
+                // means.
+                //
+                // **Shift holds the effect's parameters open instead.** They
+                // used to be the plain right-click and there is no third
+                // button to give them; between the two, typing a value is the
+                // one somebody does mid-take and the panel is the one they
+                // open once and leave alone. The status line under a knob says
+                // so while a hand is on it.
+                if let Some(hit) = self.knob_under(recorder_rect, pos) {
+                    if shift {
+                        if let Some(fx) = self.fx_under(recorder_rect, pos) {
+                            self.fx_open = Some(fx);
+                            self.fx_drag = None;
+                        }
+                        return;
+                    }
+                    if let Some(field) = recorder_panel::num_field(hit) {
+                        self.num_edit = Some(recorder::NumEdit::new(field));
+                        self.name_focused = false;
+                    }
                     return;
                 }
                 // **Right-clicking the metronome sets whether the click goes
@@ -2097,6 +2114,13 @@ impl IvoryApp {
     }
 
     /// Which effect's knob is under `pos`, if any.
+    /// Which knob is under `pos`, if any. See [`recorder_panel::Hit::is_knob`].
+    fn knob_under(&self, band: Option<Rect>, pos: Pos2) -> Option<recorder_panel::Hit> {
+        let r = band.filter(|r| r.contains(pos))?;
+        let view = self.recorder_layout_view();
+        recorder_panel::hit_test(r, &view, pos).filter(|h| h.is_knob())
+    }
+
     fn fx_under(&self, band: Option<Rect>, pos: Pos2) -> Option<recorder_panel::Fx> {
         let band = band.filter(|r| r.contains(pos))?;
         let view = self.recorder_layout_view();
@@ -5362,22 +5386,28 @@ impl IvoryApp {
                 // Released without ever moving: a TAP, which opens the control
                 // for typing rather than setting it to wherever the pointer is.
                 if !grab.moved {
-                    // **A tap opens the field — except on the tempo, which
-                    // wants a DOUBLE click.** It is turned far more often than
-                    // it is typed, and a text box that opened every time a hand
-                    // brushed the knob would be in the way of the gesture it is
-                    // mostly used for.
-                    let needs_double =
-                        matches!(grab.hit, recorder_panel::Hit::SetTempo(_));
-                    let opened = !needs_double
-                        || ctx.input(|i| {
-                            i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                        });
-                    if opened {
-                        if let Some(field) = recorder_panel::num_field(grab.hit) {
-                            self.num_edit = Some(recorder::NumEdit::new(field));
-                            self.name_focused = false;
+                    let double = ctx.input(|i| {
+                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
+                    });
+                    if grab.hit.is_knob() {
+                        // **A knob resets on a double click and does nothing
+                        // on a single one.** Nothing, because the first click
+                        // of a double click is a single one: a knob that
+                        // opened a text box under every tap could never be
+                        // reset by one. Typing into a knob is the right-click.
+                        if double {
+                            if let Some(reset) = grab.hit.reset_to() {
+                                self.apply_recorder_hit(reset);
+                                self.num_edit = None;
+                                self.save_settings();
+                            }
                         }
+                    } else if let Some(field) = recorder_panel::num_field(grab.hit) {
+                        // Everything else still opens for typing on a tap. A
+                        // fader is a long thin thing you can put a pointer on
+                        // exactly, and it has no second gesture to protect.
+                        self.num_edit = Some(recorder::NumEdit::new(field));
+                        self.name_focused = false;
                     }
                 }
             } else if let Some(pos) = pos {
@@ -6762,6 +6792,60 @@ mod tests {
             ],
         });
         (ctx, app)
+    }
+
+    /// **A double click puts a knob back, through the app, into settings.**
+    ///
+    /// The unit test beside `reset_to` proves the VALUES; this proves the
+    /// wiring — that the hit a double click produces reaches the settings the
+    /// host reads, for every one of the eight.
+    #[test]
+    fn resetting_a_knob_lands_in_the_settings() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        // Put every knob somewhere it does not belong.
+        for fx in recorder_panel::Fx::ALL {
+            app.apply_recorder_hit(recorder_panel::Hit::SetFx(fx, 0.63));
+            assert!((app.fx_value(fx) - 0.63).abs() < 1.0e-4);
+        }
+        app.apply_recorder_hit(recorder_panel::Hit::SetTempo(184.0));
+        app.apply_recorder_hit(recorder_panel::Hit::SetMaster(0.2));
+
+        // Now reset each one the way a double click would.
+        for hit in recorder_panel::Hit::ALL.into_iter().filter(|h| h.is_knob()) {
+            let reset = hit.reset_to().expect("a knob with no resting value");
+            app.apply_recorder_hit(reset);
+        }
+        for fx in recorder_panel::Fx::ALL {
+            assert_eq!(app.fx_value(fx), 0.0, "{} did not go back", fx.title());
+        }
+        assert!((app.settings.record_export.tempo_bpm - 120.0).abs() < 1.0e-9);
+        assert!(
+            (app.settings.master_gain - 1.0).abs() < 1.0e-4,
+            "the master came back at {}",
+            app.settings.master_gain
+        );
+    }
+
+    /// **A right-click on a knob opens it for typing** — all eight — and
+    /// shift keeps the effect's parameters where they were.
+    #[test]
+    fn right_clicking_a_knob_opens_it_for_typing() {
+        let (_, app) = headless_with_fx(Caps::DESKTOP);
+        let band = app.last_band;
+        for hit in recorder_panel::Hit::ALL.into_iter().filter(|h| h.is_knob()) {
+            let at = knob_cell(&app, hit).center();
+            let found = app
+                .knob_under(Some(band), at)
+                .unwrap_or_else(|| panic!("{hit:?} is not under its own cell"));
+            assert!(
+                found.is_same_control(hit),
+                "{at:?} is over {found:?}, not {hit:?}"
+            );
+            assert!(recorder_panel::num_field(found).is_some());
+        }
+        // And nothing is a knob between them.
+        assert_eq!(app.knob_under(Some(band), band.left_bottom()), None);
+        assert_eq!(app.knob_under(None, band.center()), None);
     }
 
     /// **The master knob is a fader wearing a knob**, and it lands in the

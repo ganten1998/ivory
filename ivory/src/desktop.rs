@@ -312,6 +312,30 @@ fn the_host_offers_a_choice_for_every_stepped_row() {
 fn a_filter_knob_reads_out_where_its_filter_actually_is() {
     use ivory_ui::ports::KnobUnit;
     let d = effect_defaults();
+    // The limiter reads in decibels of threshold, and the same rule applies:
+    // a number under the knob that is not where the limiter actually starts
+    // working is worse than no number at all.
+    let (_, limiter) = d
+        .units
+        .iter()
+        .find(|(k, _)| k == "limiter_mix")
+        .expect("the limiter has no unit and would read as a percentage");
+    let KnobUnit::Decibels { low, high } = *limiter else {
+        panic!("the limiter does not read in decibels")
+    };
+    assert!(
+        (low - crate::effects::LIMITER_DB.0).abs() < 1.0e-3
+            && (high - crate::effects::LIMITER_DB.1).abs() < 1.0e-3,
+        "the limiter advertises {low}..{high} dB and thresholds {}..{}",
+        crate::effects::LIMITER_DB.0,
+        crate::effects::LIMITER_DB.1
+    );
+    assert_eq!(
+        ivory_ui::recorder_panel::knob_reading(*limiter, 0.0),
+        "0.0 dB",
+        "the limiter's resting position is not 0 dB"
+    );
+
     for (key, range) in [
         ("hpf_mix", crate::effects::HPF_HZ),
         ("lpf_mix", crate::effects::LPF_HZ),
@@ -372,7 +396,6 @@ fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
         ("chorus_tone", d.chorus_tone),
         ("hpf_resonance", d.hpf_resonance),
         ("lpf_resonance", d.lpf_resonance),
-        ("limiter_ceiling", d.limiter_ceiling),
         ("limiter_release", d.limiter_release),
         ("limiter_knee", d.limiter_knee),
     ] {
@@ -396,6 +419,14 @@ fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
                 ivory_ui::ports::KnobUnit::Hertz {
                     low: crate::effects::LPF_HZ.0,
                     high: crate::effects::LPF_HZ.1,
+                },
+            ),
+            // The limiter is a threshold, and a threshold has one unit.
+            (
+                "limiter_mix".to_owned(),
+                ivory_ui::ports::KnobUnit::Decibels {
+                    low: crate::effects::LIMITER_DB.0,
+                    high: crate::effects::LIMITER_DB.1,
                 },
             ),
         ],
@@ -453,7 +484,6 @@ fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate
         ("chorus_tone", &mut p.chorus_tone),
         ("hpf_resonance", &mut p.hpf_resonance),
         ("lpf_resonance", &mut p.lpf_resonance),
-        ("limiter_ceiling", &mut p.limiter_ceiling),
         ("limiter_release", &mut p.limiter_release),
         ("limiter_knee", &mut p.limiter_knee),
     ] {
