@@ -1,7 +1,8 @@
 # Ivory 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-19. **The app is now called TANGENT.** Newest work is
-§2n: the clip lamp, the take report, the fullscreen picker freeze. Before it,
+§2o: the fullscreen freeze, diagnosed over ssh on the Linux box. Before it,
+§2n: the clip lamp and the take report. Before it,
 §2m: Linux hardening. Before it, §2l: the backing-track player. Before it, §2k: the limiter's makeup gain, the
 DX7 fader bug, and a dismissable CLIPPED.
 Before it, §2j: one gesture set across all eight knobs.
@@ -1225,6 +1226,61 @@ fullscreen window themselves.
 **Not verified here.** This one is reasoned from the symptom and the platform,
 and there is no Linux box on this end to reproduce it on. It is the next thing
 to confirm on dresden.
+
+---
+
+## 2o. 2026-08-19 — the fullscreen freeze, diagnosed on the box
+
+Shipped as **4.19.0**. Three fixes; the first was reproduced and verified over
+ssh on dresden rather than reasoned about, because 4.18.0's attempt at it was
+reasoned about and made things worse.
+
+### It was our own dialog, buried by the previous fix
+
+The box has **no FileChooser portal and no zenity** (checked: only
+`gnome-keyring.portal`), so `native_dialogs_work()` is false and the picker is
+`Dialog::FileBrowser` — a CHILD VIEWPORT, a second X11 window. 4.18.0 left
+fullscreen, opened it next frame, and then on the frame after found no pending
+request and put fullscreen **straight back**. Under i3 a fullscreen window sits
+above everything, so the browser was buried the instant it appeared; and
+`app.rs` returns early from all main-window input while a dialog is open, so
+`Z` did nothing either.
+
+Not a hang. A modal nobody could see, with the keyboard locked out — which is
+why force quit was the only way back and why nothing appeared in the console.
+`restore_fullscreen` now waits for the dialog to close.
+
+**Verified on the machine**, not inferred: fullscreen → click import → the main
+window leaves fullscreen and "Choose a backing track" appears as a normal
+window → Cancel → `_NET_WM_STATE_FULLSCREEN` is back → `Z` toggles it off. The
+whole import path was driven through as well (navigate to `~/Music`, choose a
+`.wav`, decode, waveform, IN/OUT panel) — the first end-to-end proof of the
+backing track on Linux.
+
+**How to do this again.** `ssh void`, `DISPLAY=:0`, `xdotool` to drive and
+`import -window root` to see. Two traps cost time: `pkill -f <name>` matches
+the ssh command itself and kills the session, and `xdotool key --window` uses
+`XSendEvent`, which winit ignores — activate the window and use plain
+`xdotool key` (XTEST).
+
+### The clip lamp is about the signal path
+
+With an input selected the VU meters the INPUT, so a built-in FM driven into
+the ceiling clipped the output and lit nothing: "choose a mic and clipping is
+not possible", on both platforms, one cause. The needle still answers one
+question; the lamp beside it ORs the engine's device mix in now.
+
+The "hot mic" theory was wrong and measuring killed it: dresden's input peaks
+at **-16 dBFS**, so the mic was never the clip.
+
+### The tempo knob was never relatively draggable
+
+`Hit::with_value` had no arm for `SetTempo`, so every frame of a drag
+re-applied the hit the PRESS produced — which is absolute. The knob jumped to
+wherever it was first touched and then would not move. Pre-existing; the other
+seven becoming consistent in 4.17.0 is what made it visible. The test asserts
+every draggable control actually carries the value a drag hands it, which is
+the general form of the bug.
 
 ---
 
