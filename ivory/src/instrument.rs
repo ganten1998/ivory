@@ -4453,6 +4453,31 @@ mod tests {
         );
     }
 
+    /// **A slot naming a plugin that will not load must not silence the app.**
+    ///
+    /// A Linux tester opened a build whose settings named a dead VST3 — the
+    /// app's own display plugin, which has no audio by design — and reported
+    /// the app came up silent. From the renderer's side a failed load is a slot
+    /// with nothing in it, so the built-in should carry on: this is the test
+    /// that says which of those is true.
+    #[test]
+    fn a_slot_whose_plugin_failed_to_load_still_leaves_the_builtin_audible() {
+        let (mut r, mut tx, _) = renderer_with_midi(2);
+        // What a failed load leaves behind: no instance in the slot, and no
+        // claim on the built-in either — the sentinel was never chosen.
+        assert!(r.slots.iter().all(|s| s.plugin.0.is_none()));
+        r.shared.builtin_slot.store(-1, Ordering::Relaxed);
+
+        queue(&mut tx, 0, [0x90, 60, 100]);
+        let mut out = vec![0.0_f32; 2 * 4096];
+        r.render(&mut out, 0, 0);
+        let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(
+            peak > 0.01,
+            "a dead slot silenced the built-in: peak {peak}, which is silence"
+        );
+    }
+
     #[test]
     fn events_are_placed_at_their_own_frame_inside_the_block_they_belong_to() {
         let (mut r, mut tx, _) = renderer_with_midi(2);

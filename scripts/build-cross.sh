@@ -291,9 +291,34 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   mkdir -p "$stage/font-licenses" || { rm -rf "$stage"; return 1; }
   cp assets/font-licenses/*.txt "$stage/font-licenses/" || { rm -rf "$stage"; return 1; }
   cp LICENSE THIRD-PARTY-LICENSES "$stage/" || { rm -rf "$stage"; return 1; }
+  # **The encoder, which this path shipped without for two releases.**
+  #
+  # Video on Linux is an ffmpeg subprocess, resolved exe-adjacent before PATH.
+  # `build-linux-remote.sh` packed it and this one never did — so a tarball
+  # built here was 10 MB instead of 45, video worked on any box that happened
+  # to have distro ffmpeg, and broke on every clean one. Found by a tester on
+  # a clean box; see docs/LINUX-4.11-FINDINGS.md, finding 2.
+  #
+  # x86_64 only: there is no aarch64 Linux build in `fetch-ffmpeg.sh` yet, and
+  # shipping the wrong architecture is worse than shipping none — so that arch
+  # says so out loud rather than looking complete.
+  if [ "$arch" = "x86_64" ]; then
+    scripts/fetch-ffmpeg.sh linux || { rm -rf "$stage"; return 1; }
+    cp dist/vendor/linux/tangent-ffmpeg "$stage/" || { rm -rf "$stage"; return 1; }
+    chmod 0755 "$stage/tangent-ffmpeg" || { rm -rf "$stage"; return 1; }
+    cp -R dist/vendor/linux/ffmpeg-licenses "$stage/ffmpeg-licenses" \
+      || { rm -rf "$stage"; return 1; }
+  else
+    echo "   (no aarch64 ffmpeg build yet: video needs ffmpeg on PATH there)"
+  fi
   # The same user-facing readme the macOS and Windows artifacts carry.
   cp docs/ARTIFACT-README.md "$stage/README.txt" \
     || { rm -rf "$stage"; return 1; }
+  # **Readable by somebody other than the person who packed it.** A root
+  # install of a tarball whose files are 0600 gives every other user on the
+  # box an app they cannot read. Directories need the bit too, or nobody can
+  # list them.
+  chmod -R a+rX "$stage" || { rm -rf "$stage"; return 1; }
   # Written beside the real name and moved into place, so a tar that fails
   # half way leaves the previous artifact intact rather than a truncated one.
   tar -C dist -czf "${stage}.tar.gz.new" "tangent-${VERSION}-linux-${arch}" || {

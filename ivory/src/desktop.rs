@@ -1399,8 +1399,19 @@ impl DesktopApp {
                     // that will not load today because its licence server was
                     // unreachable should still be the chosen one tomorrow, and
                     // the band shows it as `Missing` rather than forgetting it.
-                    self.recorder.engine_error =
-                        Some(format!("could not load the instrument: {err}"));
+                    //
+                    // **Named, and with somewhere to go.** "could not load the
+                    // instrument" over a rack of five rows does not say WHICH,
+                    // and a tester who has just chosen something reads a bare
+                    // failure as the app being broken rather than that file
+                    // being unsuitable.
+                    let which = std::path::Path::new(path)
+                        .file_name()
+                        .map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
+                    self.recorder.engine_error = Some(format!(
+                        "{which} did not load: {err} - Tangent DX7 in the same \
+                         list is the built-in instrument"
+                    ));
                 }
             },
         }
