@@ -976,11 +976,26 @@ impl IvoryApp {
                 return demo;
             }
         }
-        let mut set: HashSet<u8> = self.notes.held().iter().copied().collect();
+        // **Only what arrived over MIDI is transposed.**
+        //
+        // The transpose exists because a player is in one key and reading in
+        // another: a note comes off the keyboard in concert pitch and the
+        // picture shows it where they want to read it. That applies to notes
+        // the KEYBOARD sent and to nothing else.
+        //
+        // `manual_notes` are already in that space. They came from a click on
+        // the drawn keyboard, the drawn neck, the drawn staff — `piano::
+        // hit_test` answers with the note that key is DRAWN as. Transposing
+        // them again moves the highlight off the key that was clicked: with a
+        // transpose of -11, clicking middle C lit C sharp a major seventh
+        // below it. The same double application had `sounding` lighting
+        // phantom keys until it was moved after this line.
+        let held: HashSet<u8> = self.notes.held().iter().copied().collect();
+        let mut set = transposed(&held, self.settings.transpose);
         if self.settings.keytoggle_enabled {
             set.extend(self.manual_notes.iter().copied());
         }
-        transposed(&set, self.settings.transpose)
+        set
     }
 
 
@@ -1252,7 +1267,26 @@ impl IvoryApp {
         if transposed(&held, want).len() != held.len() {
             return;
         }
+        let was = self.settings.transpose;
         self.settings.transpose = want;
+        // **Placed notes are moved, not re-projected.**
+        //
+        // They live in the space they were CLICKED in — see `lit_notes` — so
+        // the display transform does not reach them and they have to be
+        // carried across by hand. Doing it here is what keeps both halves
+        // true at once: an arrow key transposes a chord you built by clicking,
+        // and a click lands on the key you clicked.
+        //
+        // The range check above already covered them, so this cannot leave
+        // MIDI's range.
+        let step = want - was;
+        let shift = |n: &u8| u8::try_from(i64::from(*n) + step).unwrap_or(*n);
+        self.manual_notes = self.manual_notes.iter().map(shift).collect();
+        self.manual_positions = self
+            .manual_positions
+            .iter()
+            .map(|(n, p)| (shift(n), *p))
+            .collect();
         self.save_settings();
         // The neck and the theory band read the same notes, so they have to be
         // rebuilt from the new ones rather than left showing the old shape.
@@ -6030,6 +6064,65 @@ mod tests {
         assert_eq!(got, vec![0, 4, 7], "the notes replaced each other");
     }
 
+    /// **A click lands on the key that was clicked, whatever the transpose.**
+    ///
+    /// The regression this exists for: with a transpose of -11 set, clicking
+    /// middle C lit C sharp a major seventh below it. Placed notes live in the
+    /// space they were clicked in, and the display transform was reaching them
+    /// a second time.
+    #[test]
+    fn a_clicked_key_lights_the_key_that_was_clicked() {
+        for transpose in [-11_i64, 0, 5] {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.keytoggle_enabled = true;
+            app.settings.transpose = transpose;
+
+            app.place_or_play(60);
+            app.clicked.clear();
+            let _ = run_frame(&ctx, &mut app);
+            assert!(
+                app.display_notes().contains(&60),
+                "transpose {transpose}: clicking middle C lit {:?}",
+                app.display_notes()
+            );
+            assert_eq!(app.display_notes().len(), 1, "transpose {transpose}");
+        }
+    }
+
+    /// **And the arrow keys still move what was placed.** The two halves pull
+    /// against each other: a click must not be re-projected, and a transpose
+    /// must still carry a chord somebody built by clicking.
+    #[test]
+    fn the_arrow_keys_carry_a_placed_chord_along() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = true;
+        app.place_or_play(60);
+        app.place_or_play(64);
+        // Let go: a note still under the button is sounding, and a sounding
+        // note lights whatever pitch it was struck at until it stops.
+        app.clicked.clear();
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(
+            app.display_notes(),
+            [60, 64].into_iter().collect::<HashSet<u8>>()
+        );
+
+        app.transpose_by(2);
+        assert_eq!(app.settings.transpose, 2);
+        assert_eq!(
+            app.display_notes(),
+            [62, 66].into_iter().collect::<HashSet<u8>>(),
+            "the placed chord did not come along"
+        );
+        // And back again, exactly.
+        app.transpose_by(-2);
+        assert_eq!(
+            app.display_notes(),
+            [60, 64].into_iter().collect::<HashSet<u8>>(),
+            "the chord did not come back where it started"
+        );
+    }
+
     /// **The staff is an instrument now.** It was a readout, and said so in a
     /// comment: a note on it is a note you are already holding. That stopped
     /// being true when every other view became playable — a pianist reading a
@@ -6262,22 +6355,25 @@ mod tests {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.settings.keytoggle_enabled = true;
         app.settings.transpose = 2;
+        // **Placed where it was clicked, and it stays there.** A transpose
+        // that is already set does not move a note somebody then places: the
+        // key they pressed is the key that lights. The arrow keys move placed
+        // notes explicitly — see `transpose_by`.
         app.manual_notes.insert(60);
         let _ = run_frame(&ctx, &mut app);
-        // Space, because that is what sounds a latched chord now.
         assert_eq!(
             space(&ctx, &mut app),
             Some(recorder::RecorderRequest::Audition {
-                notes: vec![62],
+                notes: vec![60],
                 on: true
             }),
-            "the strike did not follow the transpose"
+            "a placed note did not sound where it was placed"
         );
         let lit = app.display_notes();
         assert_eq!(
             lit,
-            [62].into_iter().collect::<HashSet<u8>>(),
-            "a phantom key lit an interval above the one playing"
+            [60].into_iter().collect::<HashSet<u8>>(),
+            "a phantom key lit an interval away from the one playing"
         );
     }
 
