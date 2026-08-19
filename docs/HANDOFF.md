@@ -1,7 +1,8 @@
 # Ivory 2.0 — Handoff / Resume Document
 
-**Last updated:** 2026-08-14. **The app is now called TANGENT.** Newest work is
-§2d: the fretboard voicing solver and the guitar view. §2c before it has the
+**Last updated:** 2026-08-18. **The app is now called TANGENT.** Newest work is
+§2g: the six-operator FM built-in, its patch picker, and the reverb/delay knobs.
+Before it, §2d: the fretboard voicing solver and the guitar view. §2c before it has the
 rename, the 2.2.0 tester-report UI fixes, the egui 0.33 downgrade and the
 MIT/GPLv3 split. Read §2c then §2d FIRST; everything above them still says
 "Ivory" and that is now the internal codename, not the product.
@@ -637,6 +638,96 @@ scripts/build-plugin.sh macos|windows|linux    # the .vst3 bundle
 scripts/build-installer.sh macos|windows|linux # the installers
 cc -o /tmp/vp scripts/verify-plugin.c && /tmp/vp <bundle>/Contents/MacOS/Tangent
 ```
+
+## 2g. 2026-08-18 — the built-in instrument, its patches, and two effect knobs
+
+Shipped as **4.6.0**, committed, **not yet published**. 4.5.0 was the batch
+before it (Space-to-audition, note names, the first FM built-in). 5.0 is still
+reserved for after the full code audit the owner asked for.
+
+### The instrument
+
+`ivory/src/dx7/` is a faithful six-operator FM engine: `voice.rs` unpacks the
+128 packed bytes of a patch, `sysex.rs` reads a 4104-byte cartridge,
+`algorithms.rs` is the transcribed routing table, `synth.rs` is the DSP.
+Validated against 11,756 real cartridges (`IVORY_SYX_CORPUS=... cargo test -p
+ivory --bins the_whole_corpus -- --ignored --nocapture`).
+
+`ivory/src/builtin.rs` is **gone** — the two-operator sketch it held is fully
+superseded.
+
+**The default patch is `Voice::electric_piano()`, written into the source.**
+That is a licensing decision as much as a size one: the factory ROMs are
+Yamaha's and the banks people trade are their authors'. Do not replace it with
+a bundled cartridge without settling that.
+
+**The landmine that was found here, by listening:** the envelope rate constants
+(`FASTEST_SWEEP`, `RATE_HALVING`) were wrong — rate 99 at 1.5ms and rate 0 at
+twenty seconds — so a held note died in a third of a second and *every*
+cartridge played with the wrong decay. Invisible to any test that only asks
+whether a sample is non-zero. Two tests now pin it:
+`the_envelope_rate_curve_matches_a_real_dx7` and
+`the_default_patch_sustains_a_held_note`.
+
+### How it is reached
+
+Not a bundled VST3 — a sentinel path (`dialogs::BUILTIN_PATH`) inserted at the
+top of the existing slot picker. No second bundle to sign, notarize or install,
+and no scan that can fail. `desktop.rs::reconcile_plugin` intercepts it.
+
+`IvoryApp::open_slot_editor` forks on it: a VST3 gets its own window, the
+built-in gets `Dialog::PatchPicker`. **Selecting is auditioning** — no Load
+button, because a patch applies between buffers and dialing one in means
+playing while you move down the list. `settings.dx7_cartridge` /
+`dx7_patch` persist it; a missing cartridge falls back silently.
+
+The host holds the `Cartridge`; the UI holds `ports::CartridgeInfo` (names
+only). Same firewall as the plugin picker's paths-not-modules.
+
+### The effects
+
+`ivory/src/effects.rs`. Reverb is Schroeder-Moorer, delay is tempo-synced to a
+dotted eighth. **Position in the chain is the feature**: applied to `self.mix`
+in `Renderer::render`, right after `render_builtin` — downstream of every
+instrument, upstream of the tap (so the take carries it), upstream of the click
+and input monitor (so those stay dry). Off by default and free when off.
+
+Two knobs on the recorder band, modelled on a Tascam 388. To pay for the width
+the fader column went from 0.43 to 0.34 of the middle group; **the meters were
+not touched** and must not be, their faces are what the band was rebuilt
+around. `a_gain_reading_fits_the_box_reserved_for_it_at_the_smallest_band` is
+the test that says where the dB reading stops fitting.
+
+`Produces::hit` now takes the rect and the point, and `recorder_panel::
+drag_axis` reports which way a control travels so the caller pins the *other*
+axis. Pinning the wrong one does not make a knob fussy — every probe reports
+the same value and it is dead.
+
+### Screenshots when screen capture stops working
+
+`screencapture -l <winid>` began returning "could not create image from window"
+mid-session. `composite.rs` has an ignored test that renders a frame offscreen
+through the real compositor and writes a PNG:
+
+```
+IVORY_SHOT=/tmp/x.png IVORY_SHOT_ROWS=210 \
+  cargo test -p ivory --bins shot::window -- --ignored --nocapture
+```
+
+The readback is **BGRA**; the writer swaps channels. Forget that and tan panels
+come out pale blue, which reads as a theme rather than a bug.
+
+### Still open
+
+- **The full code audit before 5.0** ("elegant inside and out, and optimized to
+  a degree that is unnecessary"). 124 clippy warnings are the backlog:
+  `unnecessary qualification` (28), `field assignment outside of initializer`
+  (17), collapsible `if` (7), `is_multiple_of` (5).
+- Dead since the take-is-the-window change: `paint_camera`, `WELCOME_SLACK`,
+  `keys::family`, `PluginWriter::sample_rate`.
+- `fetch-ffmpeg.sh` has no aarch64 Linux build.
+- 4.6.0 artifacts are in `dist/` for every platform; nothing is published.
+  Windows test kit staged at `~/Desktop/Tangent-windows-test/`.
 
 ## 3. Repo layout
 
