@@ -26,6 +26,39 @@
 
 use super::voice::Voice;
 
+/// The bank a fresh install plays: sixteen electric pianos and sixteen jazz
+/// guitars, written for this engine.
+///
+/// **Compiled in, and that is a licensing decision as much as a convenience.**
+/// The factory ROMs are Yamaha's and the banks people trade are their authors';
+/// this one was built from a study of what those patches DO rather than from
+/// what any of them contains — see `docs/DX7-BANK-01.md` — and is the app's to
+/// give away. None of its thirty-two voices is byte-identical to anything in
+/// the forty-two thousand unique patches the study parsed.
+///
+/// Four kilobytes. There is no version of "ship the sounds separately" that is
+/// worth a file the installer could fail to place.
+const FACTORY_BYTES: &[u8] = include_bytes!("../../assets/Tangent-01-Tines-and-Boxes.syx");
+
+/// What the built-in instrument plays before anybody loads a cartridge.
+///
+/// Parsed at every call rather than cached: it happens once at launch and once
+/// more if somebody goes back to it, and a `OnceLock` for four kilobytes of
+/// arithmetic is a lock to reason about for no reason.
+///
+/// **Cannot fail in practice**, and does not pretend it might: the bytes are in
+/// the binary and `the_factory_bank_is_a_cartridge` parses them on every build.
+/// A parse error here would mean a corrupted executable, and the honest answer
+/// to that is the patch that is written in the source.
+pub fn factory() -> Cartridge {
+    Cartridge::parse(FACTORY_BYTES, FACTORY_NAME).unwrap_or_else(|_| {
+        Cartridge::of(FACTORY_NAME, vec![Voice::default()])
+    })
+}
+
+/// What the picker calls the bank that is compiled in.
+pub const FACTORY_NAME: &str = "Tangent Bank 01 - Tines and Boxes";
+
 /// A cartridge: thirty-two patches, in the order the DX7 numbers them.
 #[derive(Debug, Clone)]
 pub struct Cartridge {
@@ -311,6 +344,42 @@ mod tests {
     fn a_bank_is_always_thirty_two_voices() {
         assert_eq!(Cartridge::of("x", Vec::new()).voices.len(), 32);
         assert_eq!(Cartridge::of("x", vec![Voice::default(); 40]).voices.len(), 32);
+    }
+
+    /// **The bank that ships is a bank.** It is compiled into the binary, so
+    /// this is the only thing standing between a bad copy and an app that has
+    /// no sound on first launch — and it runs on every build.
+    #[test]
+    fn the_factory_bank_is_a_cartridge() {
+        let c = factory();
+        assert_eq!(c.voices.len(), 32);
+        assert!(c.checksum_ok, "the bank we ship fails its own checksum");
+        assert_eq!(c.name, FACTORY_NAME);
+
+        // Every voice is named, and none of them is the empty patch: a bank
+        // half full of INIT VOICE is a bank that was truncated somewhere.
+        let names = c.names();
+        assert!(
+            names.iter().all(|n| n != "(unnamed)" && !n.is_empty()),
+            "a voice in the shipped bank has no name: {names:?}"
+        );
+        assert!(
+            c.voices.iter().all(|v| *v != Voice::default()),
+            "the shipped bank contains the default patch, so it is padded"
+        );
+
+        // And every one of them makes a sound: at least one carrier with a
+        // level above nothing. A silent patch in a shipped bank is a patch
+        // somebody selects and concludes the app is broken.
+        for (i, v) in c.voices.iter().enumerate() {
+            let dest = super::super::algorithms::DEST[usize::from(v.algorithm).min(31)];
+            let audible = v
+                .ops
+                .iter()
+                .zip(dest)
+                .any(|(op, d)| d == super::super::algorithms::OUT && op.output_level > 0);
+            assert!(audible, "voice {i} ({}) has no audible carrier", names[i]);
+        }
     }
 
     /// **Against the real world.** Ten thousand cartridges off the internet,

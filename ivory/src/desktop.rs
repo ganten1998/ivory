@@ -983,6 +983,19 @@ impl DesktopApp {
         }
     }
 
+    /// The patch the settings point at, if the cartridge has one there.
+    ///
+    /// `None` rather than a default, because the caller is deciding whether to
+    /// SEND anything: a patch being edited must not be replaced by the one the
+    /// settings remember every time a device is reopened.
+    fn chosen_voice(&self) -> Option<crate::dx7::Voice> {
+        if self.editing.is_some() {
+            return None;
+        }
+        let (_, patch) = self.app.dx7_choice();
+        self.cartridge.as_ref()?.voices.get(patch).copied()
+    }
+
     /// The patch the built-in is playing right now.
     fn current_voice(&self) -> crate::dx7::Voice {
         let (_, patch) = self.app.dx7_choice();
@@ -1074,11 +1087,19 @@ impl DesktopApp {
     fn load_cartridge_at_launch(&mut self) {
         let (path, patch) = self.app.dx7_choice();
         let (path, patch) = (path.to_owned(), patch);
-        if path.is_empty() {
-            return;
-        }
-        let Ok(cart) = crate::dx7::Cartridge::load(std::path::Path::new(&path)) else {
-            return;
+        // **No cartridge chosen means the one that ships**, not silence and not
+        // a single patch. Sixteen electric pianos and sixteen jazz guitars are
+        // in the binary; a fresh install has them all without opening a file
+        // dialog, and "Load .syx..." is for somebody who wants somebody else's.
+        let cart = if path.is_empty() {
+            crate::dx7::factory()
+        } else {
+            // A path that has moved falls back to the shipped bank rather than
+            // to nothing: cartridges live in sample folders that get
+            // reorganised, and an app that goes silent because a file moved is
+            // an app that looks broken.
+            crate::dx7::Cartridge::load(std::path::Path::new(&path))
+                .unwrap_or_else(|_| crate::dx7::factory())
         };
         self.app.set_cartridge(cartridge_info(&cart, ""));
         if let Some(v) = cart.voices.get(patch).copied() {
@@ -1169,6 +1190,16 @@ impl DesktopApp {
                 self.recorder.engine_retry = None;
                 self.recorder.plugin_loaded = [const { None }; ivory_ui::recorder::SLOTS];
                 self.push_monitor_settings();
+                // **The chosen patch, now that there is something to play it.**
+                // The cartridge is read at construction, long before the band
+                // opens a device, so a voice pushed then goes nowhere — and a
+                // fresh install would play the patch written in the source
+                // rather than the bank it ships with.
+                if let Some(v) = self.chosen_voice() {
+                    if let Some(e) = self.recorder.engine.as_mut() {
+                        e.set_builtin_voice(v);
+                    }
+                }
                 // Announces rather than loads on this frame: the band has just
                 // appeared and a remembered instrument would otherwise freeze
                 // it for five seconds before it had drawn once.

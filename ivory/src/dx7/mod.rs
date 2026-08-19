@@ -17,5 +17,5 @@ pub mod sysex;
 pub mod voice;
 
 pub use synth::Dx7;
-pub use sysex::Cartridge;
+pub use sysex::{factory, Cartridge};
 pub use voice::{Op, Voice};

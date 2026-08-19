@@ -1781,7 +1781,13 @@ pub const CARTRIDGE_VOICES: usize = 32;
 /// The row shown when no cartridge is loaded: the patch compiled into the app.
 pub const BUILTIN_PATCH_ROW: &str = "E.PIANO 1  (built in)";
 
-const PATCH_DIALOG_W: f32 = 460.0;
+/// What the two buttons on the cartridge row need between them.
+///
+/// Reserved rather than measured: measuring means laying the row out twice,
+/// and the failure it prevents is a bank name running under "Edit...".
+const BANK_BUTTONS_W: f32 = 176.0;
+
+const PATCH_DIALOG_W: f32 = 520.0;
 const PATCH_DIALOG_H: f32 = 470.0;
 
 impl Dialog {
@@ -2409,14 +2415,24 @@ pub fn show(
                         .show(ui, |ui| {
                             // ── which cartridge ─────────────────────────────
                             ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(if bank.is_empty() {
-                                        "No cartridge loaded".to_owned()
-                                    } else {
-                                        format!("Cartridge: {bank}")
-                                    })
-                                    .font(bold(12.0))
-                                    .color(t.text),
+                                // **The buttons' width is reserved before the
+                                // name is placed.** A bank can be called
+                                // anything, and the one that ships is called
+                                // something long: a label sized to its own
+                                // text ran straight under "Edit...".
+                                let room = (ui.available_width() - BANK_BUTTONS_W).max(40.0);
+                                ui.add_sized(
+                                    [room, 18.0],
+                                    egui::Label::new(
+                                        RichText::new(if bank.is_empty() {
+                                            "No cartridge loaded".to_owned()
+                                        } else {
+                                            format!("Cartridge: {bank}")
+                                        })
+                                        .font(bold(12.0))
+                                        .color(t.text),
+                                    )
+                                    .truncate(),
                                 );
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if ui
