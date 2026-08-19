@@ -89,7 +89,7 @@
 
 use crate::fonts;
 use crate::recorder::{
-    fader_to_gain, DEFAULT_BPM,
+    DEFAULT_BPM,
     disk_text, gain_text, gain_to_fader, timecode, DeviceLabel, ExportSpec, Level, Meters,
     NumField, Preview, RecordState, RecorderView, SlotView, COUNT_IN_CHOICES, MAX_BPM, MIN_BPM,
     SLOTS,
@@ -331,11 +331,6 @@ struct Layout {
     /// and neither one answers the other's question.
     master_scale: Rect,
     master_bars: Rect,
-    /// The output number under the ladders. **The limiter's gain reduction is
-    /// drawn as a wash BEHIND it** rather than in a ladder of its own: a third
-    /// column to say one number was most of the width of the master for
-    /// something that is usually zero.
-    master_readout: Rect,
     master_knob: Rect,
 
     /// The six effect knobs, in [`Fx::ALL`] order, under the meters.
@@ -633,7 +628,6 @@ impl Layout {
             click: Rect::NOTHING,
             master_scale: Rect::NOTHING,
             master_bars: Rect::NOTHING,
-            master_readout: Rect::NOTHING,
             master_knob: Rect::NOTHING,
             fx: [Rect::NOTHING; Fx::ALL.len()],
             tempo_entry: Rect::NOTHING,
@@ -992,17 +986,15 @@ impl Layout {
         if !knob_fits(knob) {
             return;
         }
-        let readout_h = (m.height() * MASTER_READOUT_H).clamp(11.0, 17.0);
-        let readout = Rect::from_min_max(
-            Pos2::new(m.left(), knob.top() - readout_h),
-            Pos2::new(m.right(), knob.top()),
-        );
-        let meter = Rect::from_min_max(m.min, Pos2::new(m.right(), readout.top() - 2.0));
+        // **Straight down to the knob.** There was a readout strip in here —
+        // a recess with the output level in it, which is where the reduction
+        // used to be drawn. The reduction reads against the scale now, and
+        // what the strip was holding open was ladder.
+        let meter = Rect::from_min_max(m.min, Pos2::new(m.right(), knob.top() - 4.0));
         if !meter.is_positive() {
             return;
         }
         self.master_knob = knob;
-        self.master_readout = readout;
         // Left to right: the numbers, the two bars, then the reduction.
         // **The scale is between nothing and everything** — it is read against
         // the bars, so it goes next to them and not off in a corner.
@@ -3475,22 +3467,6 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
     // — so 6 dB of reduction reaches the -6, and it needs no number of its own.
     // It had a column, and a column for something that is usually zero is a
     // column the meters could have had.
-    if l.master_scale.is_positive() && view.gr_db > 0.0 {
-        let inner = l.master_bars.shrink(1.0);
-        let down = (view.gr_db / -MASTER_FLOOR_DB).clamp(0.0, 1.0) * inner.height();
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(l.master_scale.left(), inner.top()),
-                Pos2::new(l.master_scale.right(), inner.top() + down),
-            ),
-            1.0,
-            // Translucent: the numbers are drawn over it and have to stay
-            // readable, which is the whole reason it lives here.
-            Color32::from_rgba_unmultiplied(LED_GR.r(), LED_GR.g(), LED_GR.b(), 96),
-        );
-    }
-
-    // The scale, read against the bars.
     if l.master_scale.is_positive() {
         let face = l.master_scale;
         // Small: eight numbers have to fit up the side of the ladder without
@@ -3501,8 +3477,34 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
             "-60",
             step * 0.86,
         );
+        let inner = l.master_bars.shrink(1.0);
+
+        // **The reduction, behind the numbers and no wider than they are.**
+        // It hangs from 0 and reaches down by however many decibels the
+        // limiter took off, against the same scale the ladders are read
+        // against — so 6 dB of reduction reaches the -6, and it needs no
+        // number of its own.
+        //
+        // Bounded by the WIDEST LABEL rather than by the column: the column is
+        // as wide as the gap it was given and the strip is meant to sit under
+        // the ticks, not sweep the whole margin.
+        if view.gr_db > 0.0 && size >= MIN_TEXT {
+            let right = face.right() - 2.0;
+            let left = (right - "-60".len() as f32 * ADV * size).max(face.left());
+            let down = (view.gr_db / -MASTER_FLOOR_DB).clamp(0.0, 1.0) * inner.height();
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(left, inner.top()),
+                    Pos2::new(right, inner.top() + down),
+                ),
+                1.0,
+                // Translucent: the numbers are drawn over it and have to stay
+                // readable, which is the whole reason it lives here.
+                Color32::from_rgba_unmultiplied(LED_GR.r(), LED_GR.g(), LED_GR.b(), 110),
+            );
+        }
+
         if size >= MIN_TEXT {
-            let inner = l.master_bars.shrink(1.0);
             for db in [0.0_f32, -6.0, -12.0, -18.0, -24.0, -36.0, -48.0, -60.0] {
                 let t = (db - MASTER_FLOOR_DB) / -MASTER_FLOOR_DB;
                 let y = inner.bottom() - t * inner.height();
@@ -3521,45 +3523,6 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
         }
     }
 
-    // The number: what is leaving — over a wash that says what the limiter is
-    // taking off.
-    if l.master_readout.is_positive() {
-        let r = l.master_readout;
-        // **Reduction is drawn DOWNWARD, behind the number.** It starts at the
-        // top of the readout and grows down by however much the limiter took
-        // off, so the picture is of the gain going away. Behind rather than
-        // beside because it is usually zero: a whole column that says nothing
-        // most of the time is a column the meters could have had.
-        // The same recess the ladders sit in, so the readout reads as part of
-        // the meter rather than as a caption under it.
-        painter.rect_filled(r, 1.0, METER_FACE);
-        let peak = m.peak();
-        let out = if peak <= 0.0 {
-            "-inf".to_owned()
-        } else {
-            format!("{:.1}", 20.0 * peak.log10())
-        };
-        let size = fit_text(
-            Rect::from_min_size(r.min, Vec2::new(l.master_bars.width(), r.height())),
-            "-88.8",
-            r.height() * 0.88,
-        );
-        if size >= MIN_TEXT {
-            // **One colour, and it is not red.** The number sits on a recess
-            // that the reduction wash fills from above, so it has to read on
-            // near-black AND on amber; there is no red that does both. The
-            // ladder beside it already says whether this is a problem, in the
-            // place somebody is looking, and two things saying it in two
-            // colours is one of them going wrong.
-            painter.text(
-                Pos2::new(r.right() - 2.0, r.center().y),
-                Align2::RIGHT_CENTER,
-                &out,
-                font(size),
-                Color32::from_rgb(0xff, 0xf4, 0xe0),
-            );
-        }
-    }
 }
 
 /// The filters' caps.
@@ -3617,14 +3580,6 @@ const METER_SHARE: f32 = 0.46;
 /// Where the transport's right column stops and the master column starts.
 const MASTER_COL: f32 = 0.78;
 
-
-/// The readout strip under the ladders, as a share of the column's height,
-/// clamped into points.
-///
-/// **Back to the height of its own number** now that the reduction is drawn
-/// behind the scale instead of in here. What that box was holding open is
-/// space below the meters, and the ladders have it.
-const MASTER_READOUT_H: f32 = 0.05;
 
 /// The dB scale's share of the master column's width. The ladders take the
 /// rest — all of it, since the reduction stopped needing a column of its own.
@@ -4349,6 +4304,7 @@ mod tests {
     /// their own.
     #[test]
     fn a_double_click_puts_every_knob_back() {
+        use crate::recorder::fader_to_gain;
         for fx in Fx::ALL {
             // The limiter's dial is a threshold: not applied is fully
             // clockwise, where it is above everything and catches nothing.
@@ -4439,12 +4395,10 @@ mod tests {
                 if w >= 900.0 {
                     assert!(l.master_bars.is_positive(), "no master ladder at {w}");
                     assert!(l.master_knob.is_positive(), "no master knob at {w}");
-                    assert!(l.master_readout.is_positive(), "no master readout at {w}");
                 }
                 let master = [
                     ("scale", l.master_scale),
                     ("bars", l.master_bars),
-                    ("readout", l.master_readout),
                     ("knob", l.master_knob),
                 ];
                 for (name, m) in master {

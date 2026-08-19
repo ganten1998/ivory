@@ -1026,6 +1026,19 @@ that are already there**, so 6 dB of reduction reaches the -6 and it needs no
 readout of its own. The readout box went back to the height of its own number
 and the ladders took the space.
 
+### The readout strip went with it
+
+The reduction wash needed a box held open to show anything, so 4.15.0 gave it
+one — a dark recess under the ladders with the output level in it. Once the
+reduction moved behind the scale that recess was a leftover, and what it was
+holding open was ladder. **Removed, number and all.** The scale beside the
+ladders is the dB readout; a second one under them was the old meter's shape
+outliving the old meter.
+
+The strip is bounded by the WIDEST LABEL (`"-60".len() * ADV * size`) rather
+than by the scale column, which is as wide as the gap it was given. It sits
+under the ticks; it does not sweep the margin.
+
 ### Two bugs
 
 **The DX7's slot fader did nothing.** Reported as "works for VSTs, not for the
