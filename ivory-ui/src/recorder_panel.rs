@@ -351,6 +351,15 @@ struct Layout {
     /// Its icon: a click imports a file, a right-click opens the waveform.
     track_icon: Rect,
 
+    /// **Never positive, and that is the point.** `Hit::PickCamera` and
+    /// `Hit::PickAudio` have to appear in [`Layout::targets`] — every variant
+    /// does, and a test proves it — but neither is a press target in the band:
+    /// the camera is chosen by right-clicking the preview and the input by
+    /// right-clicking the microphone, because a device belongs to the control
+    /// it feeds. See `preview_rect` and `input_icon`.
+    camera: Rect,
+    audio: Rect,
+
     /// The microphone icon at the head of the input fader.
     ///
     /// Not a press target — a right-click on it opens the audio input's
@@ -389,8 +398,6 @@ struct Layout {
     /// How long the disk will last, beside the folder preview. Also not
     /// clickable: it is an answer, not a question.
     disk: Rect,
-    camera: Rect,
-    audio: Rect,
     count_in: Rect,
     tempo: Rect,
     /// The time signature, typed rather than dragged. NOT `meter` — that name
@@ -512,9 +519,13 @@ const SLOT_ROWS: [(f32, f32); SLOTS] = {
     let mut i = 0;
     // A twelfth of the column between rows, so six rows breathe.
     let pitch = 1.0 / SLOTS as f32;
+    // **Scaled so the last row's bottom IS the bottom.** Rows of 86% of the
+    // pitch leave a gap after the last one as well as between them, and that
+    // trailing gap was a row's worth of nothing under the fifth instrument.
+    let k = 1.0 / (1.0 - pitch * 0.14);
     while i < SLOTS {
         let top = i as f32 * pitch;
-        out[i] = (top, top + pitch * 0.86);
+        out[i] = (top * k, (top + pitch * 0.86) * k);
         i += 1;
     }
     out
@@ -643,6 +654,8 @@ impl Layout {
             metronome_row: Rect::NOTHING,
             input_row: Rect::NOTHING,
             click: Rect::NOTHING,
+            camera: Rect::NOTHING,
+            audio: Rect::NOTHING,
             input_icon: Rect::NOTHING,
             track_row: Rect::NOTHING,
             track_icon: Rect::NOTHING,
@@ -658,9 +671,7 @@ impl Layout {
             name: Rect::NOTHING,
             folder: Rect::NOTHING,
             disk: Rect::NOTHING,
-            camera: Rect::NOTHING,
-            audio: Rect::NOTHING,
-            count_in: Rect::NOTHING,
+                    count_in: Rect::NOTHING,
             tempo: Rect::NOTHING,
             time_sig: Rect::NOTHING,
             export: Rect::NOTHING,
@@ -707,7 +718,13 @@ impl Layout {
         // The status line spans what the preview leaves, in both layouts, so
         // "no audio input selected" is in the same place before and during a
         // take.
-        let status_h = (rest.height() * 0.13).min(20.0);
+        // **One line of small text, and usually empty.** It was a fifth of
+        // the column reserved for a message that is not there most of the
+        // time, and every section above it stopped that much short of the
+        // band's bottom edge. The space it does need is still reserved — a
+        // band that changed shape when a warning appeared would move the
+        // controls under a hand — but it is the height of the line now.
+        let status_h = (rest.height() * 0.10).min(15.0);
         let status = Rect::from_min_max(
             Pos2::new(rest.left(), rest.bottom() - status_h),
             rest.max,
@@ -791,7 +808,12 @@ impl Layout {
     /// are a list that grows and anything drawn on top of a list is something
     /// the list will eventually reach.
     fn heart_h(body: Rect) -> f32 {
-        (body.height() * 0.18).clamp(9.0, 24.0)
+        // **Capped lower than it was.** The strip is a credit at the foot of
+        // the instrument column, and at 24 points it stopped the fifth slot a
+        // row's height above every other section's bottom edge. The heart is
+        // drawn at 85% of it and is a picture of a heart; it does not need a
+        // slot's worth of column.
+        (body.height() * 0.13).clamp(9.0, 17.0)
     }
 
     /// Idle: preview, transport, destination, monitor.
@@ -900,9 +922,9 @@ impl Layout {
         // **Three rows now, and the transport keeps its knob's worth.** The
         // backing track is a level like the other two and belongs with them:
         // it is the third thing in the mix that is not an instrument.
-        self.metronome_row = slice_v(col, 0.04, 0.22);
-        self.input_row = slice_v(col, 0.25, 0.43);
-        self.track_row = slice_v(col, 0.46, 0.64);
+        self.metronome_row = slice_v(col, 0.02, 0.21);
+        self.input_row = slice_v(col, 0.25, 0.44);
+        self.track_row = slice_v(col, 0.48, 0.67);
         self.click = fader_zones(self.metronome_row).0;
         self.input_icon = fader_zones(self.input_row).0;
         self.track_icon = fader_zones(self.track_row).0;
@@ -911,7 +933,7 @@ impl Layout {
         // of one size, one centred in each third of the row: they are one
         // group, and a stop bigger than the cog beside it reads as more
         // important than it is.
-        let bar = slice_v(col, 0.68, 1.00);
+        let bar = slice_v(col, 0.70, 1.00);
         // **The tempo is a knob at the head of the transport**, and that is
         // what makes the transport one thing rather than three buttons and a
         // number that happened to be nearby.
@@ -933,8 +955,14 @@ impl Layout {
                 self.fx[0].width().min(bar.width() * 0.5),
                 self.fx[0].height().min(bar.height()),
             );
+            // **Sat on the bottom of the row, not floated in the middle of
+            // it.** The tempo knob is one of eight and the other seven end at
+            // the foot of their own column; centring this one left it a dozen
+            // points higher than the rest, with the gap under it reading as
+            // the band's bottom margin — which is what "a huge unused margin
+            // below the buttons" actually was.
             Rect::from_center_size(
-                Pos2::new(bar.left() + size.x * 0.5, bar.center().y),
+                Pos2::new(bar.left() + size.x * 0.5, bar.bottom() - size.y * 0.5),
                 size,
             )
         } else {
@@ -1074,7 +1102,7 @@ impl Layout {
         // the face was measured in (see `draw_knob`). At a four percent gap
         // the word HPF landed on the reverb knob's skirt.
         let row = |top: f32, bottom: f32| slice_v(knobs, top, bottom);
-        let (top, bottom) = (row(0.00, 0.43), row(0.57, 1.00));
+        let (top, bottom) = (row(0.00, 0.45), row(0.55, 1.00));
         let cells = [
             slice_h(top, 0.00, 0.32),
             slice_h(top, 0.34, 0.66),
@@ -1184,11 +1212,59 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 46] {
+    fn targets(&self) -> [(Rect, Produces); 62] {
         use Produces::{Along, AlongV, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
+        // The dB at the end of a fader row, which is the box you type into.
+        let reading = |row: Rect| fader_zones(row).2;
+        // The word over a knob, which is the same thing for a dial.
+        // **Nothing when there is no word.** Below a certain height the label
+        // is not drawn at all (see `knob_face`), and a zero-height target is
+        // still a target as far as an overlap check is concerned.
+        // A GAP under it, the way every other pair of targets in this layout
+        // is separated: two rectangles that share an edge are two rectangles a
+        // press on that edge can land in either of.
+        let cap = |cell: Rect| {
+            knob_face(cell)
+                .filter(|f| f.label_h > 0.0)
+                .map_or(Rect::NOTHING, |f| {
+                    Rect::from_min_max(
+                        cell.min,
+                        Pos2::new(cell.right(), cell.top() + f.label_h * 0.88),
+                    )
+                })
+        };
+        // **What is left of the cell once the word is taken out of it.** The
+        // whole cell used to be the drag target, on the reasoning that a knob
+        // you can only grab by its own diameter is one you keep missing — and
+        // that is still true of the part BELOW the word. The word is a target
+        // of its own now, so the two cannot both have it.
+        let dial = |cell: Rect| {
+            knob_face(cell).map_or(Rect::NOTHING, |f| {
+                Rect::from_min_max(Pos2::new(cell.left(), cell.top() + f.label_h), cell.max)
+            })
+        };
         let s = &self.slots;
+        // **The numbers come FIRST.** A label sits inside its knob's cell and
+        // a reading beside its fader's track; both are scanned before the
+        // control they belong to, so the smaller, more specific target wins.
         [
+            (reading(self.metronome_row), Fixed(Hit::Type(NumField::Metronome))),
+            (reading(self.input_row), Fixed(Hit::Type(NumField::Input))),
+            (reading(self.track_row), Fixed(Hit::Type(NumField::Track))),
+            (s[0].value, Fixed(Hit::Type(NumField::Slot(0)))),
+            (s[1].value, Fixed(Hit::Type(NumField::Slot(1)))),
+            (s[2].value, Fixed(Hit::Type(NumField::Slot(2)))),
+            (s[3].value, Fixed(Hit::Type(NumField::Slot(3)))),
+            (s[4].value, Fixed(Hit::Type(NumField::Slot(4)))),
+            (cap(self.tempo), Fixed(Hit::Type(NumField::Tempo))),
+            (cap(self.master_knob), Fixed(Hit::Type(NumField::Master))),
+            (cap(self.fx[0]), Fixed(Hit::Type(NumField::Fx(Fx::Reverb)))),
+            (cap(self.fx[1]), Fixed(Hit::Type(NumField::Fx(Fx::Delay)))),
+            (cap(self.fx[2]), Fixed(Hit::Type(NumField::Fx(Fx::Chorus)))),
+            (cap(self.fx[3]), Fixed(Hit::Type(NumField::Fx(Fx::Hpf)))),
+            (cap(self.fx[4]), Fixed(Hit::Type(NumField::Fx(Fx::Lpf)))),
+            (cap(self.fx[5]), Fixed(Hit::Type(NumField::Fx(Fx::Limiter)))),
             (self.clip, Fixed(Hit::DismissClip)),
             (self.record, Fixed(Hit::Record)),
             (self.stop, Fixed(Hit::Stop)),
@@ -1237,13 +1313,13 @@ impl Layout {
             ),
             // Up the cell for more, which is the direction every knob in every
             // studio turns and the direction the two faders beside them move.
-            (self.master_knob, AlongV(Hit::SetMaster)),
-            (self.fx[0], AlongV(|v| Hit::SetFx(Fx::Reverb, v))),
-            (self.fx[1], AlongV(|v| Hit::SetFx(Fx::Delay, v))),
-            (self.fx[2], AlongV(|v| Hit::SetFx(Fx::Chorus, v))),
-            (self.fx[3], AlongV(|v| Hit::SetFx(Fx::Hpf, v))),
-            (self.fx[4], AlongV(|v| Hit::SetFx(Fx::Lpf, v))),
-            (self.fx[5], AlongV(|v| Hit::SetFx(Fx::Limiter, v))),
+            (dial(self.master_knob), AlongV(Hit::SetMaster)),
+            (dial(self.fx[0]), AlongV(|v| Hit::SetFx(Fx::Reverb, v))),
+            (dial(self.fx[1]), AlongV(|v| Hit::SetFx(Fx::Delay, v))),
+            (dial(self.fx[2]), AlongV(|v| Hit::SetFx(Fx::Chorus, v))),
+            (dial(self.fx[3]), AlongV(|v| Hit::SetFx(Fx::Hpf, v))),
+            (dial(self.fx[4]), AlongV(|v| Hit::SetFx(Fx::Lpf, v))),
+            (dial(self.fx[5]), AlongV(|v| Hit::SetFx(Fx::Limiter, v))),
             (self.click, Fixed(Hit::ToggleMetronome)),
             (self.dest, Fixed(Hit::ChooseFolder)),
             (self.reveal, Fixed(Hit::RevealFolder)),
@@ -1255,7 +1331,7 @@ impl Layout {
             // Turned like the sends, and typed into on a DOUBLE click — see
             // `draw_tempo`. `SetTempo` carries beats rather than 0..=1, so the
             // producer converts on the way out.
-            (self.tempo, AlongV(|t| Hit::SetTempo(knob_to_tempo(t)))),
+            (dial(self.tempo), AlongV(|t| Hit::SetTempo(knob_to_tempo(t)))),
             (self.time_sig, Fixed(Hit::EditTimeSignature)),
             (self.export, Fixed(Hit::Export)),
         ]
@@ -1359,6 +1435,15 @@ pub enum Hit {
     /// scaling cannot disagree.
     SetMetronomeGain(f32),
     /// The three effect sends, 0..=1.
+    /// Open a field for typing, and nothing else.
+    ///
+    /// **A gesture of its own, on a target of its own.** Dragging, resetting
+    /// and typing are three things a control has to do and a press has only so
+    /// many meanings: the drag is the handle, the double click is the reset,
+    /// and typing is the NUMBER — the dB at the end of a fader, the word over
+    /// a knob. Pressing what the value is written on to change it is the one
+    /// mapping nobody has to be told.
+    Type(NumField),
     /// The backing track's level, as a fader position.
     SetTrackGain(f32),
     /// Choose an audio file to play along to.
@@ -1420,7 +1505,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 48] = [
+    pub const ALL: [Hit; 49] = [
         Hit::Record,
         Hit::Stop,
         Hit::OpenSetup,
@@ -1459,6 +1544,7 @@ impl Hit {
         Hit::SetMaster(Hit::MIDWAY),
         Hit::SetTrackGain(Hit::MIDWAY),
         Hit::ImportTrack,
+        Hit::Type(NumField::Tempo),
         Hit::DismissClip,
         Hit::SetFx(Fx::Reverb, Hit::MIDWAY),
         Hit::SetFx(Fx::Delay, Hit::MIDWAY),
@@ -1537,6 +1623,7 @@ impl Hit {
             Hit::SetMaster(_) => "Master  -  right-click to type, double-click for 0 dB",
             Hit::DismissClip => "It clipped  -  click to acknowledge",
             Hit::SetTrackGain(_) => "Backing track level",
+            Hit::Type(_) => "Click to type a number",
             Hit::ImportTrack => "Backing track  -  click to choose a file",
             Hit::SetInputGain(_) => "Input level",
             Hit::SetTempo(_) => "Tempo",
@@ -1578,11 +1665,22 @@ impl Hit {
     /// **Nothing applied, for everything that applies something.** All six
     /// effects go to zero, which for the filters is a corner out at the edge
     /// of hearing and for the limiter is a threshold of 0 dB — in every case
-    /// the position where the knob is not doing anything. The two that are not
-    /// effects go to their own resting values instead: the master to unity,
-    /// which is 0 dB, and the tempo to 120.
+    /// the position where the knob is not doing anything.
+    ///
+    /// Everything that is a LEVEL goes to what it ships as instead, which is
+    /// unity for the four that carry sound and -6 dB for the click. "Nothing
+    /// applied" for a fader would be silence, and a reset that mutes the thing
+    /// you were listening to is a reset nobody uses twice.
     pub fn reset_to(self) -> Option<Hit> {
+        let ships_at = |g: f32| gain_to_fader(g);
+        let d = crate::recorder::Gains::default();
         Some(match self {
+            Hit::SetSlotGain(i, _) => {
+                Hit::SetSlotGain(i, ships_at(d.slots.get(i).copied().unwrap_or(1.0)))
+            }
+            Hit::SetMetronomeGain(_) => Hit::SetMetronomeGain(ships_at(d.metronome)),
+            Hit::SetInputGain(_) => Hit::SetInputGain(ships_at(d.input)),
+            Hit::SetTrackGain(_) => Hit::SetTrackGain(ships_at(d.track)),
             // **The limiter is the exception and it is not an inconsistency.**
             // Its knob is a threshold, so "not applied" is fully clockwise —
             // above everything, catching nothing — where every other knob's
@@ -1590,7 +1688,7 @@ impl Hit {
             Hit::SetFx(Fx::Limiter, _) => Hit::SetFx(Fx::Limiter, 1.0),
             Hit::SetFx(fx, _) => Hit::SetFx(fx, 0.0),
             Hit::SetTempo(_) => Hit::SetTempo(DEFAULT_BPM),
-            Hit::SetMaster(_) => Hit::SetMaster(gain_to_fader(1.0)),
+            Hit::SetMaster(_) => Hit::SetMaster(ships_at(d.master)),
             _ => return None,
         })
     }
@@ -1616,6 +1714,9 @@ impl Hit {
             | Hit::ClearSlot(i)
             | Hit::SetSlotGain(i, _) => i,
             Hit::SetFx(fx, _) => fx.index(),
+            // Two `Type`s are two controls: the dB at the end of slot 1 and
+            // the dB at the end of slot 2 are not the same box.
+            Hit::Type(f) => num_field_key(f),
             _ => 0,
         };
         (std::mem::discriminant(&self), index)
@@ -1630,6 +1731,22 @@ impl Hit {
     /// which is the question `==` gets right and a discriminant gets wrong.
     pub fn is_same_control(self, other: Hit) -> bool {
         self.control_key() == other.control_key()
+    }
+}
+
+/// A number for each field, so `control_key` can tell two `Type`s apart.
+fn num_field_key(f: NumField) -> usize {
+    match f {
+        NumField::Slot(i) => i,
+        NumField::Metronome => 100,
+        NumField::Input => 101,
+        NumField::Master => 102,
+        NumField::Track => 103,
+        NumField::Tempo => 104,
+        NumField::Meter => 105,
+        NumField::TrackIn => 106,
+        NumField::TrackOut => 107,
+        NumField::Fx(fx) => 200 + fx.index(),
     }
 }
 
@@ -1650,6 +1767,10 @@ pub fn num_field(hit: Hit) -> Option<NumField> {
         Hit::SetMaster(_) => Some(NumField::Master),
         Hit::SetInputGain(_) => Some(NumField::Input),
         Hit::SetTrackGain(_) => Some(NumField::Track),
+        // **The one that opens a field IS a field.** Everything else here
+        // reports which field it would be typed into if somebody asked; this
+        // one is the asking.
+        Hit::Type(f) => Some(f),
         // NOT `SetTempo`: that carries a committed value and has no box of
         // its own any more. `EditTempo` is the box.
         _ => None,
@@ -1759,14 +1880,13 @@ pub fn drag_axis(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<DragAx
 /// `None` for anything that does not travel.
 pub fn drag_travel(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<f32> {
     let l = Layout::new(rect, view);
-    let (r, k) = l
+    let (_, k) = l
         .targets()
         .into_iter()
         .find(|(r, k)| r.is_positive() && (*k).control().is_same_control(hit))?;
     match k {
         Produces::AlongV(_) => Some(KNOB_TRAVEL),
-        Produces::Along(_) => Some(r.width().max(1.0)),
-        Produces::SlotGain(_) => Some(r.width().max(1.0)),
+        Produces::Along(_) | Produces::SlotGain(_) => Some(FADER_TRAVEL),
         Produces::Fixed(_) => None,
     }
 }
@@ -1777,6 +1897,22 @@ pub fn drag_travel(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<f32>
 /// mapping that to the whole range is a control nobody can land on a number
 /// with. The hand can leave the knob, leave the band, and go on turning.
 pub const KNOB_TRAVEL: f32 = 260.0;
+
+/// How far the pointer must move to sweep a FADER end to end, in points.
+///
+/// **Wider than the fader, and by more than a knob is.** A fader used to
+/// travel its own track — one-to-one, which feels direct and is the reason
+/// half its numbers could not be reached: seventy-two decibels across two
+/// hundred points is a third of a decibel per point, and it reads to a tenth.
+/// Any value a control can DISPLAY has to be reachable with the mouse alone,
+/// so the travel is the number that makes a tenth of a decibel one point.
+///
+/// A big move is still a big move: -60 to unity is most of a screen. What
+/// makes that acceptable is that neither of the two ways of getting there in a
+/// hurry goes through the drag — a double click resets it, and the dB at the
+/// end of the row can be typed into.
+pub const FADER_TRAVEL: f32 =
+    (crate::recorder::GAIN_MAX_DB - crate::recorder::GAIN_MIN_DB) * 10.0;
 
 /// How much finer a drag is with the fine modifier held.
 ///
@@ -1859,6 +1995,16 @@ pub fn knob_rect(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<Rect> 
 /// The microphone icon, for the right-click that opens the audio picker.
 pub fn input_icon(rect: Rect, view: &RecorderView<'_>) -> Option<Rect> {
     let r = Layout::new(rect, view).input_icon;
+    r.is_positive().then_some(r)
+}
+
+/// The camera preview, for the right-click that opens the camera picker.
+///
+/// The device belongs to the picture it fills. It was a row in the take
+/// settings, next to where the file goes and how long the count-in is, which
+/// is a list of things about a TAKE — a camera is not one of them.
+pub fn preview_rect(rect: Rect, view: &RecorderView<'_>) -> Option<Rect> {
+    let r = Layout::new(rect, view).preview;
     r.is_positive().then_some(r)
 }
 
@@ -3230,28 +3376,6 @@ fn draw_readout(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
 
 // ── the destination ────────────────────────────────────────────────────────
 
-/// The suffix on a device that is named but absent.
-///
-/// `Missing` is neither `None` nor `Open` and must not read as either: it means
-/// the user already chose this thing and it is not here right now, which is a
-/// thing to go and fix rather than a thing to go and set up. The wording is per
-/// device because a camera is unplugged and a plugin fails to load, and telling
-/// a user their instrument is "not connected" sends them looking for a cable —
-/// which is why the slot rows spell out "did not load" themselves.
-fn device_note(d: DeviceLabel<'_>, missing: &'static str) -> &'static str {
-    match d {
-        DeviceLabel::Missing(_) => missing,
-        DeviceLabel::None | DeviceLabel::Open(_) => "",
-    }
-}
-
-fn device_ink(d: DeviceLabel<'_>, p: &Palette) -> Color32 {
-    match d {
-        DeviceLabel::None => p.faint,
-        DeviceLabel::Open(_) => p.ink,
-        DeviceLabel::Missing(_) => p.warn,
-    }
-}
 
 /// What a take will actually produce, in four words.
 ///
@@ -3640,10 +3764,22 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
                 painter.text(
                     Pos2::new(at_x, y),
                     align,
-                    if db == 0.0 {
-                        "0".to_owned()
-                    } else {
-                        format!("{db:.0}")
+                    {
+                        let n = if db == 0.0 {
+                            "0".to_owned()
+                        } else {
+                            format!("{db:.0}")
+                        };
+                        // **Padded to three on the right-hand scale.** These
+                        // are left-aligned over there, so "0" and "-6" start
+                        // where "-60" starts and their digits sit a character
+                        // or two left of the column the rest form. The font is
+                        // monospaced, so leading spaces are exactly the fix.
+                        if side == 0 {
+                            n
+                        } else {
+                            format!("{n:>3}")
+                        }
                     },
                     font(size),
                     p.faint,
@@ -3704,7 +3840,12 @@ const FADER_COL: f32 = 0.46;
 /// width-limited before, so a shorter column costs it less than the number
 /// suggests — and the band is taller now than it was, which pays for most of
 /// it. See `BAND_H_AT_1300`.
-const METER_SHARE: f32 = 0.46;
+/// **0.40, down from 0.46, which is where the dials got their size from.**
+/// The VU pair is a picture of a level and reads at any height; a dial below a
+/// certain diameter is three grey rings, and there are eight of them. The
+/// meters gave up eight percent of the column and every knob on the panel is a
+/// sixth bigger for it.
+const METER_SHARE: f32 = 0.40;
 
 /// Where the transport's right column stops and the master column starts.
 const MASTER_COL: f32 = 0.78;
@@ -4428,6 +4569,77 @@ mod tests {
         assert_eq!(hit_test(r, &warned, l.clip.center()), Some(Hit::DismissClip));
     }
 
+    /// **Every number in the band can be typed into by pressing the number.**
+    ///
+    /// The word over a knob and the dB at the end of a fader are where the
+    /// value is WRITTEN, so pressing them to change it is the one mapping
+    /// nobody has to be told. This is the half `every_control_is_reachable_in_the_idle_layout`
+    /// skips, because below a readable band height neither is drawn at all.
+    #[test]
+    fn every_number_can_be_typed_into_where_it_is_written() {
+        for w in [900.0_f32, 1100.0, 1300.0, 1800.0] {
+            let r = band(w);
+            // **Slots with instruments in them.** An empty slot is one big
+            // "click to load" target with no level and no number in it, so a
+            // rack of empty rows would pass this test by having nothing to
+            // find.
+            let v = with_rack(RecordState::Idle, racks()[1]);
+            let l = Layout::new(r, &v);
+            let mut found = Vec::new();
+            for (rect, k) in l.targets() {
+                if let (true, Hit::Type(f)) = (rect.is_positive(), k.control()) {
+                    // Pressing it reports itself and not the control under it.
+                    assert_eq!(
+                        hit_test(r, &v, rect.center()),
+                        Some(Hit::Type(f)),
+                        "{f:?}'s number is not pressable at {w}"
+                    );
+                    found.push(f);
+                }
+            }
+            // All eight dials and all eight levels, every one of them.
+            for fx in Fx::ALL {
+                assert!(found.contains(&NumField::Fx(fx)), "{} at {w}", fx.title());
+            }
+            for f in [
+                NumField::Tempo,
+                NumField::Master,
+                NumField::Metronome,
+                NumField::Input,
+                NumField::Track,
+                NumField::Slot(0),
+                NumField::Slot(4),
+            ] {
+                assert!(found.contains(&f), "{f:?} has no number to press at {w}");
+            }
+        }
+    }
+
+    /// **A fader is geared so every decibel it can show can be reached.**
+    ///
+    /// The rule the whole travel constant exists for: seventy-two decibels
+    /// read to a tenth is seven hundred and twenty distinguishable values, and
+    /// a drag that cannot land on all of them is a control with numbers in it
+    /// that are for looking at.
+    #[test]
+    fn a_fader_can_reach_every_tenth_of_a_decibel() {
+        use crate::recorder::{GAIN_MAX_DB, GAIN_MIN_DB};
+        // (what it is, how many values it can show, how far it travels)
+        for (what, steps, travel) in [
+            // Seventy-two decibels read to a tenth.
+            ("a fader", (GAIN_MAX_DB - GAIN_MIN_DB) * 10.0, FADER_TRAVEL),
+            // A hundred whole percents.
+            ("a knob", 100.0, KNOB_TRAVEL),
+        ] {
+            assert!(
+                steps <= travel,
+                "{what} shows {steps} values over {travel} points of travel, \
+                 so {:.0} of them cannot be landed on",
+                steps - travel
+            );
+        }
+    }
+
     /// **Every knob resets to the position where it is doing nothing** —
     /// except the two that are not effects, which have a resting value of
     /// their own.
@@ -4458,11 +4670,35 @@ mod tests {
             20.0 * fader_to_gain(back).log10()
         );
 
-        // Only knobs. A fader's tap still opens its box, so a double click on
-        // one must not silently mean something else.
-        assert_eq!(Hit::SetInputGain(0.3).reset_to(), None);
-        assert_eq!(Hit::SetSlotGain(1, 0.3).reset_to(), None);
+        // **And the faders, which reset to what they SHIP as and not to
+        // silence.** "Nothing applied" for a level would be off, and a reset
+        // that mutes what you were listening to is one nobody uses twice.
+        let d = Gains::default();
+        for (hit, want) in [
+            (Hit::SetInputGain(0.3), d.input),
+            (Hit::SetSlotGain(1, 0.3), d.slots[1]),
+            (Hit::SetTrackGain(0.3), d.track),
+            (Hit::SetMetronomeGain(0.9), d.metronome),
+        ] {
+            let back = hit.reset_to().expect("a level with no resting value");
+            let Some(v) = (match back {
+                Hit::SetInputGain(v)
+                | Hit::SetSlotGain(_, v)
+                | Hit::SetTrackGain(v)
+                | Hit::SetMetronomeGain(v) => Some(v),
+                _ => None,
+            }) else {
+                panic!("{hit:?} reset to {back:?}")
+            };
+            assert!(
+                (fader_to_gain(v) - want).abs() < 1.0e-3,
+                "{hit:?} reset to {} and ships at {want}",
+                fader_to_gain(v)
+            );
+        }
+        // A button has nothing to put back.
         assert_eq!(Hit::Record.reset_to(), None);
+        assert_eq!(Hit::Type(NumField::Tempo).reset_to(), None);
     }
 
     /// The eight knobs are exactly the controls with the knob gesture set.
@@ -4805,7 +5041,12 @@ mod tests {
     fn a_knob_reads_zero_at_the_bottom_and_one_at_the_top() {
         let r = band(1300.0);
         let v = idle();
-        let cell = Layout::new(r, &v).fx[Fx::Reverb.index()];
+        // The dial, not the whole cell: the word above it is the type field.
+        let cell = {
+            let c = Layout::new(r, &v).fx[Fx::Reverb.index()];
+            let label = knob_face(c).map_or(0.0, |f| f.label_h);
+            Rect::from_min_max(Pos2::new(c.left(), c.top() + label), c.max)
+        };
         assert!(cell.is_positive(), "the knob has no rectangle to drag in");
         let at = |y: f32| hit_test(r, &v, Pos2::new(cell.center().x, y));
         // Half a point in from the bottom edge, which is the last point inside
@@ -4901,7 +5142,7 @@ mod tests {
     /// The two effect knobs are in it for the same reason the faders are: they
     /// are a mix, they cost the audio thread nothing to move, and riding the
     /// reverb through a take is a thing a person does on purpose.
-    const SURVIVORS: [Hit; 22] = [
+    const SURVIVORS: [Hit; 37] = [
         Hit::Stop,
         Hit::SetSlotGain(0, 0.0),
         Hit::SetSlotGain(1, 0.0),
@@ -4920,6 +5161,25 @@ mod tests {
         Hit::SetMaster(0.0),
         // The backing track's level, but not its import button: see `targets`.
         Hit::SetTrackGain(0.0),
+        // **And every number that belongs to something that survives.** A
+        // level you can drag mid-take is a level you can type mid-take; the
+        // tempo is not here because its knob becomes the clock when a take
+        // starts, so there is no word left to press.
+        Hit::Type(NumField::Metronome),
+        Hit::Type(NumField::Input),
+        Hit::Type(NumField::Track),
+        Hit::Type(NumField::Master),
+        Hit::Type(NumField::Slot(0)),
+        Hit::Type(NumField::Slot(1)),
+        Hit::Type(NumField::Slot(2)),
+        Hit::Type(NumField::Slot(3)),
+        Hit::Type(NumField::Slot(4)),
+        Hit::Type(NumField::Fx(Fx::Reverb)),
+        Hit::Type(NumField::Fx(Fx::Delay)),
+        Hit::Type(NumField::Fx(Fx::Chorus)),
+        Hit::Type(NumField::Fx(Fx::Hpf)),
+        Hit::Type(NumField::Fx(Fx::Lpf)),
+        Hit::Type(NumField::Fx(Fx::Limiter)),
         Hit::SetFx(Fx::Reverb, 0.0),
         Hit::SetFx(Fx::Delay, 0.0),
         Hit::SetFx(Fx::Chorus, 0.0),
@@ -5322,8 +5582,6 @@ mod tests {
                         ("name field", l.name),
                         ("folder preview", l.folder),
                         ("disk", l.disk),
-                        ("camera", l.camera),
-                        ("audio", l.audio),
                         ("count-in", l.count_in),
                         ("tempo", l.tempo),
                         ("export", l.export),
@@ -5398,6 +5656,18 @@ mod tests {
                 // screen, which the idle fixture is not — see
                 // `the_clip_warning_can_be_dismissed_only_while_it_is_showing`,
                 // which is where that half is proved.
+                // A `Type` target is the WORD over a knob or the number
+                // beside a fader, and below a certain band height neither is
+                // drawn — see `knob_face`. Covered at a readable size by
+                // `every_number_can_be_typed_into_where_it_is_written`.
+                // A `Type` target is the WORD over a knob or the number
+                // beside a fader, and below a certain band height neither is
+                // drawn — see `knob_face`. It has a rectangle at readable
+                // sizes, so it belongs in neither branch here; it is covered
+                // by `every_number_can_be_typed_into_where_it_is_written`.
+                if matches!(want, Hit::Type(_)) {
+                    continue;
+                }
                 if IN_THE_MENU.iter().any(|m| m.is_same_control(want))
                     || want == Hit::ToggleMetronomeInTake
                     || want == Hit::DismissClip
@@ -6141,15 +6411,31 @@ mod tests {
             .into_iter()
             .filter(|h| num_field(*h).is_some() && !h.is_draggable())
             .collect();
-        // The one that is typed and never dragged: a time signature has no
-        // continuum between 4/4 and 7/8 to sweep along.
-        assert_eq!(typed_only, vec![Hit::EditTimeSignature]);
+        // What is typed and never dragged: a time signature, which has no
+        // continuum between 4/4 and 7/8 to sweep along, and the `Type` targets
+        // themselves — the number at the end of a fader and the word over a
+        // knob, which exist to be typed into and nothing else.
+        assert!(
+            typed_only
+                .iter()
+                .all(|h| matches!(h, Hit::EditTimeSignature | Hit::Type(_))),
+            "{typed_only:?}"
+        );
+        assert!(typed_only.contains(&Hit::EditTimeSignature));
     }
 
     /// The four fields are four fields, not one used four times.
+    ///
+    /// **`Type` is excluded, and deliberately.** A `Type` hit names the same
+    /// field as the control it sits on — that is the whole point of it, and
+    /// counting both would make every field look shared with itself.
     #[test]
     fn each_control_owns_its_own_field() {
-        let fields: Vec<_> = Hit::ALL.into_iter().filter_map(num_field).collect();
+        let fields: Vec<_> = Hit::ALL
+            .into_iter()
+            .filter(|h| !matches!(h, Hit::Type(_)))
+            .filter_map(num_field)
+            .collect();
         let mut seen = fields.clone();
         seen.sort_by_key(|f| format!("{f:?}"));
         seen.dedup();
@@ -6169,28 +6455,6 @@ mod tests {
         assert_eq!(tempo_text(120.0), "120");
         assert_eq!(tempo_text(92.5), "92.5");
         assert_eq!(tempo_text(60.0), "60");
-    }
-
-    /// A chosen device that is not plugged in is neither "None" nor working,
-    /// and it must not read as either: one is a thing to set up and the other
-    /// is a thing to go and fix. An instrument that would not load is a third
-    /// thing again, and "not connected" would send the user looking for a
-    /// cable.
-    #[test]
-    fn a_missing_device_reads_differently_from_an_open_one() {
-        assert_eq!(device_note(DeviceLabel::Open("FaceTime HD"), "  (gone)"), "");
-        assert_eq!(device_note(DeviceLabel::None, "  (gone)"), "");
-        assert!(device_note(DeviceLabel::Missing("Scarlett"), "  (not connected)")
-            .contains("not connected"));
-        assert!(device_note(DeviceLabel::Missing("Pianoteq"), "  (did not load)")
-            .contains("did not load"));
-        let s = Settings::default();
-        let p = palette(&s);
-        assert_eq!(device_ink(DeviceLabel::Missing("x"), &p), p.warn);
-        assert_eq!(device_ink(DeviceLabel::Open("x"), &p), p.ink);
-        assert_eq!(device_ink(DeviceLabel::None, &p), p.faint);
-        assert_ne!(p.warn, p.ink, "a missing device is drawn in the same ink");
-        assert_ne!(p.warn, p.faint);
     }
 
     #[test]
@@ -6421,7 +6685,12 @@ const SETUP_W: (f32, f32, f32) = (0.24, 290.0, 430.0);
 /// Its height over its width.
 const SETUP_ASPECT: f32 = 0.72;
 /// Rows of controls under the title.
-const SETUP_ROWS: usize = 8;
+/// **Six, down from eight.** The camera and the audio input left this panel:
+/// a device belongs to the control it feeds, so the microphone's own icon
+/// opens the audio picker and the camera preview opens the camera's — see
+/// `input_icon` and `preview_rect`. What was left was a settings panel two
+/// rows of which were about hardware and six about the take.
+const SETUP_ROWS: usize = 6;
 
 /// Every rectangle in the popup.
 struct SetupLayout {
@@ -6437,9 +6706,6 @@ struct SetupLayout {
     default_tick: Rect,
     folder: Rect,
     disk: Rect,
-    camera: Rect,
-    audio: Rect,
-    audio_status: Rect,
     count_in: Rect,
     time_sig: Rect,
     export: Rect,
@@ -6460,9 +6726,6 @@ impl SetupLayout {
         default_tick: Rect::NOTHING,
         folder: Rect::NOTHING,
         disk: Rect::NOTHING,
-        camera: Rect::NOTHING,
-        audio: Rect::NOTHING,
-        audio_status: Rect::NOTHING,
         count_in: Rect::NOTHING,
         time_sig: Rect::NOTHING,
         export: Rect::NOTHING,
@@ -6531,10 +6794,9 @@ impl SetupLayout {
             let r = row(2);
             Rect::from_center_size(r.center(), Vec2::new(r.width(), r.height() * 0.60))
         };
+        let r3 = row(3);
         let r4 = row(4);
         let r5 = row(5);
-        let r6 = row(6);
-        let r7 = row(7);
         Self {
             panel,
             title,
@@ -6553,34 +6815,28 @@ impl SetupLayout {
             // biggest thing in the panel.
             folder: slice_h(note, 0.00, 0.60),
             disk: slice_h(note, 0.62, 1.00),
-            camera: row(3),
-            audio: slice_h(r4, 0.00, 0.74),
-            audio_status: slice_h(r4, 0.77, 1.00),
             // How long a bar is, how many of them you get, and what comes out
             // at the end. The three that describe the take itself.
-            count_in: slice_h(r5, 0.00, 0.30),
-            time_sig: slice_h(r5, 0.33, 0.55),
-            export: slice_h(r5, 0.58, 1.00),
+            count_in: slice_h(r3, 0.00, 0.30),
+            time_sig: slice_h(r3, 0.33, 0.55),
+            export: slice_h(r3, 0.58, 1.00),
             // The four questions with yes-or-no answers, in two rows of two, so
             // a tick is never the only thing on a line.
-            open_when_done: slice_h(r6, 0.00, 0.49),
-            click_in_take: slice_h(r6, 0.51, 1.00),
-            count_in_in_take: slice_h(r7, 0.00, 0.49),
-            hide_elapsed: slice_h(r7, 0.51, 1.00),
+            open_when_done: slice_h(r4, 0.00, 0.49),
+            click_in_take: slice_h(r4, 0.51, 1.00),
+            count_in_in_take: slice_h(r5, 0.00, 0.49),
+            hide_elapsed: slice_h(r5, 0.51, 1.00),
         }
     }
 
     /// Every clickable region and what it means. The popup's [`Layout::targets`].
-    fn targets(&self) -> [(Rect, Hit); 13] {
+    fn targets(&self) -> [(Rect, Hit); 10] {
         [
             (self.name, Hit::NameField),
             (self.close, Hit::CloseSetup),
             (self.dest, Hit::ChooseFolder),
             (self.reveal, Hit::RevealFolder),
             (self.default_tick, Hit::ToggleDefaultDir),
-            (self.camera, Hit::PickCamera),
-            (self.audio, Hit::PickAudio),
-            (self.audio_status, Hit::ShowAudioStatus),
             (self.count_in, Hit::CycleCountIn),
             (self.time_sig, Hit::EditTimeSignature),
             (self.export, Hit::Export),
@@ -7255,15 +7511,6 @@ pub fn draw_setup(
         None => "measuring free space".to_owned(),
     };
     text_line(painter, l.disk, &disk, p.faint, true);
-
-    for (r, cap, dev) in [
-        (l.camera, "CAMERA", view.camera),
-        (l.audio, "AUDIO", view.audio),
-    ] {
-        let value = format!("{}{}", dev.text(), device_note(dev, "  (not connected)"));
-        labelled(painter, r, cap, &value, device_ink(dev, &p), &p);
-    }
-    draw_word_button(painter, l.audio_status, &["STATUS"], &p);
 
     labelled(
         painter,
