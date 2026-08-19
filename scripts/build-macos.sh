@@ -159,7 +159,12 @@ esac
 
 # ── Bundle ───────────────────────────────────────────────────────────────────
 echo "==> Assembling $APP"
-rm -rf "$APP" "$ZIP" "$DMG"
+# **The BUNDLE only.** The zip and the dmg are removed just before the new
+# ones are written, not here: everything between this line and there can fail —
+# a compile error, a signing failure, the notarization gate below — and a
+# failed build that has already destroyed the last good artifacts leaves
+# nothing to ship and nothing to compare against.
+rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$BIN" "$APP/Contents/MacOS/tangent"
@@ -320,14 +325,56 @@ if [ "$SIGNED_RELEASE" = 1 ] \
     # The only check that reflects what a downloader actually experiences.
     spctl --assess --type execute --verbose=2 "$APP" || true
   else
-    echo "warn: NOTARIZATION FAILED — this artifact will trip Gatekeeper."
+    echo "warn: NOTARIZATION FAILED — packaging will be refused below."
     echo "      Inspect with: xcrun notarytool log <submission-id> \\"
     echo "                      --keychain-profile $NOTARY_PROFILE"
   fi
   rm -rf "$NOTARY_DIR"
 elif [ "$SIGNED_RELEASE" = 1 ]; then
   echo "warn: signed but NOT notarized — no '$NOTARY_PROFILE' keychain profile."
-  echo "      Gatekeeper will still prompt. See the store-credentials line above."
+  echo "      Packaging will be refused below. See the store-credentials line above."
+fi
+
+# ── The gate ─────────────────────────────────────────────────────────────────
+# **Refuse to PACKAGE a release that is not notarized.**
+#
+# This block used to warn and carry on, three different ways: no keychain
+# profile, a failed submission, or a submission that came back rejected. Each
+# printed a line and then built a .zip and a .dmg anyway — artifacts that look
+# exactly like the real thing, are named exactly like the real thing, and are
+# refused by Gatekeeper on every machine that is not this one. 4.17.0 shipped
+# that way and it was caught by reading the log, which is not a mechanism.
+#
+# The check is `stapler validate` on the bundle rather than the exit status of
+# whatever ran above it: the question is not "did the step we took succeed", it
+# is "is there a ticket on this app". That answer stays right when the steps
+# change, and it catches the paths nobody thought of.
+#
+# An ad-hoc build (`SIGNED_RELEASE=0`) is exempt: it is for running here, it
+# was never going to be notarized, and it says so already.
+#
+# The escape hatch is deliberate and loud. `dist/Tangent.app` is already built
+# and installable at this point, so the local workflow survives an abort — what
+# is refused is the distributables.
+if [ "$SIGNED_RELEASE" = 1 ] && ! xcrun stapler validate "$APP" >/dev/null 2>&1; then
+  if [ "${IVORY_ALLOW_UNNOTARIZED:-0}" = 1 ]; then
+    echo "warn: PACKAGING AN UN-NOTARIZED RELEASE — IVORY_ALLOW_UNNOTARIZED=1."
+    echo "      These artifacts will be refused on every Mac but this one."
+  else
+    echo "" >&2
+    echo "!! REFUSING TO PACKAGE: the app is signed but carries no notarization" >&2
+    echo "   ticket, so the .zip and .dmg would be refused on every Mac but" >&2
+    echo "   this one. dist/Tangent.app is built and can still be installed." >&2
+    echo "" >&2
+    echo "   Most likely the notary credentials are missing or expired:" >&2
+    echo "     xcrun notarytool history --keychain-profile $NOTARY_PROFILE" >&2
+    echo "   Re-create them with (app-specific password, NOT the Apple ID one):" >&2
+    echo "     xcrun notarytool store-credentials $NOTARY_PROFILE \\" >&2
+    echo "       --apple-id <id> --team-id <team>" >&2
+    echo "" >&2
+    echo "   To package anyway: IVORY_ALLOW_UNNOTARIZED=1 $0" >&2
+    exit 1
+  fi
 fi
 
 # Bump bundle mtime so Icon Services notices a fresh app and reloads the icon.
@@ -338,6 +385,8 @@ touch "$APP" "$APP/Contents/Info.plist"
 # single source, so packaging "$APP" directly (as this did before 2.1.0) left
 # READ-ME-FIRST.md sitting on the build machine while the comment claimed the
 # hand-off explained itself. Windows testers got it; macOS testers did not.
+# The previous artifacts, now that there is something to replace them with.
+rm -rf "$ZIP" "$DMG"
 STAGE="dist/Tangent-${VERSION}-macos-${ARCH_NAME}"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"

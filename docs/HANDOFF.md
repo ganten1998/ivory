@@ -1436,6 +1436,14 @@ rely on Ubuntu Light. Do not disable `default_fonts`.
   bash suppresses errexit for the entire left operand of `||`, function body
   included. `scripts/build-cross.sh` shipped empty Linux tarballs for a week
   because of it. Check each step explicitly in any such function.
+- **A release script that warns and carries on has not warned anybody.**
+  `build-macos.sh` printed "signed but NOT notarized" and then built the .zip
+  and the .dmg regardless — artifacts named exactly like the real thing and
+  refused by Gatekeeper everywhere but the build machine. 4.17.0 shipped that
+  way and was caught by reading the log. It refuses to package now, gated on
+  `stapler validate` of the bundle — the OUTCOME, not the exit status of
+  whichever step was taken, so it stays right when the steps change.
+  `IVORY_ALLOW_UNNOTARIZED=1` overrides it, loudly.
 - **Do NOT give the Linux audio thread realtime priority.** It is the textbook
   fix, `LINUX-4.11-FINDINGS.md` finding 1(c) asked for it, and it is wrong
   here: measured on a 2012 MacBook Air through pipewire-alsa, promoting
