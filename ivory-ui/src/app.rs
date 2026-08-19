@@ -348,6 +348,15 @@ pub struct IvoryApp {
     /// The note under a mouse button that is still down, with keytoggle off.
     /// One at a time: a press replaces whatever the last one was.
     clicked: std::collections::BTreeSet<u8>,
+    /// Set on the frame Space goes down: sound everything afresh.
+    ///
+    /// **Space is a STRIKE, not a request for the note to exist.** Without
+    /// this, pressing it with a chord already latched changes nothing — the
+    /// notes are wanted, they are sounding, and the diff is empty — so the key
+    /// appears to have stopped working. What a pianist wants from it is the
+    /// chord again, from the top, which on a decaying instrument is the whole
+    /// point of pressing it twice.
+    restrike: bool,
     /// Whether the audition key was down last frame, so a hold is one note-on
     /// rather than one per frame. Key auto-repeat retriggered the chord dozens
     /// of times a second before this.
@@ -625,6 +634,7 @@ impl IvoryApp {
             fx_defaults: crate::ports::EffectDefaults::default(),
             sounding: std::collections::BTreeSet::new(),
             clicked: std::collections::BTreeSet::new(),
+            restrike: false,
             audition_held: false,
             audio_status: recorder::AudioStatus::default(),
             fullscreen_sent: None,
@@ -1830,6 +1840,9 @@ impl IvoryApp {
             return;
         }
         self.audition_held = down;
+        // The DOWN edge only. Holding the key is one strike, not sixty a
+        // second — that is what `audition_held` being an edge is for.
+        self.restrike |= down;
     }
 
     /// Every note a GESTURE of this app's own is asking to sound, right now.
@@ -1873,11 +1886,25 @@ impl IvoryApp {
     /// [`wanted_sound`]: IvoryApp::wanted_sound
     fn reconcile_sound(&mut self) {
         let want = self.wanted_sound();
-        if want == self.sounding {
-            return;
-        }
-        let off: Vec<u8> = self.sounding.difference(&want).copied().collect();
-        let on: Vec<u8> = want.difference(&self.sounding).copied().collect();
+        // **A strike starts from nothing.** Diffing against an empty set makes
+        // every wanted note a note-on, including the ones already sounding, so
+        // a latched chord is struck again rather than left alone.
+        let held = if std::mem::take(&mut self.restrike) {
+            std::collections::BTreeSet::new()
+        } else {
+            if want == self.sounding {
+                return;
+            }
+            std::mem::take(&mut self.sounding)
+        };
+        let off: Vec<u8> = if held.is_empty() {
+            // Everything, because everything is about to be re-struck. Not
+            // `held`, which is empty by construction on a strike.
+            self.sounding.iter().copied().collect()
+        } else {
+            held.difference(&want).copied().collect()
+        };
+        let on: Vec<u8> = want.difference(&held).copied().collect();
         self.sounding = want;
         // **Off before on.** Releasing a pitch and re-taking it in the same
         // frame has to arrive in that order, or the instrument ends up holding
@@ -5825,17 +5852,51 @@ mod tests {
         );
     }
 
-    /// **The overlap is sent once.** A latched note that Space also wants must
-    /// not get a second note-on, and letting go of Space must not stop it —
-    /// that is the bug one set exists to make impossible.
+    /// **Space is a STRIKE**, so it strikes what is already sounding too.
+    ///
+    /// The regression this exists for: once keytoggle started sounding what it
+    /// latched, pressing Space with a chord up changed nothing — the notes were
+    /// wanted, they were sounding, the diff was empty — and the key looked
+    /// broken. On a decaying instrument, hearing the chord again from the top
+    /// is the entire reason to press it twice.
+    ///
+    /// **`headless_with_band`, not `headless`.** The Welcome card is a dialog,
+    /// and `audition_tick` ignores Space while one is up — so this test on a
+    /// plain app asserted nothing at all and passed for it.
     #[test]
-    fn space_does_not_retrigger_what_is_already_latched() {
-        let (ctx, mut app) = headless(Caps::DESKTOP);
+    fn space_restrikes_a_chord_that_is_already_latched() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.settings.keytoggle_enabled = true;
         app.manual_notes.insert(60);
-        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(
+            run_frame(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Audition {
+                notes: vec![60],
+                on: true
+            }),
+            "the latch did not sound it"
+        );
 
-        assert!(space(&ctx, &mut app).is_none(), "60 was sounded twice");
+        // Off then on, in that order: a fresh attack on a note that never
+        // stopped is a note the instrument is now holding twice.
+        assert_eq!(
+            space(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Audition {
+                notes: vec![60],
+                on: false
+            }),
+            "Space did not release before it re-struck"
+        );
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::Audition {
+                notes: vec![60],
+                on: true
+            }),
+            "Space released the chord and never struck it"
+        );
+
+        // Letting go does NOT stop it: Space was never what was holding it.
         assert!(key_up(&ctx, &mut app).is_none(), "Space stopped the latch");
         // And it really is still held: unlatching it is what stops it.
         app.manual_notes.clear();
@@ -5843,6 +5904,26 @@ mod tests {
             run_frame(&ctx, &mut app),
             Some(recorder::RecorderRequest::Audition { on: false, .. })
         ));
+    }
+
+    /// Holding Space is ONE strike. Key auto-repeat fires many times a second,
+    /// and a chord re-attacked at the repeat rate is a machine gun.
+    #[test]
+    fn holding_space_strikes_once() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = true;
+        app.manual_notes.insert(64);
+        let _ = run_frame(&ctx, &mut app);
+        let _ = space(&ctx, &mut app);
+        // Drain the strike's second half.
+        let _ = app.take_recorder_request();
+        // Now hold it, with no new key events at all.
+        for _ in 0..5 {
+            assert!(
+                run_frame(&ctx, &mut app).is_none(),
+                "holding Space struck the chord again"
+            );
+        }
     }
 
     /// A transposed note sounds and lights at the transposed pitch, once.
@@ -7697,5 +7778,6 @@ mod geometry_tests {
         assert!(wm_overrode_size(Vec2::new(700.0, 150.0), asked));
     }
 }
+
 
 

@@ -104,7 +104,7 @@ use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec
 /// meters and six slot rows, and none of those wanted the height the old
 /// destination column did. The band was reaching a third of the way down the
 /// window for controls that no longer live in it.
-pub const BAND_H_AT_1300: f64 = 165.0;
+pub const BAND_H_AT_1300: f64 = 190.0;
 
 /// Height of the Recorder band for a window `w` points wide.
 ///
@@ -792,7 +792,7 @@ impl Layout {
         // band's height it was a postage stamp in a 1080p file. It takes every
         // point the band is tall and as much width as 16:9 asks for, capped so
         // it can never crowd out the transport it sits beside.
-        (body.height() * PREVIEW_ASPECT).min(body.width() * 0.17)
+        (body.height() * PREVIEW_ASPECT).min(body.width() * 0.21)
     }
 
     /// The column of words beside the preview: name, folder, tempo, Setup.
@@ -813,36 +813,11 @@ impl Layout {
         // in it: two rows in the middle of a tall column rather than two rows
         // pinned to the bottom of the band, which is what made the bottom of
         // the window read as empty.
-        // **The width comes out of the faders, not the meters.** The meters are
-        // sized by their own height against a fixed aspect and then capped by
-        // the width they are given, so a narrower meter column is a smaller
-        // FACE — and the faces are the thing this band was rebuilt around.
-        //
-        // 0.34 rather than the 0.43 the faders had to themselves: measured
-        // against `a_gain_reading_fits_the_box_reserved_for_it_at_the_smallest_
-        // band`, which is where the dB reading stops fitting. At 0.31 it does
-        // not, at the narrowest band this app will draw.
-        let col = slice_h(m, 0.00, 0.34);
-        let knobs = slice_h(m, 0.36, 0.46);
-        // Stacked, because the column that was available is tall and narrow.
-        // The gaps are inside the cells: each is a knob with a word over it,
-        // and `draw_knob` centres the pair in what it is handed.
-        let cells = [
-            slice_v(knobs, 0.02, 0.32),
-            slice_v(knobs, 0.35, 0.65),
-            slice_v(knobs, 0.68, 0.98),
-        ];
-        // **A control nobody can see is not a control.** `draw_knob` refuses a
-        // cell too small to be a knob rather than drawing a smudge, so the
-        // layout has to refuse it too — otherwise the band keeps a live drag
-        // target over blank panel. One predicate, asked by both.
-        //
-        // All three or none: two knobs where there should be three is worse
-        // than none, because the missing one is the one somebody goes looking
-        // for.
-        if cells.iter().copied().all(knob_fits) {
-            [self.reverb, self.delay, self.chorus] = cells;
-        }
+        // **The knobs left this column**, and the faders got the width back —
+        // see `fill_transport`, where the three of them are now a row under
+        // the meters. What they were was a stack ten points wide, which is a
+        // knob you cannot read and cannot land on.
+        let col = slice_h(m, 0.00, FADER_COL);
         // Tall rows in a narrow column. Moving the pair off the meters bought
         // width to give away and none to spare, so the legibility comes back
         // out of the HEIGHT: the two rows take nearly the whole column, which
@@ -858,14 +833,38 @@ impl Layout {
         if !t.is_positive() {
             return;
         }
-        // **Two columns now, not three.** The record button, the stop and the
-        // clock moved to the foot of the words column, where three small icons
-        // say what two large ones and a word said — and the fifth of the group
-        // they were using is what the faders and the meters grew into. Both
-        // take the group's full height, which is where the meters get to be
-        // meters: their faces are sized by height, so a row that was a third
-        // of the group made them postage stamps however wide the box was.
-        self.meter = slice_h(t, 0.46, 1.00);
+        // **Two columns, and the right one is stacked.** The record button,
+        // the stop and the clock live at the foot of the words column; the
+        // faders have the left of this group; and the right of it is the
+        // meters with the three effect knobs in a row underneath.
+        //
+        // The knobs were a stack in a column ten points wide, squeezed between
+        // the faders and the meters, and at that size the word over each one
+        // did not fit and the dial itself was a smudge. Across the bottom of
+        // the meter column each of them is a third of three hundred points
+        // instead — the same three controls, three times the diameter.
+        let right = slice_h(t, FADER_COL + 0.04, 1.00);
+        self.meter = slice_v(right, 0.0, METER_SHARE);
+        let knobs = slice_v(right, METER_SHARE + 0.03, 1.0);
+        // Side by side, one third each, with the gap inside the cell: the
+        // label is centred over the dial and `draw_knob` centres the pair in
+        // whatever it is handed.
+        let cells = [
+            slice_h(knobs, 0.00, 0.32),
+            slice_h(knobs, 0.34, 0.66),
+            slice_h(knobs, 0.68, 1.00),
+        ];
+        // **A control nobody can see is not a control.** `draw_knob` refuses a
+        // cell too small to be a knob rather than drawing a smudge, so the
+        // layout has to refuse it too — otherwise the band keeps a live drag
+        // target over blank panel. One predicate, asked by both.
+        //
+        // All three or none: two knobs where there should be three is worse
+        // than none, because the missing one is the one somebody goes looking
+        // for.
+        if cells.iter().copied().all(knob_fits) {
+            [self.reverb, self.delay, self.chorus] = cells;
+        }
     }
 
     /// The instrument slots, the two faders and the click.
@@ -3154,6 +3153,22 @@ const KNOB_TICKS: usize = 11;
 /// piece of hardware and not like the rest of the panel.
 const KNOB_CAP: Color32 = Color32::from_rgb(0x1c, 0x6f, 0xd6);
 
+/// The faders' share of the middle group's width.
+///
+/// The rest, less a gap, is the meters with the knob row under them. Named
+/// because three places have to agree about it and the failure when they do
+/// not is a knob drawn over a meter.
+const FADER_COL: f32 = 0.38;
+
+/// The meters' share of the height of the column they share with the knobs.
+///
+/// **The meters give up the smaller half of what the knobs gained.** A VU face
+/// is sized by whichever of its height and width runs out first and it was
+/// width-limited before, so a shorter column costs it less than the number
+/// suggests — and the band is taller now than it was, which pays for most of
+/// it. See `BAND_H_AT_1300`.
+const METER_SHARE: f32 = 0.63;
+
 /// The smallest knob face worth drawing, as a radius.
 ///
 /// Below this the body, the cap and the slot land inside a few points of each
@@ -3161,7 +3176,12 @@ const KNOB_CAP: Color32 = Color32::from_rgb(0x1c, 0x6f, 0xd6);
 const KNOB_MIN_R: f32 = 7.0;
 
 /// The label's share of a knob cell, and its bounds in points.
-const KNOB_LABEL: (f32, f32, f32) = (0.26, 6.0, 11.0);
+///
+/// The top end matters now that the knobs are a row rather than a stack: a
+/// cell three times as wide can carry a word three times the size, and a knob
+/// whose name is set in six points beside a thirty-point dial reads as a dial
+/// with a smudge over it.
+const KNOB_LABEL: (f32, f32, f32) = (0.24, 6.0, 15.0);
 
 /// What a knob gets out of its cell: where the face goes, how big it is, and
 /// how much was left for the word above it.
@@ -3258,13 +3278,24 @@ fn draw_knob(
         // A reading has to be drawn even when there is no label strip — it is
         // the whole point of the gesture — so it borrows the top of the face.
         let strip = label_h.max(KNOB_LABEL.1);
-        painter.text(
-            Pos2::new(cell.center().x, cell.top()),
-            Align2::CENTER_TOP,
-            &text,
-            FontId::new((strip * 0.86).max(5.0), fonts::courier_bold()),
-            ink,
+        // **Fitted to the cell, not just to the strip.** The row's cells are
+        // wide and short; sizing the word off the strip alone leaves it far
+        // smaller than the space it has, and "CHORUS" is six characters that
+        // have somewhere to go.
+        let band = Rect::from_min_max(
+            Pos2::new(cell.left(), cell.top()),
+            Pos2::new(cell.right(), cell.top() + strip),
         );
+        let size = fit_text(band, &text, strip * 0.96);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(cell.center().x, cell.top()),
+                Align2::CENTER_TOP,
+                &text,
+                font(size),
+                ink,
+            );
+        }
     }
     let c = Pos2::new(face.center().x, face.top() + rad);
     let t = value.clamp(0.0, 1.0);
@@ -3840,11 +3871,11 @@ mod tests {
     /// State and the presence of a frame are equally powerless over the height.
     #[test]
     fn the_band_height_is_a_function_of_width_and_nothing_else() {
-        assert_eq!(band_height(1300.0), 165.0);
-        assert_eq!(band_height(650.0), 82.0);
-        // Truncated, not rounded, like every other band: 165 * 1000/1300 is
-        // 126.9, and a half-pixel band puts every row on a fractional line.
-        assert_eq!(band_height(1000.0), 126.0);
+        assert_eq!(band_height(1300.0), 190.0);
+        assert_eq!(band_height(650.0), 95.0);
+        // Truncated, not rounded, like every other band: 190 * 1000/1300 is
+        // 146.1, and a half-pixel band puts every row on a fractional line.
+        assert_eq!(band_height(1000.0), 146.0);
         assert_eq!(band_height(0.0), 0.0);
 
         let pv = Preview {
