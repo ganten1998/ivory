@@ -754,7 +754,11 @@ impl DesktopApp {
         }
 
         if let Some(request) = self.app.take_directory_request() {
-            let mut dialog = rfd::FileDialog::new().set_title(&request.title);
+            // Parented, for the reason `take_cartridge_request` gives: an
+            // unparented panel can open behind the app on Windows.
+            let mut dialog = rfd::FileDialog::new()
+                .set_title(&request.title)
+                .set_parent(frame);
             if let Some(start) = request.start_at.filter(|p| p.exists()) {
                 dialog = dialog.set_directory(start);
             }
@@ -776,7 +780,7 @@ impl DesktopApp {
                 }
             }
         }
-        self.take_cartridge_request();
+        self.take_cartridge_request(frame);
         // Scanning reads directories, so it belongs out here with the other
         // things the UI is not allowed to do — and it runs AFTER the folder
         // picker above, so a folder added this frame is in the list this frame
@@ -1115,7 +1119,7 @@ impl DesktopApp {
     /// Out here with the folder picker and for the same reason: `rfd` runs a
     /// nested run loop, and raising one inside an egui frame re-enters the
     /// frame already on the stack.
-    fn take_cartridge_request(&mut self) {
+    fn take_cartridge_request(&mut self, frame: &eframe::Frame) {
         let Some(request) = self.app.take_file_request() else {
             return;
         };
@@ -1123,12 +1127,27 @@ impl DesktopApp {
             ivory_ui::ports::FilePurpose::Cartridge => {}
         }
         let mut dialog = rfd::FileDialog::new().set_title(&request.title);
+        // **Parented to the window that asked for it.**
+        //
+        // Without this the panel is a top-level window of its own, and on
+        // Windows it can open BEHIND the app — the button appears to do
+        // nothing, which is exactly what a tester reports as "I cannot load
+        // any file". macOS puts an unparented panel in front regardless, which
+        // is why this was invisible here.
+        dialog = dialog.set_parent(frame);
         if let Some(start) = request.start_at.filter(|p| p.exists()) {
             dialog = dialog.set_directory(start);
         }
         if !request.extensions.is_empty() {
             let exts: Vec<&str> = request.extensions.iter().map(String::as_str).collect();
             dialog = dialog.add_filter(&request.extension_label, &exts);
+            // **And everything else, as a second filter.**
+            //
+            // A filter DIMS non-matching files on macOS and HIDES them on
+            // Windows. Cartridges in the wild are named `.syx`, `.SYX`, `.dx7`,
+            // `.bin` and very often nothing at all — a folder that looks empty
+            // is a dialog somebody closes again, and they are right to.
+            dialog = dialog.add_filter("All files", &["*"]);
         }
         let Some(file) = dialog.pick_file() else { return };
         match crate::dx7::Cartridge::load(&file) {
