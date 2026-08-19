@@ -1252,6 +1252,23 @@ impl Effects {
         // filter stops rather than being switched out from under the signal.
         let hpf_on = want.hpf > OFF || self.mix.hpf > OFF;
         let lpf_on = want.lpf > OFF || self.mix.lpf > OFF;
+        // **The limiter's delay line is emptied while it is not in use.**
+        //
+        // A guard rather than a fix, and it is worth being exact about which:
+        // the line holds a millisecond of audio, and playing that back on
+        // re-engage an hour later would be an audible fragment of something
+        // else at full level — but it cannot happen today, because `mix`
+        // reaches zero by SLEWING and the limiter keeps running the whole way
+        // down, flushing itself with the silence it is being handed. A test
+        // written for the fragment passed with this line removed, which is the
+        // only reason that is known.
+        //
+        // It stays because it costs one comparison a block and stops being
+        // free the day anything sets `mix` instead of easing it.
+        let limiter_on = want.limiter > OFF || self.mix.limiter > OFF;
+        if !limiter_on {
+            self.limiter.clear();
+        }
         for ch in 0..2 {
             if hpf_on {
                 self.hpf[ch].set(self.sample_rate, hpf_hz, p.hpf_slope, p.hpf_resonance, true);
@@ -1326,7 +1343,7 @@ impl Effects {
             // **Last, and after everything.** A limiter that is not the final
             // stage is not a limiter; it is an effect that something else gets
             // to overshoot afterwards.
-            if self.mix.limiter > OFF {
+            if limiter_on {
                 let drive = 10f32.powf(DRIVE_DB * self.mix.limiter / 20.0);
                 out = self
                     .limiter
