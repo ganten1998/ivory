@@ -14,8 +14,17 @@ stderr. Kept verbatim below.
 | 2 | `tangent-ffmpeg` missing from the Linux tarball | FIXED - `build-cross.sh` packs it |
 | 3 | The app lists its own display plugin as an instrument | FIXED - labelled, and the load error names the file |
 | 4 | A dead saved slot silences the fresh default | NOT REPRODUCED - see below |
-| 5 | Pre-restore state can be persisted | OPEN |
+| 5 | Pre-restore state can be persisted | FIXED - an unreadable settings file is moved aside, never written over |
 | 6 | Packaging and window warts | PARTLY FIXED - file modes; the rest open |
+
+**On finding 5.** The mechanism turned out to be on the READ side, not the
+write side. `load_from` answers an unreadable or unparseable file with plain
+defaults — every slot null — and the app then saves those over it the first time
+anything changes. The write path has been atomic for several releases and its
+own comment names this hazard; the read path had never been fixed. A file that
+exists but will not parse is now renamed to `settings.json.unreadable` and the
+app comes up as a first launch, so nothing is silently destroyed and the bad
+file is recoverable by hand.
 
 **On finding 4.** The report's narrative says a dead slot makes the app open
 silent. The code does not do that, and the report's own measurement table says

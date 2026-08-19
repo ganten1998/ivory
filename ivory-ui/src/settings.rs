@@ -712,7 +712,32 @@ impl Settings {
             s.shows_default_applied = true;
             return s;
         }
-        let mut s = Self::load_from(&path);
+        // **A file that will not parse is moved aside, not overwritten.**
+        //
+        // `load_from` answers an unreadable file with plain defaults, and the
+        // app then saves those over it the first time anything changes — which
+        // is every setting somebody ever chose, gone, with no message. The
+        // write side was made atomic to stop a torn file happening; this is the
+        // other half, and its own comment up there has named the hazard for
+        // several releases.
+        //
+        // A Linux tester saw the shape of it from the outside: a settings write
+        // that recorded every instrument slot as null while the file on disk
+        // had one. See `docs/LINUX-4.11-FINDINGS.md`, finding 5.
+        //
+        // Renamed rather than deleted, so it is recoverable by hand. And what
+        // comes up is a FIRST LAUNCH rather than bare defaults: the comment
+        // above is right that quietly rearranging somebody's window is worse
+        // than not — but their arrangement is gone either way at this point,
+        // and a usable app beats a half-empty one.
+        let Some(mut s) = Self::try_load_from(&path) else {
+            let aside = path.with_extension("json.unreadable");
+            let _ = std::fs::rename(&path, &aside);
+            let mut s = Self::first_launch();
+            s.video_default_applied = true;
+            s.shows_default_applied = true;
+            return s;
+        };
         s.apply_video_default();
         s.apply_shows_default();
         s
@@ -773,13 +798,20 @@ impl Settings {
     }
 
     fn load_from(path: &std::path::Path) -> Self {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Self::default();
-        };
+        Self::try_load_from(path).unwrap_or_default()
+    }
+
+    /// Read a settings file, or `None` if there is one and it cannot be used.
+    ///
+    /// The distinction matters: "no file" is a first launch, and "a file I
+    /// cannot read" is somebody's settings that must not be written over. See
+    /// [`Settings::load`].
+    fn try_load_from(path: &std::path::Path) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
         let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) else {
-            return Self::default();
+            return None;
         };
-        Self::from_map(map)
+        Some(Self::from_map(map))
     }
 
     /// Round-trip through the same JSON the settings file holds.
@@ -2135,6 +2167,64 @@ mod tests {
         );
         // And the stamp does not leak into `extra`, which would write it twice.
         assert_eq!(json.matches("settings_version").count(), 1, "{json}");
+    }
+
+    /// **A settings file that will not parse is preserved, not overwritten.**
+    ///
+    /// The failure this prevents: `load_from` answers an unreadable file with
+    /// plain defaults, the app saves those the first time anything changes, and
+    /// every setting somebody ever chose is gone with no message. The write
+    /// side has been atomic for releases; this is the read side.
+    #[test]
+    fn an_unreadable_settings_file_is_moved_aside_rather_than_lost() {
+        let dir = std::env::temp_dir().join(format!("tangent-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let aside = dir.join("settings.json.unreadable");
+
+        // Something a person would mind losing, in a file nothing can parse.
+        std::fs::write(&path, b"{ \"dark_mode\": true, and then the disk died").unwrap();
+        // SAFETY: single-threaded test setup.
+        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
+        let s = Settings::load();
+        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+
+        assert!(
+            aside.exists(),
+            "the unreadable file was not preserved: {}",
+            aside.display()
+        );
+        assert!(
+            !path.exists(),
+            "the unreadable file is still where a save would land on it"
+        );
+        assert!(
+            std::fs::read_to_string(&aside).unwrap().contains("the disk died"),
+            "what was preserved is not what was there"
+        );
+        // And what came up is usable rather than a half-empty window.
+        assert!(s.show_recorder && s.show_fretboard);
+        assert_eq!(s.plugin_slots[0].as_deref(), Some(crate::dialogs::BUILTIN_PATH));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An ABSENT file is still a first launch, and nothing is moved aside.
+    #[test]
+    fn a_missing_settings_file_is_a_first_launch() {
+        let dir = std::env::temp_dir().join(format!("tangent-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // SAFETY: single-threaded test setup.
+        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
+        let s = Settings::load();
+        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+
+        assert!(!dir.join("settings.json.unreadable").exists());
+        assert!(s.show_recorder);
+        assert_eq!(s.plugin_slots[0].as_deref(), Some(crate::dialogs::BUILTIN_PATH));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A custom tuning survives a save/load round trip and is usable.
