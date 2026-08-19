@@ -486,7 +486,7 @@ pub fn hit_test(rect: Rect, views: &Views, input: Input, pos: Pos2) -> Option<Hi
     let (view, cell) = cells(rect, &views)
         .into_iter()
         .find(|(_, c)| c.contains(pos))?;
-    let body = body_rect(cell.shrink(8.0));
+    let body = body_rect(cell_inner(cell));
     match view {
         View::Circle => circle_hit(body, pos).map(Hit::Pc),
         View::Tonnetz => tonnetz_hit(body, pos).map(Hit::Pc),
@@ -531,7 +531,7 @@ pub fn draw(
         // full-screen window eight points is a hairline and the diagrams ran
         // to the edges of their cells; the three of them read as one crowded
         // picture with rules through it rather than as three panels.
-        let inner = cell.shrink((cell.width().min(cell.height()) * 0.05).clamp(8.0, 24.0));
+        let inner = cell_inner(*cell);
         match view {
             View::Circle => draw_circle(painter, inner, input, &p, s),
             View::Tonnetz => draw_tonnetz(painter, inner, input, &p, s),
@@ -582,6 +582,23 @@ pub fn draw(
 /// Shared by the drawing and the hit-testing so the two cannot disagree about
 /// where the diagram starts — the class of bug where a click lands one row
 /// above the thing it looks like it is on.
+/// The inset a cell's contents are drawn inside.
+///
+/// **One function, because the drawing and the hit test both need it.** They
+/// each had their own: `draw` used a fifth of a tenth of the cell clamped to
+/// 8..24, and `hit_test` used a flat 8. On a three-hundred-point cell that is
+/// seven points of disagreement, which is a click landing on the neighbouring
+/// node of a lattice — a bug you find by missing, and blame on yourself.
+pub fn cell_inner(cell: Rect) -> Rect {
+    cell.shrink((cell.width().min(cell.height()) * 0.05).clamp(8.0, 24.0))
+}
+
+/// Where the sheet music itself is drawn inside its cell: the inset, less the
+/// title strip above it.
+pub fn staff_body(cell: Rect) -> Rect {
+    body_rect(cell_inner(cell))
+}
+
 fn body_rect(rect: Rect) -> Rect {
     let h = (rect.height() * 0.075).clamp(9.0, 14.0);
     let used = if rect.height() > 150.0 {
@@ -2013,7 +2030,7 @@ mod tests {
                 else {
                     continue;
                 };
-                let inner = staff_cell.shrink(8.0);
+                let inner = cell_inner(*staff_cell);
                 let body = body_rect(inner);
                 let h = (inner.height() * 0.075).clamp(9.0, 14.0);
                 let lh = h * 0.82;
@@ -2088,7 +2105,7 @@ mod tests {
                 for (_, cell) in cells(band, &views) {
                     // What draw() hands each diagram, and then what title()
                     // leaves below itself.
-                    let inner = cell.shrink(8.0);
+                    let inner = cell_inner(cell);
                     let th = (inner.height() * 0.09).clamp(9.0, 15.0);
                     out.push(Rect::from_min_max(
                         Pos2::new(inner.min.x, inner.min.y + th + 2.0),
@@ -2301,7 +2318,7 @@ mod tests {
             // this bug only showed in the three-pane case.
             for (band, cell) in real_tonnetz_cells() {
                 let w = band.width();
-                let body = body_rect(cell.shrink(8.0));
+                let body = body_rect(cell_inner(cell));
                 let Some(l) = Lattice::fit(body) else {
                     continue;
                 };
@@ -2351,7 +2368,7 @@ mod tests {
         for pane in real_panes() {
             let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(pane.width() + 16.0, 300.0));
             let cell = cells(band, &views)[0].1;
-            let body = body_rect(cell.shrink(8.0));
+            let body = body_rect(cell_inner(cell));
             let Some(l) = Lattice::fit(body) else {
                 continue;
             };
@@ -2380,7 +2397,7 @@ mod tests {
     fn a_click_on_a_circle_name_finds_that_note() {
         let views = Views::of(vec![View::Circle]);
         let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(440.0, 300.0));
-        let body = body_rect(cells(band, &views)[0].1.shrink(8.0));
+        let body = body_rect(cell_inner(cells(band, &views)[0].1));
         let c = body.center();
         let r = body.width().min(body.height()) * 0.5 - 2.0;
         for (i, &pc) in FIFTHS.iter().enumerate() {
@@ -2412,7 +2429,7 @@ mod tests {
     fn a_click_on_a_chord_vertex_gives_that_chord() {
         let views = Views::of(vec![View::Triangles]);
         let band = Rect::from_min_size(Pos2::ZERO, Vec2::new(440.0, 300.0));
-        let body = body_rect(cells(band, &views)[0].1.shrink(8.0));
+        let body = body_rect(cell_inner(cells(band, &views)[0].1));
         let c = body.center();
         let r = hexagram_radius(body);
         for tonic in 0..12u8 {
@@ -2588,7 +2605,7 @@ mod tests {
     fn controls(rect: Rect, views: &Views, input: Input) -> Vec<(View, Pos2, Hit)> {
         let mut out = Vec::new();
         for (view, cell) in cells(rect, views) {
-            let body = body_rect(cell.shrink(8.0));
+            let body = body_rect(cell_inner(cell));
             match view {
                 View::Circle => {
                     let c = body.center();

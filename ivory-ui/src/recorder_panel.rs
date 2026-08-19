@@ -527,7 +527,27 @@ fn rule_x(r: Rect, x: f32) -> Rect {
 /// **0.30 in 5.0**, down from 0.36. The full-height camera preview took its
 /// points from somewhere, and a slot row is four things on one line while the
 /// VU pair is the thing anybody actually watches while a take runs.
+/// The instrument column's share of what the preview leaves.
+///
+/// **Down from what it was, because the rows had slack and the transport had
+/// none.** A slot row is a name, a slider and a number; at a third of the band
+/// it was carrying an inch of empty panel after "empty (click to load)" while
+/// the faders next door were being measured against whether their dB reading
+/// would render at five points.
 const MONITOR_W: f32 = 0.30;
+
+/// The fewest points the instrument column may have, whatever the share says.
+///
+/// A share alone is wrong in a DETACHED recorder window, which is tall and
+/// narrow: the preview takes its quarter off the top of a small width, and
+/// thirty percent of the little that is left is a slot row whose gain reading
+/// will not render. Measured against
+/// `a_slots_knob_carries_a_readable_number_at_every_size_worth_recording_at`,
+/// which is the test that says so.
+const MONITOR_MIN_W: f32 = 195.0;
+
+/// The most of the box that floor may claim. See [`Layout::monitor_of`].
+const MONITOR_FLOOR_MAX: f32 = 0.38;
 
 /// The camera preview's width over its height. The commonest sensor shape, and
 /// the shape of the file a take writes.
@@ -638,21 +658,43 @@ impl Layout {
             return Self::empty(rolling);
         }
 
-        // The status line spans the whole band in both layouts, so "no audio
-        // input selected" is in the same place before and during a take.
-        let status_h = (inner.height() * 0.13).min(20.0);
-        let status = Rect::from_min_max(
-            Pos2::new(inner.left(), inner.bottom() - status_h),
+        // **The preview keeps the band's own margin on three sides.** It is
+        // the camera inset a take will carry, so it is not a control among
+        // controls: it is a picture, and a picture hung with a different gap
+        // under it than beside it reads as an accident. The same `pad` above
+        // it, to the left of it, and below it — which means it takes the full
+        // height of `inner` and the status line starts to its right.
+        let pv_w = (inner.height() * PREVIEW_ASPECT).min(inner.width() * 0.24);
+        let preview = Rect::from_min_max(
+            inner.min,
+            Pos2::new(inner.left() + pv_w, inner.bottom()),
+        );
+
+        // Everything else lives to the right of it.
+        let rest = Rect::from_min_max(
+            Pos2::new(preview.right() + gap, inner.top()),
             inner.max,
         );
+        if !rest.is_positive() {
+            return Self::empty(rolling);
+        }
+        // The status line spans what the preview leaves, in both layouts, so
+        // "no audio input selected" is in the same place before and during a
+        // take.
+        let status_h = (rest.height() * 0.13).min(20.0);
+        let status = Rect::from_min_max(
+            Pos2::new(rest.left(), rest.bottom() - status_h),
+            rest.max,
+        );
         let body = Rect::from_min_max(
-            inner.min,
-            Pos2::new(inner.right(), status.top() - gap * 0.5),
+            rest.min,
+            Pos2::new(rest.right(), status.top() - gap * 0.5),
         );
         if !body.is_positive() {
             return Self::empty(rolling);
         }
         let mut l = Self {
+            preview,
             // The message never runs into the clip warning, whatever either
             // says: they share the row and neither may be the reason the other
             // is unreadable.
@@ -671,8 +713,22 @@ impl Layout {
 
     /// The monitor's rectangle, which is the same one in both layouts.
     fn monitor_of(body: Rect) -> Rect {
+        // **The floor is itself capped.** A minimum in POINTS is right in a
+        // detached window, which is narrow but not tiny; applied to the
+        // smallest band this app draws it takes half of everything and starves
+        // the faders, which is the failure the share was there to prevent in
+        // the first place.
+        //
+        // `MONITOR_FLOOR_MAX` is where the two tests that pull against each
+        // other both pass: `a_slots_knob_carries_a_readable_number_at_every_
+        // size_worth_recording_at` from below and `a_gain_reading_fits_the_box_
+        // reserved_for_it_at_the_smallest_band` from above. There is not much
+        // room between them, and that is a fact about a five-hundred-point
+        // band rather than a number anybody chose.
+        let floor = MONITOR_MIN_W.min(body.width() * MONITOR_FLOOR_MAX);
+        let w = (body.width() * MONITOR_W).max(floor);
         Rect::from_min_max(
-            Pos2::new(body.right() - body.width() * MONITOR_W, body.top()),
+            Pos2::new(body.right() - w, body.top()),
             Pos2::new(body.right(), body.bottom() - Self::heart_h(body)),
         )
     }
@@ -731,14 +787,11 @@ impl Layout {
         // column beside it. They used to be stacked in one narrow column,
         // which made the preview short AND the type small — the two were
         // fighting over the same points and both lost.
-        let pv_w = Self::preview_w(body);
-        self.preview = Rect::from_min_max(body.min, Pos2::new(body.left() + pv_w, body.bottom()));
+        // The preview was placed in `new`, in the band's own margin. The words
+        // column starts at the left of what it left.
         let sw = Self::setup_w(body);
         self.fill_setup(
-            Rect::from_min_max(
-                Pos2::new(self.preview.right() + gap, body.top()),
-                Pos2::new(self.preview.right() + gap + sw, body.bottom()),
-            ),
+            Rect::from_min_max(body.min, Pos2::new(body.left() + sw, body.bottom())),
             false,
         );
 
@@ -775,24 +828,11 @@ impl Layout {
     /// still want to touch would be half a survivor. Same argument the monitor
     /// column has always made; the faders took it with them when they moved.
     fn middle_of(body: Rect, gap: f32) -> Rect {
-        let left = Self::preview_w(body) + gap + Self::setup_w(body);
         let monitor = Self::monitor_of(body);
         Rect::from_min_max(
-            Pos2::new(body.left() + left + gap, body.top()),
+            Pos2::new(body.left() + Self::setup_w(body) + gap, body.top()),
             Pos2::new(monitor.left() - gap, body.bottom()),
         )
-    }
-
-    /// The left column's width, which is the same in both layouts because the
-    /// faders are placed against it. See [`Layout::middle_of`].
-    fn preview_w(body: Rect) -> f32 {
-        // **The whole height of the band, in landscape.** A take records the
-        // window, so this box is not a framing check somebody glances at — it
-        // is the camera inset the audience will see, and at a fifth of the
-        // band's height it was a postage stamp in a 1080p file. It takes every
-        // point the band is tall and as much width as 16:9 asks for, capped so
-        // it can never crowd out the transport it sits beside.
-        (body.height() * PREVIEW_ASPECT).min(body.width() * 0.21)
     }
 
     /// The column of words beside the preview: name, folder, tempo, Setup.
@@ -1007,13 +1047,12 @@ impl Layout {
     /// the two things worth reading from two metres away take most of the rest,
     /// and the monitor column stays exactly where it was.
     fn fill_rolling(&mut self, body: Rect, gap: f32, view: &RecorderView<'_>) {
-        // **The same preview, at the same size.** It used to collapse to a
-        // strip when a take started, back when it was a framing check. It is
-        // the camera inset the recording will carry now, so the moment a take
-        // starts is the moment it matters most — and the band does not
-        // rearrange itself under the eye either way.
-        let pv_w = Self::preview_w(body);
-        self.preview = Rect::from_min_max(body.min, Pos2::new(body.left() + pv_w, body.bottom()));
+        // **The same preview, at the same size**, placed in `new` for both
+        // layouts. It used to collapse to a strip when a take started, back
+        // when it was a framing check. It is the camera inset the recording
+        // will carry now, so the moment a take starts is the moment it matters
+        // most — and the band does not rearrange itself under the eye either
+        // way.
         let monitor = Self::monitor_of(body);
         self.fill_heart(body, monitor);
         self.fill_monitor(monitor, view);
@@ -3158,7 +3197,7 @@ const KNOB_CAP: Color32 = Color32::from_rgb(0x1c, 0x6f, 0xd6);
 /// The rest, less a gap, is the meters with the knob row under them. Named
 /// because three places have to agree about it and the failure when they do
 /// not is a knob drawn over a meter.
-const FADER_COL: f32 = 0.38;
+const FADER_COL: f32 = 0.40;
 
 /// The meters' share of the height of the column they share with the knobs.
 ///
@@ -3802,6 +3841,66 @@ mod tests {
             panic!("the middle of the knob is not the knob")
         };
         assert!((mid - 0.5).abs() < 0.05, "the centre reads {mid}");
+    }
+
+    /// **The camera sits in equal margins.** It is the inset a take carries,
+    /// so it is a picture rather than a control, and a picture hung with a
+    /// different gap under it than beside it reads as an accident. The status
+    /// line used to run underneath it, which is what made the bottom margin
+    /// twice the others.
+    #[test]
+    fn the_preview_has_the_same_margin_above_left_and_below_it() {
+        for w in [500.0_f32, 900.0, 1300.0, 1800.0] {
+            let r = band(w);
+            for v in [idle(), rolling()] {
+                let l = Layout::new(r, &v);
+                assert!(l.preview.is_positive(), "no preview at {w}pt");
+                let left = l.preview.left() - r.left();
+                let top = l.preview.top() - r.top();
+                let bottom = r.bottom() - l.preview.bottom();
+                for (name, got) in [("top", top), ("bottom", bottom)] {
+                    assert!(
+                        (got - left).abs() < 0.5,
+                        "at {w}pt the preview has {left:.1} to the left and {got:.1} {name}"
+                    );
+                }
+                // And it really is 16:9, which is what makes it the shape of
+                // the file rather than the shape of whatever was left over.
+                let aspect = l.preview.width() / l.preview.height();
+                assert!(
+                    (aspect - PREVIEW_ASPECT).abs() < 0.02 || l.preview.width() < r.width() * 0.24,
+                    "the preview is {aspect:.2}:1 at {w}pt"
+                );
+            }
+        }
+    }
+
+    /// Nothing else may sit in the preview's column — that is what the equal
+    /// margin means. The status line ran under it before.
+    #[test]
+    fn nothing_shares_the_previews_column() {
+        let r = band(1300.0);
+        let v = idle();
+        let l = Layout::new(r, &v);
+        for (name, other) in [
+            ("status", l.status),
+            ("clip", l.clip),
+            ("setup", l.setup),
+            ("name", l.name),
+            ("tempo", l.tempo),
+            ("meter", l.meter),
+            ("reverb", l.reverb),
+        ] {
+            if !other.is_positive() {
+                continue;
+            }
+            assert!(
+                other.left() >= l.preview.right(),
+                "{name} overlaps the preview: it starts at {:.1} and the preview ends at {:.1}",
+                other.left(),
+                l.preview.right()
+            );
+        }
     }
 
     /// The controls that stay reachable once a take is live, with a full rack.

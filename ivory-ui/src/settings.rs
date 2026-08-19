@@ -662,6 +662,18 @@ impl Settings {
     /// would change it in between. A test that mutates the machine it runs on
     /// is a test nobody can trust twice.
     pub fn path() -> PathBuf {
+        // **An override honoured in EVERY build, not just this crate's tests.**
+        //
+        // `#[cfg(test)]` below only applies while `ivory-ui` itself is being
+        // compiled for test. A test in the BINARY crate links an ordinary
+        // `ivory-ui`, so it takes the branch that finds the real home
+        // directory — and any such test that builds an `IvoryApp` and runs a
+        // frame writes the user's own settings file. That is not theoretical:
+        // an offscreen screenshot test did exactly that and emptied the
+        // owner's instrument slots.
+        if let Some(p) = std::env::var_os("IVORY_SETTINGS_PATH") {
+            return PathBuf::from(p);
+        }
         #[cfg(test)]
         {
             return test_path();

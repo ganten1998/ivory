@@ -806,19 +806,32 @@ const NAME_CAP_SPACES: f32 = 2.6;
 
 /// Draw the band. `readout` is `None` when chord detection is off entirely —
 /// only then does the staff take the whole rect.
-pub fn draw(
-    painter: &Painter,
-    rect: Rect,
-    notes: &HashSet<u8>,
-    readout: Option<Readout<'_>>,
-    s: &Settings,
-) {
-    if !rect.is_positive() {
-        return;
-    }
-    let p = palette(s);
-    painter.rect_filled(rect, 0.0, p.bg);
 
+// ── where the music lands ──────────────────────────────────────────────────
+
+/// Everything about where a staff sits in its panel.
+///
+/// **Extracted so the hit test is the inverse of the drawing by CONSTRUCTION.**
+/// Sixty lines of arithmetic decide where a staff line is; a second copy of
+/// them for the pointer would be a second copy to keep in step, and the way
+/// they drift is a click landing a third above the note it was aimed at.
+struct Frame {
+    space: f32,
+    left: f32,
+    used_w: f32,
+    margin: f32,
+    wide: bool,
+    staff_rect: Rect,
+    clefs: Vec<Clef>,
+    /// The y of each staff's BOTTOM line, top to bottom.
+    bottoms: Vec<f32>,
+}
+
+impl Frame {
+    fn new(rect: Rect, has_readout: bool, s: &Settings) -> Option<Frame> {
+        if !rect.is_positive() {
+            return None;
+        }
     // **Where the readout goes depends on the shape of the panel.**
     //
     // A grand staff needs twenty-two units of height and seventeen of width,
@@ -839,31 +852,23 @@ pub fn draw(
     // what the app shows for every second nobody is playing. The name goes in
     // the gutter the staff leaves, and appears and disappears there without
     // moving anything.
-    let staff_rect = match readout {
-        Some(_) if wide => rect,
-        Some(_) => {
+    let staff_rect = match has_readout {
+        true if wide => rect,
+        true => {
             let h = (rect.height() * READOUT_FRACTION).clamp(24.0, 64.0);
             Rect::from_min_max(Pos2::new(rect.min.x, rect.min.y + h), rect.max)
         }
-        None => rect,
+        false => rect,
     };
     if !staff_rect.is_positive() {
-        return;
+        return None;
     }
 
     let set = s.staff_set();
     let clefs = set.clefs();
     if clefs.is_empty() {
-        return;
+        return None;
     }
-    let mut sorted: Vec<u8> = notes.iter().copied().collect();
-    sorted.sort_unstable();
-    let spelled: Vec<Spelled> = sorted
-        .iter()
-        .map(|n| spell_in_key(*n, s.staff_key, s.prefer_flats))
-        .collect();
-    let per_staff = distribute(&set, &spelled);
-
     let spaces = total_spaces(clefs.len(), set.splits());
     // **The staff is as wide as what is ON it, and centred.** It used to run
     // the full width of its cell, which put the chord in the first fifth and
@@ -892,7 +897,7 @@ pub fn draw(
     // a chord starts. The box is sized in staff spaces like everything else,
     // which is what keeps the name proportionate to the music rather than
     // swollen to fill whatever gutter happened to be left over.
-    let name_box = if wide && readout.is_some() {
+    let name_box = if wide && has_readout {
         space * (NAME_BOX_SPACES + NAME_GAP_SPACES)
     } else {
         0.0
@@ -909,6 +914,110 @@ pub fn draw(
             top + space * (OUTER_SPACES + STAFF_SPACES + i as f32 * (STAFF_SPACES + gap))
         })
         .collect();
+
+
+        Some(Frame {
+            space,
+            left,
+            used_w,
+            margin,
+            wide,
+            staff_rect,
+            clefs,
+            bottoms,
+        })
+    }
+
+    /// The `i`th staff's geometry.
+    fn geometry(&self, i: usize) -> Geometry {
+        Geometry {
+            space: self.space,
+            bottom: self.bottoms[i],
+            left: self.left + self.margin,
+            right: self.left + self.used_w - self.margin,
+        }
+    }
+}
+
+/// How far above and below a staff a click still counts, in half-spaces.
+///
+/// Six is three ledger lines, which is as far as anybody reads without
+/// counting. Past that a click is somebody aiming at the panel, not at a note.
+const LEDGER_REACH: i32 = 6;
+
+/// The pitch at `pos`, if the pointer is on a staff.
+///
+/// **The staff was a readout until now.** It said so, in a comment, and the
+/// reasoning was that a note on it is a note you are already holding. That
+/// stopped being true the moment every other view became an instrument: a
+/// pianist reading a chord off the staff should be able to put one back.
+///
+/// The note comes out spelled BY THE KEY SIGNATURE — click the F line in D
+/// major and you get F sharp, because that is what the line means there and
+/// asking somebody to add the accidental themselves would make the staff the
+/// one view that lies about what it draws.
+pub fn hit_test(rect: Rect, has_readout: bool, s: &Settings, pos: Pos2) -> Option<u8> {
+    let f = Frame::new(rect, has_readout, s)?;
+    // Horizontally, anywhere on the ruled lines. There is nothing along a
+    // staff's length that means a different note, so the whole width is one
+    // target rather than a row of note-shaped ones nobody could hit.
+    let g0 = f.geometry(0);
+    if pos.x < g0.left || pos.x > g0.right {
+        return None;
+    }
+    let alters = key_alterations(s.staff_key);
+    // Whichever staff the pointer is NEAREST the middle of. A grand staff has
+    // a gap between its halves, and a click in that gap belongs to one of them
+    // — the closer — rather than to neither.
+    let (i, half) = (0..f.clefs.len())
+        .map(|i| {
+            let half = ((f.bottoms[i] - pos.y) / (f.space * 0.5)).round() as i32;
+            (i, half)
+        })
+        .min_by_key(|(_, half)| (half - 4).abs())?;
+    if !(-LEDGER_REACH..=8 + LEDGER_REACH).contains(&half) {
+        return None;
+    }
+    // The inverse of `Clef::position`, then of the octave-and-letter split
+    // that `spell_in_key` does on the way out.
+    let clef = f.clefs[i];
+    let (ref_step, ref_line) = clef.reference();
+    let step = half - ref_line * 2 + ref_step;
+    let letter = step.rem_euclid(7) as usize;
+    let octave = step.div_euclid(7);
+    let midi = (octave + 1) * 12 + NATURAL_PC[letter] + i32::from(alters[letter]);
+    u8::try_from(midi).ok().filter(|m| (0..=127).contains(m))
+}
+
+pub fn draw(
+    painter: &Painter,
+    rect: Rect,
+    notes: &HashSet<u8>,
+    readout: Option<Readout<'_>>,
+    s: &Settings,
+) {
+    if !rect.is_positive() {
+        return;
+    }
+    let p = palette(s);
+    painter.rect_filled(rect, 0.0, p.bg);
+
+    let Some(f) = Frame::new(rect, readout.is_some(), s) else {
+        return;
+    };
+    let mut sorted: Vec<u8> = notes.iter().copied().collect();
+    sorted.sort_unstable();
+    let spelled: Vec<Spelled> = sorted
+        .iter()
+        .map(|n| spell_in_key(*n, s.staff_key, s.prefer_flats))
+        .collect();
+    let set = s.staff_set();
+    let per_staff = distribute(&set, &spelled);
+    let (space, left, used_w, margin) = (f.space, f.left, f.used_w, f.margin);
+    let staff_rect = f.staff_rect;
+    let wide = f.wide;
+    let clefs = &f.clefs;
+    let bottoms = &f.bottoms;
 
     if let Some(r) = readout {
         let strip = if wide {
@@ -1597,6 +1706,96 @@ fn bezier(a: Pos2, b: Pos2, c: Pos2, d: Pos2, steps: usize) -> Vec<Pos2> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use egui::{Pos2, Rect, Vec2};
+
+    /// **A click lands on the note that is drawn there.** The round trip, at
+    /// several sizes: draw a note, ask where its head is, click it, get the
+    /// same note back. This is the assertion that the extracted `Frame` exists
+    /// for — two copies of the geometry would pass every other test and fail
+    /// this one.
+    #[test]
+    fn clicking_a_staff_position_gives_back_the_note_drawn_there() {
+        let mut s = Settings::default();
+        s.staff_key = 0;
+        for size in [
+            Vec2::new(400.0, 220.0),
+            Vec2::new(900.0, 200.0),
+            Vec2::new(240.0, 300.0),
+        ] {
+            let rect = Rect::from_min_size(Pos2::new(11.0, 7.0), size);
+            let f = Frame::new(rect, false, &s).expect("a staff fits");
+            for (i, clef) in f.clefs.iter().enumerate() {
+                let g = f.geometry(i);
+                // Every position on the staff, and a couple of ledger lines.
+                for half in -2..=10 {
+                    let step = half - clef.reference().1 * 2 + clef.reference().0;
+                    let letter = step.rem_euclid(7) as usize;
+                    let octave = step.div_euclid(7);
+                    let want = (octave + 1) * 12 + NATURAL_PC[letter];
+                    let Ok(want) = u8::try_from(want) else { continue };
+
+                    let at = Pos2::new((g.left + g.right) * 0.5, g.y(half));
+                    let got = hit_test(rect, false, &s, at);
+                    assert_eq!(
+                        got,
+                        Some(want),
+                        "{clef:?} half-space {half} at {size:?} drew {want} and read back {got:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The key signature is applied, because the line means what the key
+    /// says it means.** Clicking the F line in D major is an F sharp; asking
+    /// somebody to add the accidental in their head would make the staff the
+    /// one view in the app that lies about what it draws.
+    #[test]
+    fn a_click_is_spelled_by_the_key_signature() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 240.0));
+        let f_line = |key: i32| {
+            let mut s = Settings::default();
+            s.staff_key = key;
+            let f = Frame::new(rect, false, &s).expect("a staff fits");
+            let g = f.geometry(0);
+            // Top line of the treble staff is F5.
+            hit_test(rect, false, &s, Pos2::new((g.left + g.right) * 0.5, g.y(8)))
+        };
+        assert_eq!(f_line(0), Some(77), "F5 in C major");
+        assert_eq!(f_line(2), Some(78), "F sharp 5 in D major");
+        // And a flat key bends the line the other way. The MIDDLE line of the
+        // treble staff — position 4 — is B4; in F major it is B flat.
+        let mut s = Settings::default();
+        s.staff_key = -1;
+        let f = Frame::new(rect, false, &s).expect("a staff fits");
+        let g = f.geometry(0);
+        assert_eq!(
+            hit_test(rect, false, &s, Pos2::new((g.left + g.right) * 0.5, g.y(4))),
+            Some(70),
+            "B flat 4 in F major"
+        );
+    }
+
+    /// Off the ruled lines is not a note. A panel is mostly empty space, and a
+    /// click in it must not place whatever pitch the arithmetic extrapolates
+    /// to twenty ledger lines up.
+    #[test]
+    fn a_click_off_the_staff_is_not_a_note() {
+        let s = Settings::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0));
+        let f = Frame::new(rect, false, &s).expect("a staff fits");
+        let g = f.geometry(0);
+        let mid_x = (g.left + g.right) * 0.5;
+        assert_eq!(hit_test(rect, false, &s, Pos2::new(g.left - 8.0, g.y(4))), None);
+        assert_eq!(hit_test(rect, false, &s, Pos2::new(g.right + 8.0, g.y(4))), None);
+        // Far above the top staff and far below the bottom one.
+        assert_eq!(hit_test(rect, false, &s, Pos2::new(mid_x, rect.top() + 1.0)), None);
+        assert_eq!(
+            hit_test(rect, false, &s, Pos2::new(mid_x, rect.bottom() - 1.0)),
+            None
+        );
+    }
     use super::*;
 
     /// **A key signature decides both the spelling and what is printed.**

@@ -864,12 +864,30 @@ impl DesktopApp {
                     // indistinguishable from a played one: same path, same
                     // instrument, and it lands in a take that is rolling, which
                     // is what somebody demonstrating a voicing on camera wants.
-                    if let Some(e) = self.recorder.engine.as_ref() {
-                        let at = e.timebase().now();
-                        let status = if on { 0x90 } else { 0x80 };
-                        let vel = if on { ivory_ui::recorder::AUDITION_VELOCITY } else { 64 };
-                        for note in notes {
-                            e.send_midi(at, &[status, note, vel]);
+                    let sent: Option<(i64, Vec<[u8; 3]>)> =
+                        self.recorder.engine.as_ref().map(|e| {
+                            let at = e.timebase().now();
+                            let status = if on { 0x90 } else { 0x80 };
+                            let vel = if on {
+                                ivory_ui::recorder::AUDITION_VELOCITY
+                            } else {
+                                64
+                            };
+                            let events: Vec<[u8; 3]> =
+                                notes.iter().map(|n| [status, *n, vel]).collect();
+                            for ev in &events {
+                                e.send_midi(at, ev);
+                            }
+                            (at, events)
+                        });
+                    // **And into the take's `.mid`.** The audio always carried
+                    // these; the file never did, so a take of somebody
+                    // demonstrating a voicing had the sound and no notes.
+                    // Captured with the stamp the engine was given, so the two
+                    // cannot drift.
+                    if let Some((at, events)) = sent {
+                        for ev in events {
+                            self.recorder.session.capture_app_midi(at, ev);
                         }
                     }
                 }

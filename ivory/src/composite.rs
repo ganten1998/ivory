@@ -862,6 +862,17 @@ mod shot {
             eprintln!("IVORY_SHOT not set");
             return;
         };
+        // **Never the real settings file.** This builds an `IvoryApp` and runs
+        // frames, and a frame can save. `ivory-ui` is linked here as an
+        // ordinary library, so its own `#[cfg(test)]` guard is not in force —
+        // see `Settings::path`.
+        // SAFETY: single-threaded test setup, before any app exists.
+        unsafe {
+            std::env::set_var(
+                "IVORY_SETTINGS_PATH",
+                std::env::temp_dir().join("tangent-shot-settings.json"),
+            );
+        }
         let (w, h) = (1600u32, 900u32);
         let mut c = match Compositor::standalone(w, h) {
             Ok(c) => c,

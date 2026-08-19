@@ -1388,6 +1388,23 @@ impl Session {
         self.midi.prune(horizon - MIDI_HISTORY_NS);
     }
 
+    /// Capture a MIDI event this APP made, so a take carries it too.
+    ///
+    /// **The audio always had it and the `.mid` never did.** Anything the app
+    /// sounds — a clicked key, a chord on the fretboard, a note placed on the
+    /// lattice, the Space strike, the re-strike when a transpose moves a
+    /// latched chord — goes to the instrument through `Engine::send_midi`, so
+    /// it reaches the mix, the monitor and the recorded AUDIO. None of it went
+    /// anywhere near [`pump_midi`], which drains the input device, so the
+    /// `.mid` beside the audio was missing every note that was not played on a
+    /// keyboard.
+    ///
+    /// Same stamp and same bytes as the engine was given, so the two cannot
+    /// drift: what is written is what was heard, to the sample.
+    pub fn capture_app_midi(&mut self, at: Nanos, bytes: [u8; 3]) {
+        self.midi.push(Captured::new(at, bytes));
+    }
+
     /// Press the one button. Starts a pre-roll, starts a take, or stops one.
     ///
     /// One button rather than arm-then-record, per RECORDER-PLAN §5: the second

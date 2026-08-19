@@ -162,6 +162,11 @@ pub struct IvoryApp {
     /// Where the bands were actually drawn, which is centred in the pane.
     /// Child windows and in-canvas dialogs centre on this.
     last_drawn: Rect,
+    /// Where the theory band was last drawn, or `NOTHING` when it was not.
+    ///
+    /// Recorded rather than recomputed, for the same reason `last_band` is: a
+    /// caller reasoning about a gesture must not restate a layout.
+    last_theory: Rect,
     /// Where the recorder band was last drawn, or `NOTHING` when it was not.
     ///
     /// Recorded rather than recomputed: the band's position depends on which
@@ -456,6 +461,28 @@ struct Grab {
 /// does and what makes a small knob usable at all.
 const KNOB_TRAVEL: f32 = 260.0;
 
+/// The pitches a theory-panel hit means, in the octave above middle C.
+///
+/// The same octave `toggle_theory_hit` places into, so a triad clicked with
+/// the toggle off sounds where the same click would have put it with the
+/// toggle on. One rule, so the two modes are the same instrument.
+fn theory_pitches(hit: theory_panel::Hit) -> Vec<u8> {
+    match hit {
+        theory_panel::Hit::Pc(pc) => vec![60 + pc],
+        theory_panel::Hit::Triad { root, minor } => {
+            let m = if minor {
+                theory_panel::minor_triad(root)
+            } else {
+                theory_panel::major_triad(root)
+            };
+            (0..12u8)
+                .filter(|pc| m & (1 << pc) != 0)
+                .map(|pc| 60 + pc)
+                .collect()
+        }
+    }
+}
+
 /// How far the pointer has to travel before a press counts as a drag.
 ///
 /// Generous rather than tight. A tap is meant to be easy: on a trackpad a
@@ -582,6 +609,7 @@ impl IvoryApp {
             last_pane: Vec2::ZERO,
             last_drawn: Rect::NOTHING,
             last_band: Rect::NOTHING,
+            last_theory: Rect::NOTHING,
             manual_barre: None,
             barre_drag: None,
             demo_menu_done: false,
@@ -1026,6 +1054,57 @@ impl IvoryApp {
     ///
     /// Pitch classes have no octave, so they are placed in the octave above
     /// middle C — the one the piano puts in the middle of the window.
+    /// The pitch under `pos` on the sheet-music panel, if it is showing.
+    ///
+    /// The staff is one of the theory band's cells, so this asks the theory
+    /// panel where that cell is rather than working it out again.
+    fn staff_note_at(&self, band: Rect, pos: Pos2) -> Option<u8> {
+        let (_, cell) = theory_panel::cells(band, &self.settings.theory_views())
+            .into_iter()
+            .find(|(v, _)| *v == theory_panel::View::Staff)?;
+        // The same shrink the panel applies before handing the cell to the
+        // staff, and the same readout flag — otherwise the pointer is measured
+        // against a staff a few points from the one on screen.
+        staff::hit_test(
+            theory_panel::staff_body(cell),
+            self.settings.chord_detection_enabled,
+            &self.settings,
+            pos,
+        )
+    }
+
+    /// Sound `note` while the button is down, and place it if keytoggle is on.
+    ///
+    /// **Both, not one or the other.** The sound follows the CLICK in either
+    /// mode — that is what makes every surface here an instrument — and the
+    /// toggle decides only whether the note is still lit after the button
+    /// comes up. See [`wanted_sound`](IvoryApp::wanted_sound) for why the
+    /// latch does not hold the note down.
+    fn place_or_play(&mut self, note: u8) {
+        self.sound_while_held([note]);
+        if !self.settings.keytoggle_enabled {
+            return;
+        }
+        if self.manual_notes.remove(&note) {
+            self.manual_positions.remove(&note);
+        } else {
+            self.manual_notes.insert(note);
+        }
+        self.sync_pins();
+        self.detection_tick(true);
+        self.voicing_tick(true);
+    }
+
+    /// Sound these until the mouse button comes up, replacing whatever the
+    /// last press sounded.
+    ///
+    /// One press at a time: dragging across a keyboard is not a glissando
+    /// here, and a chord placed from the lattice arrives as a chord.
+    fn sound_while_held(&mut self, notes: impl IntoIterator<Item = u8>) {
+        self.clicked.clear();
+        self.clicked.extend(notes);
+    }
+
     fn toggle_theory_hit(&mut self, hit: theory_panel::Hit) {
         let pcs: Vec<u8> = match hit {
             theory_panel::Hit::Pc(pc) => vec![pc],
@@ -1579,22 +1658,36 @@ impl IvoryApp {
                     }
                 }
 
-                // The theory band is a third instrument. Clicking a name on
-                // the circle or a node on the lattice places that note;
-                // clicking a chord vertex places the whole triad. Handled
-                // before the piano and the neck because it is the only one
-                // that speaks in pitch classes rather than in notes.
-                if self.settings.keytoggle_enabled {
-                    if let Some(hit) = theory_rect.filter(|r| r.contains(pos)).and_then(|r| {
-                        let display = self.display_notes();
-                        theory_panel::hit_test(
-                            r,
-                            &self.settings.theory_views(),
-                            self.theory_input(&display),
-                            pos,
-                        )
-                    }) {
-                        self.toggle_theory_hit(hit);
+                // **The theory band is an instrument too, in both modes.** A
+                // name on the circle, a node on the lattice, a vertex of the
+                // triangles, a line or a space on the STAFF: each is a place a
+                // musician points at meaning a note, and every one of them was
+                // silent unless keytoggle happened to be on.
+                //
+                // Handled before the piano and the neck because most of it
+                // speaks in pitch classes rather than in notes.
+                if let Some(r) = theory_rect.filter(|r| r.contains(pos)) {
+                    // The staff first: it is the one that answers with a real
+                    // PITCH rather than a pitch class, so it must not be
+                    // rounded off to one by whatever the lattice would say.
+                    if let Some(note) = self.staff_note_at(r, pos) {
+                        self.place_or_play(note);
+                        return;
+                    }
+                    let display = self.display_notes();
+                    if let Some(hit) = theory_panel::hit_test(
+                        r,
+                        &self.settings.theory_views(),
+                        self.theory_input(&display),
+                        pos,
+                    ) {
+                        // Sounded either way — a triad as a triad, not as its
+                        // lowest note — and placed as well when the toggle is
+                        // on. See `place_or_play`.
+                        self.sound_while_held(theory_pitches(hit));
+                        if self.settings.keytoggle_enabled {
+                            self.toggle_theory_hit(hit);
+                        }
                         return;
                     }
                 }
@@ -1613,11 +1706,7 @@ impl IvoryApp {
                         })
                     };
                     if let Some(note) = hit {
-                        // One at a time. Dragging across the keyboard is not a
-                        // glissando here: the press replaces whatever the last
-                        // one sounded, and letting go ends it.
-                        self.clicked.clear();
-                        self.clicked.insert(note);
+                        self.sound_while_held([note]);
                         return;
                     }
                 }
@@ -1636,6 +1725,10 @@ impl IvoryApp {
                         })
                     };
                     if let Some(note) = hit {
+                        // **Sounded on the way past, in this mode too.** The
+                        // toggle decides whether the note stays LIT, not
+                        // whether pressing a key makes a sound.
+                        self.sound_while_held([note]);
                         if self.manual_notes.remove(&note) {
                             self.manual_positions.remove(&note);
                         } else {
@@ -1862,12 +1955,16 @@ impl IvoryApp {
     /// note-on for a key somebody is holding down.
     fn wanted_sound(&self) -> std::collections::BTreeSet<u8> {
         let mut want = std::collections::BTreeSet::new();
-        // **Nothing latches while a take is rolling.** A note the app is
-        // holding is not a note anybody played, and it would land in the file
-        // as though it were. The performance is the take.
-        if !self.recorder.state.is_active() {
-            want.extend(self.latched_notes());
-        }
+        // **What keytoggle latches is VISUAL, and only visual.**
+        //
+        // The switch decides whether a click leaves the note BEHIND on screen.
+        // It does not hold the sound: a note-on with no note-off is a patch
+        // ringing for ever, and on an organ or a pad that is exactly what it
+        // sounds like. So the latched set is not in here.
+        //
+        // What sounds is a gesture somebody is making — a button still down,
+        // or Space — and both of those end. Space is how a latched chord is
+        // heard again, which is the whole reason it is a strike.
         want.extend(self.clicked.iter().copied());
         if self.audition_held {
             want.extend(self.lit_notes());
@@ -4910,6 +5007,7 @@ impl IvoryApp {
             ui.painter()
                 .rect_filled(row, 0.0, theory_panel::band_bg(&self.settings));
         }
+        self.last_theory = theory_rect_for_hit.unwrap_or(Rect::NOTHING);
         if let Some(theory_rect) = theory_rect_for_hit {
             theory_panel::draw(
                 ui.painter(),
@@ -5765,146 +5863,207 @@ mod tests {
         app.take_recorder_request()
     }
 
-    /// **Keytoggle plays, and keeps playing.** The switch decides whether a
-    /// click leaves the note BEHIND, not whether it makes a sound. Placing a
-    /// note used to light a key silently, which is the wrong answer for a
-    /// picture of a piano.
+    /// **The staff is an instrument now.** It was a readout, and said so in a
+    /// comment: a note on it is a note you are already holding. That stopped
+    /// being true when every other view became playable — a pianist reading a
+    /// chord off the staff should be able to put one back.
     #[test]
-    fn a_latched_note_sounds_until_it_is_unlatched() {
-        let (ctx, mut app) = headless(Caps::DESKTOP);
+    fn a_click_on_the_staff_sounds_the_note_that_is_drawn_there() {
+        for keytoggle in [false, true] {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.keytoggle_enabled = keytoggle;
+            app.settings.theory_order = theory_panel::View::Staff.key().to_owned();
+            let _ = run_frame(&ctx, &mut app);
+
+            // Middle line of the treble staff, which is B4.
+            let band = app.last_theory;
+            assert!(band.is_positive(), "the theory band is not showing");
+            let (_, cell) = theory_panel::cells(band, &app.settings.theory_views())
+                .into_iter()
+                .find(|(v, _)| *v == theory_panel::View::Staff)
+                .expect("the staff has a cell");
+            let body = theory_panel::staff_body(cell);
+            let want = staff::hit_test(
+                body,
+                app.settings.chord_detection_enabled,
+                &app.settings,
+                body.center(),
+            );
+            let Some(want) = want else {
+                panic!("nothing is drawn at the centre of the staff")
+            };
+            assert_eq!(
+                app.staff_note_at(band, body.center()),
+                Some(want),
+                "the app asked a different staff than the panel drew"
+            );
+
+            app.place_or_play(want);
+            assert_eq!(
+                run_frame(&ctx, &mut app),
+                Some(recorder::RecorderRequest::Audition {
+                    notes: vec![want],
+                    on: true
+                }),
+                "keytoggle {keytoggle}: clicking the staff made no sound"
+            );
+        }
+    }
+
+    /// A triad from the harmonic triangles arrives as a TRIAD, in both modes.
+    /// Clicking a chord and hearing its root alone is the wrong instrument.
+    #[test]
+    fn a_chord_from_the_theory_band_sounds_whole() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.sound_while_held(theory_pitches(theory_panel::Hit::Triad {
+            root: 0,
+            minor: false,
+        }));
+        assert_eq!(
+            run_frame(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Audition {
+                notes: vec![60, 64, 67],
+                on: true
+            }),
+            "a C major vertex did not sound as C major"
+        );
+    }
+
+    /// **What keytoggle latches is visual, and only visual.**
+    ///
+    /// A note-on with no note-off is a patch ringing for ever, and on an organ
+    /// or a pad that is exactly what it sounds like. The owner asked for this
+    /// after hearing it: the toggle decides whether the note stays LIT, not
+    /// whether the app holds it down. What sounds is a gesture that ends — a
+    /// button still down, or Space.
+    #[test]
+    fn a_latched_note_is_lit_but_does_not_ring() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.settings.keytoggle_enabled = true;
 
         app.manual_notes.insert(64);
-        assert_eq!(
-            run_frame(&ctx, &mut app),
-            Some(recorder::RecorderRequest::Audition {
-                notes: vec![64],
-                on: true
-            }),
-            "placing a note did not sound it"
+        assert!(
+            run_frame(&ctx, &mut app).is_none(),
+            "a latched note held the instrument down"
         );
-        // Frame after frame, nothing more is sent: it is already sounding, and
-        // a note-on every frame is a machine gun.
+        // It IS on screen, which is the half of it the toggle is for.
+        assert!(app.display_notes().contains(&64));
+        // Frame after frame, still nothing: no note-on, and nothing to release.
         assert!(run_frame(&ctx, &mut app).is_none());
+        app.manual_notes.clear();
         assert!(run_frame(&ctx, &mut app).is_none());
-
-        // A second note joins it, and only the second one is sent.
-        app.manual_notes.insert(67);
-        assert_eq!(
-            run_frame(&ctx, &mut app),
-            Some(recorder::RecorderRequest::Audition {
-                notes: vec![67],
-                on: true
-            }),
-            "the note already sounding was retriggered"
-        );
-
-        // Clicking one off releases that one alone.
-        app.manual_notes.remove(&64);
-        assert_eq!(
-            run_frame(&ctx, &mut app),
-            Some(recorder::RecorderRequest::Audition {
-                notes: vec![64],
-                on: false
-            })
-        );
-        assert!(run_frame(&ctx, &mut app).is_none(), "67 was disturbed");
     }
 
-    /// Switching keytoggle off releases what it was holding. Otherwise the
-    /// chord rings for ever with nothing on screen to say why.
+    /// **A click sounds in both modes, and stops when the button comes up.**
+    /// The toggle decides what is left on screen, not whether pressing a key
+    /// makes a sound.
     #[test]
-    fn turning_keytoggle_off_releases_the_latch() {
-        let (ctx, mut app) = headless(Caps::DESKTOP);
+    fn a_click_sounds_while_the_button_is_down_in_either_mode() {
+        for keytoggle in [false, true] {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.keytoggle_enabled = keytoggle;
+
+            app.place_or_play(67);
+            assert_eq!(
+                run_frame(&ctx, &mut app),
+                Some(recorder::RecorderRequest::Audition {
+                    notes: vec![67],
+                    on: true
+                }),
+                "keytoggle {keytoggle}: the click made no sound"
+            );
+            // Letting go stops it, wherever the pointer ended up.
+            app.clicked.clear();
+            assert_eq!(
+                run_frame(&ctx, &mut app),
+                Some(recorder::RecorderRequest::Audition {
+                    notes: vec![67],
+                    on: false
+                }),
+                "keytoggle {keytoggle}: the note went on ringing"
+            );
+            // And only with the toggle ON is it still lit afterwards.
+            assert_eq!(
+                app.display_notes().contains(&67),
+                keytoggle,
+                "keytoggle {keytoggle}: the wrong thing was left on screen"
+            );
+        }
+    }
+
+    /// Switching keytoggle off takes the notes off the screen. Nothing is
+    /// sounding to release — see `a_latched_note_is_lit_but_does_not_ring`.
+    #[test]
+    fn turning_keytoggle_off_clears_what_it_was_showing() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.settings.keytoggle_enabled = true;
         app.manual_notes.extend([60, 64]);
         let _ = run_frame(&ctx, &mut app);
+        assert!(app.display_notes().contains(&60));
 
         app.settings.keytoggle_enabled = false;
+        assert!(run_frame(&ctx, &mut app).is_none());
+        assert!(!app.display_notes().contains(&60), "the notes stayed lit");
+    }
+
+    /// **A take records a performance, and placing a voicing is part of one.**
+    /// Nothing is silenced when Record is pressed, because the latch was never
+    /// making a sound — and a click during a take sounds like any other.
+    #[test]
+    fn a_rolling_take_does_not_silence_a_click() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = true;
+        app.recorder.state = recorder::RecordState::Rolling;
+        app.place_or_play(60);
         assert_eq!(
             run_frame(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Audition {
+                notes: vec![60],
+                on: true
+            }),
+            "a note clicked during a take made no sound"
+        );
+    }
+
+    /// **Space is what plays a latched chord**, and it is a strike.
+    ///
+    /// The latch is silent by design, so Space is not a nicety here: it is the
+    /// only way to hear a voicing built up by clicking. Down sounds the whole
+    /// lit set, up releases it, and pressing it again strikes it again — which
+    /// on a decaying instrument is the entire point.
+    #[test]
+    fn space_strikes_the_chord_that_keytoggle_is_showing() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = true;
+        app.manual_notes.extend([60, 64]);
+        assert!(
+            run_frame(&ctx, &mut app).is_none(),
+            "placing the chord rang it"
+        );
+
+        assert_eq!(
+            space(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Audition {
+                notes: vec![60, 64],
+                on: true
+            }),
+            "Space did not sound what was lit"
+        );
+        assert_eq!(
+            key_up(&ctx, &mut app),
             Some(recorder::RecorderRequest::Audition {
                 notes: vec![60, 64],
                 on: false
             }),
-            "the latch outlived the switch that made it"
+            "letting go of Space did not release the chord"
         );
-    }
-
-    /// **A take records a performance, not the app's own held notes.** A latch
-    /// left over from choosing a voicing would land in the file as though
-    /// somebody had played it.
-    #[test]
-    fn a_rolling_take_silences_the_latch() {
-        let (ctx, mut app) = headless(Caps::DESKTOP);
-        app.settings.keytoggle_enabled = true;
-        app.manual_notes.insert(60);
-        let _ = run_frame(&ctx, &mut app);
-
-        app.recorder.state = recorder::RecordState::Rolling;
-        assert_eq!(
-            run_frame(&ctx, &mut app),
-            Some(recorder::RecorderRequest::Audition {
-                notes: vec![60],
-                on: false
-            }),
-            "the latch played into the take"
-        );
-    }
-
-    /// **Space is a STRIKE**, so it strikes what is already sounding too.
-    ///
-    /// The regression this exists for: once keytoggle started sounding what it
-    /// latched, pressing Space with a chord up changed nothing — the notes were
-    /// wanted, they were sounding, the diff was empty — and the key looked
-    /// broken. On a decaying instrument, hearing the chord again from the top
-    /// is the entire reason to press it twice.
-    ///
-    /// **`headless_with_band`, not `headless`.** The Welcome card is a dialog,
-    /// and `audition_tick` ignores Space while one is up — so this test on a
-    /// plain app asserted nothing at all and passed for it.
-    #[test]
-    fn space_restrikes_a_chord_that_is_already_latched() {
-        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
-        app.settings.keytoggle_enabled = true;
-        app.manual_notes.insert(60);
-        assert_eq!(
-            run_frame(&ctx, &mut app),
-            Some(recorder::RecorderRequest::Audition {
-                notes: vec![60],
-                on: true
-            }),
-            "the latch did not sound it"
-        );
-
-        // Off then on, in that order: a fresh attack on a note that never
-        // stopped is a note the instrument is now holding twice.
-        assert_eq!(
-            space(&ctx, &mut app),
-            Some(recorder::RecorderRequest::Audition {
-                notes: vec![60],
-                on: false
-            }),
-            "Space did not release before it re-struck"
-        );
-        assert_eq!(
-            app.take_recorder_request(),
-            Some(recorder::RecorderRequest::Audition {
-                notes: vec![60],
-                on: true
-            }),
-            "Space released the chord and never struck it"
-        );
-
-        // Letting go does NOT stop it: Space was never what was holding it.
-        assert!(key_up(&ctx, &mut app).is_none(), "Space stopped the latch");
-        // And it really is still held: unlatching it is what stops it.
-        app.manual_notes.clear();
+        // Again, from the top.
         assert!(matches!(
-            run_frame(&ctx, &mut app),
-            Some(recorder::RecorderRequest::Audition { on: false, .. })
+            space(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Audition { on: true, .. })
         ));
     }
+
 
     /// Holding Space is ONE strike. Key auto-repeat fires many times a second,
     /// and a chord re-attacked at the repeat rate is a machine gun.
@@ -5933,17 +6092,19 @@ mod tests {
     /// interval above the ones being played.
     #[test]
     fn transpose_is_applied_once_to_what_is_sounding() {
-        let (ctx, mut app) = headless(Caps::DESKTOP);
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.settings.keytoggle_enabled = true;
         app.settings.transpose = 2;
         app.manual_notes.insert(60);
+        let _ = run_frame(&ctx, &mut app);
+        // Space, because that is what sounds a latched chord now.
         assert_eq!(
-            run_frame(&ctx, &mut app),
+            space(&ctx, &mut app),
             Some(recorder::RecorderRequest::Audition {
                 notes: vec![62],
                 on: true
             }),
-            "the latch did not follow the transpose"
+            "the strike did not follow the transpose"
         );
         let lit = app.display_notes();
         assert_eq!(
@@ -6122,7 +6283,7 @@ mod tests {
     /// the wrong effect would look like the panel simply not working.
     #[test]
     fn right_clicking_a_knob_opens_that_effect() {
-        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        let (_, app) = headless_with_fx(Caps::DESKTOP);
         for (fx, hit) in [
             (recorder_panel::Fx::Reverb, recorder_panel::Hit::SetReverb(0.0)),
             (recorder_panel::Fx::Delay, recorder_panel::Hit::SetDelay(0.0)),
@@ -6956,33 +7117,27 @@ mod tests {
         // and it is the only way a placed note is one of the notes on screen.
         app.settings.keytoggle_enabled = true;
         app.manual_notes.insert(60);
-        // **The latch sounds it before Space is ever touched.** Placing a note
-        // with keytoggle on plays it and leaves it playing, so the first
-        // request out is the latch's, not the audition's.
+        // Idle, Space strikes what is lit. The latch is silent by itself —
+        // see `a_latched_note_is_lit_but_does_not_ring` — so this request is
+        // Space's own.
         assert!(
             matches!(
                 space(&ctx, &mut app),
                 Some(recorder::RecorderRequest::Audition { on: true, .. })
             ),
-            "with nothing rolling, a lit note sounds"
+            "with nothing rolling, Space sounds what is lit"
         );
-        // And letting go of Space does NOT stop it, because Space was never
-        // what was holding it. This is the difference the toggle names.
-        assert!(
-            key_up(&ctx, &mut app).is_none(),
-            "letting go of Space unlatched a note keytoggle was holding"
-        );
-        // The hold that DOES have to let go is the latch itself. It is
-        // asserted rather than merely drained: a note that never stops is the
-        // failure this whole model exists to prevent.
-        app.manual_notes.clear();
+        // And it is a HOLD: letting go releases it. Asserted rather than
+        // merely drained, because a chord that never lets go is the failure
+        // this whole model exists to prevent.
         assert!(
             matches!(
-                run_frame(&ctx, &mut app),
+                key_up(&ctx, &mut app),
                 Some(recorder::RecorderRequest::Audition { on: false, .. })
             ),
-            "clearing the note did not release it"
+            "letting go of the key did not release the chord"
         );
+        app.manual_notes.clear();
 
         app.name_focused = true;
         assert_eq!(
