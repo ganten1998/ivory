@@ -15,7 +15,7 @@ stderr. Kept verbatim below.
 | 3 | The app lists its own display plugin as an instrument | FIXED - labelled, and the load error names the file |
 | 4 | A dead saved slot silences the fresh default | NOT REPRODUCED - see below |
 | 5 | Pre-restore state can be persisted | FIXED - an unreadable settings file is moved aside, never written over |
-| 6 | Packaging and window warts | PARTLY FIXED - file modes; the rest open |
+| 6 | Packaging and window warts | FIXED (packaging) - file modes and the xattr pax headers; the i3 off-screen map is OPEN |
 
 **On finding 5.** The mechanism turned out to be on the READ side, not the
 write side. `load_from` answers an unreadable or unparseable file with plain

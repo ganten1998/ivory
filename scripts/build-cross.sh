@@ -321,7 +321,14 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   chmod -R a+rX "$stage" || { rm -rf "$stage"; return 1; }
   # Written beside the real name and moved into place, so a tar that fails
   # half way leaves the previous artifact intact rather than a truncated one.
-  tar -C dist -czf "${stage}.tar.gz.new" "tangent-${VERSION}-linux-${arch}" || {
+  # **No mac metadata in a Linux tarball.** bsdtar writes the host's extended
+  # attributes as pax headers — Dropbox's, Apple's provenance, the lot — and GNU
+  # tar on the far side prints a warning for every one of them. Forty lines of
+  # "Ignoring unknown extended header keyword" is what somebody sees instead of
+  # the file list, and it reads like the archive is damaged.
+  COPYFILE_DISABLE=1 \
+  tar --no-xattrs --no-mac-metadata \
+      -C dist -czf "${stage}.tar.gz.new" "tangent-${VERSION}-linux-${arch}" || {
     rm -rf "$stage" "${stage}.tar.gz.new"; return 1;
   }
   mv -f "${stage}.tar.gz.new" "${stage}.tar.gz" || {
