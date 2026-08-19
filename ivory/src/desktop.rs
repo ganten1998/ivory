@@ -250,7 +250,20 @@ pub struct DesktopApp {
     /// `SetPatchParam`.
     #[cfg(feature = "recorder")]
     editing: Option<crate::dx7::Voice>,
+    /// The decoded backing track, kept so the engine's `Arc` has an owner here
+    /// and the file is not decoded again on every settings push.
+    #[cfg(feature = "recorder")]
+    track: Option<Arc<ivory_record::decode::Clip>>,
 }
+
+/// How many columns the backing track's waveform is drawn from.
+///
+/// **Not the pixel width of the row.** The envelope is computed once when the
+/// file is imported and drawn at whatever size the window happens to be, so it
+/// has to be finer than the widest band anybody will open and coarse enough to
+/// stay a few kilobytes. A thousand columns is under a pixel each at 1080p.
+#[cfg(feature = "recorder")]
+const TRACK_WAVE_BUCKETS: usize = 1000;
 
 /// **Every stepped row has a list to step through.**
 ///
@@ -1341,9 +1354,7 @@ impl DesktopApp {
         let Some(request) = self.app.take_file_request() else {
             return;
         };
-        match request.purpose {
-            ivory_ui::ports::FilePurpose::Cartridge => {}
-        }
+        let purpose = request.purpose;
         let mut dialog = rfd::FileDialog::new().set_title(&request.title);
         // **Parented to the window that asked for it.**
         //
@@ -1368,6 +1379,10 @@ impl DesktopApp {
             dialog = dialog.add_filter("All files", &["*"]);
         }
         let Some(file) = dialog.pick_file() else { return };
+        if purpose == ivory_ui::ports::FilePurpose::BackingTrack {
+            self.load_track(&file);
+            return;
+        }
         match crate::dx7::Cartridge::load(&file) {
             Ok(cart) => {
                 self.app.set_cartridge(cartridge_info(&cart, ""));
@@ -1381,6 +1396,71 @@ impl DesktopApp {
             Err(e) => self
                 .app
                 .set_cartridge(ivory_ui::ports::CartridgeInfo { error: e, ..Default::default() }),
+        }
+    }
+
+    /// Reload last session's backing track, if the file is still there.
+    ///
+    /// **Quietly when it is not.** A file that has been moved or is on a drive
+    /// that is not plugged in is the ordinary case for a path remembered
+    /// across launches; an error dialog on startup about a backing track
+    /// nobody has asked for yet is not.
+    #[cfg(feature = "recorder")]
+    fn load_track_at_launch(&mut self) {
+        let (path, from, to) = self.app.track_settings();
+        if path.is_empty() {
+            return;
+        }
+        let path = std::path::PathBuf::from(path);
+        if !path.is_file() {
+            return;
+        }
+        self.load_track(&path);
+        // The trim is put BACK, because it belongs to this file — which is the
+        // one being reloaded. `set_track_path` clears it, on the reasoning
+        // that a NEW file should not open already cut to the last one's
+        // length, and that reasoning does not apply here.
+        self.app.set_track_trim(from, to);
+    }
+
+    /// Decode an audio file and hand it to the engine.
+    ///
+    /// **Decoded once, here, and held as one `Arc`.** The renderer must never
+    /// allocate, and a hundred megabytes of `Vec<f32>` is the largest thing
+    /// this app ever holds — so it is built on this thread, handed over behind
+    /// a pointer, and the old one is dropped here when the new one lands.
+    #[cfg(feature = "recorder")]
+    fn load_track(&mut self, file: &std::path::Path) {
+        let rate = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or(48_000, |e| e.output().sample_rate);
+        match ivory_record::decode::decode(file, rate) {
+            Ok(clip) => {
+                let clip = Arc::new(clip);
+                self.app.set_track_info(ivory_ui::ports::TrackInfo {
+                    name: clip.label(),
+                    seconds: clip.seconds(),
+                    wave: clip.envelope(TRACK_WAVE_BUCKETS),
+                    error: String::new(),
+                });
+                self.app
+                    .set_track_path(file.to_string_lossy().into_owned());
+                if let Some(e) = self.recorder.engine.as_ref() {
+                    e.set_track(Some(Arc::clone(&clip)));
+                }
+                self.track = Some(clip);
+            }
+            // The name is kept out of the info on purpose: a row that says a
+            // file name next to an error reads as "this is loaded but broken",
+            // and nothing is loaded.
+            Err(error) => {
+                self.app.set_track_info(ivory_ui::ports::TrackInfo {
+                    error,
+                    ..Default::default()
+                });
+            }
         }
     }
 
@@ -1478,6 +1558,30 @@ impl DesktopApp {
         }
         e.set_metronome_gain(gains.metronome);
         e.set_master_gain(gains.master);
+        // The backing track's level and trim, pushed with the rest for the
+        // same reason: the settings are the one live value, so a fader moved,
+        // a project loaded and a hand-edited file all arrive by one path.
+        let (track_gain, from_s, to_s) = self.app.track_playback();
+        e.set_track_gain(track_gain);
+        let rate = f64::from(e.output().sample_rate);
+        // Seconds to frames HERE, because seconds are what survives a machine
+        // whose device runs at a different rate than the one that set them.
+        let frames = |s: f64| (s.max(0.0) * rate) as u64;
+        e.set_track_trim(frames(from_s), frames(to_s));
+        // **Rolling with the transport — and only while it is Rolling.**
+        //
+        // Not during the count-in: the count-in is what counts you IN to the
+        // track, and a track that started under it would have its downbeat a
+        // bar away from the one being clicked. Not during `Finishing` either,
+        // which is a file flushing after the performance ended.
+        //
+        // Starting at the same instant the take starts writing is also what
+        // makes the two line up: the backing track and the recorded audio
+        // begin on the same sample.
+        e.set_track_playing(matches!(
+            self.recorder.session.state(),
+            ivory_ui::recorder::RecordState::Rolling
+        ));
         // Pushed every frame with the gains, and for the same reason: the
         // settings are the one live value, so a knob dragged, a project loaded
         // and a settings file hand-edited all arrive by the same path.
@@ -1884,6 +1988,8 @@ impl DesktopApp {
             cartridge: None,
             #[cfg(feature = "recorder")]
             editing: None,
+            #[cfg(feature = "recorder")]
+            track: None,
         };
         // What the effects ship as, so the panel can draw a slider for a
         // parameter nobody has moved. See `ports::EffectDefaults`: the DSP owns
@@ -1897,6 +2003,7 @@ impl DesktopApp {
         // patch, which is what a fresh install plays anyway.
         #[cfg(feature = "recorder")]
         me.load_cartridge_at_launch();
+        me.load_track_at_launch();
         me
     }
 }

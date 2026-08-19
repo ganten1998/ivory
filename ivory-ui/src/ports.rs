@@ -106,6 +106,41 @@ pub struct FileRequest {
     pub purpose: FilePurpose,
 }
 
+/// The backing track, as the band needs to draw it.
+///
+/// **The waveform is precomputed by the host**, because the samples are on the
+/// other side of the firewall and there are a hundred million of them.
+/// `ivory-ui` gets an outline it can draw and a length it can label; what a
+/// peak envelope is, and how many megabytes it came from, is the recorder's
+/// business.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TrackInfo {
+    /// The file's name, or empty when nothing is loaded.
+    pub name: String,
+    /// How long the file is, in seconds.
+    pub seconds: f64,
+    /// A peak envelope, 0..=1, left to right across the whole file.
+    pub wave: Vec<f32>,
+    /// Why the last import did not work, if it did not.
+    pub error: String,
+}
+
+impl TrackInfo {
+    /// Nothing loaded, as a borrowable constant — the band's `EMPTY` view is a
+    /// `const` and cannot build a `String`.
+    pub const NONE: &'static TrackInfo = &TrackInfo {
+        name: String::new(),
+        seconds: 0.0,
+        wave: Vec::new(),
+        error: String::new(),
+    };
+
+    /// Whether anything is loaded at all.
+    pub fn is_empty(&self) -> bool {
+        self.name.is_empty()
+    }
+}
+
 /// What the effects ship as, pushed in by the host.
 ///
 /// **The DSP owns these numbers, and it is on the other side of the firewall.**
@@ -234,6 +269,8 @@ pub struct CartridgeInfo {
 pub enum FilePurpose {
     /// A DX7 cartridge to load into the built-in FM instrument.
     Cartridge,
+    /// An audio file to play along to.
+    BackingTrack,
 }
 
 /// Why a folder is being asked for.

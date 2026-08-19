@@ -265,6 +265,10 @@ pub struct RecorderView<'a> {
     /// What each of those numbers MEANS, in [`crate::recorder_panel::Fx::ALL`]
     /// order. Told by the host; see [`crate::ports::KnobUnit`].
     pub fx_units: [crate::ports::KnobUnit; 6],
+    /// The backing track: its name, its length and its outline. Borrowed, not
+    /// owned — the outline is a thousand floats and the view is built every
+    /// frame.
+    pub track: &'a crate::ports::TrackInfo,
     /// The control a hand is on right now, if any. A knob shows its number
     /// while it is being turned and its name the rest of the time: there is
     /// nowhere on a knob to keep both, and the number is only wanted while it
@@ -333,6 +337,7 @@ impl RecorderView<'_> {
             gains: Gains::default(),
             fx: FxSends { reverb: 0.0, delay: 0.0, chorus: 0.0, hpf: 0.0, lpf: 0.0, limiter: 0.0 },
             fx_units: [crate::ports::KnobUnit::Percent; 6],
+            track: crate::ports::TrackInfo::NONE,
             turning: None,
             metronome_on: false,
             metronome_in_take: false,
@@ -374,6 +379,8 @@ pub struct Gains {
     /// **The master.** Last on the instrument bus, after the limiter, on both
     /// what you hear and what is written. Not the click, which has its own.
     pub master: f32,
+    /// The backing track, which rolls with the transport.
+    pub track: f32,
 }
 
 impl Default for Gains {
@@ -388,6 +395,7 @@ impl Default for Gains {
             metronome: 0.5,
             input: 1.0,
             master: 1.0,
+            track: 1.0,
         }
     }
 }
@@ -493,6 +501,9 @@ impl RecorderState {
             count_in_bars: knobs.count_in_bars,
             time_signature: knobs.time_signature,
             fx: knobs.fx,
+            // Nothing until the caller says otherwise, for the same reason as
+            // the units below: the track is the host's to describe.
+            track: crate::ports::TrackInfo::NONE,
             // Percent until the caller says otherwise: what each knob's number
             // MEANS is the host describing its own sweeps, not a preference,
             // so it is set over the top rather than threaded through here.
@@ -1523,6 +1534,11 @@ pub enum NumField {
     /// The master, typed in **decibels** like the faders it shares a curve
     /// with — not a percentage. It is a level.
     Master,
+    /// The backing track's level, in decibels like the faders beside it.
+    Track,
+    /// The backing track's trim points, typed as `m:ss.t` or as seconds.
+    TrackIn,
+    TrackOut,
     /// One of the six effect knobs, typed as a PERCENT. Every other field
     /// here is typed in the unit it is displayed in, and "40" for four tenths
     /// wet is the only reading of a send anybody has ever wanted to write.
@@ -1531,6 +1547,28 @@ pub enum NumField {
     /// The time signature. Typed rather than dragged — "6/8" is two numbers and
     /// a slash, and there is no continuum between 4/4 and 7/8 to drag along.
     Meter,
+}
+
+/// A time typed into a trim field, in seconds.
+///
+/// **Both ways somebody writes one.** `12.5` is twelve and a half seconds and
+/// `1:12.5` is a minute and twelve — a backing track is minutes long, so the
+/// second is what anybody reading a player's display will type, and refusing
+/// it would be a field that rejects the format it prints.
+pub fn parse_time(text: &str) -> Option<f64> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (mins, rest) = match t.split_once(':') {
+        Some((m, r)) => (m.trim().parse::<f64>().ok()?, r.trim()),
+        None => (0.0, t),
+    };
+    let secs = rest.parse::<f64>().ok()?;
+    if !mins.is_finite() || !secs.is_finite() || mins < 0.0 || secs < 0.0 {
+        return None;
+    }
+    Some(mins * 60.0 + secs)
 }
 
 /// A percent typed into an effect send, as 0..=1.

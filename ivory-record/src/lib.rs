@@ -20,6 +20,7 @@
 pub mod audio;
 pub mod camera;
 pub mod clock;
+pub mod decode;
 pub mod encode;
 pub mod graph;
 pub mod smf;

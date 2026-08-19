@@ -858,6 +858,21 @@ struct Shared {
     /// one constant rather than a fourth field in four structs.
     slot_gains: [AtomicU32; SLOTS],
     metro_gain: AtomicU32,
+    /// The backing track's level, linear.
+    track_gain: AtomicU32,
+    /// Whether the backing track should be rolling. Set by the transport.
+    track_playing: AtomicBool,
+    /// Where the track starts and stops, in frames. `out` of zero means "to
+    /// the end", so a clip with no trim needs no knowledge of its own length
+    /// down here.
+    track_in: AtomicU64,
+    track_out: AtomicU64,
+    /// A clip on its way to the renderer, or `Some(None)` to take one away.
+    ///
+    /// **A mutex the audio thread only ever `try_lock`s**, exactly like
+    /// `pending_voice`: importing a file is a thing that happens once and can
+    /// wait a block; a block that waits on a file import is a dropout.
+    pending_track: std::sync::Mutex<Option<Option<Arc<ivory_record::decode::Clip>>>>,
     /// The master, as a LINEAR gain. The last thing on the instrument bus,
     /// after the limiter, reaching both the device mix and the take — the same
     /// rule the effects follow.
@@ -965,6 +980,11 @@ impl Shared {
             // Both effects OFF by default. A first launch has to sound like the
             // instrument and not like a room, and `Effects::process` skips its
             // whole cost at zero.
+            track_gain: AtomicU32::new(1.0f32.to_bits()),
+            track_playing: AtomicBool::new(false),
+            track_in: AtomicU64::new(0),
+            track_out: AtomicU64::new(0),
+            pending_track: std::sync::Mutex::new(None),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
             gr_db: AtomicU32::new(0),
             reverb_mix: AtomicU32::new(0.0f32.to_bits()),
@@ -1016,6 +1036,32 @@ impl Shared {
     /// Publish one slot's gain. **A slot that does not exist is ignored**, not
     /// an index: this is reached from UI code, and the app's panic hook turns a
     /// panic into a dialog and `exit(1)`.
+    /// Hand the renderer a backing track, or `None` to take one away.
+    fn set_track(&self, clip: Option<Arc<ivory_record::decode::Clip>>) {
+        if let Ok(mut g) = self.pending_track.lock() {
+            *g = Some(clip);
+        }
+    }
+
+    fn set_track_gain(&self, linear: f32) {
+        self.track_gain
+            .store(sane_gain(linear).to_bits(), Ordering::Relaxed);
+    }
+
+    fn set_track_trim(&self, from: u64, to: u64) {
+        self.track_in.store(from, Ordering::Relaxed);
+        self.track_out.store(to, Ordering::Relaxed);
+    }
+
+    /// Roll the backing track, or stop it and rewind to the in-point.
+    ///
+    /// **Rewind on stop, not on start.** Both would work; only this one also
+    /// makes stopping leave the track where a person expects to find it, and
+    /// "pressing stop puts it back to the top" is what everybody assumes.
+    fn set_track_playing(&self, playing: bool) {
+        self.track_playing.store(playing, Ordering::Relaxed);
+    }
+
     fn set_slot_gain(&self, slot: usize, linear: f32) {
         if let Some(cell) = self.slot_gains.get(slot) {
             cell.store(sane_gain(linear).to_bits(), Ordering::Relaxed);
@@ -1238,6 +1284,17 @@ struct Renderer {
     /// the picker keeps making one after a real plugin has been tried and
     /// removed. See `dx7/` for the synth and `builtin.rs` for what it grew out
     /// of.
+    /// The backing track, and where in it the transport is.
+    ///
+    /// **Held by the renderer, swapped in whole.** A clip is a hundred
+    /// megabytes of `Vec<f32>` and the audio thread must never allocate or
+    /// free one, so it arrives behind an `Arc` through `pending_track` and the
+    /// old one is dropped by whoever pushed the new one.
+    track: Option<Arc<ivory_record::decode::Clip>>,
+    track_pos: u64,
+    track_gain: f32,
+    /// Whether it was rolling last block, so the rewind happens once.
+    track_was_playing: bool,
     builtin: crate::dx7::Dx7,
     /// The built-in's own output, before its slot gain.
     ///
@@ -1526,18 +1583,33 @@ impl Renderer {
                 // this one is what leaves, which is what a master fader is.
                 // Turning it above unity CAN go past the limiter's ceiling,
                 // exactly as it does on a desk, and the master meter shows it.
-                let master = Shared::f32_of(&self.shared.master_gain);
-                if (master - 1.0).abs() > 1.0e-6 {
-                    for v in mix.iter_mut() {
-                        *v *= master;
-                    }
-                }
+                // **The backing track, after the effects and before the
+                // master.** After, because it arrived finished — a reverb on
+                // somebody else's mix is not a thing anybody asked for.
+                // Before, because the master is the master.
+                //
+                // It reaches the tap as well as the device, the same as the
+                // effects do: a take of somebody playing along to a backing
+                // track, with the backing track missing, is not a take of what
+                // happened.
                 // How hard the limiter worked, for the meter beside it. Kept
                 // as the WORST since the UI last looked: it asks sixty times a
                 // second and the moment worth showing is a few samples long.
                 let gr = self.effects.gain_reduction_db();
                 if gr > 0.0 {
                     self.shared.gr_db.fetch_max(gr.to_bits(), Ordering::Relaxed);
+                }
+            }
+            // Its own statement rather than inside the block above, because it
+            // borrows `self.mix` itself: a method taking `&mut self` cannot be
+            // called while a slice of one of self's fields is still alive.
+            self.mix_track(n);
+            if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
+                let master = Shared::f32_of(&self.shared.master_gain);
+                if (master - 1.0).abs() > 1.0e-6 {
+                    for v in mix.iter_mut() {
+                        *v *= master;
+                    }
                 }
             }
 
@@ -1638,6 +1710,65 @@ impl Renderer {
     /// chose. `widths` is what actually rendered this block, which is the
     /// honest test — a slot holding a faulted plugin is an empty slot as far as
     /// the bus is concerned.
+    /// Add the backing track to the bus, if one is loaded and rolling.
+    ///
+    /// The clip is stereo at the device's rate — `decode` guarantees both — so
+    /// there is no resampling and no channel mapping here, which is the whole
+    /// reason it is guaranteed there.
+    fn mix_track(&mut self, frames: usize) {
+        // A clip arriving, or being taken away. `try_lock`, never `lock`.
+        if let Ok(mut pending) = self.shared.pending_track.try_lock() {
+            if let Some(next) = pending.take() {
+                self.track = next;
+                self.track_pos = 0;
+                self.track_was_playing = false;
+            }
+        }
+        let playing = self.shared.track_playing.load(Ordering::Relaxed);
+        let from = self.shared.track_in.load(Ordering::Relaxed);
+        if !playing {
+            // Stopped: back to the in-point, once, so the next press starts
+            // where the trim says and not where the last stop left it.
+            if self.track_was_playing {
+                self.track_pos = from;
+                self.track_was_playing = false;
+            }
+            return;
+        }
+        if !self.track_was_playing {
+            self.track_pos = from;
+            self.track_was_playing = true;
+        }
+        let Some(clip) = self.track.clone() else {
+            return;
+        };
+        let total = clip.frames() as u64;
+        let out = match self.shared.track_out.load(Ordering::Relaxed) {
+            0 => total,
+            n => n.min(total),
+        };
+        let target = Shared::f32_of(&self.shared.track_gain).clamp(0.0, 8.0);
+        let coeff = self.gain_coeff;
+        let Some(mix) = self.mix.get_mut(..frames * TAP_CHANNELS) else {
+            return;
+        };
+        for f in 0..frames {
+            self.track_gain += (target - self.track_gain) * coeff;
+            if self.track_pos >= out {
+                continue;
+            }
+            let at = (self.track_pos as usize) * 2;
+            // Bounds-checked rather than trusted: `out` is clamped to the
+            // clip's length above, and this is the line that would panic on
+            // the audio thread if that ever stopped being true.
+            if let (Some(l), Some(r)) = (clip.samples.get(at), clip.samples.get(at + 1)) {
+                mix[f * TAP_CHANNELS] += l * self.track_gain;
+                mix[f * TAP_CHANNELS + 1] += r * self.track_gain;
+            }
+            self.track_pos += 1;
+        }
+    }
+
     fn render_builtin(&mut self, frames: usize, widths: &[usize; SLOTS], targets: &[f32; SLOTS]) {
         // Asked for by name, or nothing else is playing. The second is what
         // makes a fresh install audible; the first is what makes the picker's
@@ -2166,6 +2297,10 @@ impl Engine {
             midi: midi_rx,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
+            track: None,
+            track_pos: 0,
+            track_gain: 1.0,
+            track_was_playing: false,
             builtin: crate::dx7::Dx7::new(rate as f32),
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             builtin_gain: 1.0,
@@ -2880,6 +3015,25 @@ impl Engine {
     /// What each effect is set to.
     pub fn set_effect_params(&self, params: crate::effects::Params) {
         self.shared.set_effect_params(params);
+    }
+
+    /// Hand the renderer a backing track, or `None` to take one away.
+    pub fn set_track(&self, clip: Option<Arc<ivory_record::decode::Clip>>) {
+        self.shared.set_track(clip);
+    }
+
+    pub fn set_track_gain(&self, linear: f32) {
+        self.shared.set_track_gain(linear);
+    }
+
+    /// Where the track starts and stops, in frames. `out` of 0 is "the end".
+    pub fn set_track_trim(&self, from: u64, to: u64) {
+        self.shared.set_track_trim(from, to);
+    }
+
+    /// Roll the backing track, or stop it and rewind to the in-point.
+    pub fn set_track_playing(&self, playing: bool) {
+        self.shared.set_track_playing(playing);
     }
 
     /// The master, as a linear gain. See [`Shared::master_gain`].
@@ -4374,6 +4528,10 @@ mod tests {
         // renderer under test needs no partner threads at all.
         let (_, midi) = RingBuffer::<MidiEvent>::new(1024);
         Renderer {
+            track: None,
+            track_pos: 0,
+            track_gain: 1.0,
+            track_was_playing: false,
             shared,
             timebase: Timebase::new(),
             rate: RATE,
@@ -4474,6 +4632,79 @@ mod tests {
     ///
     /// Two patches chosen to be unmistakably different: an organ (algorithm 32,
     /// six carriers, no modulation) against the tine piano.
+    /// **The backing track rolls with the transport, trims where it is told,
+    /// and reaches the take.**
+    ///
+    /// Four claims in one test because they are one feature: a track that
+    /// plays but ignores the trim is not usable, and one that is heard but
+    /// missing from the take is a take of half a performance.
+    #[test]
+    fn the_backing_track_plays_between_its_trim_points() {
+        use std::sync::Arc;
+
+        // A clip whose value IS its frame index, so where playback started and
+        // stopped can be read straight off the output.
+        let frames = 1000usize;
+        let clip = Arc::new(ivory_record::decode::Clip {
+            samples: (0..frames).flat_map(|i| [i as f32, i as f32]).collect(),
+            rate: 48_000,
+            source: std::path::PathBuf::from("t.wav"),
+        });
+
+        let (mut r, _tx, shared) = renderer_with_midi(2);
+        shared.set_track(Some(Arc::clone(&clip)));
+        shared.set_track_gain(1.0);
+        r.track_gain = 1.0;
+
+        // Not rolling: nothing comes out.
+        let mut out = vec![0.0_f32; 2 * 256];
+        r.render(&mut out, 0, 0);
+        assert_eq!(
+            out.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+            0.0,
+            "the track played with the transport stopped"
+        );
+
+        // Rolling, trimmed to frames 100..200.
+        shared.set_track_trim(100, 200);
+        shared.set_track_playing(true);
+        let mut out = vec![0.0_f32; 2 * 256];
+        r.render(&mut out, 0, 0);
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        assert!(
+            (left[0] - 100.0).abs() < 0.5,
+            "it started at frame {} and the in-point is 100",
+            left[0]
+        );
+        assert!(
+            (left[99] - 199.0).abs() < 0.5,
+            "frame 99 of playback is {} and should be 199",
+            left[99]
+        );
+        // Past the out-point: silence, not the rest of the file.
+        assert_eq!(left[120], 0.0, "it played past the out-point");
+
+        // Stopping rewinds to the in-point rather than leaving it where it was.
+        shared.set_track_playing(false);
+        let mut out = vec![0.0_f32; 2 * 64];
+        r.render(&mut out, 0, 0);
+        shared.set_track_playing(true);
+        let mut out = vec![0.0_f32; 2 * 64];
+        r.render(&mut out, 0, 0);
+        assert!(
+            (out[0] - 100.0).abs() < 0.5,
+            "after a stop it resumed at {} instead of the in-point",
+            out[0]
+        );
+
+        // Taking it away takes it away.
+        shared.set_track(None);
+        shared.set_track_playing(true);
+        let mut out = vec![0.0_f32; 2 * 64];
+        r.render(&mut out, 0, 0);
+        assert_eq!(out.iter().fold(0.0f32, |m, s| m.max(s.abs())), 0.0);
+    }
+
     /// **The built-in's slot fader moves the built-in.**
     ///
     /// It did not, and it looked exactly like a working control: the number

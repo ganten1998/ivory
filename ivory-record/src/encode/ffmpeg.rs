@@ -80,7 +80,7 @@ const BUNDLED: &str = if cfg!(target_os = "windows") {
 /// copy shipped beside the executable, so the artifact works on a machine with
 /// nothing installed — the release carries its own encoder on the platforms
 /// that need one. Only then the bare name, so `PATH` decides.
-fn program() -> PathBuf {
+pub fn program() -> PathBuf {
     if let Some(p) = std::env::var_os("IVORY_FFMPEG") {
         return PathBuf::from(p);
     }
@@ -100,7 +100,7 @@ fn program() -> PathBuf {
 /// Reachable only when the bundled copy beside the executable is gone too —
 /// somebody copied `tangent` out of its folder, most likely — so the bundled
 /// copy is worth naming ahead of the package manager.
-fn how_to_install() -> &'static str {
+pub fn how_to_install() -> &'static str {
     if cfg!(target_os = "windows") {
         "restore the tangent-ffmpeg.exe that shipped next to tangent.exe, \
          install it with `winget install ffmpeg`, or put ffmpeg.exe on PATH"

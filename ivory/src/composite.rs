@@ -918,6 +918,28 @@ mod shot {
                 4.5,
             );
         }
+        if let Ok(what) = std::env::var("IVORY_SHOT_TRACK") {
+            // A waveform with a quiet lead-in and a quiet tail, which is what
+            // somebody actually trims off.
+            let wave: Vec<f32> = (0..1000)
+                .map(|i| {
+                    let t = i as f32 / 1000.0;
+                    let body = ((t - 0.5) * 6.0).cos().abs();
+                    let env = if (0.06..=0.93).contains(&t) { 1.0 } else { 0.05 };
+                    (0.35 + 0.6 * ((i as f32 * 0.7).sin().abs())) * body * env
+                })
+                .collect();
+            app.set_track_for_shot(
+                ivory_ui::ports::TrackInfo {
+                    name: "Blue Bossa - backing.mp3".to_owned(),
+                    seconds: 214.0,
+                    wave,
+                    error: String::new(),
+                },
+                what == "open",
+            );
+            app.set_track_trim(9.5, 196.0);
+        }
         let mut shoot = |app: &IvoryApp| {
             c.frame(app, Layout::default(), DisplayShows::default(), false, true, None)
                 .map(|_| ())

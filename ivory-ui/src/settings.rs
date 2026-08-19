@@ -458,6 +458,21 @@ pub struct Settings {
     /// The master, linear. Unity by default: it is a master, and a master that
     /// ships anywhere else is one every user has to put back.
     pub master_gain: f64,
+    /// The backing track's level, linear.
+    pub track_gain: f64,
+    /// The audio file the backing track plays, or empty for none.
+    ///
+    /// **A path and not the audio.** A settings file that carried a hundred
+    /// megabytes of decoded track would be a settings file nobody could sync,
+    /// and the file on disk is the thing the user thinks they chose.
+    pub track_path: String,
+    /// Where the track starts and stops, in SECONDS. `out` of 0 is "the end".
+    ///
+    /// Seconds rather than frames because the file's rate is not this file's
+    /// business: the same trim has to survive being opened on a machine whose
+    /// device runs at 44.1 when it was set at 48.
+    pub track_in: f64,
+    pub track_out: f64,
     /// Transpose, in semitones, applied to every note the display and the
     /// chord detector see.
     ///
@@ -645,6 +660,10 @@ impl Default for Settings {
             metronome_gain: 0.5,
             input_gain: 1.0,
             master_gain: 1.0,
+            track_gain: 1.0,
+            track_path: String::new(),
+            track_in: 0.0,
+            track_out: 0.0,
             transpose: 0,
             show_transpose: true,
             metronome_on: false,
@@ -1226,6 +1245,22 @@ impl Settings {
         take_gain(&mut map, "metronome_gain", &mut s.metronome_gain);
         take_gain(&mut map, "input_gain", &mut s.input_gain);
         take_gain(&mut map, "master_gain", &mut s.master_gain);
+        take_gain(&mut map, "track_gain", &mut s.track_gain);
+        if let Some(Value::String(path)) = map.shift_remove("track_path") {
+            s.track_path = path;
+        }
+        // Trim points are seconds and a person can hand-edit them. Negative or
+        // NaN would be a track that starts before it starts.
+        for (key, dst) in [
+            ("track_in", &mut s.track_in),
+            ("track_out", &mut s.track_out),
+        ] {
+            if let Some(v) = map.shift_remove(key).and_then(|v| v.as_f64()) {
+                if v.is_finite() && v >= 0.0 {
+                    *dst = v;
+                }
+            }
+        }
         if let Some(v) = map.shift_remove("transpose") {
             if let Some(n) = v.as_i64() {
                 s.transpose = n.clamp(-TRANSPOSE_MAX, TRANSPOSE_MAX);
@@ -1673,10 +1708,14 @@ impl Settings {
             Value::String(self.dx7_cartridge.clone()),
         );
         map.insert("dx7_patch".into(), Value::Number(self.dx7_patch.into()));
+        map.insert("track_path".into(), Value::String(self.track_path.clone()));
         for (key, gain) in [
             ("metronome_gain", self.metronome_gain),
             ("input_gain", self.input_gain),
             ("master_gain", self.master_gain),
+            ("track_gain", self.track_gain),
+            ("track_in", self.track_in),
+            ("track_out", self.track_out),
         ] {
             if let Some(n) = serde_json::Number::from_f64(gain) {
                 map.insert(key.into(), Value::Number(n));
@@ -1944,6 +1983,7 @@ impl Settings {
                 metronome: self.metronome_gain as f32,
                 input: self.input_gain as f32,
                 master: self.master_gain as f32,
+                track: self.track_gain as f32,
             },
             metronome_on: self.metronome_on,
             metronome_in_take: self.metronome_in_take,
@@ -2466,6 +2506,10 @@ mod tests {
         s.reverb_mix = 0.35;
         s.delay_mix = 0.2;
         s.chorus_mix = 0.6;
+        s.track_gain = 0.8;
+        s.track_path = "/Users/x/Music/backing.mp3".to_owned();
+        s.track_in = 1.25;
+        s.track_out = 184.5;
         s.hpf_mix = 0.3;
         s.lpf_mix = 0.45;
         s.limiter_mix = 0.7;

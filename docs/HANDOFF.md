@@ -1,7 +1,8 @@
 # Ivory 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-19. **The app is now called TANGENT.** Newest work is
-§2k: the limiter's makeup gain, the DX7 fader bug, and a dismissable CLIPPED.
+§2l: the backing-track player. Before it, §2k: the limiter's makeup gain, the
+DX7 fader bug, and a dismissable CLIPPED.
 Before it, §2j: one gesture set across all eight knobs.
 Before it, §2i (the master column) and §2h (six effect knobs, the true-peak
 limiter, video without a camera).
@@ -1057,6 +1058,77 @@ anything. `Hit::DismissClip` clears all three latches — the live input tracker
 own atomic. Clearing two of three would be a button that appears not to work.
 Its rect exists only while the warning is on screen, because a target with
 nothing drawn in it swallows presses meant for the row underneath.
+
+---
+
+## 2l. 2026-08-19 (last) — the backing track
+
+Shipped as **4.16.0**. A third fader under the click and the input: import an
+audio file, trim it, and it rolls with the transport.
+
+### Decoding, without a decoding crate
+
+`ivory-record/src/decode.rs`, split per platform the same way `encode` is:
+
+* **Not macOS** — `tangent-ffmpeg`, which the release already ships so video
+  works on a machine with nothing installed. One command does format, channel
+  layout and sample rate together.
+* **macOS** — `/usr/bin/afconvert`, on every Mac ever sold. The mac build has
+  no bundled ffmpeg (video is AVFoundation), so the alternatives were shipping
+  76 MB of encoder for something that is not encoding, or CoreAudio FFI plus a
+  resampler. It writes a temp WAV; `riff_data` **walks the chunks** rather than
+  assuming offset 44, because `afconvert` writes an `FLLR` padding chunk and
+  the fixed offset lands inside it — which sounds like a track that starts with
+  a burst of noise.
+
+Either way out comes interleaved stereo f32 at the device's rate, which is the
+only shape the mixer wants.
+
+### Playing
+
+`Shared` carries the gain, the trim (in FRAMES) and a `pending_track` mutex the
+audio thread only ever `try_lock`s — the same treatment `pending_voice` gets,
+because a clip is a hundred megabytes and the render thread may not allocate.
+
+`Renderer::mix_track` adds it **after the effects and before the master**:
+after, because it arrived finished and a reverb on somebody else's mix is not a
+thing anybody asked for; before, because the master is the master. It reaches
+the tap as well as the device — a take of somebody playing along to a backing
+track, with the track missing, is not a take of what happened.
+
+**It rolls only while `Rolling`.** Not the count-in, which is what counts you IN
+to the track; not `Finishing`, which is a file flushing after the performance
+ended. Starting when the take starts writing is what makes the two line up.
+
+Trim is stored in SECONDS in the settings and converted to frames at the push,
+so it survives being opened on a machine whose device runs at a different rate.
+
+### The panel
+
+Right-click the waveform icon. Peak envelope (peak and not mean — a mean is a
+grey sausage), the trimmed part lit and the rest dimmed rather than hidden,
+draggable handles, and IN/OUT fields that take `12.5` or `1:12.5`. What the
+panel prints is what the field accepts, which is asserted.
+
+`MIN_TRIM` stops the handles crossing: an out-point before the in-point is a
+track that plays nothing, discovered by pressing Record and hearing silence.
+
+**It does not screenshot.** `IVORY_SHOT_TRACK=open` loads a fake clip, but the
+compositor draws BANDS for the video and not overlay panels — the same gap
+`IVORY_SHOT_FX` has. The panel is covered by hit-test and layout tests instead.
+
+### Two things moved
+
+Right-clicking the **microphone** icon opens the audio input picker; right
+clicking the **waveform** icon opens the trim panel. Both mirror the metronome,
+whose right-click sets whether the click lands in the file. The menu entries
+stay where they were — nothing was taken away.
+
+The master meter is **one split fader**: thinner ladders side by side with the
+dB scale mirrored on BOTH sides, because one scale for a stereo pair means one
+of the two channels is always being estimated. The master knob is centred
+between the ladders rather than on the column, which carries a scale down each
+edge and so is not centred on them.
 
 ---
 

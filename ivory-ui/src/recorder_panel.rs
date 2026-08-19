@@ -329,7 +329,10 @@ struct Layout {
     /// after the effects, after the limiter, after the master. On a machine
     /// with an interface plugged in those are two genuinely different things,
     /// and neither one answers the other's question.
-    master_scale: Rect,
+    /// The dB scale, **on both sides of the ladders**. Each channel is read
+    /// against the numbers next to it; a right channel three inches from the
+    /// only scale is a right channel nobody reads accurately.
+    master_scale: [Rect; 2],
     master_bars: Rect,
     master_knob: Rect,
 
@@ -342,6 +345,20 @@ struct Layout {
     /// Where a typed tempo goes: a small box under the knob, drawn only while
     /// one is being typed.
     tempo_entry: Rect,
+
+    /// The backing track's fader, under the click and the input.
+    track_row: Rect,
+    /// Its icon: a click imports a file, a right-click opens the waveform.
+    track_icon: Rect,
+
+    /// The microphone icon at the head of the input fader.
+    ///
+    /// Not a press target — a right-click on it opens the audio input's
+    /// picker, the way a right-click on the metronome sets whether the click
+    /// lands in the file. The device belongs to the fader it feeds, and a
+    /// picker reachable only from a menu of subjects that are mostly about the
+    /// piano is a picker nobody finds.
+    input_icon: Rect,
 
     /// The supporter heart, bottom-right of the band.
     ///
@@ -626,7 +643,10 @@ impl Layout {
             metronome_row: Rect::NOTHING,
             input_row: Rect::NOTHING,
             click: Rect::NOTHING,
-            master_scale: Rect::NOTHING,
+            input_icon: Rect::NOTHING,
+            track_row: Rect::NOTHING,
+            track_icon: Rect::NOTHING,
+            master_scale: [Rect::NOTHING; 2],
             master_bars: Rect::NOTHING,
             master_knob: Rect::NOTHING,
             fx: [Rect::NOTHING; Fx::ALL.len()],
@@ -877,15 +897,21 @@ impl Layout {
         // height.** The faders lose a little of theirs to pay for it: a fader
         // is a bar and a number and reads at any height, and a knob below a
         // certain size is three grey rings.
-        self.metronome_row = slice_v(col, 0.06, 0.28);
-        self.input_row = slice_v(col, 0.32, 0.54);
+        // **Three rows now, and the transport keeps its knob's worth.** The
+        // backing track is a level like the other two and belongs with them:
+        // it is the third thing in the mix that is not an instrument.
+        self.metronome_row = slice_v(col, 0.04, 0.22);
+        self.input_row = slice_v(col, 0.25, 0.43);
+        self.track_row = slice_v(col, 0.46, 0.64);
         self.click = fader_zones(self.metronome_row).0;
+        self.input_icon = fader_zones(self.input_row).0;
+        self.track_icon = fader_zones(self.track_row).0;
 
         // **The transport, under the faders it belongs with.** Three squares
         // of one size, one centred in each third of the row: they are one
         // group, and a stop bigger than the cog beside it reads as more
         // important than it is.
-        let bar = slice_v(col, 0.60, 1.00);
+        let bar = slice_v(col, 0.68, 1.00);
         // **The tempo is a knob at the head of the transport**, and that is
         // what makes the transport one thing rather than three buttons and a
         // number that happened to be nearby.
@@ -978,9 +1004,13 @@ impl Layout {
             return;
         }
         // The knob sits at the foot of the column, the same size as an effect
-        // knob and centred on the column's width.
+        // knob, **centred between the two ladders rather than on the column**.
+        // The column carries the scale down its left-hand side, so its centre
+        // is not the meters' centre — and a knob that belongs to the pair
+        // above it has to line up with the pair and not with the margin.
+        let bars = slice_h(m, MASTER_SCALE_W + 0.03, 1.0 - MASTER_SCALE_W - 0.03);
         let knob = Rect::from_center_size(
-            Pos2::new(m.center().x, m.bottom() - knob_size.y * 0.5),
+            Pos2::new(bars.center().x, m.bottom() - knob_size.y * 0.5),
             Vec2::new(knob_size.x.min(m.width()), knob_size.y),
         );
         if !knob_fits(knob) {
@@ -998,8 +1028,15 @@ impl Layout {
         // Left to right: the numbers, the two bars, then the reduction.
         // **The scale is between nothing and everything** — it is read against
         // the bars, so it goes next to them and not off in a corner.
-        self.master_scale = slice_h(meter, 0.00, MASTER_SCALE_W);
-        self.master_bars = slice_h(meter, MASTER_SCALE_W, 1.0);
+        // **One split meter, not two.** The pair used to be most of the
+        // column and read as two separate bars that happened to be adjacent;
+        // narrow and close together they read as one stereo meter with a seam
+        // down it, which is what a master is.
+        self.master_scale = [
+            slice_h(meter, 0.00, MASTER_SCALE_W),
+            slice_h(meter, 1.0 - MASTER_SCALE_W, 1.0),
+        ];
+        self.master_bars = slice_h(meter, MASTER_SCALE_W + 0.03, 1.0 - MASTER_SCALE_W - 0.03);
     }
 
     fn fill_transport(&mut self, t: Rect) {
@@ -1147,7 +1184,7 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 44] {
+    fn targets(&self) -> [(Rect, Produces); 46] {
         use Produces::{Along, AlongV, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
         let s = &self.slots;
@@ -1184,6 +1221,20 @@ impl Layout {
             (s[4].clear, Fixed(Hit::ClearSlot(4))),
             (track(self.metronome_row), Along(Hit::SetMetronomeGain)),
             (track(self.input_row), Along(Hit::SetInputGain)),
+            (track(self.track_row), Along(Hit::SetTrackGain)),
+            // The icon is the import button. A left click on it opens the
+            // file dialog; a right click opens the waveform, the same way the
+            // microphone's icon opens the audio picker.
+            //
+            // **Not while a take is rolling.** Swapping the backing track
+            // half way through a performance is not a thing anybody means to
+            // do, and the dialog it opens is modal — it would stop the one
+            // gesture that matters at that moment, which is Stop. The LEVEL
+            // stays live, like every other fader.
+            (
+                if self.rolling { Rect::NOTHING } else { self.track_icon },
+                Fixed(Hit::ImportTrack),
+            ),
             // Up the cell for more, which is the direction every knob in every
             // studio turns and the direction the two faders beside them move.
             (self.master_knob, AlongV(Hit::SetMaster)),
@@ -1308,6 +1359,10 @@ pub enum Hit {
     /// scaling cannot disagree.
     SetMetronomeGain(f32),
     /// The three effect sends, 0..=1.
+    /// The backing track's level, as a fader position.
+    SetTrackGain(f32),
+    /// Choose an audio file to play along to.
+    ImportTrack,
     /// Acknowledge the clip warning and put every clip latch out.
     ///
     /// A latch that clears itself is one the performer never sees, because
@@ -1353,6 +1408,7 @@ impl Hit {
             Hit::SetMaster(_) => Hit::SetMaster(v),
             Hit::SetMetronomeGain(_) => Hit::SetMetronomeGain(v),
             Hit::SetInputGain(_) => Hit::SetInputGain(v),
+            Hit::SetTrackGain(_) => Hit::SetTrackGain(v),
             Hit::SetSlotGain(i, _) => Hit::SetSlotGain(i, v),
             other => other,
         }
@@ -1364,7 +1420,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 46] = [
+    pub const ALL: [Hit; 48] = [
         Hit::Record,
         Hit::Stop,
         Hit::OpenSetup,
@@ -1401,6 +1457,8 @@ impl Hit {
         Hit::SetSlotGain(4, Hit::MIDWAY),
         Hit::SetMetronomeGain(Hit::MIDWAY),
         Hit::SetMaster(Hit::MIDWAY),
+        Hit::SetTrackGain(Hit::MIDWAY),
+        Hit::ImportTrack,
         Hit::DismissClip,
         Hit::SetFx(Fx::Reverb, Hit::MIDWAY),
         Hit::SetFx(Fx::Delay, Hit::MIDWAY),
@@ -1478,6 +1536,8 @@ impl Hit {
             Hit::SetFx(fx, _) => fx.describe(),
             Hit::SetMaster(_) => "Master  -  right-click to type, double-click for 0 dB",
             Hit::DismissClip => "It clipped  -  click to acknowledge",
+            Hit::SetTrackGain(_) => "Backing track level",
+            Hit::ImportTrack => "Backing track  -  click to choose a file",
             Hit::SetInputGain(_) => "Input level",
             Hit::SetTempo(_) => "Tempo",
             Hit::EditTimeSignature => "Time signature",
@@ -1497,6 +1557,7 @@ impl Hit {
                 | Hit::SetFx(..)
                 | Hit::SetMaster(_)
                 | Hit::SetInputGain(_)
+                | Hit::SetTrackGain(_)
                 | Hit::SetTempo(_)
         )
     }
@@ -1588,6 +1649,7 @@ pub fn num_field(hit: Hit) -> Option<NumField> {
         Hit::SetFx(fx, _) => Some(NumField::Fx(fx)),
         Hit::SetMaster(_) => Some(NumField::Master),
         Hit::SetInputGain(_) => Some(NumField::Input),
+        Hit::SetTrackGain(_) => Some(NumField::Track),
         // NOT `SetTempo`: that carries a committed value and has no box of
         // its own any more. `EditTempo` is the box.
         _ => None,
@@ -1791,6 +1853,19 @@ pub fn knob_rect(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<Rect> 
         Hit::SetTempo(_) => l.tempo,
         _ => return None,
     };
+    r.is_positive().then_some(r)
+}
+
+/// The microphone icon, for the right-click that opens the audio picker.
+pub fn input_icon(rect: Rect, view: &RecorderView<'_>) -> Option<Rect> {
+    let r = Layout::new(rect, view).input_icon;
+    r.is_positive().then_some(r)
+}
+
+/// The backing track's icon: a left click imports, a right click opens the
+/// waveform.
+pub fn track_icon(rect: Rect, view: &RecorderView<'_>) -> Option<Rect> {
+    let r = Layout::new(rect, view).track_icon;
     r.is_positive().then_some(r)
 }
 
@@ -2121,6 +2196,15 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
             view.gains.input,
             NumField::Input,
         ),
+        (
+            l.track_row,
+            FaderIcon::Waveform,
+            // Lit only when a file is loaded, so an empty row reads as an
+            // offer rather than as a control that does nothing.
+            if view.track.is_empty() { p.faint } else { p.ink },
+            view.gains.track,
+            NumField::Track,
+        ),
     ] {
         draw_fader(painter, row, icon, ink, gain, typing_for(view, field), p);
     }
@@ -2354,6 +2438,9 @@ fn draw_clear_button(painter: &Painter, r: Rect, p: &Palette) {
 enum FaderIcon {
     Metronome,
     Microphone,
+    /// The backing track: three bars of a waveform, which is the only thing
+    /// this row could be a picture of.
+    Waveform,
 }
 
 /// One fader: its icon, a slotted track with a handle in it, and the level in
@@ -2409,6 +2496,31 @@ fn draw_fader_icon(painter: &Painter, r: Rect, icon: FaderIcon, ink: Color32, p:
     match icon {
         FaderIcon::Metronome => draw_metronome(painter, b, ink, p),
         FaderIcon::Microphone => draw_microphone(painter, b, ink),
+        FaderIcon::Waveform => draw_waveform_icon(painter, b, ink),
+    }
+}
+
+/// A waveform: five bars about a centre line, tall in the middle.
+///
+/// **Bars and not a drawn curve.** At twelve points across, a curve is a
+/// wobble; the bars survive being small, and they are what the row below the
+/// microphone is a picture of.
+fn draw_waveform_icon(painter: &Painter, b: Rect, ink: Color32) {
+    let n = 5;
+    let w = b.width() / (n as f32 * 2.0 - 1.0);
+    // Tallest in the middle, so it reads as a sound and not as a bar chart.
+    let heights = [0.34_f32, 0.72, 1.0, 0.58, 0.28];
+    for (i, h) in heights.iter().enumerate() {
+        let x = b.left() + i as f32 * w * 2.0;
+        let half = b.height() * 0.5 * h;
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(x, b.center().y - half),
+                Pos2::new(x + w, b.center().y + half),
+            ),
+            0.0,
+            ink,
+        );
     }
 }
 
@@ -3444,7 +3556,7 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
     let (left, right) = if m.mono {
         (bars, Rect::NOTHING)
     } else {
-        (slice_h(bars, 0.0, 0.46), slice_h(bars, 0.54, 1.0))
+        (slice_h(bars, 0.0, 0.48), slice_h(bars, 0.52, 1.0))
     };
     draw_ladder(
         painter,
@@ -3467,8 +3579,21 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
     // — so 6 dB of reduction reaches the -6, and it needs no number of its own.
     // It had a column, and a column for something that is usually zero is a
     // column the meters could have had.
-    if l.master_scale.is_positive() {
-        let face = l.master_scale;
+    // **Both sides, mirrored.** The numbers on the left are read against the
+    // left channel and the ones on the right against the right; one scale for
+    // a stereo pair means one of the two channels is always being estimated.
+    for (side, face) in l.master_scale.into_iter().enumerate() {
+        if !face.is_positive() {
+            continue;
+        }
+        // The left scale is right-aligned against the ladders and the right
+        // scale left-aligned against them, so both sit next to what they
+        // measure rather than out at the column's edges.
+        let (align, at_x) = if side == 0 {
+            (Align2::RIGHT_CENTER, face.right() - 2.0)
+        } else {
+            (Align2::LEFT_CENTER, face.left() + 2.0)
+        };
         // Small: eight numbers have to fit up the side of the ladder without
         // touching each other, and the ladder is what is being read.
         let step = l.master_bars.height() / 9.0;
@@ -3489,8 +3614,12 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
         // as wide as the gap it was given and the strip is meant to sit under
         // the ticks, not sweep the whole margin.
         if view.gr_db > 0.0 && size >= MIN_TEXT {
-            let right = face.right() - 2.0;
-            let left = (right - "-60".len() as f32 * ADV * size).max(face.left());
+            let wide = "-60".len() as f32 * ADV * size;
+            let (left, right) = if side == 0 {
+                ((at_x - wide).max(face.left()), at_x)
+            } else {
+                (at_x, (at_x + wide).min(face.right()))
+            };
             let down = (view.gr_db / -MASTER_FLOOR_DB).clamp(0.0, 1.0) * inner.height();
             painter.rect_filled(
                 Rect::from_min_max(
@@ -3509,8 +3638,8 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
                 let t = (db - MASTER_FLOOR_DB) / -MASTER_FLOOR_DB;
                 let y = inner.bottom() - t * inner.height();
                 painter.text(
-                    Pos2::new(face.right() - 2.0, y),
-                    Align2::RIGHT_CENTER,
+                    Pos2::new(at_x, y),
+                    align,
                     if db == 0.0 {
                         "0".to_owned()
                     } else {
@@ -3581,8 +3710,8 @@ const METER_SHARE: f32 = 0.46;
 const MASTER_COL: f32 = 0.78;
 
 
-/// The dB scale's share of the master column's width. The ladders take the
-/// rest — all of it, since the reduction stopped needing a column of its own.
+/// The dB scale's share of the master column's width, **at each side**. What
+/// is left between the two is the ladders.
 const MASTER_SCALE_W: f32 = 0.26;
 
 /// The smallest knob face worth drawing, as a radius.
@@ -4354,6 +4483,133 @@ mod tests {
         }
     }
 
+    /// A track panel, and a track to put in it.
+    fn a_track() -> crate::ports::TrackInfo {
+        crate::ports::TrackInfo {
+            name: "backing.mp3".to_owned(),
+            seconds: 200.0,
+            wave: vec![0.5; 1000],
+            error: String::new(),
+        }
+    }
+
+    /// **The trim reads as a fraction of the file, and zero means the end.**
+    #[test]
+    fn the_trim_spans_what_it_says() {
+        // Untrimmed: the whole file.
+        assert_eq!(trim_fractions(200.0, 0.0, 0.0), (0.0, 1.0));
+        // An out-point of zero is the END, everywhere — it is what the engine
+        // reads and what the settings hold.
+        assert_eq!(trim_fractions(200.0, 50.0, 0.0), (0.25, 1.0));
+        assert_eq!(trim_fractions(200.0, 50.0, 150.0), (0.25, 0.75));
+        // Past the ends it pins rather than drawing off the edge.
+        assert_eq!(trim_fractions(200.0, -9.0, 900.0), (0.0, 1.0));
+        // A file of no length has no fractions to give and must not divide.
+        assert_eq!(trim_fractions(0.0, 1.0, 2.0), (0.0, 1.0));
+        // Crossed points come back in order rather than as a negative span.
+        let (a, b) = trim_fractions(200.0, 150.0, 50.0);
+        assert!(a <= b, "{a} {b}");
+    }
+
+    /// **Each part of the panel answers for itself, and the waveform's middle
+    /// answers for nothing.**
+    ///
+    /// A press in the body of a waveform is a press on a picture. Treating it
+    /// as "move whichever handle is nearest" would move half the track from
+    /// under a hand that was only pointing at something.
+    #[test]
+    fn the_track_panel_hits_what_is_under_the_pointer() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let anchor = Rect::from_min_size(Pos2::new(420.0, 300.0), Vec2::new(18.0, 18.0));
+        let l = TrackLayout::new(screen, anchor);
+        assert!(l.panel.is_positive(), "no panel");
+        assert!(
+            screen.contains_rect(l.panel),
+            "the panel hangs off the window"
+        );
+
+        let at = |p: Pos2| track_hit_test(screen, anchor, 200.0, 50.0, 150.0, p);
+        assert_eq!(at(l.close.center()), Some(TrackHit::Close));
+        assert_eq!(at(l.reset.center()), Some(TrackHit::ClearTrim));
+        assert_eq!(at(l.field_in.center()), Some(TrackHit::TypeIn));
+        assert_eq!(at(l.field_out.center()), Some(TrackHit::TypeOut));
+        // Outside the panel entirely: not ours, which is what dismisses it.
+        assert_eq!(at(Pos2::new(5.0, 5.0)), None);
+
+        // The handles: 50/200 and 150/200 along the waveform.
+        let x = |t: f32| l.wave.left() + t * l.wave.width();
+        let y = l.wave.center().y;
+        assert!(matches!(
+            at(Pos2::new(x(0.25), y)),
+            Some(TrackHit::DragIn(_))
+        ));
+        assert!(matches!(
+            at(Pos2::new(x(0.75), y)),
+            Some(TrackHit::DragOut(_))
+        ));
+        // And the middle of the kept part is neither.
+        assert_eq!(at(Pos2::new(x(0.5), y)), None, "the body moved a handle");
+
+        // The fraction a drag reports is where the pointer is, not where the
+        // handle was.
+        let Some(TrackHit::DragIn(t)) = at(Pos2::new(x(0.25) + 2.0, y)) else {
+            panic!("not the in handle")
+        };
+        assert!((t - 0.25).abs() < 0.02, "it reported {t}");
+    }
+
+    /// The panel stays on screen however near an edge its icon is.
+    #[test]
+    fn the_track_panel_stays_inside_the_window() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+        for corner in [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(890.0, 0.0),
+            Pos2::new(0.0, 590.0),
+            Pos2::new(890.0, 590.0),
+        ] {
+            let anchor = Rect::from_min_size(corner, Vec2::new(14.0, 14.0));
+            let l = TrackLayout::new(screen, anchor);
+            assert!(
+                screen.contains_rect(l.panel),
+                "anchored at {corner:?} the panel is at {:?}",
+                l.panel
+            );
+        }
+    }
+
+    /// Drawing an empty panel and a full one both work at every size.
+    #[test]
+    fn the_track_panel_draws_at_every_size() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        for w in [400.0_f32, 900.0, 1600.0] {
+            for track in [crate::ports::TrackInfo::default(), a_track()] {
+                let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w * 0.6));
+                let anchor = Rect::from_min_size(
+                    Pos2::new(w * 0.3, w * 0.3),
+                    Vec2::new(14.0, 14.0),
+                );
+                let _ = ctx.run(Default::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        draw_track_panel(
+                            ui.painter(),
+                            TrackPanel {
+                                screen,
+                                anchor,
+                                track: &track,
+                                from: 9.5,
+                                to: 196.0,
+                                typing: (None, Some("1:12")),
+                            },
+                            &Settings::default(),
+                        );
+                    });
+                });
+            }
+        }
+    }
+
     /// **The master ladder is linear in decibels**, which is the only scale
     /// on which the bottom half of a meter ever moves.
     #[test]
@@ -4397,7 +4653,8 @@ mod tests {
                     assert!(l.master_knob.is_positive(), "no master knob at {w}");
                 }
                 let master = [
-                    ("scale", l.master_scale),
+                    ("scale L", l.master_scale[0]),
+                    ("scale R", l.master_scale[1]),
                     ("bars", l.master_bars),
                     ("knob", l.master_knob),
                 ];
@@ -4644,7 +4901,7 @@ mod tests {
     /// The two effect knobs are in it for the same reason the faders are: they
     /// are a mix, they cost the audio thread nothing to move, and riding the
     /// reverb through a take is a thing a person does on purpose.
-    const SURVIVORS: [Hit; 21] = [
+    const SURVIVORS: [Hit; 22] = [
         Hit::Stop,
         Hit::SetSlotGain(0, 0.0),
         Hit::SetSlotGain(1, 0.0),
@@ -4661,6 +4918,8 @@ mod tests {
         // The master most of all: it is the level control somebody reaches
         // for at 0:47, and a take is exactly when.
         Hit::SetMaster(0.0),
+        // The backing track's level, but not its import button: see `targets`.
+        Hit::SetTrackGain(0.0),
         Hit::SetFx(Fx::Reverb, 0.0),
         Hit::SetFx(Fx::Delay, 0.0),
         Hit::SetFx(Fx::Chorus, 0.0),
@@ -5985,6 +6244,14 @@ mod tests {
             texture: egui::TextureId::User(7),
             size: Vec2::new(640.0, 480.0),
         };
+        let loaded_track = crate::ports::TrackInfo {
+            name: "backing.mp3".to_owned(),
+            seconds: 214.0,
+            wave: (0..1000)
+                .map(|i| ((i as f32 / 60.0).sin().abs() * 0.9).min(1.0))
+                .collect(),
+            error: String::new(),
+        };
         for dark in [false, true] {
             let s = Settings {
                 dark_mode: dark,
@@ -6024,6 +6291,7 @@ mod tests {
                                     metronome: 0.0,
                                     input: 0.5,
                                     master: if dark { 1.0 } else { 0.35 },
+                                    track: 0.7,
                                 },
                                 // Both ends of each knob's travel, so a slot or
                                 // a pointer that escapes at one extreme is
@@ -6058,6 +6326,10 @@ mod tests {
                                     clipped: dark,
                                 },
                                 gr_db: if dark { 7.5 } else { 0.0 },
+                                // A loaded track on one pass and none on the
+                                // other, so the sweep covers both the row that
+                                // is an offer and the row that is a control.
+                                track: if dark { &loaded_track } else { crate::ports::TrackInfo::NONE },
                                 fx_units: [
                                     KnobUnit::Percent,
                                     KnobUnit::Percent,
@@ -7032,3 +7304,306 @@ pub fn draw_setup(
 }
 
 
+
+// ── the backing track's waveform ────────────────────────────────────────────
+//
+// A right-click on the track's icon opens this. The row itself is a level and
+// an import button, because that is all a fifteen-point row can be; where the
+// track STARTS and STOPS is a question about a picture, and it needs one.
+
+/// The panel's width, as a fraction of the window and in points.
+///
+/// Wider than an effect panel and deliberately: this one holds a waveform, and
+/// a waveform four inches wide is where a person can actually find the bar
+/// they meant. The effect panels are four rows of text and want no more room
+/// than the text.
+const TRACK_W: (f32, f32, f32) = (0.46, 320.0, 720.0);
+const TRACK_ASPECT: f32 = 0.44;
+
+/// How wide a trim handle's grab zone is, in points.
+///
+/// **Fatter than the line it draws.** The line is one point because a fat line
+/// hides the waveform under it; a one-point grab target is a control nobody
+/// can catch. Fourteen is a comfortable thumb at any window size.
+const TRIM_GRAB: f32 = 14.0;
+
+/// The shortest a trimmed track may be, in seconds.
+///
+/// **Not zero.** Two handles that can meet are two handles that can cross, and
+/// what that produces is a track which plays nothing — discovered by pressing
+/// Record and hearing silence.
+pub const MIN_TRIM: f64 = 0.05;
+
+/// Where everything in the track panel goes.
+pub struct TrackLayout {
+    pub panel: Rect,
+    pub title: Rect,
+    pub close: Rect,
+    /// The waveform itself. Trim positions are fractions ALONG this.
+    pub wave: Rect,
+    /// The two typed fields, and the button that clears the trim.
+    pub field_in: Rect,
+    pub field_out: Rect,
+    pub reset: Rect,
+}
+
+impl TrackLayout {
+    const NONE: Self = Self {
+        panel: Rect::NOTHING,
+        title: Rect::NOTHING,
+        close: Rect::NOTHING,
+        wave: Rect::NOTHING,
+        field_in: Rect::NOTHING,
+        field_out: Rect::NOTHING,
+        reset: Rect::NOTHING,
+    };
+
+    pub fn new(screen: Rect, anchor: Rect) -> Self {
+        if !screen.is_positive() || !anchor.is_positive() {
+            return Self::NONE;
+        }
+        let w = (screen.width() * TRACK_W.0).clamp(TRACK_W.1, TRACK_W.2.min(screen.width()));
+        let h = (w * TRACK_ASPECT).min(screen.height() * 0.80);
+        let mut panel = Rect::from_min_size(
+            Pos2::new(anchor.center().x - w * 0.25, anchor.bottom() + h * 0.05),
+            Vec2::new(w, h),
+        );
+        // Nudged back inside the window, both axes, exactly as the effect
+        // panels are: a panel anchored to a control near an edge otherwise
+        // hangs off it.
+        let dx = (screen.left() - panel.left()).max(0.0) - (panel.right() - screen.right()).max(0.0);
+        let dy = (screen.top() - panel.top()).max(0.0) - (panel.bottom() - screen.bottom()).max(0.0);
+        panel = panel.translate(Vec2::new(dx, dy));
+        if !panel.is_positive() {
+            return Self::NONE;
+        }
+        let body = panel.shrink(panel.width() * 0.035);
+        let title = slice_v(body, 0.00, 0.16);
+        let wave = slice_v(body, 0.22, 0.68);
+        let row = slice_v(body, 0.76, 1.00);
+        Self {
+            panel,
+            title: slice_h(title, 0.0, 0.86),
+            close: slice_h(title, 0.88, 1.0),
+            wave,
+            field_in: slice_h(row, 0.00, 0.30),
+            field_out: slice_h(row, 0.34, 0.64),
+            reset: slice_h(row, 0.74, 1.00),
+        }
+    }
+}
+
+/// What a press in the track panel means.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TrackHit {
+    /// Drag the in-point to this fraction of the file.
+    DragIn(f32),
+    /// Drag the out-point to this fraction of the file.
+    DragOut(f32),
+    /// Type the in- or out-point instead.
+    TypeIn,
+    TypeOut,
+    /// Play the whole file again.
+    ClearTrim,
+    Close,
+}
+
+/// Where a trim point sits along the waveform, 0..=1.
+///
+/// `out` of zero means the end of the file, everywhere: it is what the engine
+/// reads and what the settings hold, so the drawing has to agree.
+pub fn trim_fractions(seconds: f64, from: f64, to: f64) -> (f32, f32) {
+    if seconds <= 0.0 {
+        return (0.0, 1.0);
+    }
+    let a = (from / seconds).clamp(0.0, 1.0) as f32;
+    let b = if to <= 0.0 {
+        1.0
+    } else {
+        (to / seconds).clamp(0.0, 1.0) as f32
+    };
+    (a.min(b), b.max(a))
+}
+
+/// What a press at `pos` in the track panel means, if anything.
+pub fn track_hit_test(
+    screen: Rect,
+    anchor: Rect,
+    seconds: f64,
+    from: f64,
+    to: f64,
+    pos: Pos2,
+) -> Option<TrackHit> {
+    let l = TrackLayout::new(screen, anchor);
+    if !l.panel.contains(pos) {
+        return None;
+    }
+    if l.close.contains(pos) {
+        return Some(TrackHit::Close);
+    }
+    if l.reset.contains(pos) {
+        return Some(TrackHit::ClearTrim);
+    }
+    if l.field_in.contains(pos) {
+        return Some(TrackHit::TypeIn);
+    }
+    if l.field_out.contains(pos) {
+        return Some(TrackHit::TypeOut);
+    }
+    if l.wave.is_positive() && l.wave.expand(TRIM_GRAB).contains(pos) {
+        let t = ((pos.x - l.wave.left()) / l.wave.width()).clamp(0.0, 1.0);
+        let (a, b) = trim_fractions(seconds, from, to);
+        let (xa, xb) = (
+            l.wave.left() + a * l.wave.width(),
+            l.wave.left() + b * l.wave.width(),
+        );
+        // **Whichever handle is nearer, and only if the press is near one.**
+        // A press in the middle of the waveform is not a request to move the
+        // end that happens to be closest — it is a press on the picture, and
+        // moving half the track under it would be the worst kind of surprise.
+        let (da, db) = ((pos.x - xa).abs(), (pos.x - xb).abs());
+        if da.min(db) <= TRIM_GRAB {
+            return Some(if da <= db {
+                TrackHit::DragIn(t)
+            } else {
+                TrackHit::DragOut(t)
+            });
+        }
+    }
+    None
+}
+
+/// The panel's rectangle, for a caller that has to swallow presses.
+pub fn track_popup_rect(screen: Rect, anchor: Rect) -> Rect {
+    TrackLayout::new(screen, anchor).panel
+}
+
+/// A time in seconds as `m:ss.t`, which is how somebody reads a trim point.
+pub fn trim_text(seconds: f64) -> String {
+    let s = seconds.max(0.0);
+    format!("{}:{:04.1}", (s / 60.0) as u64, s % 60.0)
+}
+
+/// Everything `draw_track_panel` needs, as one argument.
+///
+/// A struct rather than eight parameters: six of them are `f64`, `&str` and
+/// `Rect` in pairs, and the way that goes wrong is silently — a trim drawn
+/// with the in and out the wrong way round looks like a panel with a bug in
+/// the waveform.
+pub struct TrackPanel<'a> {
+    pub screen: Rect,
+    pub anchor: Rect,
+    pub track: &'a crate::ports::TrackInfo,
+    /// The trim, in seconds. `to` of zero is the end of the file.
+    pub from: f64,
+    pub to: f64,
+    /// What is being typed into the IN and OUT fields, if either is open.
+    pub typing: (Option<&'a str>, Option<&'a str>),
+}
+
+/// Draw the waveform, the trim, and the two numbers.
+pub fn draw_track_panel(painter: &Painter, at: TrackPanel<'_>, s: &Settings) {
+    let TrackPanel {
+        screen,
+        anchor,
+        track,
+        from,
+        to,
+        typing,
+    } = at;
+    let l = TrackLayout::new(screen, anchor);
+    if !l.panel.is_positive() {
+        return;
+    }
+    let p = palette(s);
+    painter.rect_filled(screen, 0.0, Color32::from_black_alpha(96));
+    painter.rect_filled(l.panel, 4.0, p.bg);
+    painter.rect_stroke(l.panel, 4.0, Stroke::new(1.0_f32, p.ink), StrokeKind::Inside);
+
+    if l.title.is_positive() {
+        let name = if track.is_empty() {
+            "no backing track loaded".to_owned()
+        } else {
+            format!("{}   {}", track.name, trim_text(track.seconds))
+        };
+        let size = fit_text(l.title, &name, l.title.height() * 0.62);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(l.title.left(), l.title.center().y),
+                Align2::LEFT_CENTER,
+                &name,
+                font(size),
+                p.ink,
+            );
+        }
+        draw_word_button(painter, l.close, &["X"], &p);
+    }
+
+    // The waveform, in the same recess the meters use.
+    if l.wave.is_positive() {
+        painter.rect_filled(l.wave, 2.0, METER_FACE);
+        let (a, b) = trim_fractions(track.seconds, from, to);
+        let x_at = |t: f32| l.wave.left() + t * l.wave.width();
+        let mid = l.wave.center().y;
+        let half = l.wave.height() * 0.46;
+        if track.wave.is_empty() {
+            let msg = "click the waveform icon in the band to import a file";
+            let size = fit_text(l.wave, msg, l.wave.height() * 0.16);
+            if size >= MIN_TEXT {
+                painter.text(l.wave.center(), Align2::CENTER_CENTER, msg, font(size), p.faint);
+            }
+        } else {
+            // One column per point, sampled from the envelope — the envelope
+            // is a thousand buckets and the panel is a few hundred points
+            // wide, so this is a decimation and not a stretch.
+            let cols = l.wave.width().max(1.0) as usize;
+            for i in 0..cols {
+                let t = i as f32 / cols as f32;
+                let v = track.wave[(t * track.wave.len() as f32) as usize % track.wave.len()];
+                let x = l.wave.left() + i as f32;
+                // **Outside the trim is drawn and dimmed, not hidden.** What
+                // was cut is how somebody knows they cut the right thing, and
+                // a waveform that jumped to only the kept part every time a
+                // handle moved would be impossible to aim.
+                let lit = t >= a && t <= b;
+                let ink = if lit {
+                    Color32::from_rgb(0x5f, 0xc9, 0x8a)
+                } else {
+                    Color32::from_rgba_unmultiplied(0x5f, 0xc9, 0x8a, 52)
+                };
+                let h = (v * half).max(0.5);
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(x, mid - h), Pos2::new(x + 1.0, mid + h)),
+                    0.0,
+                    ink,
+                );
+            }
+            // The handles, over the top.
+            for x in [x_at(a), x_at(b)] {
+                painter.line_segment(
+                    [Pos2::new(x, l.wave.top()), Pos2::new(x, l.wave.bottom())],
+                    Stroke::new(1.5_f32, Color32::from_rgb(0xff, 0xf4, 0xe0)),
+                );
+            }
+        }
+    }
+
+    // The two numbers and the way back.
+    let (kept_from, kept_to) = (from, if to <= 0.0 { track.seconds } else { to });
+    for (r, label, value, typed) in [
+        (l.field_in, "IN", kept_from, typing.0),
+        (l.field_out, "OUT", kept_to, typing.1),
+    ] {
+        if !r.is_positive() {
+            continue;
+        }
+        painter.rect_filled(r, 2.0, p.field);
+        let text = typed.map_or_else(|| trim_text(value), |t| format!("{t}_"));
+        let shown = format!("{label} {text}");
+        let size = fit_text(r.shrink(r.width() * 0.06), &shown, r.height() * 0.56);
+        if size >= MIN_TEXT {
+            painter.text(r.center(), Align2::CENTER_CENTER, &shown, font(size), p.ink);
+        }
+    }
+    draw_word_button(painter, l.reset, &["WHOLE FILE"], &p);
+}

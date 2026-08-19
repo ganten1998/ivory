@@ -325,6 +325,9 @@ pub struct IvoryApp {
     /// One at a time, like `dialog`: three panels at once over a band this
     /// small is three panels covering each other.
     fx_open: Option<recorder_panel::Fx>,
+    /// The backing track's waveform panel, and which handle a hand is on.
+    track_open: bool,
+    track_drag: Option<bool>,
     /// The row of that panel a drag is on, once one has started. `&'static
     /// str` because it is the settings KEY — the same thing the panel reports
     /// and the host reads back, so a drag cannot end up writing to a row it
@@ -402,6 +405,8 @@ pub struct IvoryApp {
     /// band and every inline panel — and nothing at all of a separate
     /// viewport. So the card opened on the first frame and sat on top of the
     /// wordmark for the whole of the launch wait.
+    /// The backing track, as the host decoded it. Empty when none is loaded.
+    track: crate::ports::TrackInfo,
     pending_welcome: Option<dialogs::Dialog>,
     /// Whether the host says its launch splash is still up. Always false in
     /// hosts that have no splash, which is every host but the desktop app.
@@ -641,10 +646,13 @@ impl IvoryApp {
             picker_slot: 0,
             grabbed: None,
             num_edit: None,
+            track: crate::ports::TrackInfo::default(),
             menu_over_recorder: false,
             menu_over_staff: false,
             setup_open: false,
             fx_open: None,
+            track_open: false,
+            track_drag: None,
             fx_drag: None,
             fx_defaults: crate::ports::EffectDefaults::default(),
             sounding: std::collections::BTreeSet::new(),
@@ -1208,6 +1216,7 @@ impl IvoryApp {
     fn recorder_layout_view(&self) -> recorder::RecorderView<'_> {
         recorder::RecorderView {
             fx_units: self.fx_units(),
+            track: &self.track,
             ..self.recorder.view(
             self.settings.record_take_name.as_deref().unwrap_or_default(),
             self.name_focused,
@@ -1481,8 +1490,25 @@ impl IvoryApp {
                 // the band with no box of its own: it is set once and it was
                 // taking a caption and a tick in the busiest row there is.
                 // Everywhere else on the band, a right-click opens the menu.
+                // **And right-clicking the microphone opens the audio
+                // input's picker.** Same idea, one row down: the device
+                // belongs to the fader it feeds, and it was reachable only
+                // from a menu led by subjects that are mostly about the piano.
                 if let Some(r) = recorder_rect.filter(|r| r.contains(pos)) {
                     let view = self.recorder_layout_view();
+                    if recorder_panel::input_icon(r, &view).is_some_and(|i| i.contains(pos)) {
+                        self.apply_recorder_hit(recorder_panel::Hit::PickAudio);
+                        return;
+                    }
+                    // **And right-clicking the waveform icon opens the
+                    // waveform.** A left click imports; where the file starts
+                    // and stops is a question about a picture, and the row is
+                    // fifteen points tall.
+                    if recorder_panel::track_icon(r, &view).is_some_and(|i| i.contains(pos)) {
+                        self.track_open = true;
+                        self.track_drag = None;
+                        return;
+                    }
                     if recorder_panel::hit_test(r, &view, pos)
                         == Some(recorder_panel::Hit::ToggleMetronome)
                     {
@@ -1558,6 +1584,19 @@ impl IvoryApp {
         // release is what ends the gesture, not where it happened.
         if pointer_released {
             self.clicked.clear();
+        }
+
+        // The backing track's panel, on the same terms as the effect panels.
+        if self.track_open {
+            if primary_pressed || (pointer_down && self.track_drag.is_some()) {
+                if let Some(pos) = pointer {
+                    self.press_in_track_panel(ui.max_rect(), pos, primary_pressed);
+                }
+                return;
+            }
+            if pointer_released {
+                self.track_drag = None;
+            }
         }
 
         // The effect panel, on the same terms as the take settings below it.
@@ -2135,6 +2174,103 @@ impl IvoryApp {
         recorder_panel::knob_rect(self.last_band, &view, fx.hit()).unwrap_or(Rect::NOTHING)
     }
 
+    /// Where the track panel hangs from: the waveform icon in the band.
+    fn track_anchor(&self) -> Rect {
+        let view = self.recorder_layout_view();
+        recorder_panel::track_icon(self.last_band, &view).unwrap_or(Rect::NOTHING)
+    }
+
+    /// A press or a drag inside the backing track's panel.
+    ///
+    /// **A drag stays on the handle it started on**, the same rule the effect
+    /// panels' rows follow: the two handles meet when a track is trimmed to
+    /// nothing, and a hand that crossed over would start dragging the other
+    /// one from under itself.
+    fn press_in_track_panel(&mut self, screen: Rect, pos: Pos2, pressed: bool) {
+        let anchor = self.track_anchor();
+        let seconds = self.track.seconds;
+        if let Some(is_in) = self.track_drag.filter(|_| !pressed) {
+            let l = recorder_panel::TrackLayout::new(screen, anchor);
+            if l.wave.is_positive() {
+                let t = ((pos.x - l.wave.left()) / l.wave.width()).clamp(0.0, 1.0);
+                self.set_trim(is_in, f64::from(t) * seconds);
+            }
+            return;
+        }
+        if !pressed {
+            return;
+        }
+        let hit = recorder_panel::track_hit_test(
+            screen,
+            anchor,
+            seconds,
+            self.settings.track_in,
+            self.settings.track_out,
+            pos,
+        );
+        match hit {
+            Some(recorder_panel::TrackHit::Close) => {
+                self.track_open = false;
+                self.track_drag = None;
+            }
+            Some(recorder_panel::TrackHit::ClearTrim) => {
+                self.settings.track_in = 0.0;
+                self.settings.track_out = 0.0;
+                self.save_settings();
+            }
+            Some(recorder_panel::TrackHit::TypeIn) => {
+                self.num_edit = Some(recorder::NumEdit::new(recorder::NumField::TrackIn));
+            }
+            Some(recorder_panel::TrackHit::TypeOut) => {
+                self.num_edit = Some(recorder::NumEdit::new(recorder::NumField::TrackOut));
+            }
+            Some(recorder_panel::TrackHit::DragIn(t)) => {
+                self.track_drag = Some(true);
+                self.set_trim(true, f64::from(t) * seconds);
+            }
+            Some(recorder_panel::TrackHit::DragOut(t)) => {
+                self.track_drag = Some(false);
+                self.set_trim(false, f64::from(t) * seconds);
+            }
+            // Inside the panel and on nothing: swallowed. Outside: dismissed.
+            None => {
+                if !recorder_panel::track_popup_rect(screen, anchor).contains(pos) {
+                    self.track_open = false;
+                    self.track_drag = None;
+                }
+            }
+        }
+    }
+
+    /// Move one trim point, keeping the two in order.
+    ///
+    /// **They may not cross.** An out-point before the in-point is a track
+    /// that plays nothing, and the way a person discovers it is by pressing
+    /// Record and hearing silence.
+    fn set_trim(&mut self, is_in: bool, seconds: f64) {
+        let len = self.track.seconds;
+        let want = seconds.clamp(0.0, len);
+        if is_in {
+            let end = if self.settings.track_out <= 0.0 {
+                len
+            } else {
+                self.settings.track_out
+            };
+            self.settings.track_in = want.min((end - recorder_panel::MIN_TRIM).max(0.0));
+        } else {
+            // Landing on the very end means "to the end", which is the zero
+            // the engine and the settings both read as "no out-point" — so a
+            // track dragged back to full length stops carrying an out-point
+            // that would have to be updated if the file were ever replaced.
+            self.settings.track_out = if want >= len - recorder_panel::MIN_TRIM {
+                0.0
+            } else {
+                want.max(self.settings.track_in + recorder_panel::MIN_TRIM)
+            };
+        }
+        self.save_settings_soon();
+    }
+
     /// A press or a drag inside the open effect panel.
     ///
     /// **A drag stays on the row it started on.** Once `fx_drag` names a key,
@@ -2185,6 +2321,13 @@ impl IvoryApp {
         self.save_settings_soon();
     }
 
+    /// Load a made-up backing track and open its panel, for the screenshot
+    /// hook — which has no file to import and no dialog to import it with.
+    pub fn set_track_for_shot(&mut self, info: crate::ports::TrackInfo, open: bool) {
+        self.track = info;
+        self.track_open = open;
+    }
+
     /// Put a level on the master meter and a reduction on the limiter, so the
     /// screenshot hook can show a meter that is doing something. A silent
     /// picture of a meter says nothing about whether it reads.
@@ -2227,6 +2370,71 @@ impl IvoryApp {
     /// the same state a right-click sets.
     pub fn open_effect_panel(&mut self, fx: recorder_panel::Fx) {
         self.fx_open = Some(fx);
+    }
+
+    /// Ask the host for an audio file to play along to.
+    ///
+    /// **Every extension ffmpeg and CoreAudio read**, plus an "All files"
+    /// filter behind it, for the same reason the cartridge picker has one: a
+    /// filter dims non-matching files on macOS and HIDES them on Windows, and
+    /// a folder that looks empty is a dialog somebody closes again.
+    fn ask_for_track(&mut self) {
+        self.file_request = Some(crate::ports::FileRequest {
+            start_at: (!self.settings.track_path.is_empty())
+                .then(|| std::path::PathBuf::from(&self.settings.track_path))
+                .and_then(|p| p.parent().map(std::path::Path::to_path_buf)),
+            title: "Choose a backing track".to_owned(),
+            extensions: [
+                "wav", "aiff", "aif", "mp3", "m4a", "aac", "flac", "ogg", "opus", "caf", "wma",
+                "mp4", "mov",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            extension_label: "Audio".to_owned(),
+            purpose: crate::ports::FilePurpose::BackingTrack,
+        });
+    }
+
+    /// The backing track, as the host decoded it.
+    pub fn set_track_info(&mut self, info: crate::ports::TrackInfo) {
+        self.track = info;
+    }
+
+    /// Remember which file the track came from, so it loads again next launch.
+    pub fn set_track_path(&mut self, path: String) {
+        self.settings.track_path = path;
+        // A fresh file starts untrimmed: the in and out points belonged to the
+        // one before it, and a track that opens already cut to somebody else's
+        // length is a track that looks broken.
+        self.settings.track_in = 0.0;
+        self.settings.track_out = 0.0;
+        self.save_settings();
+    }
+
+    /// The backing track's file and trim, for the host to reload it at launch.
+    pub fn track_settings(&self) -> (String, f64, f64) {
+        (
+            self.settings.track_path.clone(),
+            self.settings.track_in,
+            self.settings.track_out,
+        )
+    }
+
+    /// Put the trim back after a reload. See `load_track_at_launch`.
+    pub fn set_track_trim(&mut self, from: f64, to: f64) {
+        self.settings.track_in = from.max(0.0);
+        self.settings.track_out = to.max(0.0);
+    }
+
+    /// The backing track's level, trim and length, for the host to push at the
+    /// engine. Seconds, because that is what the settings hold.
+    pub fn track_playback(&self) -> (f32, f64, f64) {
+        (
+            self.settings.track_gain as f32,
+            self.settings.track_in,
+            self.settings.track_out,
+        )
     }
 
     /// What the effects ship as. Told by the host; see [`EffectDefaults`].
@@ -2372,6 +2580,7 @@ impl IvoryApp {
             H::SetMetronomeGain(_) => fader(self.settings.metronome_gain),
             H::SetInputGain(_) => fader(self.settings.input_gain),
             H::SetMaster(_) => fader(self.settings.master_gain),
+            H::SetTrackGain(_) => fader(self.settings.track_gain),
             H::SetSlotGain(i, _) => self
                 .settings
                 .plugin_gains
@@ -2693,6 +2902,11 @@ impl IvoryApp {
                 self.settings.master_gain = f64::from(recorder::fader_to_gain(p));
                 self.save_settings_soon();
             }
+            Hit::SetTrackGain(p) => {
+                self.settings.track_gain = f64::from(recorder::fader_to_gain(p));
+                self.save_settings_soon();
+            }
+            Hit::ImportTrack => self.ask_for_track(),
             Hit::SetTempo(bpm) => {
                 self.settings.record_export.tempo_bpm =
                     bpm.clamp(recorder::MIN_BPM, recorder::MAX_BPM);
@@ -3014,8 +3228,18 @@ impl IvoryApp {
             }
             return;
         }
+        // The trim points are not `Hit`s either: they belong to a panel rather
+        // than to a control in the band, and they are the only two numbers
+        // here measured in time.
+        if matches!(edit.field, F::TrackIn | F::TrackOut) {
+            if let Some(t) = recorder::parse_time(&edit.text) {
+                self.set_trim(edit.field == F::TrackIn, t);
+                self.save_settings();
+            }
+            return;
+        }
         let hit = match edit.field {
-            F::Meter => None,
+            F::Meter | F::TrackIn | F::TrackOut => None,
             F::Tempo => recorder::parse_bpm(&edit.text).map(Hit::SetTempo),
             // The setters take a FADER POSITION, not a gain, so a typed dB has
             // to go back through the same curve the drag uses. Doing it here
@@ -3030,6 +3254,8 @@ impl IvoryApp {
             // Decibels, like the faders it shares a curve with.
             F::Master => recorder::parse_gain(&edit.text)
                 .map(|g| Hit::SetMaster(recorder::gain_to_fader(g))),
+            F::Track => recorder::parse_gain(&edit.text)
+                .map(|g| Hit::SetTrackGain(recorder::gain_to_fader(g))),
             // A PERCENT, not a gain: these are not faders and there is no dB
             // curve to invert. "40" is four tenths wet.
             // In the knob's OWN unit: a filter is typed in hertz.
@@ -4768,6 +4994,7 @@ impl IvoryApp {
                     name_focused: false,
                     editing: None,
                     fx_units: self.fx_units(),
+                    track: &self.track,
                     // The composite's own copy: nothing is focused, nothing
                     // is being typed into and no hand is on a knob, because
                     // there is no pointer in a video frame.
@@ -5322,6 +5549,34 @@ impl IvoryApp {
         // would float on top of its own dimming. Only the thanks card comes
         // later, and only because a card raised from a heart you can still see
         // is a card that belongs in front.
+        if self.track_open {
+            let anchor = self.track_anchor();
+            if anchor.is_positive() {
+                let typing = |f: recorder::NumField| {
+                    self.num_edit
+                        .as_ref()
+                        .filter(|e| e.field == f)
+                        .map(|e| e.text.as_str())
+                };
+                recorder_panel::draw_track_panel(
+                    ui.painter(),
+                    recorder_panel::TrackPanel {
+                        screen: ui.max_rect(),
+                        anchor,
+                        track: &self.track,
+                        from: self.settings.track_in,
+                        to: self.settings.track_out,
+                        typing: (
+                            typing(recorder::NumField::TrackIn),
+                            typing(recorder::NumField::TrackOut),
+                        ),
+                    },
+                    &self.settings,
+                );
+            } else {
+                self.track_open = false;
+            }
+        }
         // The effect panels, on the same terms and for the same reasons.
         if let Some(fx) = self.fx_open {
             let anchor = self.fx_anchor(fx);
@@ -6793,6 +7048,75 @@ mod tests {
             ],
         });
         (ctx, app)
+    }
+
+    /// **The two trim handles may not cross.**
+    ///
+    /// An out-point before the in-point is a track that plays nothing, and the
+    /// way somebody finds out is by pressing Record and hearing silence.
+    #[test]
+    fn the_trim_handles_stay_in_order() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        app.set_track_for_shot(
+            crate::ports::TrackInfo {
+                name: "b.mp3".to_owned(),
+                seconds: 200.0,
+                wave: vec![0.5; 100],
+                error: String::new(),
+            },
+            false,
+        );
+
+        app.set_trim(true, 50.0);
+        app.set_trim(false, 150.0);
+        assert!((app.settings.track_in - 50.0).abs() < 1.0e-6);
+        assert!((app.settings.track_out - 150.0).abs() < 1.0e-6);
+
+        // Dragging the in-point past the out-point stops at it.
+        app.set_trim(true, 180.0);
+        assert!(
+            app.settings.track_in < app.settings.track_out,
+            "in {} is not before out {}",
+            app.settings.track_in,
+            app.settings.track_out
+        );
+        // And the other way.
+        app.set_trim(false, 1.0);
+        assert!(app.settings.track_out > app.settings.track_in);
+
+        // Dragged back to the very end, the out-point becomes "no out-point",
+        // which is the zero the engine and the settings both read as the end.
+        app.set_trim(true, 0.0);
+        app.set_trim(false, 200.0);
+        assert_eq!(app.settings.track_out, 0.0);
+
+        // Past either end it pins inside the file.
+        app.set_trim(true, 9_000.0);
+        assert!(app.settings.track_in <= 200.0);
+        app.set_trim(true, -5.0);
+        assert_eq!(app.settings.track_in, 0.0);
+    }
+
+    /// A trim typed as a time lands where a player's display would say.
+    #[test]
+    fn a_typed_trim_reads_both_ways_of_writing_a_time() {
+        assert_eq!(recorder::parse_time("12.5"), Some(12.5));
+        assert_eq!(recorder::parse_time("1:12.5"), Some(72.5));
+        assert_eq!(recorder::parse_time(" 2:00 "), Some(120.0));
+        assert_eq!(recorder::parse_time("0"), Some(0.0));
+        // And nonsense is refused rather than read as the top of the file.
+        assert_eq!(recorder::parse_time(""), None);
+        assert_eq!(recorder::parse_time("soon"), None);
+        assert_eq!(recorder::parse_time("-4"), None);
+        assert_eq!(recorder::parse_time("1:-4"), None);
+        // What the panel PRINTS is what the field ACCEPTS, which is the whole
+        // reason the minutes form is parsed at all.
+        for t in [0.0_f64, 9.5, 72.5, 196.0] {
+            let shown = recorder_panel::trim_text(t);
+            let back = recorder::parse_time(&shown)
+                .unwrap_or_else(|| panic!("{shown} is printed and not accepted"));
+            assert!((back - t).abs() < 0.06, "{shown} came back as {back}");
+        }
     }
 
     /// **A double click puts a knob back, through the app, into settings.**
