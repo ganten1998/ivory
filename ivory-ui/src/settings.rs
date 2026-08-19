@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 7;
+const SETTINGS_VERSION: u64 = 8;
 
 /// Recorder backgrounds this app shipped as defaults before [`SETTINGS_VERSION`]
 /// 1, and which are therefore not evidence that anybody chose them.
@@ -429,6 +429,12 @@ pub struct Settings {
     pub reverb_mix: f64,
     pub delay_mix: f64,
     pub chorus_mix: f64,
+    /// The high-pass corner, 0..=1. 0 is out of the way.
+    pub hpf_mix: f64,
+    /// The low-pass corner, 0..=1. **Up is darker.**
+    pub lpf_mix: f64,
+    /// How hard the limiter is driven, 0..=1. 0 is bypass.
+    pub limiter_mix: f64,
     /// What each effect is set to, under its right-click menu.
     ///
     /// **Stored as a flat map of 0..=1 values**, keyed by the same names the
@@ -625,6 +631,9 @@ impl Default for Settings {
             reverb_mix: 0.0,
             delay_mix: 0.0,
             chorus_mix: 0.0,
+            hpf_mix: 0.0,
+            lpf_mix: 0.0,
+            limiter_mix: 0.0,
             effect_params: Map::new(),
             dx7_cartridge: String::new(),
             dx7_patch: 0,
@@ -1179,6 +1188,9 @@ impl Settings {
             ("reverb_mix", &mut s.reverb_mix),
             ("delay_mix", &mut s.delay_mix),
             ("chorus_mix", &mut s.chorus_mix),
+            ("hpf_mix", &mut s.hpf_mix),
+            ("lpf_mix", &mut s.lpf_mix),
+            ("limiter_mix", &mut s.limiter_mix),
         ] {
             if let Some(v) = map.shift_remove(key).and_then(|v| v.as_f64()) {
                 // Clamped on read: this multiplies into a feedback loop, and a
@@ -1252,6 +1264,17 @@ impl Settings {
         legacy_staff: bool,
         saw_order: bool,
     ) {
+        if was < 8 {
+            // **Video on, for people who have it off because it shipped off.**
+            //
+            // See `VideoMode::Composite`: the default was audio-and-MIDI, and
+            // what that produced was takes with no `.mp4` and nobody knowing
+            // why. Under this file's own rule — only values this app shipped as
+            // a default are touched, and only once — that is exactly what a
+            // migration is for. Somebody who deliberately turned video off
+            // loses that once and turns it off again.
+            self.record_export.video = crate::recorder::VideoMode::Composite;
+        }
         if was < 4 && !saw_order {
             // **The three bools become an ordered list.** Whatever diagrams
             // somebody had chosen, they keep — in the numbered order, because
@@ -1618,6 +1641,9 @@ impl Settings {
             ("reverb_mix", self.reverb_mix),
             ("delay_mix", self.delay_mix),
             ("chorus_mix", self.chorus_mix),
+            ("hpf_mix", self.hpf_mix),
+            ("lpf_mix", self.lpf_mix),
+            ("limiter_mix", self.limiter_mix),
         ] {
             if let Some(n) = serde_json::Number::from_f64(v) {
                 map.insert(key.into(), Value::Number(n));
@@ -1906,9 +1932,14 @@ impl Settings {
             count_in_beats: self.count_in_beats(),
             count_in_bars: self.count_in_bars(),
             time_signature: self.time_signature(),
-            reverb: self.reverb_mix as f32,
-            delay: self.delay_mix as f32,
-            chorus: self.chorus_mix as f32,
+            fx: crate::recorder::FxSends {
+                reverb: self.reverb_mix as f32,
+                delay: self.delay_mix as f32,
+                chorus: self.chorus_mix as f32,
+                hpf: self.hpf_mix as f32,
+                lpf: self.lpf_mix as f32,
+                limiter: self.limiter_mix as f32,
+            },
         }
     }
 
@@ -2078,6 +2109,38 @@ mod tests {
     /// came back, because the key that recorded it was read by nothing; and a
     /// band with one diagram in it kept the diagram but gained the staff
     /// whether or not it was wanted.
+    /// **A file from before 4.12 gets video, once.**
+    ///
+    /// The tester who found this recorded a whole session, had no webcam, and
+    /// got a `.wav` and a `.mid` and nothing else — because video was off by
+    /// default and the only thing that had ever turned it on was choosing a
+    /// camera. New installs get it from the default; existing files need the
+    /// migration, and only the one time.
+    #[test]
+    fn an_older_file_is_moved_onto_video() {
+        use crate::recorder::VideoMode;
+        let older = r#"{"settings_version": 7, "record_export": {"video": "none"}}"#;
+        assert_eq!(
+            Settings::from_json(older).record_export.video,
+            VideoMode::Composite,
+            "an older file was left with no video"
+        );
+
+        // A file already at this version is somebody who has seen the default
+        // and turned it off. That choice is theirs and it stands.
+        let current = format!(
+            r#"{{"settings_version": {SETTINGS_VERSION}, "record_export": {{"video": "none"}}}}"#
+        );
+        assert_eq!(
+            Settings::from_json(&current).record_export.video,
+            VideoMode::None,
+            "a deliberate choice was overwritten"
+        );
+
+        // And a fresh file has it without any migration at all.
+        assert_eq!(Settings::default().record_export.video, VideoMode::Composite);
+    }
+
     #[test]
     fn the_theory_migration_keeps_what_the_user_actually_chose() {
         use crate::theory_panel::{View, Views};
@@ -2382,8 +2445,14 @@ mod tests {
         s.reverb_mix = 0.35;
         s.delay_mix = 0.2;
         s.chorus_mix = 0.6;
+        s.hpf_mix = 0.3;
+        s.lpf_mix = 0.45;
+        s.limiter_mix = 0.7;
         s.effect_params
             .insert("reverb_size".into(), Value::from(0.8));
+        s.effect_params.insert("hpf_slope".into(), Value::from("12"));
+        s.effect_params
+            .insert("limiter_ceiling".into(), Value::from(0.6));
         s.dx7_patch = 12;
         s.extra.insert(
             "a_key_from_a_later_build".into(),

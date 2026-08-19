@@ -119,11 +119,24 @@ pub struct FileRequest {
 pub struct EffectDefaults {
     /// Parameter key to its default, as the settings file would store it.
     pub values: serde_json::Map<String, serde_json::Value>,
-    /// The delay's divisions, `(key, label)`, in the order the panel steps
-    /// through them.
-    pub divisions: Vec<(String, String)>,
-    /// Which of those is the default.
-    pub default_division: String,
+    /// Every parameter that is a list of names rather than a number.
+    ///
+    /// **General, because there are three of them now.** The delay's time was
+    /// the only one, and it was two dedicated fields; a filter slope is the
+    /// same shape of thing — a short list a row steps through — and a second
+    /// and third copy of "divisions / default_division" is how the two drift.
+    pub choices: Vec<ChoiceParam>,
+}
+
+/// One parameter whose values are named rather than continuous.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChoiceParam {
+    /// The settings key, e.g. `delay_division`.
+    pub key: String,
+    /// `(key, label)`, in the order a row steps through them.
+    pub options: Vec<(String, String)>,
+    /// Which option applies when the settings file says nothing.
+    pub default: String,
 }
 
 /// One editable parameter of a patch.

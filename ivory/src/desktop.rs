@@ -252,6 +252,54 @@ pub struct DesktopApp {
     editing: Option<crate::dx7::Voice>,
 }
 
+/// **Every stepped row has a list to step through.**
+///
+/// The panel decides which rows are named-value rows ([`FxRow::step`]) and the
+/// HOST decides what those names are; they meet by string key and nothing
+/// makes them agree. A row whose key the host never sends draws an empty box
+/// that does nothing when pressed — which is what `lpf_slope` did for exactly
+/// as long as it took to write this.
+///
+/// [`FxRow::step`]: ivory_ui::recorder_panel::FxRow::step
+#[cfg(all(test, feature = "recorder"))]
+#[test]
+fn the_host_offers_a_choice_for_every_stepped_row() {
+    let d = effect_defaults();
+    for fx in ivory_ui::recorder_panel::Fx::ALL {
+        for row in fx.rows() {
+            if !row.step {
+                continue;
+            }
+            let c = d
+                .choices
+                .iter()
+                .find(|c| c.key == row.key)
+                .unwrap_or_else(|| panic!("{} has no choices for {}", fx.title(), row.key));
+            assert!(!c.options.is_empty(), "{} offers an empty list", row.key);
+            assert!(
+                c.options.iter().any(|(k, _)| *k == c.default),
+                "{}'s default {:?} is not one of its options",
+                row.key,
+                c.default
+            );
+        }
+    }
+    // And every sliding row has a default value, for the same reason.
+    for fx in ivory_ui::recorder_panel::Fx::ALL {
+        for row in fx.rows() {
+            if row.step || row.key.is_empty() {
+                continue;
+            }
+            assert!(
+                d.values.contains_key(row.key),
+                "{} has no shipped value for {}",
+                fx.title(),
+                row.key
+            );
+        }
+    }
+}
+
 /// [`effect_defaults`], for the offscreen screenshot test.
 #[cfg(all(test, feature = "recorder"))]
 pub fn effect_defaults_for_shot() -> ivory_ui::ports::EffectDefaults {
@@ -278,16 +326,41 @@ fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
         ("chorus_depth", d.chorus_depth),
         ("chorus_width", d.chorus_width),
         ("chorus_tone", d.chorus_tone),
+        ("hpf_resonance", d.hpf_resonance),
+        ("lpf_resonance", d.lpf_resonance),
+        ("limiter_ceiling", d.limiter_ceiling),
+        ("limiter_release", d.limiter_release),
+        ("limiter_knee", d.limiter_knee),
     ] {
         values.insert(key.to_owned(), serde_json::Value::from(f64::from(v)));
     }
     ivory_ui::ports::EffectDefaults {
         values,
-        divisions: Division::ALL
+        choices: vec![
+            ivory_ui::ports::ChoiceParam {
+                key: "delay_division".to_owned(),
+                options: Division::ALL
+                    .into_iter()
+                    .map(|x| (x.key().to_owned(), x.label().to_owned()))
+                    .collect(),
+                default: d.delay_division.key().to_owned(),
+            },
+            slope_choice("hpf_slope", d.hpf_slope),
+            slope_choice("lpf_slope", d.lpf_slope),
+        ],
+    }
+}
+
+/// One filter's slope, as a choice the panel can step through.
+#[cfg(feature = "recorder")]
+fn slope_choice(key: &str, default: crate::effects::Slope) -> ivory_ui::ports::ChoiceParam {
+    ivory_ui::ports::ChoiceParam {
+        key: key.to_owned(),
+        options: crate::effects::Slope::ALL
             .into_iter()
             .map(|x| (x.key().to_owned(), x.label().to_owned()))
             .collect(),
-        default_division: d.delay_division.key().to_owned(),
+        default: default.key().to_owned(),
     }
 }
 
@@ -315,6 +388,11 @@ fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate
         ("chorus_depth", &mut p.chorus_depth),
         ("chorus_width", &mut p.chorus_width),
         ("chorus_tone", &mut p.chorus_tone),
+        ("hpf_resonance", &mut p.hpf_resonance),
+        ("lpf_resonance", &mut p.lpf_resonance),
+        ("limiter_ceiling", &mut p.limiter_ceiling),
+        ("limiter_release", &mut p.limiter_release),
+        ("limiter_knee", &mut p.limiter_knee),
     ] {
         if let Some(v) = num(key) {
             *dst = v;
@@ -326,6 +404,18 @@ fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate
         .and_then(Division::from_key)
     {
         p.delay_division = d;
+    }
+    for (key, dst) in [
+        ("hpf_slope", &mut p.hpf_slope),
+        ("lpf_slope", &mut p.lpf_slope),
+    ] {
+        if let Some(v) = map
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(crate::effects::Slope::from_key)
+        {
+            *dst = v;
+        }
     }
     p.sane()
 }
@@ -518,9 +608,20 @@ impl DesktopApp {
                         > std::time::Duration::from_secs(3)
                 }))
                 .then(|| {
-                    "the camera is open but sending no picture - check Camera \
-                     access in System Settings > Privacy & Security"
-                        .to_owned()
+                    // Where the fix lives is not the same sentence on every
+                    // platform, and naming the wrong panel is worse than
+                    // naming none.
+                    if cfg!(target_os = "macos") {
+                        "the camera is open but sending no picture - check \
+                         Camera access in System Settings > Privacy & Security"
+                    } else if cfg!(target_os = "linux") {
+                        "the camera is open but sending no picture - another \
+                         program may be holding it, or the format may not be \
+                         supported"
+                    } else {
+                        "the camera is open but sending no picture"
+                    }
+                    .to_owned()
                 })
             })
             .or_else(|| {
@@ -1262,11 +1363,14 @@ impl DesktopApp {
         // Pushed every frame with the gains, and for the same reason: the
         // settings are the one live value, so a knob dragged, a project loaded
         // and a settings file hand-edited all arrive by the same path.
-        let [reverb, delay, chorus] = self.app.effect_sends();
+        let [reverb, delay, chorus, hpf, lpf, limiter] = self.app.effect_sends();
         e.set_effects(crate::effects::Sends {
             reverb,
             delay,
             chorus,
+            hpf,
+            lpf,
+            limiter,
         });
         // The parameters too, and `set_effect_params` is what makes this cheap:
         // it compares before it takes the lock, so pushing the same eleven
@@ -1838,7 +1942,7 @@ impl DesktopApp {
         let (w, h) = spec.resolution.pixels().or(cam).unwrap_or((1920, 1080));
         let want_camera = spec.composite.camera && self.recorder.session.camera_running();
         let want_display = spec.composite.display && spec.composite.shows.any();
-        if !want_camera && !want_display {
+        if !spec.produces_video(self.recorder.session.camera_running()) {
             self.recorder.engine_error =
                 Some("the video has neither the camera nor the display in it".to_owned());
             return;

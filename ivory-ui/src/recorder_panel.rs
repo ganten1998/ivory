@@ -319,14 +319,12 @@ struct Layout {
     input_row: Rect,
     click: Rect,
 
-    /// The three effect knobs, stacked between the faders and the meters.
+    /// The six effect knobs, in [`Fx::ALL`] order, under the meters.
     ///
     /// The whole CELL, label included, and the whole cell is the drag target:
     /// a knob is thirty points across and a control you can only grab by its
     /// own diameter is a control you keep missing.
-    reverb: Rect,
-    delay: Rect,
-    chorus: Rect,
+    fx: [Rect; Fx::ALL.len()],
     /// Where a typed tempo goes: a small box under the knob, drawn only while
     /// one is being typed.
     tempo_entry: Rect,
@@ -630,9 +628,7 @@ impl Layout {
             metronome_row: Rect::NOTHING,
             input_row: Rect::NOTHING,
             click: Rect::NOTHING,
-            reverb: Rect::NOTHING,
-            delay: Rect::NOTHING,
-            chorus: Rect::NOTHING,
+            fx: [Rect::NOTHING; Fx::ALL.len()],
             tempo_entry: Rect::NOTHING,
             setup: Rect::NOTHING,
             dest: Rect::NOTHING,
@@ -889,19 +885,19 @@ impl Layout {
         // **The same cell as an effect knob, to the point.** They are the same
         // control and the eye reads them as a set; a tempo knob a few points
         // off the size of the three beside it looks like a mistake nobody can
-        // name. Sized from `self.reverb`, which `fill_transport` has already
-        // placed — not from a fraction of this row, which would agree with it
-        // only by luck and only at one window size.
+        // name. Sized from the first effect cell, which `fill_transport` has
+        // already placed — not from a fraction of this row, which would agree
+        // with it only by luck and only at one window size.
         //
         // **And the clock takes its place while a take runs.** The tempo
         // cannot be changed mid-take — the `.mid`'s tempo map is already
         // written — so leaving a live knob there would be a control that lies.
         // What goes in its place is the one number anybody looks at from a
         // piano bench, in the row their hand is already on.
-        let head = if self.reverb.is_positive() {
+        let head = if self.fx[0].is_positive() {
             let size = Vec2::new(
-                self.reverb.width().min(bar.width() * 0.5),
-                self.reverb.height().min(bar.height()),
+                self.fx[0].width().min(bar.width() * 0.5),
+                self.fx[0].height().min(bar.height()),
             );
             Rect::from_center_size(
                 Pos2::new(bar.left() + size.x * 0.5, bar.center().y),
@@ -984,21 +980,35 @@ impl Layout {
         // Side by side, one third each, with the gap inside the cell: the
         // label is centred over the dial and `draw_knob` centres the pair in
         // whatever it is handed.
+        // **Two rows of three.** Three sends on top, then the three that
+        // shape the whole output: a high-pass, a low-pass and the limiter that
+        // is always the last thing in the chain. Six across one row would put
+        // every knob below the size `knob_fits` will accept at any window this
+        // app opens at.
+        // **The gap between the rows is bigger than it looks like it needs to
+        // be**, because a knob is bigger than its cell: the tick marks stand
+        // out to 1.26 of the face radius and are drawn OUTSIDE the rectangle
+        // the face was measured in (see `draw_knob`). At a four percent gap
+        // the word HPF landed on the reverb knob's skirt.
+        let row = |top: f32, bottom: f32| slice_v(knobs, top, bottom);
+        let (top, bottom) = (row(0.00, 0.43), row(0.57, 1.00));
         let cells = [
-            slice_h(knobs, 0.00, 0.32),
-            slice_h(knobs, 0.34, 0.66),
-            slice_h(knobs, 0.68, 1.00),
+            slice_h(top, 0.00, 0.32),
+            slice_h(top, 0.34, 0.66),
+            slice_h(top, 0.68, 1.00),
+            slice_h(bottom, 0.00, 0.32),
+            slice_h(bottom, 0.34, 0.66),
+            slice_h(bottom, 0.68, 1.00),
         ];
         // **A control nobody can see is not a control.** `draw_knob` refuses a
         // cell too small to be a knob rather than drawing a smudge, so the
         // layout has to refuse it too — otherwise the band keeps a live drag
         // target over blank panel. One predicate, asked by both.
         //
-        // All three or none: two knobs where there should be three is worse
-        // than none, because the missing one is the one somebody goes looking
-        // for.
+        // All six or none: five knobs where there should be six is worse than
+        // none, because the missing one is the one somebody goes looking for.
         if cells.iter().copied().all(knob_fits) {
-            [self.reverb, self.delay, self.chorus] = cells;
+            self.fx = cells;
         }
     }
 
@@ -1086,7 +1096,7 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 39] {
+    fn targets(&self) -> [(Rect, Produces); 42] {
         use Produces::{Along, AlongV, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
         let s = &self.slots;
@@ -1124,9 +1134,12 @@ impl Layout {
             (track(self.input_row), Along(Hit::SetInputGain)),
             // Up the cell for more, which is the direction every knob in every
             // studio turns and the direction the two faders beside them move.
-            (self.reverb, AlongV(Hit::SetReverb)),
-            (self.delay, AlongV(Hit::SetDelay)),
-            (self.chorus, AlongV(Hit::SetChorus)),
+            (self.fx[0], AlongV(|v| Hit::SetFx(Fx::Reverb, v))),
+            (self.fx[1], AlongV(|v| Hit::SetFx(Fx::Delay, v))),
+            (self.fx[2], AlongV(|v| Hit::SetFx(Fx::Chorus, v))),
+            (self.fx[3], AlongV(|v| Hit::SetFx(Fx::Hpf, v))),
+            (self.fx[4], AlongV(|v| Hit::SetFx(Fx::Lpf, v))),
+            (self.fx[5], AlongV(|v| Hit::SetFx(Fx::Limiter, v))),
             (self.click, Fixed(Hit::ToggleMetronome)),
             (self.dest, Fixed(Hit::ChooseFolder)),
             (self.reveal, Fixed(Hit::RevealFolder)),
@@ -1242,9 +1255,10 @@ pub enum Hit {
     /// scaling cannot disagree.
     SetMetronomeGain(f32),
     /// The three effect sends, 0..=1.
-    SetReverb(f32),
-    SetDelay(f32),
-    SetChorus(f32),
+    /// One of the six effect knobs, 0..=1. **One variant, not six**: they are
+    /// the same control six times over, and six parallel variants meant six
+    /// parallel arms in every match that ever touches one.
+    SetFx(Fx, f32),
     SetInputGain(f32),
     /// Tempo dragged, already clamped to `MIN_BPM..=MAX_BPM`.
     SetTempo(f64),
@@ -1272,9 +1286,7 @@ impl Hit {
     pub fn with_value(self, v: f32) -> Hit {
         let v = v.clamp(0.0, 1.0);
         match self {
-            Hit::SetReverb(_) => Hit::SetReverb(v),
-            Hit::SetDelay(_) => Hit::SetDelay(v),
-            Hit::SetChorus(_) => Hit::SetChorus(v),
+            Hit::SetFx(fx, _) => Hit::SetFx(fx, v),
             Hit::SetMetronomeGain(_) => Hit::SetMetronomeGain(v),
             Hit::SetInputGain(_) => Hit::SetInputGain(v),
             Hit::SetSlotGain(i, _) => Hit::SetSlotGain(i, v),
@@ -1288,7 +1300,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 41] = [
+    pub const ALL: [Hit; 44] = [
         Hit::Record,
         Hit::Stop,
         Hit::OpenSetup,
@@ -1324,9 +1336,12 @@ impl Hit {
         Hit::SetSlotGain(3, Hit::MIDWAY),
         Hit::SetSlotGain(4, Hit::MIDWAY),
         Hit::SetMetronomeGain(Hit::MIDWAY),
-        Hit::SetReverb(Hit::MIDWAY),
-        Hit::SetDelay(Hit::MIDWAY),
-        Hit::SetChorus(Hit::MIDWAY),
+        Hit::SetFx(Fx::Reverb, Hit::MIDWAY),
+        Hit::SetFx(Fx::Delay, Hit::MIDWAY),
+        Hit::SetFx(Fx::Chorus, Hit::MIDWAY),
+        Hit::SetFx(Fx::Hpf, Hit::MIDWAY),
+        Hit::SetFx(Fx::Lpf, Hit::MIDWAY),
+        Hit::SetFx(Fx::Limiter, Hit::MIDWAY),
         Hit::SetInputGain(Hit::MIDWAY),
         Hit::SetTempo((MIN_BPM + MAX_BPM) * 0.5),
         Hit::EditTimeSignature,
@@ -1394,9 +1409,7 @@ impl Hit {
             Hit::ToggleMetronomeInTake => "Record the click into takes",
             Hit::SetSlotGain(i, _) => GAIN[n(i)],
             Hit::SetMetronomeGain(_) => "Click level",
-            Hit::SetReverb(_) => "Reverb, on every instrument",
-            Hit::SetDelay(_) => "Delay, in time with the tempo",
-            Hit::SetChorus(_) => "Chorus, in true stereo",
+            Hit::SetFx(fx, _) => fx.describe(),
             Hit::SetInputGain(_) => "Input level",
             Hit::SetTempo(_) => "Tempo",
             Hit::EditTimeSignature => "Time signature",
@@ -1413,31 +1426,36 @@ impl Hit {
             self,
             Hit::SetSlotGain(_, _)
                 | Hit::SetMetronomeGain(_)
-                | Hit::SetReverb(_)
-                | Hit::SetDelay(_)
-                | Hit::SetChorus(_)
+                | Hit::SetFx(..)
                 | Hit::SetInputGain(_)
                 | Hit::SetTempo(_)
         )
     }
 
     /// Which control this is, for [`Hit::is_same_control`]: the variant, plus
-    /// the slot for the four that have one.
+    /// the index for the ones that carry one.
     ///
-    /// **The slot index is half the answer.** `mem::discriminant` alone says
+    /// **The index is half the answer.** `mem::discriminant` alone says
     /// `SetSlotGain(0, _)` and `SetSlotGain(1, _)` are the same control, and a
     /// caller that believes it is still dragging the knob it grabbed would then
     /// set slot 1's level from a drag that started on slot 0's knob — silently,
     /// and only once the pointer wandered a row.
+    ///
+    /// `SetFx` is the same trap and it arrived the same way: six knobs that
+    /// used to be six variants became one variant carrying which, and a
+    /// discriminant cannot see the difference between the reverb and the
+    /// limiter. Grabbing REVERB and dragging down onto HPF would have set the
+    /// high-pass.
     fn control_key(self) -> (std::mem::Discriminant<Hit>, usize) {
-        let slot = match self {
+        let index = match self {
             Hit::PickSlot(i)
             | Hit::OpenSlotEditor(i)
             | Hit::ClearSlot(i)
             | Hit::SetSlotGain(i, _) => i,
+            Hit::SetFx(fx, _) => fx.index(),
             _ => 0,
         };
-        (std::mem::discriminant(&self), slot)
+        (std::mem::discriminant(&self), index)
     }
 
     /// Whether two hits are the same CONTROL, ignoring any value one carries.
@@ -1465,9 +1483,7 @@ pub fn num_field(hit: Hit) -> Option<NumField> {
         // The knob IS the box: a double click on it opens the field. There is
         // no separate control to press.
         Hit::SetTempo(_) => Some(NumField::Tempo),
-        Hit::SetReverb(_) => Some(NumField::Reverb),
-        Hit::SetDelay(_) => Some(NumField::Delay),
-        Hit::SetChorus(_) => Some(NumField::Chorus),
+        Hit::SetFx(fx, _) => Some(NumField::Fx(fx)),
         Hit::SetInputGain(_) => Some(NumField::Input),
         // NOT `SetTempo`: that carries a committed value and has no box of
         // its own any more. `EditTempo` is the box.
@@ -1667,9 +1683,7 @@ pub fn heart_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
 pub fn knob_rect(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<Rect> {
     let l = Layout::new(rect, view);
     let r = match hit {
-        Hit::SetReverb(_) => l.reverb,
-        Hit::SetDelay(_) => l.delay,
-        Hit::SetChorus(_) => l.chorus,
+        Hit::SetFx(fx, _) => l.fx[fx.index()],
         Hit::SetTempo(_) => l.tempo,
         _ => return None,
     };
@@ -2006,22 +2020,21 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
     ] {
         draw_fader(painter, row, icon, ink, gain, typing_for(view, field), p);
     }
-    // The two effect sends, beside the faders they belong with.
-    for (cell, v, label, field) in [
-        (l.reverb, view.reverb, "REVERB", NumField::Reverb),
-        (l.delay, view.delay, "DELAY", NumField::Delay),
-        (l.chorus, view.chorus, "CHORUS", NumField::Chorus),
-    ] {
+    // The six effect knobs, under the meters: three sends, then the three
+    // that shape what leaves.
+    for fx in Fx::ALL {
+        let field = NumField::Fx(fx);
+        let v = view.fx.get(fx);
         draw_knob(
             painter,
-            cell,
+            l.fx[fx.index()],
             &Knob {
                 value: v,
-                label,
+                label: fx.title(),
                 typing: typing_for(view, field),
                 turning: view.turning == Some(field),
                 reading: format!("{:.0}%", v.clamp(0.0, 1.0) * 100.0),
-                cap: KNOB_CAP,
+                cap: fx.cap(),
             },
             p,
         );
@@ -3117,6 +3130,20 @@ const TEMPO_CAP: Color32 = Color32::from_rgb(0xb5, 0x5c, 0x18);
 /// piece of hardware and not like the rest of the panel.
 const KNOB_CAP: Color32 = Color32::from_rgb(0x1c, 0x6f, 0xd6);
 
+/// The filters' caps.
+///
+/// Off-white rather than white: a pure `#ffffff` cap is the brightest thing on
+/// the panel by a distance, and these are two knobs that mostly sit at zero.
+/// This is the colour of an ivory-capped pot, which is the reference.
+const FILTER_CAP: Color32 = Color32::from_rgb(0xe6, 0xe1, 0xd6);
+
+/// The limiter's cap.
+///
+/// Red because it is the one control here that changes a take whether or not
+/// anybody is listening for it — every other knob adds something you can hear
+/// yourself adding.
+const LIMITER_CAP: Color32 = Color32::from_rgb(0xc4, 0x2f, 0x22);
+
 /// A transport button's side, as a fraction of the tempo knob's diameter.
 ///
 /// **Measured against the knob beside them**, which is what makes the four of
@@ -3145,7 +3172,7 @@ const FADER_COL: f32 = 0.46;
 /// width-limited before, so a shorter column costs it less than the number
 /// suggests — and the band is taller now than it was, which pays for most of
 /// it. See `BAND_H_AT_1300`.
-const METER_SHARE: f32 = 0.62;
+const METER_SHARE: f32 = 0.46;
 
 /// The smallest knob face worth drawing, as a radius.
 ///
@@ -3808,8 +3835,8 @@ mod tests {
         // of a control that is not there is correctly answered with None.
         let v = with_rack(RecordState::Idle, racks()[1]);
         for (hit, want) in [
-            (Hit::SetReverb(0.0), DragAxis::Vertical),
-            (Hit::SetDelay(0.0), DragAxis::Vertical),
+            (Hit::SetFx(Fx::Reverb, 0.0), DragAxis::Vertical),
+            (Hit::SetFx(Fx::Delay, 0.0), DragAxis::Vertical),
             (Hit::SetMetronomeGain(0.0), DragAxis::Horizontal),
             (Hit::SetInputGain(0.0), DragAxis::Horizontal),
             (Hit::SetSlotGain(0, 0.0), DragAxis::Horizontal),
@@ -3832,18 +3859,26 @@ mod tests {
     fn a_knob_reads_zero_at_the_bottom_and_one_at_the_top() {
         let r = band(1300.0);
         let v = idle();
-        let cell = Layout::new(r, &v).reverb;
+        let cell = Layout::new(r, &v).fx[Fx::Reverb.index()];
         assert!(cell.is_positive(), "the knob has no rectangle to drag in");
         let at = |y: f32| hit_test(r, &v, Pos2::new(cell.center().x, y));
         // Half a point in from the bottom edge, which is the last point inside
         // the rect — so this is "as low as the pointer can get", not exactly 0.
-        let Some(Hit::SetReverb(low)) = at(cell.bottom() - 0.5) else {
+        let Some(Hit::SetFx(Fx::Reverb, low)) = at(cell.bottom() - 0.5) else {
             panic!("the bottom of the knob is not the knob")
         };
-        assert!(low < 0.02, "the bottom of the travel reads {low}");
-        assert_eq!(at(cell.top()), Some(Hit::SetReverb(1.0)));
+        // **A point of travel, not a fixed 2%.** The knobs are half the height
+        // they were now that there are six of them in two rows, so half a point
+        // is twice the fraction of the travel it used to be — an absolute
+        // tolerance here fails on a layout change rather than on a bug.
+        assert!(
+            low <= 1.0 / cell.height(),
+            "the bottom of the travel reads {low} in a cell {} high",
+            cell.height()
+        );
+        assert_eq!(at(cell.top()), Some(Hit::SetFx(Fx::Reverb, 1.0)));
         // And the middle is the middle, not an end.
-        let Some(Hit::SetReverb(mid)) = at(cell.center().y) else {
+        let Some(Hit::SetFx(Fx::Reverb, mid)) = at(cell.center().y) else {
             panic!("the middle of the knob is not the knob")
         };
         assert!((mid - 0.5).abs() < 0.05, "the centre reads {mid}");
@@ -3895,7 +3930,8 @@ mod tests {
             ("name", l.name),
             ("tempo", l.tempo),
             ("meter", l.meter),
-            ("reverb", l.reverb),
+            ("reverb", l.fx[Fx::Reverb.index()]),
+            ("limiter", l.fx[Fx::Limiter.index()]),
         ] {
             if !other.is_positive() {
                 continue;
@@ -3919,7 +3955,7 @@ mod tests {
     /// The two effect knobs are in it for the same reason the faders are: they
     /// are a mix, they cost the audio thread nothing to move, and riding the
     /// reverb through a take is a thing a person does on purpose.
-    const SURVIVORS: [Hit; 17] = [
+    const SURVIVORS: [Hit; 20] = [
         Hit::Stop,
         Hit::SetSlotGain(0, 0.0),
         Hit::SetSlotGain(1, 0.0),
@@ -3933,9 +3969,15 @@ mod tests {
         Hit::OpenSlotEditor(4),
         Hit::SetMetronomeGain(0.0),
         Hit::SetInputGain(0.0),
-        Hit::SetReverb(0.0),
-        Hit::SetDelay(0.0),
-        Hit::SetChorus(0.0),
+        Hit::SetFx(Fx::Reverb, 0.0),
+        Hit::SetFx(Fx::Delay, 0.0),
+        Hit::SetFx(Fx::Chorus, 0.0),
+        // The filters and the limiter survive a take for the same reason the
+        // sends do: they are the sound, and a take is when somebody wants to
+        // change it.
+        Hit::SetFx(Fx::Hpf, 0.0),
+        Hit::SetFx(Fx::Lpf, 0.0),
+        Hit::SetFx(Fx::Limiter, 0.0),
         Hit::ToggleMetronome,
     ];
 
@@ -5198,7 +5240,15 @@ mod tests {
     #[test]
     fn the_export_line_says_what_a_take_will_produce() {
         use crate::recorder::VideoMode;
-        assert_eq!(export_summary(&ExportSpec::default()), "wav + midi");
+        assert_eq!(
+            export_summary(&ExportSpec {
+                video: VideoMode::None,
+                ..Default::default()
+            }),
+            "wav + midi"
+        );
+        // The shipped default is not that one. A take records the window.
+        assert_eq!(export_summary(&ExportSpec::default()), "wav + midi + 1 video");
         assert_eq!(
             export_summary(&ExportSpec {
                 video: VideoMode::Composite,
@@ -5220,6 +5270,7 @@ mod tests {
             export_summary(&ExportSpec {
                 audio: false,
                 midi: false,
+                video: VideoMode::None,
                 ..Default::default()
             }),
             "nothing"
@@ -5279,12 +5330,17 @@ mod tests {
                                 // Both ends of each knob's travel, so a slot or
                                 // a pointer that escapes at one extreme is
                                 // caught rather than only being drawn mid-way.
-                                reverb: 0.0,
-                                delay: 1.0,
-                                chorus: 0.5,
+                                fx: crate::recorder::FxSends {
+                                    reverb: 0.0,
+                                    delay: 1.0,
+                                    chorus: 0.5,
+                                    hpf: 0.35,
+                                    lpf: 1.0,
+                                    limiter: 0.7,
+                                },
                                 // A knob mid-turn, so the sweep also covers a
                                 // knob showing a number instead of its name.
-                                turning: Some(NumField::Reverb),
+                                turning: Some(NumField::Fx(Fx::Reverb)),
                                 metronome_on: true,
                                 metronome_in_take: dark,
                                 tempo_bpm: 92.5,
@@ -5556,16 +5612,32 @@ pub enum Fx {
     Reverb,
     Delay,
     Chorus,
+    Hpf,
+    Lpf,
+    Limiter,
 }
 
 impl Fx {
-    pub const ALL: [Fx; 3] = [Fx::Reverb, Fx::Delay, Fx::Chorus];
+    /// **In drawn order: the top row, then the bottom row.** Three sends over
+    /// three things that shape the whole output. Anything walking all six
+    /// walks them in the order a hand finds them.
+    pub const ALL: [Fx; 6] = [
+        Fx::Reverb,
+        Fx::Delay,
+        Fx::Chorus,
+        Fx::Hpf,
+        Fx::Lpf,
+        Fx::Limiter,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Fx::Reverb => "REVERB",
             Fx::Delay => "DELAY",
             Fx::Chorus => "CHORUS",
+            Fx::Hpf => "HPF",
+            Fx::Lpf => "LPF",
+            Fx::Limiter => "LIMITER",
         }
     }
 
@@ -5577,45 +5649,120 @@ impl Fx {
             Fx::Reverb => "eight combs into four allpasses",
             Fx::Delay => "in time with the tempo",
             Fx::Chorus => "true stereo, after the Boss CE-1",
+            Fx::Hpf => "takes the bottom off, after everything",
+            Fx::Lpf => "takes the top off - up is darker",
+            Fx::Limiter => "true peak, 6 samples of latency",
         }
     }
 
     /// The knob this panel hangs off.
     pub fn hit(self) -> Hit {
+        Hit::SetFx(self, 0.0)
+    }
+
+    /// Its position in [`Fx::ALL`], which is its cell in the layout.
+    pub fn index(self) -> usize {
+        Fx::ALL.iter().position(|&x| x == self).unwrap_or(0)
+    }
+
+    /// What the status line says while a hand is on it.
+    pub fn describe(self) -> &'static str {
         match self {
-            Fx::Reverb => Hit::SetReverb(0.0),
-            Fx::Delay => Hit::SetDelay(0.0),
-            Fx::Chorus => Hit::SetChorus(0.0),
+            Fx::Reverb => "Reverb, on every instrument",
+            Fx::Delay => "Delay, in time with the tempo",
+            Fx::Chorus => "Chorus, in true stereo",
+            Fx::Hpf => "High-pass, on everything that leaves",
+            Fx::Lpf => "Low-pass, on everything that leaves",
+            Fx::Limiter => "Limiter, true peak, last in the chain",
         }
     }
 
-    /// The four rows, in order: the settings key each writes, and its label.
+    /// The colour of the knob's cap.
+    ///
+    /// **The bottom row is not the top row.** Reverb, delay and chorus are
+    /// sends — things added to a sound. The filters and the limiter change
+    /// what leaves, and the limiter is the one that will alter a take whether
+    /// or not anybody is listening for it, so it is the one that is red.
+    pub fn cap(self) -> Color32 {
+        match self {
+            Fx::Reverb | Fx::Delay | Fx::Chorus => KNOB_CAP,
+            Fx::Hpf | Fx::Lpf => FILTER_CAP,
+            Fx::Limiter => LIMITER_CAP,
+        }
+    }
+
+    /// The four rows, in order.
     ///
     /// **Keys, not indices.** They are what goes in the settings file and what
     /// the host reads back, so a row that is renamed or reordered here cannot
     /// silently start writing to a different parameter.
-    pub fn rows(self) -> [(&'static str, &'static str); 4] {
+    pub fn rows(self) -> [FxRow; 4] {
+        const fn slide(key: &'static str, label: &'static str) -> FxRow {
+            FxRow { key, label, step: false }
+        }
+        const fn step(key: &'static str, label: &'static str) -> FxRow {
+            FxRow { key, label, step: true }
+        }
         match self {
             Fx::Reverb => [
-                ("reverb_size", "Size"),
-                ("reverb_damp", "Damping"),
-                ("reverb_width", "Width"),
-                ("", ""),
+                slide("reverb_size", "Size"),
+                slide("reverb_damp", "Damping"),
+                slide("reverb_width", "Width"),
+                FxRow::NONE,
             ],
             Fx::Delay => [
-                ("delay_division", "Time"),
-                ("delay_feedback", "Repeats"),
-                ("delay_tone", "Tone"),
-                ("delay_width", "Width"),
+                step("delay_division", "Time"),
+                slide("delay_feedback", "Repeats"),
+                slide("delay_tone", "Tone"),
+                slide("delay_width", "Width"),
             ],
             Fx::Chorus => [
-                ("chorus_rate", "Rate"),
-                ("chorus_depth", "Depth"),
-                ("chorus_width", "Width"),
-                ("chorus_tone", "Tone"),
+                slide("chorus_rate", "Rate"),
+                slide("chorus_depth", "Depth"),
+                slide("chorus_width", "Width"),
+                slide("chorus_tone", "Tone"),
+            ],
+            Fx::Hpf => [
+                step("hpf_slope", "Slope"),
+                slide("hpf_resonance", "Resonance"),
+                FxRow::NONE,
+                FxRow::NONE,
+            ],
+            Fx::Lpf => [
+                step("lpf_slope", "Slope"),
+                slide("lpf_resonance", "Resonance"),
+                FxRow::NONE,
+                FxRow::NONE,
+            ],
+            Fx::Limiter => [
+                slide("limiter_ceiling", "Ceiling"),
+                slide("limiter_release", "Release"),
+                slide("limiter_knee", "Knee"),
+                FxRow::NONE,
             ],
         }
     }
+}
+
+/// One row of an effect's parameter panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FxRow {
+    /// The settings key this row writes. Empty means the row is not there.
+    pub key: &'static str,
+    pub label: &'static str,
+    /// Whether it steps through a named list rather than sliding along a
+    /// track. There is no position along a track that means "a dotted eighth",
+    /// and none that means "24 dB an octave" either.
+    pub step: bool,
+}
+
+impl FxRow {
+    /// A row that is not there. Panels have between two and four.
+    pub const NONE: Self = Self {
+        key: "",
+        label: "",
+        step: false,
+    };
 }
 
 /// A row of an effect panel, and how it is set.
@@ -5623,8 +5770,8 @@ impl Fx {
 pub enum FxHit {
     /// Drag along the row to set `key` to 0..=1.
     Set { key: &'static str, value: f32 },
-    /// The delay's time: step to the next named division.
-    NextDivision,
+    /// A named parameter: step to the next value in its list.
+    NextChoice { key: &'static str },
     /// Put this effect back to what it shipped as.
     Reset(Fx),
     Close,
@@ -5753,18 +5900,16 @@ pub fn fx_hit_test(screen: Rect, anchor: Rect, fx: Fx, pos: Pos2) -> Option<FxHi
     if l.reset.contains(pos) {
         return Some(FxHit::Reset(fx));
     }
-    for (i, (key, _)) in fx.rows().into_iter().enumerate() {
-        if key.is_empty() || !l.rows[i].contains(pos) {
+    for (i, row) in fx.rows().into_iter().enumerate() {
+        if row.key.is_empty() || !l.rows[i].contains(pos) {
             continue;
         }
-        // The delay's time is a list of names, not a continuum: there is no
-        // position along a track that means "a dotted eighth".
-        if key == "delay_division" {
-            return Some(FxHit::NextDivision);
+        if row.step {
+            return Some(FxHit::NextChoice { key: row.key });
         }
         let track = FxLayout::track(l.rows[i]);
         return Some(FxHit::Set {
-            key,
+            key: row.key,
             value: along(track, pos),
         });
     }
@@ -5777,8 +5922,11 @@ pub fn fx_hit_test(screen: Rect, anchor: Rect, fx: Fx, pos: Pos2) -> Option<FxHi
 /// the pointer has slid onto the row above — the same reason `is_same_control`
 /// exists for the band.
 pub fn fx_row_at(screen: Rect, anchor: Rect, fx: Fx, pos: Pos2) -> Option<&'static str> {
+    // A stepped row is a row. The question this answers is "which parameter is
+    // under the pointer", and answering `None` over the Slope row would say
+    // there is nothing there.
     match fx_hit_test(screen, anchor, fx, pos)? {
-        FxHit::Set { key, .. } => Some(key),
+        FxHit::Set { key, .. } | FxHit::NextChoice { key } => Some(key),
         _ => None,
     }
 }
@@ -5789,7 +5937,7 @@ pub fn fx_row_at(screen: Rect, anchor: Rect, fx: Fx, pos: Pos2) -> Option<&'stat
 /// end of a row pins the value instead of dropping the gesture.
 pub fn fx_value_at(screen: Rect, anchor: Rect, fx: Fx, key: &str, pos: Pos2) -> Option<f32> {
     let l = FxLayout::new(screen, anchor);
-    let i = fx.rows().iter().position(|(k, _)| *k == key)?;
+    let i = fx.rows().iter().position(|r| r.key == key)?;
     let track = FxLayout::track(l.rows[i]);
     track.is_positive().then(|| along(track, pos))
 }
@@ -5848,7 +5996,8 @@ pub fn draw_fx(
     anchor: Rect,
     fx: Fx,
     values: &dyn Fn(&str) -> f32,
-    division: &str,
+    // `choice`: the label a stepped row shows, for its key. See `FxRow::step`.
+    choice: &dyn Fn(&str) -> String,
     s: &Settings,
 ) {
     let l = FxLayout::new(screen, anchor);
@@ -5887,7 +6036,7 @@ pub fn draw_fx(
         draw_word_button(painter, l.close, &["X"], &p);
     }
 
-    for (i, (key, label)) in fx.rows().into_iter().enumerate() {
+    for (i, FxRow { key, label, step }) in fx.rows().into_iter().enumerate() {
         let row = l.rows[i];
         if key.is_empty() || !row.is_positive() {
             continue;
@@ -5904,10 +6053,12 @@ pub fn draw_fx(
         }
         let track = FxLayout::track(row);
         let reading = Rect::from_min_max(Pos2::new(track.right(), row.top()), row.max);
-        if key == "delay_division" {
+        if step {
             // A name, in a box, that steps to the next one when pressed. Drawn
             // as a button rather than as a track, because it is one: there is
-            // no position along a line that means "a dotted eighth".
+            // no position along a line that means "a dotted eighth", and none
+            // that means "24 dB an octave" either.
+            let division = &choice(key);
             let box_r = Rect::from_min_max(
                 Pos2::new(track.left(), row.top() + row.height() * 0.14),
                 Pos2::new(reading.right(), row.bottom() - row.height() * 0.14),

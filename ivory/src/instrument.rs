@@ -858,11 +858,14 @@ struct Shared {
     /// one constant rather than a fourth field in four structs.
     slot_gains: [AtomicU32; SLOTS],
     metro_gain: AtomicU32,
-    /// The three effect knobs, 0..=1. On the instrument bus only — see
+    /// The six effect knobs, 0..=1. On the instrument bus only — see
     /// `effects.rs` for what that includes and what it deliberately does not.
     reverb_mix: AtomicU32,
     delay_mix: AtomicU32,
     chorus_mix: AtomicU32,
+    hpf_mix: AtomicU32,
+    lpf_mix: AtomicU32,
+    limiter_mix: AtomicU32,
     /// What each effect is set to, behind a lock.
     ///
     /// **A lock, unlike the knobs above.** There are eleven of these and they
@@ -952,6 +955,9 @@ impl Shared {
             // instrument and not like a room, and `Effects::process` skips its
             // whole cost at zero.
             reverb_mix: AtomicU32::new(0.0f32.to_bits()),
+            hpf_mix: AtomicU32::new(0.0f32.to_bits()),
+            lpf_mix: AtomicU32::new(0.0f32.to_bits()),
+            limiter_mix: AtomicU32::new(0.0f32.to_bits()),
             delay_mix: AtomicU32::new(0.0f32.to_bits()),
             chorus_mix: AtomicU32::new(0.0f32.to_bits()),
             params: Mutex::new(crate::effects::Params::default()),
@@ -1012,6 +1018,12 @@ impl Shared {
             .store(sane(sends.delay).to_bits(), Ordering::Relaxed);
         self.chorus_mix
             .store(sane(sends.chorus).to_bits(), Ordering::Relaxed);
+        self.hpf_mix
+            .store(sane(sends.hpf).to_bits(), Ordering::Relaxed);
+        self.lpf_mix
+            .store(sane(sends.lpf).to_bits(), Ordering::Relaxed);
+        self.limiter_mix
+            .store(sane(sends.limiter).to_bits(), Ordering::Relaxed);
     }
 
     /// What the effects are set to. Picked up by the renderer next block.
@@ -1473,6 +1485,9 @@ impl Renderer {
                         reverb: Shared::f32_of(&self.shared.reverb_mix),
                         delay: Shared::f32_of(&self.shared.delay_mix),
                         chorus: Shared::f32_of(&self.shared.chorus_mix),
+                        hpf: Shared::f32_of(&self.shared.hpf_mix),
+                        lpf: Shared::f32_of(&self.shared.lpf_mix),
+                        limiter: Shared::f32_of(&self.shared.limiter_mix),
                     },
                     &self.effect_params,
                     f64::from_bits(self.shared.bpm.load(Ordering::Relaxed)),

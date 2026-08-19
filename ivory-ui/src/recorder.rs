@@ -254,10 +254,8 @@ pub struct RecorderView<'a> {
     /// The four faders, as LINEAR gains (not fader positions). See
     /// [`gain_to_fader`] for turning one into a knob angle.
     pub gains: Gains,
-    /// The three effect sends, 0..=1, as the knobs are drawn.
-    pub reverb: f32,
-    pub delay: f32,
-    pub chorus: f32,
+    /// The six effect knobs, 0..=1, as they are drawn.
+    pub fx: FxSends,
     /// The control a hand is on right now, if any. A knob shows its number
     /// while it is being turned and its name the rest of the time: there is
     /// nowhere on a knob to keep both, and the number is only wanted while it
@@ -316,9 +314,7 @@ impl RecorderView<'_> {
             folder_preview: "",
             slots: [SlotView::EMPTY; SLOTS],
             gains: Gains::default(),
-            reverb: 0.0,
-            delay: 0.0,
-            chorus: 0.0,
+            fx: FxSends { reverb: 0.0, delay: 0.0, chorus: 0.0, hpf: 0.0, lpf: 0.0, limiter: 0.0 },
             turning: None,
             metronome_on: false,
             metronome_in_take: false,
@@ -468,9 +464,7 @@ impl RecorderState {
             count_in_beats: knobs.count_in_beats,
             count_in_bars: knobs.count_in_bars,
             time_signature: knobs.time_signature,
-            reverb: knobs.reverb,
-            delay: knobs.delay,
-            chorus: knobs.chorus,
+            fx: knobs.fx,
             turning,
             camera: label(&self.camera_name, self.camera_missing),
             audio: label(&self.audio_name, self.audio_missing),
@@ -485,6 +479,41 @@ impl RecorderState {
 
 /// The settings the band renders but does not own.
 ///
+/// Where the six effect knobs are, 0..=1.
+///
+/// **One struct, because it was three loose floats in three places.** Adding
+/// the filters and the limiter would have made that eighteen fields to keep in
+/// step by hand, and a knob wired to the wrong one of them looks exactly like a
+/// knob that does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FxSends {
+    pub reverb: f32,
+    pub delay: f32,
+    pub chorus: f32,
+    /// The high-pass corner. 0 is out of the way.
+    pub hpf: f32,
+    /// The low-pass corner. **Up is darker** — see the binary's `Sends::lpf`.
+    pub lpf: f32,
+    /// How hard the limiter is driven. 0 is bypass.
+    pub limiter: f32,
+}
+
+impl FxSends {
+    /// In the order they are drawn: the row of sends, then the row of
+    /// dynamics. Used by anything that walks all six.
+    pub fn get(&self, fx: crate::recorder_panel::Fx) -> f32 {
+        use crate::recorder_panel::Fx;
+        match fx {
+            Fx::Reverb => self.reverb,
+            Fx::Delay => self.delay,
+            Fx::Chorus => self.chorus,
+            Fx::Hpf => self.hpf,
+            Fx::Lpf => self.lpf,
+            Fx::Limiter => self.limiter,
+        }
+    }
+}
+
 /// Passed in rather than stored on [`RecorderState`] because every one of them
 /// is a persisted user preference the app already holds, and a second copy is a
 /// second thing to keep in step.
@@ -497,11 +526,9 @@ pub struct Knobs {
     pub count_in_beats: u32,
     pub count_in_bars: u32,
     pub time_signature: TimeSignature,
-    /// The three effect sends, 0..=1. See `effects.rs` in the binary for what
+    /// The six effect knobs, 0..=1. See `effects.rs` in the binary for what
     /// they reach: every instrument, and nothing else.
-    pub reverb: f32,
-    pub delay: f32,
-    pub chorus: f32,
+    pub fx: FxSends,
 }
 
 impl Default for Knobs {
@@ -513,9 +540,7 @@ impl Default for Knobs {
             tempo_bpm: DEFAULT_BPM,
             count_in_beats: 4,
             count_in_bars: 1,
-            reverb: 0.0,
-            delay: 0.0,
-            chorus: 0.0,
+            fx: FxSends::default(),
             time_signature: TimeSignature::default(),
         }
     }
@@ -615,11 +640,20 @@ pub const AUDITION_VELOCITY: u8 = 88;
 /// How many video files a take produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoMode {
-    /// Audio and MIDI only. The default, and not a degraded one: it is what
-    /// somebody recording a practice session actually wants.
-    #[default]
+    /// Audio and MIDI only.
     None,
     /// One file containing whichever of camera / display / audio are ticked.
+    ///
+    /// **The default, and it does not need a camera.** A take records the
+    /// WINDOW — the piano, the chord, the diagrams, the band — and the camera
+    /// is an inset when there is one. This was `None` on the theory that
+    /// somebody recording a practice session wants audio and MIDI only; what
+    /// actually happened is that a tester recorded a take, got no `.mp4`, and
+    /// had no way to know video was a thing they had to go and switch on.
+    ///
+    /// A take that was supposed to produce a video and did not is the failure
+    /// that wastes a performance, and it costs a rerun to find out.
+    #[default]
     Composite,
     /// One file per source, each on its own.
     PerSource,
@@ -1193,6 +1227,24 @@ impl ExportSpec {
         }
     }
 
+    /// Whether this spec actually writes a video file, given the camera.
+    ///
+    /// The host asks before opening an encoder, and the answer has to be the
+    /// same one `begin_video` acts on — this is that decision, not a second
+    /// copy of it. **A camera is not required.** A take with no camera at all
+    /// still records the window, which is the part somebody plays from; a
+    /// tester recorded a whole session, had no webcam, and got no `.mp4`,
+    /// because the only thing that had ever switched video on was picking a
+    /// camera.
+    pub fn produces_video(&self, camera_running: bool) -> bool {
+        if !self.video.wants_video() {
+            return false;
+        }
+        let camera = self.composite.camera && camera_running;
+        let display = self.composite.display && self.composite.shows.any();
+        camera || display
+    }
+
     /// Roughly how many megabytes a minute this spec writes.
     ///
     /// Deliberately crude and deliberately honest about it: it exists to turn
@@ -1434,12 +1486,10 @@ pub enum NumField {
     Slot(usize),
     Metronome,
     Input,
-    /// The three effect sends, typed as a PERCENT. Every other field here is
-    /// typed in the unit it is displayed in, and "40" for four tenths wet is
-    /// the only reading of a send anybody has ever wanted to write.
-    Reverb,
-    Delay,
-    Chorus,
+    /// One of the six effect knobs, typed as a PERCENT. Every other field
+    /// here is typed in the unit it is displayed in, and "40" for four tenths
+    /// wet is the only reading of a send anybody has ever wanted to write.
+    Fx(crate::recorder_panel::Fx),
     Tempo,
     /// The time signature. Typed rather than dragged — "6/8" is two numbers and
     /// a slash, and there is no continuum between 4/4 and 7/8 to drag along.
@@ -1928,12 +1978,57 @@ mod tests {
     /// The camera question decides what a *finished* take can be re-exported
     /// as, so getting it wrong offers the user an option that cannot work.
     #[test]
+    /// The bug this exists to stop coming back: record a take on a machine
+    /// with no webcam, get a `.wav` and a `.mid` and no video, and have
+    /// nothing anywhere explain that video was a setting.
+    #[test]
+    fn a_take_with_no_camera_still_writes_a_video() {
+        assert!(
+            ExportSpec::default().produces_video(false),
+            "the window is the take"
+        );
+        assert!(ExportSpec::default().produces_video(true));
+
+        // Off is still off, and a composite with nothing in it still writes
+        // nothing — that is the case `begin_video` reports as an error.
+        assert!(!ExportSpec {
+            video: VideoMode::None,
+            ..Default::default()
+        }
+        .produces_video(true));
+        assert!(!ExportSpec {
+            composite: Composite {
+                camera: false,
+                display: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .produces_video(true));
+
+        // Camera-only, no camera: nothing to encode.
+        let cam_only = ExportSpec {
+            composite: Composite {
+                display: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(cam_only.produces_video(true));
+        assert!(!cam_only.produces_video(false));
+    }
+
+    #[test]
     fn needing_a_camera_follows_the_video_mode_and_the_tick() {
         let no_cam = Composite {
             camera: false,
             ..Default::default()
         };
-        assert!(!ExportSpec::default().needs_camera());
+        assert!(!ExportSpec {
+            video: VideoMode::None,
+            ..Default::default()
+        }
+        .needs_camera());
         assert!(ExportSpec {
             video: VideoMode::Composite,
             ..Default::default()

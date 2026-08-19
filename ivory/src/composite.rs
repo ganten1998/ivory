@@ -886,6 +886,9 @@ mod shot {
         settings.reverb_mix = 0.42;
         settings.delay_mix = 0.18;
         settings.chorus_mix = 0.66;
+        settings.hpf_mix = 0.30;
+        settings.lpf_mix = 0.55;
+        settings.limiter_mix = 0.75;
         settings.metronome_gain = 0.5;
         settings.input_gain = 1.0;
         settings.plugin_slots[0] = Some(ivory_ui::dialogs::BUILTIN_PATH.to_owned());
@@ -918,6 +921,9 @@ mod shot {
             app.open_effect_panel(match which.as_str() {
                 "delay" => ivory_ui::recorder_panel::Fx::Delay,
                 "chorus" => ivory_ui::recorder_panel::Fx::Chorus,
+                "hpf" => ivory_ui::recorder_panel::Fx::Hpf,
+                "lpf" => ivory_ui::recorder_panel::Fx::Lpf,
+                "limiter" => ivory_ui::recorder_panel::Fx::Limiter,
                 _ => ivory_ui::recorder_panel::Fx::Reverb,
             });
             for _ in 0..2 {

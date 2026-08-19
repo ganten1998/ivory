@@ -1240,6 +1240,26 @@ impl DeviceKind {
     /// Per-platform, because the advice is: "System Settings > Privacy &
     /// Security" on a Linux box sends the user hunting for a panel that does
     /// not exist, when the actual fix is group membership on the device node.
+    ///
+    /// **On Windows there is no camera backend at all** (`ivory-record`'s
+    /// `camera::stub`), so the list is empty on every machine, working webcam
+    /// or not. A tester opened the picker, found it empty, and was told to
+    /// check a System Settings panel that does not exist on their operating
+    /// system — which reads as "the app is broken" rather than "this is not
+    /// built yet". An empty list needs a reason, and the reason has to be the
+    /// true one.
+    #[cfg(target_os = "windows")]
+    fn nothing_found(self) -> &'static str {
+        match self {
+            DeviceKind::Camera => {
+                "Camera recording is not available on Windows yet - it is not                  a permission problem and there is nothing to grant. Takes                  still record the window, the audio and the MIDI."
+            }
+            DeviceKind::AudioInput => {
+                "No audio inputs found. If an interface is connected, check                  that it appears under Settings > System > Sound > Input."
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn nothing_found(self) -> &'static str {
         match self {
@@ -1255,7 +1275,7 @@ impl DeviceKind {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     fn nothing_found(self) -> &'static str {
         match self {
             DeviceKind::Camera => {
@@ -5185,7 +5205,10 @@ mod tests {
     /// I play" are two questions and a byte count answers only one of them.
     #[test]
     fn the_estimate_names_a_rate_and_an_encoder_count() {
-        let quiet = estimate_line(&ExportSpec::default());
+        let quiet = estimate_line(&ExportSpec {
+            video: VideoMode::None,
+            ..Default::default()
+        });
         assert!(quiet.contains("MB a minute"), "{quiet}");
         assert!(
             quiet.contains("no video encoder"),

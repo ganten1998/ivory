@@ -2135,7 +2135,7 @@ impl IvoryApp {
                 self.fx_drag = Some(key);
                 self.set_effect_param(key, value);
             }
-            Some(recorder_panel::FxHit::NextDivision) => self.next_delay_division(),
+            Some(recorder_panel::FxHit::NextChoice { key }) => self.next_choice(key),
             Some(recorder_panel::FxHit::Reset(fx)) => self.reset_effect(fx),
             Some(recorder_panel::FxHit::Close) => self.fx_open = None,
             // A press on the panel's own chrome is swallowed; one outside it
@@ -2200,42 +2200,49 @@ impl IvoryApp {
         self.fx_defaults = defaults;
     }
 
-    /// Step the delay to the next named division.
-    fn next_delay_division(&mut self) {
-        let list = &self.fx_defaults.divisions;
-        if list.is_empty() {
+    /// Step a named parameter to the next value in its list, and wrap.
+    fn next_choice(&mut self, key: &str) {
+        let Some(c) = self.fx_defaults.choices.iter().find(|c| c.key == key) else {
+            return;
+        };
+        if c.options.is_empty() {
             return;
         }
-        let now = self.delay_division_key();
-        let i = list.iter().position(|(k, _)| *k == now).unwrap_or(0);
-        let next = list[(i + 1) % list.len()].0.clone();
+        let now = self.choice_key(key);
+        let i = c.options.iter().position(|(k, _)| *k == now).unwrap_or(0);
+        let next = c.options[(i + 1) % c.options.len()].0.clone();
         self.settings
             .effect_params
-            .insert("delay_division".to_owned(), serde_json::Value::from(next));
+            .insert(key.to_owned(), serde_json::Value::from(next));
         self.save_settings();
     }
 
-    /// The delay's division key, as stored or as it ships.
-    fn delay_division_key(&self) -> String {
+    /// A named parameter's current key, as stored or as it ships.
+    ///
+    /// A stored value the host does not offer is ignored rather than kept: it
+    /// is what a settings file written by a later build looks like, and the
+    /// answer to "24 dB isn't a slope I have" is the default, not an empty row.
+    fn choice_key(&self, key: &str) -> String {
+        let Some(c) = self.fx_defaults.choices.iter().find(|c| c.key == key) else {
+            return String::new();
+        };
         self.settings
             .effect_params
-            .get("delay_division")
+            .get(key)
             .and_then(serde_json::Value::as_str)
-            .filter(|k| self.fx_defaults.divisions.iter().any(|(d, _)| d == k))
-            .map_or_else(
-                || self.fx_defaults.default_division.clone(),
-                str::to_owned,
-            )
+            .filter(|k| c.options.iter().any(|(o, _)| o == k))
+            .map_or_else(|| c.default.clone(), str::to_owned)
     }
 
-    /// What the delay's time row shows.
-    fn delay_division_label(&self) -> String {
-        let key = self.delay_division_key();
+    /// What a named parameter's row shows.
+    fn choice_label(&self, key: &str) -> String {
+        let now = self.choice_key(key);
         self.fx_defaults
-            .divisions
+            .choices
             .iter()
-            .find(|(k, _)| *k == key)
-            .map_or(key, |(_, label)| label.clone())
+            .find(|c| c.key == key)
+            .and_then(|c| c.options.iter().find(|(k, _)| *k == now))
+            .map_or(now, |(_, label)| label.clone())
     }
 
     /// Put one effect back to what it shipped as.
@@ -2244,7 +2251,7 @@ impl IvoryApp {
     /// parameter that is not in the settings is a parameter at its default,
     /// which is the same rule that makes an old file load without a migration.
     fn reset_effect(&mut self, fx: recorder_panel::Fx) {
-        for (key, _) in fx.rows() {
+        for recorder_panel::FxRow { key, .. } in fx.rows() {
             if !key.is_empty() {
                 self.settings.effect_params.shift_remove(key);
             }
@@ -2267,16 +2274,45 @@ impl IvoryApp {
 
     /// What a value-carrying control reads right now, 0..=1.
     ///
+    /// Where one effect knob's value lives in the settings.
+    ///
+    /// **One place, reached by both the reader and the writer.** Six knobs
+    /// times two directions is twelve chances to wire a knob to the wrong
+    /// field, and a knob reading one number while writing another looks
+    /// exactly like a knob that does not work.
+    fn fx_mix(&mut self, fx: recorder_panel::Fx) -> &mut f64 {
+        use recorder_panel::Fx;
+        match fx {
+            Fx::Reverb => &mut self.settings.reverb_mix,
+            Fx::Delay => &mut self.settings.delay_mix,
+            Fx::Chorus => &mut self.settings.chorus_mix,
+            Fx::Hpf => &mut self.settings.hpf_mix,
+            Fx::Lpf => &mut self.settings.lpf_mix,
+            Fx::Limiter => &mut self.settings.limiter_mix,
+        }
+    }
+
     /// Only the knobs answer, because only the knobs are dragged relatively
     /// and need somewhere to start from. Everything else returns zero and does
     /// not use it.
+    /// One effect knob's value, read-only. The mirror of [`Self::fx_mix`].
+    fn fx_value(&self, fx: recorder_panel::Fx) -> f32 {
+        use recorder_panel::Fx;
+        (match fx {
+            Fx::Reverb => self.settings.reverb_mix,
+            Fx::Delay => self.settings.delay_mix,
+            Fx::Chorus => self.settings.chorus_mix,
+            Fx::Hpf => self.settings.hpf_mix,
+            Fx::Lpf => self.settings.lpf_mix,
+            Fx::Limiter => self.settings.limiter_mix,
+        }) as f32
+    }
+
     fn control_value(&self, hit: recorder_panel::Hit) -> f32 {
         use recorder_panel::Hit as H;
         let fader = |g: f64| recorder::gain_to_fader(g as f32);
         match hit {
-            H::SetReverb(_) => self.settings.reverb_mix as f32,
-            H::SetDelay(_) => self.settings.delay_mix as f32,
-            H::SetChorus(_) => self.settings.chorus_mix as f32,
+            H::SetFx(fx, _) => self.fx_value(fx),
             H::SetMetronomeGain(_) => fader(self.settings.metronome_gain),
             H::SetInputGain(_) => fader(self.settings.input_gain),
             H::SetSlotGain(i, _) => self
@@ -2301,11 +2337,14 @@ impl IvoryApp {
     }
 
     /// The three effect sends, 0..=1, for the host to hand the audio thread.
-    pub fn effect_sends(&self) -> [f32; 3] {
+    pub fn effect_sends(&self) -> [f32; 6] {
         [
             self.settings.reverb_mix as f32,
             self.settings.delay_mix as f32,
             self.settings.chorus_mix as f32,
+            self.settings.hpf_mix as f32,
+            self.settings.lpf_mix as f32,
+            self.settings.limiter_mix as f32,
         ]
     }
 
@@ -2563,16 +2602,8 @@ impl IvoryApp {
             // Both knobs write to settings and are pushed to the engine after
             // the frame, the same shape as a fader: `save_settings_soon`
             // because a drag is a hundred of these and each one is a file.
-            Hit::SetReverb(v) => {
-                self.settings.reverb_mix = f64::from(v.clamp(0.0, 1.0));
-                self.save_settings_soon();
-            }
-            Hit::SetDelay(v) => {
-                self.settings.delay_mix = f64::from(v.clamp(0.0, 1.0));
-                self.save_settings_soon();
-            }
-            Hit::SetChorus(v) => {
-                self.settings.chorus_mix = f64::from(v.clamp(0.0, 1.0));
+            Hit::SetFx(fx, v) => {
+                *self.fx_mix(fx) = f64::from(v.clamp(0.0, 1.0));
                 self.save_settings_soon();
             }
             Hit::SetSlotGain(slot, p) => {
@@ -2936,9 +2967,7 @@ impl IvoryApp {
                 .map(|g| Hit::SetInputGain(recorder::gain_to_fader(g))),
             // A PERCENT, not a gain: these are not faders and there is no dB
             // curve to invert. "40" is four tenths wet.
-            F::Reverb => recorder::parse_percent(&edit.text).map(Hit::SetReverb),
-            F::Delay => recorder::parse_percent(&edit.text).map(Hit::SetDelay),
-            F::Chorus => recorder::parse_percent(&edit.text).map(Hit::SetChorus),
+            F::Fx(fx) => recorder::parse_percent(&edit.text).map(|v| Hit::SetFx(fx, v)),
         };
         if let Some(hit) = hit {
             self.apply_recorder_hit(hit);
@@ -5229,14 +5258,13 @@ impl IvoryApp {
         if let Some(fx) = self.fx_open {
             let anchor = self.fx_anchor(fx);
             if anchor.is_positive() {
-                let division = self.delay_division_label();
                 recorder_panel::draw_fx(
                     ui.painter(),
                     ui.max_rect(),
                     anchor,
                     fx,
                     &|key| self.effect_param(key),
-                    &division,
+                    &|key| self.choice_label(key),
                     &self.settings,
                 );
             } else {
@@ -6390,12 +6418,12 @@ mod tests {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.settings.reverb_mix = 0.5;
 
-        let cell = knob_cell(&app, recorder_panel::Hit::SetReverb(0.0));
+        let cell = knob_cell(&app, recorder_panel::Hit::SetFx(recorder_panel::Fx::Reverb, 0.0));
         let from = cell.center();
         press(&ctx, &mut app, from);
         assert!(
             app.grabbed
-                .is_some_and(|g| g.hit.is_same_control(recorder_panel::Hit::SetReverb(0.0))),
+                .is_some_and(|g| g.hit.is_same_control(recorder_panel::Hit::SetFx(recorder_panel::Fx::Reverb, 0.0))),
             "pressing the knob did not grab it"
         );
 
@@ -6416,7 +6444,7 @@ mod tests {
         // And the knob says so while the hand is on it: a number, not a name.
         assert_eq!(
             app.recorder_layout_view().turning,
-            Some(recorder::NumField::Reverb),
+            Some(recorder::NumField::Fx(recorder_panel::Fx::Reverb)),
             "a knob being turned does not show its reading"
         );
     }
@@ -6542,7 +6570,7 @@ mod tests {
         for (start, push, want) in [(0.5_f64, -3.0_f32, 1.0_f64), (0.5, 3.0, 0.0)] {
             let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
             app.settings.delay_mix = start;
-            let from = knob_cell(&app, recorder_panel::Hit::SetDelay(0.0)).center();
+            let from = knob_cell(&app, recorder_panel::Hit::SetFx(recorder_panel::Fx::Delay, 0.0)).center();
             press(&ctx, &mut app, from);
             move_to(
                 &ctx,
@@ -6625,6 +6653,20 @@ mod tests {
     // ── the effect panels ───────────────────────────────────────────────────
 
     /// An app with the band up and the effect defaults the host would push.
+    /// One filter's slope, as the host offers it. See `desktop::slope_choice`
+    /// — this is a hand copy of it, which is exactly why the binary has a test
+    /// asserting the host supplies a choice for every stepped row.
+    fn slope_choice(key: &str) -> crate::ports::ChoiceParam {
+        crate::ports::ChoiceParam {
+            key: key.to_owned(),
+            options: [("6", "6 dB/oct"), ("12", "12 dB/oct"), ("24", "24 dB/oct")]
+                .into_iter()
+                .map(|(k, l)| (k.to_owned(), l.to_owned()))
+                .collect(),
+            default: "24".to_owned(),
+        }
+    }
+
     fn headless_with_fx(caps: Caps) -> (egui::Context, IvoryApp) {
         let (ctx, mut app) = headless_with_band(caps);
         app.set_effect_defaults(crate::ports::EffectDefaults {
@@ -6643,31 +6685,36 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), serde_json::Value::from(v)))
             .collect(),
-            divisions: [
-                ("quarter", "1/4"),
-                ("dotted-eighth", "1/8 dotted"),
-                ("eighth", "1/8"),
-            ]
-            .into_iter()
-            .map(|(k, l)| (k.to_owned(), l.to_owned()))
-            .collect(),
-            default_division: "dotted-eighth".to_owned(),
+            choices: vec![
+                crate::ports::ChoiceParam {
+                    key: "delay_division".to_owned(),
+                    options: [
+                        ("quarter", "1/4"),
+                        ("dotted-eighth", "1/8 dotted"),
+                        ("eighth", "1/8"),
+                    ]
+                    .into_iter()
+                    .map(|(k, l)| (k.to_owned(), l.to_owned()))
+                    .collect(),
+                    default: "dotted-eighth".to_owned(),
+                },
+                slope_choice("hpf_slope"),
+                slope_choice("lpf_slope"),
+            ],
         });
         (ctx, app)
     }
 
     /// **Right-clicking a knob opens the effect behind it**, and the right one.
-    /// The three knobs are stacked and forty points apart; a panel that opened
-    /// the wrong effect would look like the panel simply not working.
+    ///
+    /// All six, and in a grid rather than a row: the knobs are two rows of
+    /// three now, so a panel that opened the wrong effect could be wrong in
+    /// two directions. It would look like the panel simply not working.
     #[test]
     fn right_clicking_a_knob_opens_that_effect() {
         let (_, app) = headless_with_fx(Caps::DESKTOP);
-        for (fx, hit) in [
-            (recorder_panel::Fx::Reverb, recorder_panel::Hit::SetReverb(0.0)),
-            (recorder_panel::Fx::Delay, recorder_panel::Hit::SetDelay(0.0)),
-            (recorder_panel::Fx::Chorus, recorder_panel::Hit::SetChorus(0.0)),
-        ] {
-            let at = knob_cell(&app, hit).center();
+        for fx in recorder_panel::Fx::ALL {
+            let at = knob_cell(&app, recorder_panel::Hit::SetFx(fx, 0.0)).center();
             assert_eq!(
                 app.fx_under(Some(app.last_band), at),
                 Some(fx),
@@ -6691,7 +6738,8 @@ mod tests {
         let anchor = app.fx_anchor(fx);
         assert!(anchor.is_positive(), "the panel has nothing to hang off");
 
-        for (key, _) in fx.rows() {
+        for recorder_panel::FxRow { key, step, .. } in fx.rows() {
+            assert!(!step, "this test only knows how to drag a sliding row");
             // The row is found by ASKING the panel, not by guessing: the
             // layout owns where the rows are and this test must not restate
             // it, or it would pass while the panel drew them somewhere else.
@@ -6712,6 +6760,55 @@ mod tests {
                 "{key} came out at {} at the bottom",
                 app.effect_param(key)
             );
+        }
+    }
+
+    /// **Every panel, every row, hits the parameter it is labelled with.**
+    ///
+    /// The one above drags one panel in detail; this one walks all six and
+    /// asks a cheaper question of each row — does pressing it reach THIS key
+    /// and no other. A filter's Slope row and the delay's Time row step rather
+    /// than slide, so they are checked by stepping.
+    #[test]
+    fn every_panel_row_reaches_its_own_parameter() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        for fx in recorder_panel::Fx::ALL {
+            app.fx_open = Some(fx);
+            let anchor = app.fx_anchor(fx);
+            assert!(
+                anchor.is_positive(),
+                "{} has no knob to hang off",
+                fx.title()
+            );
+            for recorder_panel::FxRow { key, step, .. } in fx.rows() {
+                if key.is_empty() {
+                    continue;
+                }
+                if step {
+                    // A stepped row moves to a different named value, and the
+                    // host is what decides which values exist.
+                    let before = app.choice_key(key);
+                    let at = row_probe(screen, anchor, fx, key, 0.5);
+                    app.press_in_fx_panel(screen, fx, at, true);
+                    app.fx_drag = None;
+                    assert_ne!(
+                        app.choice_key(key),
+                        before,
+                        "{key} did not step when its row was pressed"
+                    );
+                    continue;
+                }
+                let at = row_probe(screen, anchor, fx, key, 1.0);
+                app.press_in_fx_panel(screen, fx, at, true);
+                app.fx_drag = None;
+                assert!(
+                    (app.effect_param(key) - 1.0).abs() < 0.02,
+                    "{} row {key} came out at {}",
+                    fx.title(),
+                    app.effect_param(key)
+                );
+            }
         }
     }
 
@@ -6764,23 +6861,43 @@ mod tests {
         assert!(!app.settings.effect_params.contains_key("chorus_depth"));
     }
 
-    /// The delay's time steps through its divisions and wraps.
+    /// A named parameter steps through its list and wraps.
+    ///
+    /// Both of them, because "the delay's time" and "a filter's slope" are the
+    /// same mechanism now and the second one is the reason it is a mechanism
+    /// rather than a special case.
     #[test]
-    fn the_delay_time_steps_through_its_divisions() {
+    fn a_named_parameter_steps_through_its_choices() {
         let (_, mut app) = headless_with_fx(Caps::DESKTOP);
-        assert_eq!(app.delay_division_label(), "1/8 dotted");
-        app.next_delay_division();
-        assert_eq!(app.delay_division_label(), "1/8");
-        app.next_delay_division();
-        assert_eq!(app.delay_division_label(), "1/4", "it did not wrap");
+        assert_eq!(app.choice_label("delay_division"), "1/8 dotted");
+        app.next_choice("delay_division");
+        assert_eq!(app.choice_label("delay_division"), "1/8");
+        app.next_choice("delay_division");
+        assert_eq!(app.choice_label("delay_division"), "1/4", "it did not wrap");
 
-        // A division a later build wrote, which this one does not know, reads
-        // as the default rather than as an empty box.
+        // The filter slope, which ships at the steepest and wraps to the
+        // gentlest.
+        assert_eq!(app.choice_label("hpf_slope"), "24 dB/oct");
+        app.next_choice("hpf_slope");
+        assert_eq!(app.choice_label("hpf_slope"), "6 dB/oct", "it did not wrap");
+        app.next_choice("hpf_slope");
+        assert_eq!(app.choice_label("hpf_slope"), "12 dB/oct");
+        // Stepping one did not move the other.
+        assert_eq!(app.choice_label("delay_division"), "1/4");
+
+        // A value a later build wrote, which this one does not know, reads as
+        // the default rather than as an empty box.
         app.settings.effect_params.insert(
             "delay_division".to_owned(),
             serde_json::Value::from("some-future-division"),
         );
-        assert_eq!(app.delay_division_label(), "1/8 dotted");
+        assert_eq!(app.choice_label("delay_division"), "1/8 dotted");
+
+        // A key with no choice at all answers with nothing rather than
+        // panicking: the host decides what is a choice, and an older host is
+        // allowed not to offer this one.
+        assert_eq!(app.choice_label("no_such_param"), "");
+        app.next_choice("no_such_param");
     }
 
     /// A press outside the panel closes it and does nothing else.

@@ -1,7 +1,8 @@
 # Ivory 2.0 — Handoff / Resume Document
 
-**Last updated:** 2026-08-18. **The app is now called TANGENT.** Newest work is
-§2g: the six-operator FM built-in, its patch picker, and the reverb/delay knobs.
+**Last updated:** 2026-08-19. **The app is now called TANGENT.** Newest work is
+§2h: six effect knobs, the true-peak limiter, and video that happens without a
+camera. Before it, §2g: the six-operator FM built-in and its patch picker.
 Before it, §2d: the fretboard voicing solver and the guitar view. §2c before it has the
 rename, the 2.2.0 tester-report UI fixes, the egui 0.33 downgrade and the
 MIT/GPLv3 split. Read §2c then §2d FIRST; everything above them still says
@@ -728,6 +729,125 @@ come out pale blue, which reads as a theme rather than a bug.
 - `fetch-ffmpeg.sh` has no aarch64 Linux build.
 - 4.6.0 artifacts are in `dist/` for every platform; nothing is published.
   Windows test kit staged at `~/Desktop/Tangent-windows-test/`.
+
+## 2h. 2026-08-19 — six knobs, a true-peak limiter, and video that happens
+
+Shipped as **4.12.0**. Driven entirely by the Windows tester's report on
+4.11.3: the DX7 works end to end there (patches, SysEx, editor), record works,
+`.wav` and `.mid` are both right — and two things were wrong.
+
+### A take with no camera produced no video
+
+`VideoMode::default()` was `None`, and the only thing that had ever switched
+video on was `apply_video_default`, which fires **only if a camera was
+chosen**. So a machine with no webcam recorded audio and MIDI, wrote no
+`.mp4`, and said nothing about it. The default is now `Composite`, and
+`SETTINGS_VERSION` went 7 → 8 to move existing files onto it once.
+
+**The window is the take.** A camera is an inset when there is one; the piano,
+the chord and the diagrams are the thing being recorded either way. The
+decision now lives in one place — `ExportSpec::produces_video(camera_running)`
+— which `begin_video` calls rather than re-deriving, so the test and the host
+cannot disagree.
+
+### The Windows camera picker offered a macOS privacy panel
+
+There is **no Windows camera backend**: `ivory-record/src/camera.rs` has
+`macos`, `linux` and `stub`, and Windows gets `stub`, so the list is empty on
+every Windows machine whether or not a webcam is plugged in. The picker then
+told the user to check "System Settings > Privacy & Security", which is not a
+thing that exists on their operating system — so it read as a broken app
+rather than an unbuilt feature. `DeviceKind::nothing_found` now has a Windows
+arm saying plainly that camera recording is not available there yet and that
+takes still record the window. **The `cfg` arm was checked by compiling for
+`x86_64-pc-windows-msvc`**, per §8's rule about host-evaluated `cfg`.
+
+`ivory/src/desktop.rs`'s "camera is open but sending no picture" advice is now
+per-platform too; it was macOS text on all three.
+
+### Six knobs, in two rows
+
+`Fx` grew from three to six: REVERB / DELAY / CHORUS on top in Tascam blue,
+then HPF and LPF in ivory and LIMITER in red. `METER_SHARE` went 0.62 → 0.46 to
+pay for the second row — the meters gave up the height, because six knobs that
+do not fit are worse than a shorter VU.
+
+Three things collapsed on the way, and they are the interesting part:
+
+- **`Hit::SetReverb/SetDelay/SetChorus` → `Hit::SetFx(Fx, f32)`**, and
+  `NumField::Reverb/Delay/Chorus` → `NumField::Fx(Fx)`. There were 55 sites
+  across two files; six knobs would have made 110. **This introduced a real
+  bug and a test caught it**: `Hit::control_key` disambiguated by
+  `mem::discriminant`, which cannot tell one `SetFx` from another, so grabbing
+  REVERB and dragging down onto HPF would have set the high-pass. It carries
+  `fx.index()` now, exactly as it already carried the slot index.
+- **`EffectDefaults.divisions`/`default_division` → `choices: Vec<ChoiceParam>`.**
+  A filter slope is the same shape of thing as the delay's time — a short list
+  a row steps through — and `FxHit::NextDivision` became
+  `FxHit::NextChoice { key }`. `Fx::rows()` returns `FxRow { key, label, step }`
+  so the panel reads which rows step instead of matching on
+  `key == "delay_division"`.
+- **Three loose floats in three structs → `FxSends`.** Six knobs would have
+  been eighteen fields kept in step by hand.
+
+`lpf_slope` shipped for about ten minutes with no entry in the test fixture's
+choice list, drawing an empty box that did nothing. The guard against that is
+`the_host_offers_a_choice_for_every_stepped_row` in `desktop.rs`, which walks
+`Fx::ALL` and asserts the host supplies a list for every `step` row and a
+default value for every sliding one.
+
+### The limiter, and what "true peak" cost
+
+`limiter_ceiling` defaults to **-1.0 dBTP** exactly, with a 252 ms release and
+a 4.5 dB knee. The knob is drive: 0 is bypass, full is 12 dB into the ceiling.
+
+**The first design was wrong and the test said so.** It had no lookahead at
+all — reconstruct the peak between two samples, reduce the gain on the spot —
+and it let 0.5 dB past the ceiling. The reason is worth keeping: *the peak
+between two samples is not made by those two samples.* A converter builds it
+from twenty either side, so scaling one sample and leaving its neighbours
+alone barely moves the curve they reconstruct together. The gain has to be
+down across the whole kernel, which means it has to start going down before
+the peak arrives. There is now a 1 ms lookahead with the required gain drawn
+backwards as a straight line and kept where it is lowest; total latency is
+`look + TP_CENTRE` = 58 samples, **1.2 ms at 48 kHz**.
+
+Two of the three failures on the way there were **bugs in the ruler, not the
+DSP**, and both are the kind that would have been "fixed" by loosening a
+tolerance:
+
+- The test's own reference reconstruction zero-padded off the ends of the
+  buffer. That is a step into silence, and a truncated sinc rings on a step by
+  about 9% — which read as the limiter overshooting by 0.9 dB. It measures the
+  interior only.
+- The slope test measured a low-pass at 16 kHz against 48 k and read 3.9 dB an
+  octave for a perfectly good 6. That is bilinear warping. Both measurement
+  points now stay under an eighth of the sample rate, and the response is
+  checked against `1/sqrt(1 + r^2n)` — the Butterworth its name promises —
+  rather than against an asymptote that would pass a filter of the right
+  steepness and the wrong shape.
+
+The detector is **8 phases of a 21-tap Blackman-windowed sinc**, verified to
+find a pure sine's crest to 0.000 dB from 1 to 11 kHz. It is checked in the
+test by an *independent* 8×/33-tap reconstruction, because a true-peak claim
+checked with the same filter that made it is the detector agreeing with itself.
+
+### Still open
+
+- The filter knobs read **percent, not Hz**. Hz is what a musician wants, but
+  the sweep constants (`HPF_HZ`, `LPF_HZ`) live in the binary behind the
+  firewall and `RecorderView` has no route for them. It needs a display-unit
+  hint on `EffectDefaults`; it is not hard, it was just more than the knob was
+  worth today.
+- `IVORY_SHOT_FX` renders no panel — for the reverb either, so it predates
+  this work. The panels are covered by `every_panel_row_reaches_its_own_parameter`
+  instead, which walks all six.
+- Everything in §2g's "take next" that is still open, plus Void finding 1: the
+  audio engine owns neither its sample rate, its buffer, nor its thread
+  priority, and a failed stream open is silent. That is where the 5.0 audit
+  starts.
+
+---
 
 ## 3. Repo layout
 
