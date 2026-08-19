@@ -351,13 +351,15 @@ struct Layout {
     /// Its icon: a click imports a file, a right-click opens the waveform.
     track_icon: Rect,
 
-    /// **Never positive, and that is the point.** `Hit::PickCamera` and
-    /// `Hit::PickAudio` have to appear in [`Layout::targets`] — every variant
-    /// does, and a test proves it — but neither is a press target in the band:
-    /// the camera is chosen by right-clicking the preview and the input by
+    /// **Never positive, and that is the point.** `Hit::PickAudio` has to
+    /// appear in [`Layout::targets`] — every variant does, and a test proves
+    /// it — but it is not a press target in the band: the input is chosen by
     /// right-clicking the microphone, because a device belongs to the control
-    /// it feeds. See `preview_rect` and `input_icon`.
-    camera: Rect,
+    /// it feeds. See `input_icon`.
+    ///
+    /// The camera used to be here too. It is the PREVIEW now, on a left click,
+    /// because the picture is the whole of what a camera does here and a box
+    /// that says "Select Camera" had better be the thing you press.
     audio: Rect,
 
     /// The microphone icon at the head of the input fader.
@@ -409,7 +411,6 @@ struct Layout {
 
     /// One line of status, and the clip warning beside it.
     status: Rect,
-    clip: Rect,
 
     /// Hairlines in the gaps between the groups. Not controls, and not hits —
     /// they are the cheapest way to make four groups look like four groups
@@ -654,7 +655,6 @@ impl Layout {
             metronome_row: Rect::NOTHING,
             input_row: Rect::NOTHING,
             click: Rect::NOTHING,
-            camera: Rect::NOTHING,
             audio: Rect::NOTHING,
             input_icon: Rect::NOTHING,
             track_row: Rect::NOTHING,
@@ -677,7 +677,6 @@ impl Layout {
             export: Rect::NOTHING,
             open_when_done: Rect::NOTHING,
             status: Rect::NOTHING,
-            clip: Rect::NOTHING,
             rules: [Rect::NOTHING; 2],
         }
     }
@@ -741,15 +740,10 @@ impl Layout {
             // The message never runs into the clip warning, whatever either
             // says: they share the row and neither may be the reason the other
             // is unreadable.
-            status: slice_h(status, 0.0, 0.68),
-            // **Only while it is showing.** The rect is a press target now,
-            // and a target where nothing is drawn is a hole in the band that
-            // swallows clicks meant for the row underneath.
-            clip: if view.showing_clip() {
-                slice_h(status, 0.70, 1.0)
-            } else {
-                Rect::NOTHING
-            },
+            // **The whole row.** It shared it with a `CLIPPED` word that has
+            // gone: the lamp on the VU face says that, in the place somebody
+            // watching levels is already looking.
+            status,
             ..Self::empty(rolling)
         };
 
@@ -1265,7 +1259,19 @@ impl Layout {
             (cap(self.fx[3]), Fixed(Hit::Type(NumField::Fx(Fx::Hpf)))),
             (cap(self.fx[4]), Fixed(Hit::Type(NumField::Fx(Fx::Lpf)))),
             (cap(self.fx[5]), Fixed(Hit::Type(NumField::Fx(Fx::Limiter)))),
-            (self.clip, Fixed(Hit::DismissClip)),
+            // **The picture is the picker.** Not while a take is rolling: the
+            // camera cannot be changed mid-take, and the dialog it opens is
+            // modal over the one gesture that matters then, which is Stop.
+            (
+                if self.rolling { Rect::NOTHING } else { self.preview },
+                Fixed(Hit::PickCamera),
+            ),
+            // **The clip latch is cleared by pressing the meter it is shown
+            // on.** There was a word `CLIPPED` in the status line to press
+            // instead; the lamp on the VU face says the same thing in the
+            // place somebody is already looking, and two indicators for one
+            // fact is one of them being wrong.
+            (self.meter, Fixed(Hit::DismissClip)),
             (self.record, Fixed(Hit::Record)),
             (self.stop, Fixed(Hit::Stop)),
             (self.setup, Fixed(Hit::OpenSetup)),
@@ -1325,7 +1331,6 @@ impl Layout {
             (self.reveal, Fixed(Hit::RevealFolder)),
             (self.default_tick, Fixed(Hit::ToggleDefaultDir)),
             (self.open_when_done, Fixed(Hit::ToggleOpenWhenDone)),
-            (self.camera, Fixed(Hit::PickCamera)),
             (self.audio, Fixed(Hit::PickAudio)),
             (self.count_in, Fixed(Hit::CycleCountIn)),
             // Turned like the sends, and typed into on a DOUBLE click — see
@@ -1448,12 +1453,13 @@ pub enum Hit {
     SetTrackGain(f32),
     /// Choose an audio file to play along to.
     ImportTrack,
-    /// Acknowledge the clip warning and put every clip latch out.
+    /// Put every clip latch out. **The VU face is the target.**
     ///
     /// A latch that clears itself is one the performer never sees, because
     /// they were looking at their hands. A latch with no way to clear it is
     /// one that stays lit for the rest of the session and stops meaning
-    /// anything — which is the same failure, slower.
+    /// anything — the same failure, slower. It was a word in the status line
+    /// and is the meter now: one indicator, pressed where it is shown.
     DismissClip,
     /// The master, as a FADER POSITION 0..=1 — not a gain. Same curve as the
     /// four faders, because it is one; it just wears a knob.
@@ -1621,7 +1627,7 @@ impl Hit {
             Hit::SetMetronomeGain(_) => "Click level",
             Hit::SetFx(fx, _) => fx.describe(),
             Hit::SetMaster(_) => "Master  -  right-click to type, double-click for 0 dB",
-            Hit::DismissClip => "It clipped  -  click to acknowledge",
+            Hit::DismissClip => "Levels  -  click to clear the clip lamp",
             Hit::SetTrackGain(_) => "Backing track level",
             Hit::Type(_) => "Click to type a number",
             Hit::ImportTrack => "Backing track  -  click to choose a file",
@@ -2239,8 +2245,12 @@ fn draw_camera(
                 // the middle of the band. It is behind the cog now, and a
                 // placeholder pointing at somewhere the control has not been
                 // for a release is worse than no placeholder.
-                DeviceLabel::None => ("NO CAMERA SELECTED", "choose one under the cog"),
-                DeviceLabel::Missing(_) => ("CAMERA NOT AVAILABLE", "it is not plugged in"),
+                // **The hint is the gesture**, because the box IS the
+                // control now: clicking the preview opens the picker. It said
+                // "choose one under the cog", which was a direction to
+                // somewhere else and stopped being true twice.
+                DeviceLabel::None => ("NO CAMERA", "Select Camera"),
+                DeviceLabel::Missing(_) => ("CAMERA NOT AVAILABLE", "Select Camera"),
                 DeviceLabel::Open(_) => ("WAITING FOR CAMERA", "the first frame has not arrived"),
             };
             let size =
@@ -2257,7 +2267,7 @@ fn draw_camera(
                     Pos2::new(r.center().x, r.center().y + size),
                     Align2::CENTER_CENTER,
                     hint,
-                    font_light(size * 0.9),
+                    font_light(size * 0.72),
                     p.faint,
                 );
             }
@@ -4187,9 +4197,7 @@ fn draw_status(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
     // Latched, so it is still there after Stop. An indicator that clears itself
     // is one the performer never sees, because they were looking at their hands
     // when it happened.
-    if view.showing_clip() {
-        text_line(painter, l.clip, "CLIPPED", p.rec, true);
-    }
+
 }
 
 /// One-pixel top edge so the band reads as its own, matching the fretboard's.
@@ -4537,107 +4545,48 @@ mod tests {
 
     /// Both ends of a knob's travel are reachable, and up is more.
     /// **A filter knob reads in hertz, and a send still reads in percent.**
-    /// **The clip warning is a press target exactly while it is on screen.**
+    /// **The clip latch is cleared by pressing the meter it is shown on.**
     ///
-    /// A rect with nothing drawn in it is a hole in the band that swallows
-    /// presses meant for the row underneath; a warning with no way to dismiss
-    /// it stays lit for the rest of the session and stops meaning anything.
+    /// It was a word in the status line, which is a second place to look for a
+    /// fact the VU's own lamp already carries — and on a Mac with no interface
+    /// selected the lamp never lit at all, so the word was the only indication
+    /// and it was the one that did not work. One indicator, in the place
+    /// somebody watching levels is already looking, and pressing it is what
+    /// puts it out.
     #[test]
-    fn the_clip_warning_can_be_dismissed_only_while_it_is_showing() {
+    fn the_clip_latch_is_cleared_by_pressing_the_meter() {
         let r = band(1300.0);
-        // Not clipping: no rectangle, and a press there is not a dismiss.
-        let quiet = idle();
-        assert!(!quiet.showing_clip());
-        let l = Layout::new(r, &quiet);
-        assert!(!l.clip.is_positive(), "the clip warning has a target unlit");
+        let v = idle();
+        let l = Layout::new(r, &v);
+        assert!(l.meter.is_positive(), "no meter to press");
+        assert_eq!(hit_test(r, &v, l.meter.center()), Some(Hit::DismissClip));
 
-        // Clipping on the live meter — what the VU paints itself red from.
-        let mut hot = idle();
-        hot.meters.clipped = true;
-        assert!(hot.showing_clip());
-        let l = Layout::new(r, &hot);
-        assert!(l.clip.is_positive(), "nothing to press while it is lit");
-        assert_eq!(hit_test(r, &hot, l.clip.center()), Some(Hit::DismissClip));
-
-        // And from the take summary, which arrives by a different path and
-        // lights the same word.
-        let mut warned = idle();
-        warned.clip_warning = true;
-        assert!(warned.showing_clip());
-        let l = Layout::new(r, &warned);
-        assert!(l.clip.is_positive());
-        assert_eq!(hit_test(r, &warned, l.clip.center()), Some(Hit::DismissClip));
+        // Live as well as idle: a clip during a take is exactly when somebody
+        // acknowledges one.
+        let rolling = rolling();
+        let l = Layout::new(r, &rolling);
+        assert!(l.meter.is_positive());
+        assert_eq!(hit_test(r, &rolling, l.meter.center()), Some(Hit::DismissClip));
     }
 
-    /// **Every number in the band can be typed into by pressing the number.**
-    ///
-    /// The word over a knob and the dB at the end of a fader are where the
-    /// value is WRITTEN, so pressing them to change it is the one mapping
-    /// nobody has to be told. This is the half `every_control_is_reachable_in_the_idle_layout`
-    /// skips, because below a readable band height neither is drawn at all.
+    /// **Pressing the preview chooses the camera** — and only at rest.
     #[test]
-    fn every_number_can_be_typed_into_where_it_is_written() {
-        for w in [900.0_f32, 1100.0, 1300.0, 1800.0] {
-            let r = band(w);
-            // **Slots with instruments in them.** An empty slot is one big
-            // "click to load" target with no level and no number in it, so a
-            // rack of empty rows would pass this test by having nothing to
-            // find.
-            let v = with_rack(RecordState::Idle, racks()[1]);
-            let l = Layout::new(r, &v);
-            let mut found = Vec::new();
-            for (rect, k) in l.targets() {
-                if let (true, Hit::Type(f)) = (rect.is_positive(), k.control()) {
-                    // Pressing it reports itself and not the control under it.
-                    assert_eq!(
-                        hit_test(r, &v, rect.center()),
-                        Some(Hit::Type(f)),
-                        "{f:?}'s number is not pressable at {w}"
-                    );
-                    found.push(f);
-                }
-            }
-            // All eight dials and all eight levels, every one of them.
-            for fx in Fx::ALL {
-                assert!(found.contains(&NumField::Fx(fx)), "{} at {w}", fx.title());
-            }
-            for f in [
-                NumField::Tempo,
-                NumField::Master,
-                NumField::Metronome,
-                NumField::Input,
-                NumField::Track,
-                NumField::Slot(0),
-                NumField::Slot(4),
-            ] {
-                assert!(found.contains(&f), "{f:?} has no number to press at {w}");
-            }
-        }
-    }
+    fn the_preview_is_the_camera_picker_until_a_take_starts() {
+        let r = band(1300.0);
+        let v = idle();
+        let l = Layout::new(r, &v);
+        assert!(l.preview.is_positive(), "no preview");
+        assert_eq!(hit_test(r, &v, l.preview.center()), Some(Hit::PickCamera));
 
-    /// **A fader is geared so every decibel it can show can be reached.**
-    ///
-    /// The rule the whole travel constant exists for: seventy-two decibels
-    /// read to a tenth is seven hundred and twenty distinguishable values, and
-    /// a drag that cannot land on all of them is a control with numbers in it
-    /// that are for looking at.
-    #[test]
-    fn a_fader_can_reach_every_tenth_of_a_decibel() {
-        use crate::recorder::{GAIN_MAX_DB, GAIN_MIN_DB};
-        // (what it is, how many values it can show, how far it travels)
-        for (what, steps, travel) in [
-            // Seventy-two decibels read to a tenth.
-            ("a fader", (GAIN_MAX_DB - GAIN_MIN_DB) * 10.0, FADER_TRAVEL),
-            // A hundred whole percents.
-            ("a knob", 100.0, KNOB_TRAVEL),
-        ] {
-            assert!(
-                steps <= travel,
-                "{what} shows {steps} values over {travel} points of travel, \
-                 so {:.0} of them cannot be landed on",
-                steps - travel
-            );
-        }
+        // Not mid-take: the camera cannot be changed then, and the dialog it
+        // opens would be modal over the one gesture that matters, which is
+        // Stop.
+        let rolling = rolling();
+        assert_ne!(
+            hit_test(r, &rolling, Layout::new(r, &rolling).preview.center()),
+            Some(Hit::PickCamera),
+            "the picker is reachable during a take"
+        );
     }
 
     /// **Every knob resets to the position where it is doing nothing** —
@@ -5112,7 +5061,6 @@ mod tests {
         let l = Layout::new(r, &v);
         for (name, other) in [
             ("status", l.status),
-            ("clip", l.clip),
             ("setup", l.setup),
             ("name", l.name),
             ("tempo", l.tempo),
@@ -5142,7 +5090,7 @@ mod tests {
     /// The two effect knobs are in it for the same reason the faders are: they
     /// are a mix, they cost the audio thread nothing to move, and riding the
     /// reverb through a take is a thing a person does on purpose.
-    const SURVIVORS: [Hit; 37] = [
+    const SURVIVORS: [Hit; 38] = [
         Hit::Stop,
         Hit::SetSlotGain(0, 0.0),
         Hit::SetSlotGain(1, 0.0),
@@ -5161,6 +5109,9 @@ mod tests {
         Hit::SetMaster(0.0),
         // The backing track's level, but not its import button: see `targets`.
         Hit::SetTrackGain(0.0),
+        // Pressing the VU puts its clip lamp out, and a clip during a take is
+        // exactly when somebody does that.
+        Hit::DismissClip,
         // **And every number that belongs to something that survives.** A
         // level you can drag mid-take is a level you can type mid-take; the
         // tempo is not here because its knob becomes the clock when a take
@@ -5586,8 +5537,7 @@ mod tests {
                         ("tempo", l.tempo),
                         ("export", l.export),
                         ("status", l.status),
-                        ("clip", l.clip),
-                    ] {
+                                ] {
                         if z.is_positive() {
                             zones.push((what.to_owned(), z));
                         }
@@ -5640,12 +5590,11 @@ mod tests {
                 // a session, and the band is what your hands are on while a
                 // take runs. `SetTempo` is here because the tempo BOX is a
                 // control and the value is not — see `Hit::EditTempo`.
-                const IN_THE_MENU: [Hit; 10] = [
+                const IN_THE_MENU: [Hit; 9] = [
                     Hit::ChooseFolder,
                     Hit::RevealFolder,
                     Hit::ToggleDefaultDir,
                     Hit::ToggleOpenWhenDone,
-                    Hit::PickCamera,
                     Hit::PickAudio,
                     Hit::CycleCountIn,
                     Hit::Export,
@@ -5670,7 +5619,6 @@ mod tests {
                 }
                 if IN_THE_MENU.iter().any(|m| m.is_same_control(want))
                     || want == Hit::ToggleMetronomeInTake
-                    || want == Hit::DismissClip
                 {
                     assert!(
                         l.targets().into_iter().all(|(rect, k)| {

@@ -460,6 +460,9 @@ pub struct Settings {
     pub master_gain: f64,
     /// The backing track's level, linear.
     pub track_gain: f64,
+    /// Whether the after-a-take report appears. A take with a PROBLEM ignores
+    /// this: see [`crate::dialogs::Dialog::TakeSummary`].
+    pub show_take_summary: bool,
     /// The audio file the backing track plays, or empty for none.
     ///
     /// **A path and not the audio.** A settings file that carried a hundred
@@ -661,6 +664,7 @@ impl Default for Settings {
             input_gain: 1.0,
             master_gain: 1.0,
             track_gain: 1.0,
+            show_take_summary: true,
             track_path: String::new(),
             track_in: 0.0,
             track_out: 0.0,
@@ -977,6 +981,11 @@ impl Settings {
         if let Some(v) = map.shift_remove("show_welcome") {
             if let Some(b) = v.as_bool() {
                 s.show_welcome = b;
+            }
+        }
+        if let Some(v) = map.shift_remove("show_take_summary") {
+            if let Some(b) = v.as_bool() {
+                s.show_take_summary = b;
             }
         }
         if let Some(v) = map.shift_remove("show_heart") {
@@ -1489,6 +1498,10 @@ impl Settings {
             Value::String(self.recorder_bg_color.to_hex()),
         );
         map.insert("show_welcome".into(), Value::Bool(self.show_welcome));
+        map.insert(
+            "show_take_summary".into(),
+            Value::Bool(self.show_take_summary),
+        );
         map.insert("show_heart".into(), Value::Bool(self.show_heart));
         map.insert("heart_color".into(), Value::Number(self.heart_color.into()));
         let mut put_opt = |key: &str, v: Option<i64>| {

@@ -152,6 +152,25 @@ pub enum Dialog {
         /// than an empty folder.
         error: String,
     },
+    /// What a take produced, after it is written.
+    ///
+    /// **A popup rather than a line in the band.** It used to sit in the
+    /// status strip, where it competed with live errors, stayed up until
+    /// something else replaced it, and — being one line in a narrow strip —
+    /// was routinely the first thing to be shrunk to illegibility. It is the
+    /// report on the thing the whole app exists to do; it can have a box.
+    ///
+    /// The tick suppresses the ORDINARY ones only. A take that hit a problem
+    /// still says so however many times this has been dismissed: "the disk
+    /// filled" is not a message anybody meant to stop seeing.
+    TakeSummary {
+        message: String,
+        /// True when the take had a real problem, which is what makes it
+        /// unsuppressable.
+        problem: bool,
+        /// The tick's live state, committed when the box is closed.
+        dont_show: bool,
+    },
     NoMidiInput,
     MidiError {
         message: String,
@@ -304,6 +323,8 @@ pub enum DialogAction {
     },
     /// Persist the welcome dialog's "don't show again" choice.
     SetShowWelcome(bool),
+    /// Persist the take summary's "don't show again" choice.
+    SetShowTakeSummary(bool),
     /// Frames per audio callback, or `None` for the device's own default.
     /// Applies to both streams and reopens them.
     SetBufferFrames(Option<u32>),
@@ -2228,6 +2249,46 @@ pub fn show(
                                     result.close = true;
                                 }
                                 if ui.button("Cancel").clicked() {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
+        Dialog::TakeSummary {
+            message,
+            problem,
+            dont_show,
+        } => {
+            let problem = *problem;
+            let stock = stock_style(ctx);
+            show_dialog_viewport(
+                ctx,
+                placement,
+                if problem { "Take - problem" } else { "Take" },
+                Vec2::new(460.0, 210.0),
+                Vec2::new(320.0, 150.0),
+                |ui, result| {
+                    *ui.style_mut() = stock.clone();
+                    let bg = ui.style().visuals.window_fill;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(message.as_str());
+                            ui.add_space(10.0);
+                            // Not offered on a problem: see the type's doc.
+                            if !problem {
+                                ui.checkbox(dont_show, "Don't show this again");
+                                ui.add_space(6.0);
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("OK").clicked() {
+                                    if !problem && *dont_show {
+                                        action = Some(DialogAction::SetShowTakeSummary(false));
+                                    }
                                     result.close = true;
                                 }
                             });

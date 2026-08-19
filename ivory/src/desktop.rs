@@ -250,6 +250,20 @@ pub struct DesktopApp {
     /// `SetPatchParam`.
     #[cfg(feature = "recorder")]
     editing: Option<crate::dx7::Voice>,
+    /// The window was fullscreen when a picker was asked for, so it comes out
+    /// of fullscreen, opens the picker next frame, and goes back after. See
+    /// `picker_needs_windowed`.
+    #[cfg(feature = "recorder")]
+    refullscreen: bool,
+    /// A picker deferred by one frame for that reason.
+    #[cfg(feature = "recorder")]
+    deferred_file: Option<ivory_ui::ports::FileRequest>,
+    #[cfg(feature = "recorder")]
+    deferred_dir: Option<ivory_ui::ports::DirRequest>,
+    /// The take report already shown, so it is raised once rather than every
+    /// frame until the next take.
+    #[cfg(feature = "recorder")]
+    reported_take: Option<String>,
     /// What the in-app browser is filtering by, so the folder it navigates
     /// into is listed the same way the first one was.
     #[cfg(feature = "recorder")]
@@ -789,7 +803,13 @@ impl DesktopApp {
                     .ok()
                     .and_then(|d| d.clone())
             })
-            .or_else(|| self.recorder.session.last_summary().map(|s| s.message()));
+            // **The take's report is not here any more.** It was the last
+            // `or_else` in this chain, which meant it sat in a one-line strip
+            // competing with live errors and stayed up until something else
+            // replaced it. It is a dialog now — see `report_take` below and
+            // `Dialog::TakeSummary`. What remains in this chain is the live
+            // problems, which belong in the band because they are true NOW.
+            ;
 
         let preview = self.recorder.preview.as_ref().map(|h| ivory_ui::recorder::Preview {
             texture: h.id(),
@@ -840,6 +860,18 @@ impl DesktopApp {
                 }
             });
 
+        // **Once per take, on the edge.** `last_summary` keeps answering with
+        // the same take until the next one, so the message it carries is the
+        // trigger: folders are timestamped, so two takes never produce the
+        // same one. Before the state borrow, because raising a dialog is
+        // another `&mut self.app`.
+        if let Some(summary) = self.recorder.session.last_summary() {
+            let (message, problem) = (summary.message(), summary.is_problem());
+            if self.reported_take.as_deref() != Some(message.as_str()) {
+                self.reported_take = Some(message.clone());
+                self.app.report_take(message, problem);
+            }
+        }
         let state = self.app.recorder_state_mut();
         state.preview = preview;
         state.camera_name = self
@@ -858,6 +890,17 @@ impl DesktopApp {
         if let Some(e) = self.recorder.engine.as_ref() {
             state.master = e.meters();
             state.gr_db = e.gain_reduction_db();
+            // **And the VU falls back to it when nothing else is feeding.**
+            // The band's meter shows what is being recorded: the input when
+            // there is one, and otherwise the instrument. With no interface
+            // selected neither of the session's two sources exists, so it
+            // answered SILENT — a dead needle and a clip lamp that could never
+            // light, on a Mac with a piano plugged into it and the FM playing.
+            // Read ONCE, because the peaks clear on read: the same numbers go
+            // to both meters rather than one of them getting zero.
+            if !self.recorder.session.has_meter_source() {
+                state.meters = state.master;
+            }
         } else {
             state.master = ivory_ui::recorder::Meters::SILENT;
             state.gr_db = 0.0;
@@ -1037,7 +1080,14 @@ impl DesktopApp {
             self.finish_dir_choice(purpose, dir);
         }
 
-        if let Some(request) = self.app.take_directory_request() {
+        if let Some(request) = self.app.take_directory_request().or_else(|| self.deferred_dir.take())
+        {
+            if Self::picker_needs_windowed(ctx) {
+                self.deferred_dir = Some(request);
+                self.refullscreen = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                return;
+            }
             // No portal and no zenity: our own browser, as for files.
             if !Self::native_dialogs_work() {
                 let at = request
@@ -1066,8 +1116,9 @@ impl DesktopApp {
             if let Some(dir) = dialog.pick_folder() {
                 self.finish_dir_choice(request.purpose, dir);
             }
+            self.restore_fullscreen(ctx);
         }
-        self.take_cartridge_request(frame);
+        self.take_cartridge_request(ctx, frame);
         // Scanning reads directories, so it belongs out here with the other
         // things the UI is not allowed to do — and it runs AFTER the folder
         // picker above, so a folder added this frame is in the list this frame
@@ -1417,10 +1468,23 @@ impl DesktopApp {
     /// Out here with the folder picker and for the same reason: `rfd` runs a
     /// nested run loop, and raising one inside an egui frame re-enters the
     /// frame already on the stack.
-    fn take_cartridge_request(&mut self, frame: &eframe::Frame) {
-        let Some(request) = self.app.take_file_request() else {
+    fn take_cartridge_request(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(request) = self
+            .app
+            .take_file_request()
+            .or_else(|| self.deferred_file.take())
+        else {
+            self.restore_fullscreen(ctx);
             return;
         };
+        // Out of fullscreen first, and open on the frame after: see
+        // `picker_needs_windowed`. This is the case that froze the app.
+        if Self::picker_needs_windowed(ctx) {
+            self.deferred_file = Some(request);
+            self.refullscreen = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            return;
+        }
         let purpose = request.purpose;
         // **No portal, no zenity: our own browser.** Otherwise this opens a
         // dialog that never appears and returns the same `None` a cancel does.
@@ -1463,7 +1527,11 @@ impl DesktopApp {
             // is a dialog somebody closes again, and they are right to.
             dialog = dialog.add_filter("All files", &["*"]);
         }
-        let Some(file) = dialog.pick_file() else { return };
+        let file = dialog.pick_file();
+        // Back to fullscreen whether or not anything was chosen: a cancel must
+        // not leave the window in a shape the user did not ask for.
+        self.restore_fullscreen(ctx);
+        let Some(file) = file else { return };
         self.finish_file_choice(purpose, &file);
     }
 
@@ -1532,6 +1600,38 @@ impl DesktopApp {
             Err(e) => self
                 .app
                 .set_cartridge(ivory_ui::ports::CartridgeInfo { error: e, ..Default::default() }),
+        }
+    }
+
+    /// Whether a picker has to wait for the window to leave fullscreen first.
+    ///
+    /// **Linux only, and it is not a hang.** Under i3 — and under any X11 WM
+    /// that honours `_NET_WM_STATE_FULLSCREEN` properly — a fullscreen window
+    /// sits above everything, including a modal file panel. `rfd::pick_file`
+    /// is a BLOCKING call: it stops the main thread until the panel returns.
+    /// Put those together and choosing a backing track from fullscreen froze
+    /// the whole app with nothing in the console, because the app was waiting
+    /// on a dialog that had opened underneath the window and could not be
+    /// seen, focused or dismissed.
+    ///
+    /// So the window comes out of fullscreen first, the picker opens on the
+    /// frame after — the change needs a frame to reach the WM — and fullscreen
+    /// goes back when the picker is done. macOS and Windows put a panel in
+    /// front of a fullscreen window themselves and are left alone.
+    #[cfg(target_os = "linux")]
+    fn picker_needs_windowed(ctx: &egui::Context) -> bool {
+        ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn picker_needs_windowed(_ctx: &egui::Context) -> bool {
+        false
+    }
+
+    /// Put fullscreen back after a picker that had to leave it.
+    fn restore_fullscreen(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.refullscreen) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
         }
     }
 
@@ -2207,6 +2307,14 @@ impl DesktopApp {
             cartridge: None,
             #[cfg(feature = "recorder")]
             editing: None,
+            #[cfg(feature = "recorder")]
+            refullscreen: false,
+            #[cfg(feature = "recorder")]
+            deferred_file: None,
+            #[cfg(feature = "recorder")]
+            deferred_dir: None,
+            #[cfg(feature = "recorder")]
+            reported_take: None,
             #[cfg(feature = "recorder")]
             browse_extensions: Vec::new(),
             #[cfg(feature = "recorder")]

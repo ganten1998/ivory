@@ -1,6 +1,7 @@
 # Ivory 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-19. **The app is now called TANGENT.** Newest work is
+§2n: the clip lamp, the take report, the fullscreen picker freeze. Before it,
 §2m: Linux hardening. Before it, §2l: the backing-track player. Before it, §2k: the limiter's makeup gain, the
 DX7 fader bug, and a dismissable CLIPPED.
 Before it, §2j: one gesture set across all eight knobs.
@@ -1170,6 +1171,60 @@ an order of magnitude worse — 75 underruns against 6, starting the instant the
 thread was promoted — because pipewire's own data loop is already at RT 83 and
 a client at FIFO 70 inverts priority against its non-RT IPC thread. It is in
 §8's trap list now so it does not get "fixed" again.
+
+---
+
+## 2n. 2026-08-19 — the clip lamp, the take report, and a fullscreen freeze
+
+Shipped as **4.18.0**.
+
+### CLIPPED was two indicators for one fact, and the wrong one worked
+
+There was a `CLIPPED` word in the status strip AND a lamp on each VU face.
+On Linux the word appeared and could not be cleared; on macOS **neither** ever
+appeared, because `record.rs::meters()` answers `SILENT` when there is no audio
+input and no plugin audio — which is a Mac with a piano plugged into it and the
+built-in FM playing. The needle sat still and the lamp could never light.
+
+The word is gone. The lamp is the indicator, **pressing the meter is what puts
+it out**, and the VU falls back to the engine's own device-mix meters when the
+session has no source of its own (`Session::has_meter_source`). Read once, so
+the same numbers reach both meters rather than one of them getting the zero the
+other's read-and-clear left behind.
+
+### The take's report is a dialog now
+
+It was the last `or_else` in the status chain, so it competed with live errors
+in a one-line strip and stayed up until something replaced it. It is
+`Dialog::TakeSummary`, raised once per take on the edge, with a **don't show
+again** that suppresses the ordinary "recorded 2:14 of audio + MIDI" and
+**never** a take that hit a problem — `Summary::is_problem()`, which counts a
+silent take, because that is the failure nobody notices until they open the
+file. It also never replaces a dialog already open.
+
+### The preview is the camera picker
+
+Left click, at rest, on the picture — which now says `NO CAMERA` / `Select
+Camera` rather than pointing at the cog, a direction that had already stopped
+being true twice. `Layout::camera` is gone; only `audio` is left as a
+never-positive target.
+
+### Choosing a file from fullscreen froze the app on Linux
+
+Not a hang: `rfd::pick_file` blocks the main thread, and under i3 a fullscreen
+window sits above everything — including the modal panel it was waiting on. The
+app was frozen on a dialog that had opened underneath the window and could not
+be seen, focused or dismissed, which is exactly "hangs with no console
+messages".
+
+`picker_needs_windowed()` drops fullscreen, defers the picker by one frame — the
+change needs a frame to reach the WM — and restores fullscreen after, on cancel
+as well as on choose. Linux only; macOS and Windows put a panel in front of a
+fullscreen window themselves.
+
+**Not verified here.** This one is reasoned from the symptom and the platform,
+and there is no Linux box on this end to reproduce it on. It is the next thing
+to confirm on dresden.
 
 ---
 

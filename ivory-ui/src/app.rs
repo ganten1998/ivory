@@ -2504,6 +2504,23 @@ impl IvoryApp {
         });
     }
 
+    /// Report what a take produced. See `Dialog::TakeSummary`.
+    ///
+    /// **A problem is always shown**, whatever the tick says; suppression is
+    /// for the ordinary "recorded 2:14 of audio + MIDI" line. And it never
+    /// replaces a dialog that is already open — a summary landing on top of
+    /// the picker somebody is using would be the report interrupting the work.
+    pub fn report_take(&mut self, message: String, problem: bool) {
+        if self.dialog.is_some() || (!problem && !self.settings.show_take_summary) {
+            return;
+        }
+        self.dialog = Some(dialogs::Dialog::TakeSummary {
+            message,
+            problem,
+            dont_show: false,
+        });
+    }
+
     /// The backing track, as the host decoded it.
     pub fn set_track_info(&mut self, info: crate::ports::TrackInfo) {
         self.track = info;
@@ -4388,6 +4405,10 @@ impl IvoryApp {
         match action {
             // The browser asks; the host reads the disk and hands the rows
             // back through `set_browser`.
+            DialogAction::SetShowTakeSummary(v) => {
+                self.settings.show_take_summary = v;
+                self.save_settings();
+            }
             DialogAction::BrowseTo(dir) => self.browse_request = Some(dir),
             DialogAction::Browsed { what, path } => self.finish_browse(what, path),
             DialogAction::SetBufferFrames(frames) => {
@@ -7158,6 +7179,55 @@ mod tests {
             ],
         });
         (ctx, app)
+    }
+
+    /// **A take's report can be turned off, and a problem cannot.**
+    ///
+    /// The tick is for the ordinary "recorded 2:14 of audio + MIDI" line. A
+    /// take that hit a problem says so however many times it has been
+    /// dismissed: "the disk filled" and "the audio is silent" are not messages
+    /// anybody meant to stop seeing.
+    #[test]
+    fn a_take_report_is_suppressable_and_a_problem_is_not() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        assert!(app.settings.show_take_summary, "reports ship off");
+
+        app.report_take("Recorded 2:14".to_owned(), false);
+        assert!(
+            matches!(app.dialog, Some(dialogs::Dialog::TakeSummary { .. })),
+            "an ordinary report did not appear"
+        );
+        // Ticking the box is what turns it off.
+        app.apply_dialog_action(dialogs::DialogAction::SetShowTakeSummary(false));
+        app.dialog = None;
+        assert!(!app.settings.show_take_summary);
+
+        app.report_take("Recorded 2:14".to_owned(), false);
+        assert!(app.dialog.is_none(), "it came back after being turned off");
+
+        // The problem ignores it.
+        app.report_take("No space left on device".to_owned(), true);
+        let Some(dialogs::Dialog::TakeSummary { problem, .. }) = &app.dialog else {
+            panic!("a problem was suppressed")
+        };
+        assert!(*problem);
+        app.dialog = None;
+
+        // **And it never lands on top of a dialog already open.** A report
+        // arriving over the picker somebody is using is the report
+        // interrupting the work.
+        app.settings.show_take_summary = true;
+        app.open_browser(
+            "x".to_owned(),
+            dialogs::BrowseFor::File(crate::ports::FilePurpose::BackingTrack),
+            std::path::PathBuf::from("/"),
+            Vec::new(),
+        );
+        app.report_take("Recorded 0:30".to_owned(), false);
+        assert!(
+            matches!(app.dialog, Some(dialogs::Dialog::FileBrowser { .. })),
+            "the report replaced an open dialog"
+        );
     }
 
     /// **The two trim handles may not cross.**

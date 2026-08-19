@@ -859,6 +859,16 @@ pub struct Summary {
 
 impl Summary {
     /// One line, and it has to survive being the only thing the user reads.
+    /// Whether this take hit a real problem, as opposed to simply finishing.
+    ///
+    /// What makes the report unsuppressable: "the disk filled" is not a
+    /// message anybody meant to stop seeing. A silent take counts — it is the
+    /// failure the meter exists to prevent and the one nobody notices until
+    /// they open the file.
+    pub fn is_problem(&self) -> bool {
+        self.problem.is_some() || self.silent
+    }
+
     pub fn message(&self) -> String {
         if let Some(p) = &self.problem {
             // The folder still comes first when there IS one. A disk that
@@ -1070,6 +1080,19 @@ impl Session {
                 buffer_frames: a.buffer_frames,
             },
         ))
+    }
+
+    /// Whether anything is feeding the band's VU at all.
+    ///
+    /// **False is the ordinary case, not an error.** With no audio interface
+    /// selected and the built-in instrument playing, neither of the two
+    /// sources this type meters exists — so `meters()` answers SILENT and the
+    /// VU sits still and never latches a clip, however hard the FM is driven.
+    /// That is a Mac with a piano plugged into it, which is most of them; the
+    /// caller falls back to the engine's own device-mix meters when this is
+    /// false. See `DesktopApp::push_state`.
+    pub fn has_meter_source(&self) -> bool {
+        self.audio.is_some() || self.plugin_audio.is_some()
     }
 
     pub fn audio_device_name(&self) -> Option<&str> {
