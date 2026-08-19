@@ -363,10 +363,21 @@ impl OutputInfo {
     pub fn latency_line(&self) -> String {
         match self.buffer_frames {
             Some(f) if self.sample_rate > 0 => format!(
-                "{} frames, {:.1} ms buffer at {} Hz",
+                "{} frames, {:.1} ms buffer at {} Hz{}",
                 f,
                 f as f32 * 1_000.0 / self.sample_rate as f32,
-                self.sample_rate
+                self.sample_rate,
+                // **The ring, where it is not the same as the period.** On
+                // Linux the two differ by four (see `BUFFER_PERIODS`), so a
+                // line that named only one of them would be answering a
+                // different question than the one somebody debugging dropouts
+                // is asking. Everywhere else they are the same number and
+                // saying it twice would be noise.
+                if BUFFER_PERIODS > 1 {
+                    format!("  ({} frame ring)", f * BUFFER_PERIODS)
+                } else {
+                    String::new()
+                }
             ),
             _ => format!("{} Hz, device buffer size", self.sample_rate),
         }
@@ -3259,6 +3270,29 @@ fn resolve_output(host: &cpal::Host, want: Option<&str>) -> Result<cpal::Device,
     ))
 }
 
+/// How many periods the requested size is asked for, per platform.
+///
+/// **cpal's ALSA host reads `Fixed(v)` as the whole RING, not the period**, and
+/// splits it into four (`host/alsa/mod.rs`: `period = v / 4`). So asking for
+/// 256 on Linux does not produce 256-frame callbacks — it produces a 256-frame
+/// ring refilled every 64 frames, which is four times the callback rate the
+/// number was chosen for, on a plain SCHED_OTHER thread. macOS and WASAPI read
+/// the same call as the period.
+///
+/// Multiplying by four on Linux makes the two agree: the callback cadence is
+/// the 256 frames it was always meant to be, and what deepens is the safety
+/// ring behind it to the four periods ALSA assumes anyway. Measured on a 2012
+/// MacBook Air under four CPU hogs: six underruns in thirty seconds at the
+/// stock setting, none at all with the ring four times deeper.
+///
+/// **And no realtime promotion to go with it.** The obvious companion fix
+/// makes it dramatically worse through pipewire-alsa on the same box — 75
+/// underruns against 6, starting the moment the thread is promoted, because
+/// the plugin's own data loop already runs at RT 83 and a client at FIFO 70
+/// inverts priority against its non-RT IPC thread. See
+/// `docs/LINUX-4.16-FINDINGS.md`.
+const BUFFER_PERIODS: u32 = if cfg!(target_os = "linux") { 4 } else { 1 };
+
 /// Ask for [`WANT_BUFFER_FRAMES`], inside whatever the device will accept.
 ///
 /// A `Fixed` size outside the supported range is a build error rather than a
@@ -3281,8 +3315,15 @@ fn pick_buffer(
         .unwrap_or(WANT_BUFFER_FRAMES);
     match supported {
         cpal::SupportedBufferSize::Range { min, max } if *min <= *max => {
-            let frames = want.clamp(*min, *max);
-            (cpal::BufferSize::Fixed(frames), Some(frames))
+            // The PERIOD is what `want` means; the ring is however many
+            // periods this platform's host expects to be handed. See
+            // `BUFFER_PERIODS`.
+            let ring = want.saturating_mul(BUFFER_PERIODS).clamp(*min, *max);
+            // What is reported back is the period, because that is the number
+            // the callback runs at and the one the Audio Status panel is
+            // talking about.
+            let period = (ring / BUFFER_PERIODS).max(1);
+            (cpal::BufferSize::Fixed(ring), Some(period))
         }
         _ => (cpal::BufferSize::Default, None),
     }
@@ -5261,11 +5302,36 @@ mod tests {
         let (size, frames) = pick_buffer(&cpal::SupportedBufferSize::Unknown, None);
         assert!(matches!(size, cpal::BufferSize::Default));
         assert_eq!(frames, None);
-        let (size, frames) = pick_buffer(&cpal::SupportedBufferSize::Range { min: 512, max: 4096 }, None);
-        assert!(matches!(size, cpal::BufferSize::Fixed(512)));
-        assert_eq!(frames, Some(512), "the request is clamped up to the minimum");
-        let (_, frames) = pick_buffer(&cpal::SupportedBufferSize::Range { min: 16, max: 64 }, None);
-        assert_eq!(frames, Some(64), "and down to the maximum");
+        // **The RING is what is asked for and the PERIOD is what is
+        // reported**, and on Linux those differ by four — see
+        // `BUFFER_PERIODS`. Written in terms of the constant rather than in
+        // literal frames, because a test that hard-codes 512 passes on the
+        // machine it was written on and fails on the one the fix is for.
+        let range = |min, max| cpal::SupportedBufferSize::Range { min, max };
+        let ring_of = |b: cpal::BufferSize| match b {
+            cpal::BufferSize::Fixed(n) => n,
+            cpal::BufferSize::Default => 0,
+        };
+
+        // Roomy device: the ring is the wanted period times the count.
+        let (size, frames) = pick_buffer(&range(16, 8192), Some(256));
+        assert_eq!(ring_of(size), 256 * BUFFER_PERIODS);
+        assert_eq!(frames, Some(256), "the period is not what was asked for");
+
+        // Clamped up to the minimum, and the period follows the ring.
+        let (size, frames) = pick_buffer(&range(4096, 8192), Some(256));
+        assert_eq!(ring_of(size), 4096);
+        assert_eq!(frames, Some(4096 / BUFFER_PERIODS));
+
+        // And down to the maximum.
+        let (size, frames) = pick_buffer(&range(16, 64), Some(256));
+        assert_eq!(ring_of(size), 64);
+        assert_eq!(frames, Some(64 / BUFFER_PERIODS));
+
+        // A period is never reported as zero, whatever the device says: it is
+        // divided into and displayed.
+        let (_, frames) = pick_buffer(&range(1, 2), Some(1));
+        assert!(frames.is_some_and(|f| f >= 1));
     }
 
     // ── with a real device and a real plugin ───────────────────────────────

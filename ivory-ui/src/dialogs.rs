@@ -126,6 +126,32 @@ pub enum Dialog {
         /// down.
         focus: bool,
     },
+    /// **A file browser of our own, for a Linux box with no portal.**
+    ///
+    /// `rfd` on Linux has exactly two backends: xdg-desktop-portal, then a
+    /// zenity subprocess. On a machine with neither — which is an ordinary
+    /// Void or minimal XFCE install — `pick_file` returns `None`, and rfd
+    /// makes that **indistinguishable from the user pressing Cancel**. So the
+    /// button did nothing, silently, with no way for the app to know it had
+    /// failed. Installing a portal is a fix for one machine; this is the fix
+    /// for the app.
+    ///
+    /// A directory listing and nothing more, in the same spirit as
+    /// [`Dialog::PluginPicker`]: no thumbnails, no places sidebar, no
+    /// bookmarks. It exists so that somebody with nothing installed can still
+    /// choose a file.
+    FileBrowser {
+        title: String,
+        what: BrowseFor,
+        /// The directory being shown. The host lists it; this only draws.
+        at: std::path::PathBuf,
+        /// Directories first, then matching files, sorted by the host.
+        entries: Vec<FileEntry>,
+        selected: Option<usize>,
+        /// Why the last listing came back empty, if it was a reason rather
+        /// than an empty folder.
+        error: String,
+    },
     NoMidiInput,
     MidiError {
         message: String,
@@ -266,6 +292,16 @@ pub struct LearningStatus {
 
 pub enum DialogAction {
     ConnectPort(String),
+    /// List this directory and hand the rows back. The host reads the disk;
+    /// the dialog draws what it is given, the same division the plugin picker
+    /// uses.
+    BrowseTo(std::path::PathBuf),
+    /// The browser's answer. `None` is a cancel, and is sent so the host can
+    /// drop whatever it was holding for the request.
+    Browsed {
+        what: BrowseFor,
+        path: Option<std::path::PathBuf>,
+    },
     /// Persist the welcome dialog's "don't show again" choice.
     SetShowWelcome(bool),
     /// Frames per audio callback, or `None` for the device's own default.
@@ -1193,6 +1229,22 @@ impl Dialog {
             had_camera,
         }
     }
+}
+
+/// One row in the in-app file browser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    /// What to show. The file name, or `..` for the way up.
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub is_dir: bool,
+}
+
+/// What the in-app browser is being opened for, so its answer can be routed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseFor {
+    File(crate::ports::FilePurpose),
+    Folder(crate::ports::DirPurpose),
 }
 
 /// Which kind of device a [`Dialog::DevicePicker`] is choosing.
@@ -2179,6 +2231,120 @@ pub fn show(
                                     result.close = true;
                                 }
                             });
+                        });
+                },
+            )
+        }
+
+        Dialog::FileBrowser {
+            title,
+            what,
+            at,
+            entries,
+            selected,
+            error,
+        } => {
+            let what = *what;
+            let stock = stock_style(ctx);
+            let folder = matches!(what, BrowseFor::Folder(_));
+            show_dialog_viewport(
+                ctx,
+                placement,
+                title,
+                Vec2::new(560.0, 420.0),
+                Vec2::new(360.0, 240.0),
+                |ui, result| {
+                    *ui.style_mut() = stock.clone();
+                    let bg = ui.style().visuals.window_fill;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            // Where we are. Truncated from the LEFT: the end
+                            // of a path is the part that says where you are.
+                            let shown = at.to_string_lossy();
+                            let shown = if shown.chars().count() > 64 {
+                                let tail: String =
+                                    shown.chars().rev().take(61).collect::<Vec<_>>()
+                                        .into_iter().rev().collect();
+                                format!("...{tail}")
+                            } else {
+                                shown.into_owned()
+                            };
+                            ui.label(shown);
+                            if !error.is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(error.as_str());
+                            }
+                            ui.add_space(4.0);
+                            let bottom_h = 34.0;
+                            let list_h = (ui.available_height() - bottom_h).max(40.0);
+                            let mut go: Option<std::path::PathBuf> = None;
+                            egui::ScrollArea::vertical()
+                                .max_height(list_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    if entries.is_empty() && error.is_empty() {
+                                        ui.label("nothing here that can be opened");
+                                    }
+                                    for (i, e) in entries.iter().enumerate() {
+                                        let label = if e.is_dir {
+                                            format!("{}/", e.name)
+                                        } else {
+                                            e.name.clone()
+                                        };
+                                        let r =
+                                            ui.selectable_label(*selected == Some(i), label);
+                                        if r.clicked() {
+                                            *selected = Some(i);
+                                        }
+                                        // **A double click on a folder goes
+                                        // in.** One click selects, because a
+                                        // folder is a valid answer when the
+                                        // browser is picking one.
+                                        if r.double_clicked() && e.is_dir {
+                                            go = Some(e.path.clone());
+                                        }
+                                    }
+                                });
+                            ui.add_space(6.0);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let chosen = selected.and_then(|i| entries.get(i));
+                                let into_dir = chosen.filter(|e| e.is_dir).map(|e| e.path.clone());
+                                // Choosing a FOLDER can mean "this one", so
+                                // the button says which it will do.
+                                let verb = match (&into_dir, folder) {
+                                    (Some(_), false) => "Open",
+                                    (Some(_), true) => "Open",
+                                    (None, _) => "Choose",
+                                };
+                                if ui.button(verb).clicked() {
+                                    if let Some(dir) = into_dir {
+                                        go = Some(dir);
+                                    } else if let Some(e) = chosen {
+                                        action = Some(DialogAction::Browsed {
+                                            what,
+                                            path: Some(e.path.clone()),
+                                        });
+                                        result.close = true;
+                                    }
+                                }
+                                if folder && ui.button("Use this folder").clicked() {
+                                    action = Some(DialogAction::Browsed {
+                                        what,
+                                        path: Some(at.clone()),
+                                    });
+                                    result.close = true;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    action = Some(DialogAction::Browsed { what, path: None });
+                                    result.close = true;
+                                }
+                            });
+                            if let Some(dir) = go {
+                                *selected = None;
+                                action = Some(DialogAction::BrowseTo(dir));
+                            }
                         });
                 },
             )

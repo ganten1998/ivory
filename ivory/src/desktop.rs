@@ -250,6 +250,10 @@ pub struct DesktopApp {
     /// `SetPatchParam`.
     #[cfg(feature = "recorder")]
     editing: Option<crate::dx7::Voice>,
+    /// What the in-app browser is filtering by, so the folder it navigates
+    /// into is listed the same way the first one was.
+    #[cfg(feature = "recorder")]
+    browse_extensions: Vec<String>,
     /// The decoded backing track, kept so the engine's `Arc` has an owner here
     /// and the file is not decoded again on every settings push.
     #[cfg(feature = "recorder")]
@@ -382,6 +386,51 @@ fn a_filter_knob_reads_out_where_its_filter_actually_is() {
             );
         }
     }
+}
+
+/// **A directory listing is a listing, sorted and filtered.**
+///
+/// The in-app browser exists because `rfd` silently does nothing on a Linux
+/// box with no portal and no zenity, so this is the only way to choose a file
+/// there — and a browser that hid the file somebody wanted, or offered them a
+/// `.DS_Store`, would be a worse answer than the silence it replaced.
+#[cfg(all(test, feature = "recorder"))]
+#[test]
+fn the_browser_lists_folders_first_and_filters_what_it_offers() {
+    let root = std::env::temp_dir().join(format!("tangent-browse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("Zebra")).expect("mkdir");
+    std::fs::create_dir_all(root.join("apple")).expect("mkdir");
+    for f in ["b.wav", "A.MP3", "notes.txt", ".hidden.wav"] {
+        std::fs::write(root.join(f), b"x").expect("write");
+    }
+    let exts: Vec<String> = ["wav", "mp3"].into_iter().map(str::to_owned).collect();
+    let (rows, err) = DesktopApp::list_dir(&root, &exts);
+    assert!(err.is_empty(), "{err}");
+    let names: Vec<&str> = rows.iter().map(|e| e.name.as_str()).collect();
+
+    // The way up, then folders, then files - each sorted without regard to
+    // case, which is the order every file manager uses.
+    assert_eq!(names, ["..", "apple", "Zebra", "A.MP3", "b.wav"], "{names:?}");
+    assert!(rows[0].is_dir && rows[1].is_dir && rows[2].is_dir);
+    assert!(!rows[3].is_dir);
+    // **Case-insensitively filtered**: a file named `.MP3` is an mp3, and a
+    // browser that only matched lowercase would hide half of anybody's music.
+    assert!(!names.contains(&"notes.txt"), "an unmatched file was offered");
+    assert!(!names.contains(&".hidden.wav"), "a dotfile was offered");
+
+    // No filter at all offers everything but the dotfiles.
+    let (all, _) = DesktopApp::list_dir(&root, &[]);
+    assert!(all.iter().any(|e| e.name == "notes.txt"));
+    assert!(!all.iter().any(|e| e.name.starts_with('.') && e.name != ".."));
+
+    // A folder that is not there is a sentence, not a panic or an empty list
+    // that looks like an empty folder.
+    let (rows, err) = DesktopApp::list_dir(&root.join("nope"), &exts);
+    assert!(rows.is_empty());
+    assert!(!err.is_empty(), "a missing folder reported nothing");
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// [`effect_defaults`], for the offscreen screenshot test.
@@ -973,7 +1022,39 @@ impl DesktopApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
+        // The in-app browser's three messages, pumped out here with the native
+        // dialogs because listing a directory is disk I/O and `ivory-ui` does
+        // not do that.
+        if let Some(dir) = self.app.take_browse_request() {
+            let exts = self.browse_extensions.clone();
+            let (entries, error) = Self::list_dir(&dir, &exts);
+            self.app.set_browser(dir, entries, error);
+        }
+        if let Some((purpose, file)) = self.app.take_browsed_file() {
+            self.finish_file_choice(purpose, &file);
+        }
+        if let Some((purpose, dir)) = self.app.take_browsed_dir() {
+            self.finish_dir_choice(purpose, dir);
+        }
+
         if let Some(request) = self.app.take_directory_request() {
+            // No portal and no zenity: our own browser, as for files.
+            if !Self::native_dialogs_work() {
+                let at = request
+                    .start_at
+                    .filter(|p| p.is_dir())
+                    .or_else(dirs::home_dir)
+                    .unwrap_or_else(|| std::path::PathBuf::from("/"));
+                self.browse_extensions = Vec::new();
+                let (entries, _) = Self::list_dir(&at, &[]);
+                self.app.open_browser(
+                    request.title.clone(),
+                    ivory_ui::dialogs::BrowseFor::Folder(request.purpose),
+                    at,
+                    entries,
+                );
+                return;
+            }
             // Parented, for the reason `take_cartridge_request` gives: an
             // unparented panel can open behind the app on Windows.
             let mut dialog = rfd::FileDialog::new()
@@ -983,21 +1064,7 @@ impl DesktopApp {
                 dialog = dialog.set_directory(start);
             }
             if let Some(dir) = dialog.pick_folder() {
-                match request.purpose {
-                    // The tick is left where the user had it. Choosing a folder
-                    // is not a statement about whether to go on choosing it,
-                    // and silently ticking "use this by default" because
-                    // somebody picked a folder once is how a temporary
-                    // destination becomes permanent without anyone deciding it
-                    // should.
-                    ivory_ui::ports::DirPurpose::RecordRoot => {
-                        let remember = self.app.record_dir_is_default();
-                        self.app.set_record_dir(dir, remember);
-                    }
-                    ivory_ui::ports::DirPurpose::PluginFolder => {
-                        self.app.add_plugin_folder(dir);
-                    }
-                }
+                self.finish_dir_choice(request.purpose, dir);
             }
         }
         self.take_cartridge_request(frame);
@@ -1355,6 +1422,24 @@ impl DesktopApp {
             return;
         };
         let purpose = request.purpose;
+        // **No portal, no zenity: our own browser.** Otherwise this opens a
+        // dialog that never appears and returns the same `None` a cancel does.
+        if !Self::native_dialogs_work() {
+            let at = request
+                .start_at
+                .filter(|p| p.is_dir())
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(|| std::path::PathBuf::from("/"));
+            let (entries, _) = Self::list_dir(&at, &request.extensions);
+            self.browse_extensions = request.extensions.clone();
+            self.app.open_browser(
+                request.title.clone(),
+                ivory_ui::dialogs::BrowseFor::File(request.purpose),
+                at,
+                entries,
+            );
+            return;
+        }
         let mut dialog = rfd::FileDialog::new().set_title(&request.title);
         // **Parented to the window that asked for it.**
         //
@@ -1379,24 +1464,7 @@ impl DesktopApp {
             dialog = dialog.add_filter("All files", &["*"]);
         }
         let Some(file) = dialog.pick_file() else { return };
-        if purpose == ivory_ui::ports::FilePurpose::BackingTrack {
-            self.load_track(&file);
-            return;
-        }
-        match crate::dx7::Cartridge::load(&file) {
-            Ok(cart) => {
-                self.app.set_cartridge(cartridge_info(&cart, ""));
-                self.app
-                    .set_dx7_cartridge(file.to_string_lossy().into_owned());
-                self.cartridge = Some(cart);
-            }
-            // Reported INTO the dialog rather than as a message box, because
-            // the dialog is still open and the next thing the user will do is
-            // pick a different file from the same folder.
-            Err(e) => self
-                .app
-                .set_cartridge(ivory_ui::ports::CartridgeInfo { error: e, ..Default::default() }),
-        }
+        self.finish_file_choice(purpose, &file);
     }
 
     /// Reload last session's backing track, if the file is still there.
@@ -1421,6 +1489,157 @@ impl DesktopApp {
         // that a NEW file should not open already cut to the last one's
         // length, and that reasoning does not apply here.
         self.app.set_track_trim(from, to);
+    }
+
+    /// What to do with a chosen folder, whichever picker chose it.
+    #[cfg(feature = "recorder")]
+    fn finish_dir_choice(&mut self, purpose: ivory_ui::ports::DirPurpose, dir: std::path::PathBuf) {
+        match purpose {
+            // The tick is left where the user had it. Choosing a folder is not
+            // a statement about whether to go on choosing it, and silently
+            // ticking "use this by default" because somebody picked a folder
+            // once is how a temporary destination becomes permanent without
+            // anyone deciding it should.
+            ivory_ui::ports::DirPurpose::RecordRoot => {
+                let remember = self.app.record_dir_is_default();
+                self.app.set_record_dir(dir, remember);
+            }
+            ivory_ui::ports::DirPurpose::PluginFolder => self.app.add_plugin_folder(dir),
+        }
+    }
+
+    /// What to do with a chosen file, whichever picker chose it.
+    #[cfg(feature = "recorder")]
+    fn finish_file_choice(
+        &mut self,
+        purpose: ivory_ui::ports::FilePurpose,
+        file: &std::path::Path,
+    ) {
+        if purpose == ivory_ui::ports::FilePurpose::BackingTrack {
+            self.load_track(file);
+            return;
+        }
+        match crate::dx7::Cartridge::load(file) {
+            Ok(cart) => {
+                self.app.set_cartridge(cartridge_info(&cart, ""));
+                self.app
+                    .set_dx7_cartridge(file.to_string_lossy().into_owned());
+                self.cartridge = Some(cart);
+            }
+            // Reported INTO the dialog rather than as a message box, because
+            // the dialog is still open and the next thing the user will do is
+            // pick a different file from the same folder.
+            Err(e) => self
+                .app
+                .set_cartridge(ivory_ui::ports::CartridgeInfo { error: e, ..Default::default() }),
+        }
+    }
+
+    /// Whether a NATIVE file dialog will actually appear.
+    ///
+    /// **`rfd` cannot tell you this and its failure looks like a cancel.** On
+    /// Linux it has two backends compiled in — xdg-desktop-portal, then a
+    /// zenity subprocess — and on a box with neither, `pick_file` returns
+    /// `None`, which is the same thing it returns when somebody presses
+    /// Cancel. The app cannot distinguish them, so a missing portal is a
+    /// button that silently does nothing. Diagnosed on Void + XFCE; see
+    /// `docs/LINUX-4.16-FINDINGS.md`.
+    ///
+    /// So it is probed instead, from the two facts that decide it:
+    ///
+    /// * a portal implementation that provides `FileChooser` — every portal
+    ///   backend registers itself in a `.portal` file listing the interfaces
+    ///   it implements, and the box in the report had one for Secret and none
+    ///   for files, which is why "a portal is installed" is not the question;
+    /// * or `zenity` somewhere on `PATH`.
+    ///
+    /// No new dependency, and wrong only in the direction that costs nothing:
+    /// if this says no and a native dialog would have worked, the in-app
+    /// browser opens instead and still chooses the file.
+    #[cfg(target_os = "linux")]
+    fn native_dialogs_work() -> bool {
+        fn which_on_path(exe: &str) -> bool {
+            std::env::var_os("PATH").is_some_and(|p| {
+                std::env::split_paths(&p).any(|d| d.join(exe).is_file())
+            })
+        }
+
+        // A session bus at all. Without one there is no portal by definition.
+        let has_bus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some();
+        let portal_dirs = [
+            std::path::PathBuf::from("/usr/share/xdg-desktop-portal/portals"),
+            std::path::PathBuf::from("/usr/local/share/xdg-desktop-portal/portals"),
+        ];
+        let chooser = has_bus
+            && portal_dirs.iter().any(|dir| {
+                std::fs::read_dir(dir).is_ok_and(|rd| {
+                    rd.flatten().any(|e| {
+                        e.path().extension().is_some_and(|x| x == "portal")
+                            && std::fs::read_to_string(e.path())
+                                .is_ok_and(|t| t.contains("FileChooser"))
+                    })
+                })
+            });
+        chooser || which_on_path("zenity")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn native_dialogs_work() -> bool {
+        true
+    }
+
+    /// The directory the in-app browser should show, and its rows.
+    ///
+    /// Directories first and then files, each sorted case-insensitively,
+    /// because that is the order every file manager uses and the one a hand
+    /// reaching down a list expects.
+    #[cfg(feature = "recorder")]
+    fn list_dir(
+        at: &std::path::Path,
+        extensions: &[String],
+    ) -> (Vec<ivory_ui::dialogs::FileEntry>, String) {
+        use ivory_ui::dialogs::FileEntry;
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        let read = match std::fs::read_dir(at) {
+            Ok(r) => r,
+            Err(e) => return (Vec::new(), format!("cannot open that folder ({e})")),
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Dotfiles stay hidden. Somebody who needs one can still reach it,
+            // because the browser follows wherever it is pointed.
+            if name.starts_with('.') {
+                continue;
+            }
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            if is_dir {
+                dirs.push(FileEntry { name, path, is_dir });
+            } else if extensions.is_empty()
+                || path.extension().is_some_and(|x| {
+                    let x = x.to_string_lossy().to_lowercase();
+                    extensions.iter().any(|e| e.eq_ignore_ascii_case(&x))
+                })
+            {
+                files.push(FileEntry { name, path, is_dir });
+            }
+        }
+        let key = |e: &FileEntry| e.name.to_lowercase();
+        dirs.sort_by_key(key);
+        files.sort_by_key(key);
+        // The way up first, when there is one.
+        let mut out = Vec::with_capacity(dirs.len() + files.len() + 1);
+        if let Some(up) = at.parent() {
+            out.push(FileEntry {
+                name: "..".to_owned(),
+                path: up.to_path_buf(),
+                is_dir: true,
+            });
+        }
+        out.extend(dirs);
+        out.extend(files);
+        (out, String::new())
     }
 
     /// Decode an audio file and hand it to the engine.
@@ -1988,6 +2207,8 @@ impl DesktopApp {
             cartridge: None,
             #[cfg(feature = "recorder")]
             editing: None,
+            #[cfg(feature = "recorder")]
+            browse_extensions: Vec::new(),
             #[cfg(feature = "recorder")]
             track: None,
         };

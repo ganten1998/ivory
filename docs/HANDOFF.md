@@ -1,7 +1,7 @@
 # Ivory 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-19. **The app is now called TANGENT.** Newest work is
-§2l: the backing-track player. Before it, §2k: the limiter's makeup gain, the
+§2m: Linux hardening. Before it, §2l: the backing-track player. Before it, §2k: the limiter's makeup gain, the
 DX7 fader bug, and a dismissable CLIPPED.
 Before it, §2j: one gesture set across all eight knobs.
 Before it, §2i (the master column) and §2h (six effect knobs, the true-peak
@@ -1132,6 +1132,47 @@ edge and so is not centred on them.
 
 ---
 
+## 2m. 2026-08-19 — Linux hardening, and one piece of advice reversed
+
+Shipped as **4.17.0**, from `docs/LINUX-4.16-FINDINGS.md` — a measured report
+off the Void box. Both findings were real and one of them contradicts what this
+project had already written down.
+
+### The file picker was dead on a portal-less box
+
+`rfd` on Linux has two backends: xdg-desktop-portal, then a zenity subprocess.
+With neither, `pick_file()` returns `None` — **which is exactly what it returns
+when somebody presses Cancel**, so the app could not tell it had failed and
+silently did nothing. That is every file dialog: the cartridge, the backing
+track, the record folder, the plugin folder.
+
+`Dialog::FileBrowser` is the fallback: a directory listing and nothing more, in
+the same spirit as `PluginPicker`. The host lists the directory (disk I/O stays
+out of `ivory-ui`) and the dialog draws rows. `native_dialogs_work()` decides
+which to open, from two facts and no new dependency: does any installed
+`.portal` file advertise `FileChooser` — the report's box had a Secret portal
+and no file one, so "a portal exists" is the wrong question — and is `zenity`
+on `PATH`. Wrong only in the direction that costs nothing: a false negative
+opens our browser and still chooses the file.
+
+### The underruns were buffer geometry, not scheduling
+
+cpal's ALSA host reads `BufferSize::Fixed(v)` as the whole RING and divides it
+into four. So `Fixed(256)` on Linux is not a 256-frame callback — it is a
+256-frame ring refilled every **64 frames**, four times the callback rate the
+number was chosen for, on a SCHED_OTHER thread. macOS and WASAPI read the same
+call as the period. `BUFFER_PERIODS` multiplies by four on Linux so the two
+agree; measured 6 underruns per 30 s before, 0 after.
+
+**And no realtime promotion**, which is the part worth remembering.
+`LINUX-4.11-FINDINGS.md` finding 1(c) asked for rtkit. Measured, it made things
+an order of magnitude worse — 75 underruns against 6, starting the instant the
+thread was promoted — because pipewire's own data loop is already at RT 83 and
+a client at FIFO 70 inverts priority against its non-RT IPC thread. It is in
+§8's trap list now so it does not get "fixed" again.
+
+---
+
 ## 3. Repo layout
 
 ```
@@ -1395,6 +1436,19 @@ rely on Ubuntu Light. Do not disable `default_fonts`.
   bash suppresses errexit for the entire left operand of `||`, function body
   included. `scripts/build-cross.sh` shipped empty Linux tarballs for a week
   because of it. Check each step explicitly in any such function.
+- **Do NOT give the Linux audio thread realtime priority.** It is the textbook
+  fix, `LINUX-4.11-FINDINGS.md` finding 1(c) asked for it, and it is wrong
+  here: measured on a 2012 MacBook Air through pipewire-alsa, promoting
+  `cpal_alsa_out` to FIFO 70 took 6 underruns per 30 s to **75**, starting the
+  moment the thread was promoted. The plugin's own data loop already runs at
+  RT 83 and a client above its non-RT IPC thread inverts priority against it.
+  What actually fixed it was the buffer geometry — see `BUFFER_PERIODS`.
+- **`rfd` on Linux fails silently and returns the same `None` as a cancel.**
+  Two backends compiled in (xdg-desktop-portal, then a zenity subprocess); a
+  box with neither is an ordinary minimal install, and every file dialog in the
+  app was a button that did nothing with no way to detect it. There is an
+  in-app browser behind `native_dialogs_work()` now. Anything new that reaches
+  for `rfd` needs the same fallback.
 - **A `cfg`-gated module is not compiled on the host, so `cargo build` proves
   nothing about it.** `decode.rs` reached into `encode::ffmpeg`, which is
   `#[cfg(not(macos))]` — the mac build never compiles it, every mac check

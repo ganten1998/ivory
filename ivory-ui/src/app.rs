@@ -259,6 +259,11 @@ pub struct IvoryApp {
     /// the native panel's nested run loop never starts inside an egui frame.
     dir_request: Option<crate::ports::DirRequest>,
     file_request: Option<crate::ports::FileRequest>,
+    /// The in-app browser's three messages to the host: list this, I chose a
+    /// file, I chose a folder. See `Dialog::FileBrowser`.
+    browse_request: Option<std::path::PathBuf>,
+    browsed_file: Option<(crate::ports::FilePurpose, std::path::PathBuf)>,
+    browsed_dir: Option<(crate::ports::DirPurpose, std::path::PathBuf)>,
     /// Patch names of the cartridge the host has loaded, for the picker. The
     /// app never reads a `.syx`: this is pushed in after the host parses one.
     cartridge: crate::ports::CartridgeInfo,
@@ -638,6 +643,9 @@ impl IvoryApp {
             recorder_request: std::collections::VecDeque::new(),
             dir_request: None,
             file_request: None,
+            browse_request: None,
+            browsed_file: None,
+            browsed_dir: None,
             cartridge: crate::ports::CartridgeInfo::default(),
             plugin_rescan: false,
             reveal_request: None,
@@ -2399,6 +2407,77 @@ impl IvoryApp {
     /// the same state a right-click sets.
     pub fn open_effect_panel(&mut self, fx: recorder_panel::Fx) {
         self.fx_open = Some(fx);
+    }
+
+    /// A directory the in-app browser wants listed. See `Dialog::FileBrowser`.
+    pub fn take_browse_request(&mut self) -> Option<std::path::PathBuf> {
+        self.browse_request.take()
+    }
+
+    /// The rows for the directory the browser asked about.
+    pub fn set_browser(
+        &mut self,
+        at: std::path::PathBuf,
+        entries: Vec<dialogs::FileEntry>,
+        error: String,
+    ) {
+        if let Some(dialogs::Dialog::FileBrowser {
+            at: shown,
+            entries: rows,
+            selected,
+            error: err,
+            ..
+        }) = self.dialog.as_mut()
+        {
+            *shown = at;
+            *rows = entries;
+            *selected = None;
+            *err = error;
+        }
+    }
+
+    /// Open the in-app browser, for a host with no native dialog to offer.
+    pub fn open_browser(
+        &mut self,
+        title: String,
+        what: dialogs::BrowseFor,
+        at: std::path::PathBuf,
+        entries: Vec<dialogs::FileEntry>,
+    ) {
+        self.dialog = Some(dialogs::Dialog::FileBrowser {
+            title,
+            what,
+            at,
+            entries,
+            selected: None,
+            error: String::new(),
+        });
+    }
+
+    /// What the browser came back with, routed the same way the native
+    /// dialog's answer is.
+    fn finish_browse(&mut self, what: dialogs::BrowseFor, path: Option<std::path::PathBuf>) {
+        let Some(path) = path else {
+            return;
+        };
+        match what {
+            dialogs::BrowseFor::File(p) => self.browsed_file = Some((p, path)),
+            dialogs::BrowseFor::Folder(p) => self.browsed_dir = Some((p, path)),
+        }
+    }
+
+    /// A file the in-app browser chose, for the host to act on.
+    pub fn take_browsed_file(
+        &mut self,
+    ) -> Option<(crate::ports::FilePurpose, std::path::PathBuf)> {
+        self.browsed_file.take()
+    }
+
+    /// A folder the in-app browser chose.
+    pub fn take_browsed_dir(
+        &mut self,
+    ) -> Option<(crate::ports::DirPurpose, std::path::PathBuf)> {
+        self.browsed_dir.take()
     }
 
     /// Ask the host for an audio file to play along to.
@@ -4307,6 +4386,10 @@ impl IvoryApp {
     /// script.
     pub fn apply_dialog_action(&mut self, action: DialogAction) {
         match action {
+            // The browser asks; the host reads the disk and hands the rows
+            // back through `set_browser`.
+            DialogAction::BrowseTo(dir) => self.browse_request = Some(dir),
+            DialogAction::Browsed { what, path } => self.finish_browse(what, path),
             DialogAction::SetBufferFrames(frames) => {
                 self.settings.record_buffer_frames = i64::from(frames.unwrap_or(0));
                 self.save_settings();

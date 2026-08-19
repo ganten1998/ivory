@@ -244,6 +244,12 @@ fn main() {
     install_panic_hook();
 
     if !acquire_single_instance() {
+        // **The terminal first**, as the panic hook does. A message box on
+        // Linux goes through a portal or a zenity subprocess, and on a box
+        // with neither `rfd` shows nothing and says nothing about it — so the
+        // one line explaining why the app just exited would be lost on exactly
+        // the machines where somebody is running it from a shell anyway.
+        eprintln!("Tangent is already running. Only one instance can run at a time.");
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Warning)
             .set_title("Tangent Already Running")
