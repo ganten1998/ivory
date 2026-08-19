@@ -1182,6 +1182,16 @@ impl Meters {
         self.clipped.iter().any(|c| *c)
     }
 
+    /// Put out the clip latch, and nothing else.
+    ///
+    /// **Not the take's history.** `take_peak` and `frames` are what say
+    /// whether anything was recorded at all; a user acknowledging a red light
+    /// must not also erase the evidence that the take was silent.
+    pub fn clear_clip(&mut self) {
+        self.clipped.iter_mut().for_each(|c| *c = false);
+        self.clipped_samples = 0;
+    }
+
     pub fn loudest_take_peak(&self) -> f32 {
         self.take_peak.iter().copied().fold(0.0f32, f32::max)
     }
@@ -1243,9 +1253,18 @@ impl LevelTracker {
     /// gone by bar 4 and the whole point of a latch is lost.
     pub fn arm(&mut self) {
         self.take_peak.iter_mut().for_each(|p| *p = 0.0);
+        self.clear_clip();
+        self.frames = 0;
+    }
+
+    /// Put out the clip latch, and nothing else.
+    ///
+    /// **Not `arm`.** Arming also forgets `take_peak` and the frame count,
+    /// which are the take's history — a user acknowledging a red light must
+    /// not also erase the evidence that the take was silent.
+    pub fn clear_clip(&mut self) {
         self.clipped.iter_mut().for_each(|c| *c = false);
         self.clipped_samples = 0;
-        self.frames = 0;
     }
 
     pub fn channels(&self) -> usize {

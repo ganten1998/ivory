@@ -2585,6 +2585,7 @@ impl IvoryApp {
         match hit {
             Hit::Record => self.request_recorder(R::Toggle),
             Hit::Stop => self.request_recorder(R::Stop),
+            Hit::DismissClip => self.request_recorder(R::DismissClip),
             // Opens the menu, led by the Recorder's own categories, at the
             // button. The take's settings live there now, and a button that
             // opens the place they went is what keeps them findable by
@@ -6816,7 +6817,8 @@ mod tests {
             app.apply_recorder_hit(reset);
         }
         for fx in recorder_panel::Fx::ALL {
-            assert_eq!(app.fx_value(fx), 0.0, "{} did not go back", fx.title());
+            let rest = if fx == recorder_panel::Fx::Limiter { 1.0 } else { 0.0 };
+            assert_eq!(app.fx_value(fx), rest, "{} did not go back", fx.title());
         }
         assert!((app.settings.record_export.tempo_bpm - 120.0).abs() < 1.0e-9);
         assert!(

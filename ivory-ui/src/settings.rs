@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 8;
+const SETTINGS_VERSION: u64 = 9;
 
 /// Recorder backgrounds this app shipped as defaults before [`SETTINGS_VERSION`]
 /// 1, and which are therefore not evidence that anybody chose them.
@@ -433,7 +433,9 @@ pub struct Settings {
     pub hpf_mix: f64,
     /// The low-pass corner, 0..=1. **Up is darker.**
     pub lpf_mix: f64,
-    /// How hard the limiter is driven, 0..=1. 0 is bypass.
+    /// The limiter's threshold, 0..=1. **1.0 is bypass** — this is the one
+    /// knob in the band whose resting position is the top of its travel,
+    /// because that is what a threshold control is.
     pub limiter_mix: f64,
     /// What each effect is set to, under its right-click menu.
     ///
@@ -636,7 +638,7 @@ impl Default for Settings {
             chorus_mix: 0.0,
             hpf_mix: 0.0,
             lpf_mix: 0.0,
-            limiter_mix: 0.0,
+            limiter_mix: 1.0,
             effect_params: Map::new(),
             dx7_cartridge: String::new(),
             dx7_patch: 0,
@@ -1269,6 +1271,18 @@ impl Settings {
         legacy_staff: bool,
         saw_order: bool,
     ) {
+        if was < 9 {
+            // **The limiter's dial turned round.** It used to be off at zero
+            // like everything else; it is a threshold now and off is fully
+            // clockwise. A file written before this says `limiter_mix: 0.0`,
+            // which under the new reading is a -48 dB threshold — every take
+            // slammed flat, on a control the user never touched.
+            //
+            // Nobody loses a setting they chose here: the old dial only went
+            // 12 dB and the new one means something different at every
+            // position, so there is nothing to carry across.
+            self.limiter_mix = 1.0;
+        }
         if was < 8 {
             // **Video on, for people who have it off because it shipped off.**
             //

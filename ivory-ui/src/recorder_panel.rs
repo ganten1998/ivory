@@ -711,7 +711,14 @@ impl Layout {
             // says: they share the row and neither may be the reason the other
             // is unreadable.
             status: slice_h(status, 0.0, 0.68),
-            clip: slice_h(status, 0.70, 1.0),
+            // **Only while it is showing.** The rect is a press target now,
+            // and a target where nothing is drawn is a hole in the band that
+            // swallows clicks meant for the row underneath.
+            clip: if view.showing_clip() {
+                slice_h(status, 0.70, 1.0)
+            } else {
+                Rect::NOTHING
+            },
             ..Self::empty(rolling)
         };
 
@@ -985,7 +992,7 @@ impl Layout {
         if !knob_fits(knob) {
             return;
         }
-        let readout_h = (m.height() * MASTER_READOUT_H).clamp(13.0, 24.0);
+        let readout_h = (m.height() * MASTER_READOUT_H).clamp(11.0, 17.0);
         let readout = Rect::from_min_max(
             Pos2::new(m.left(), knob.top() - readout_h),
             Pos2::new(m.right(), knob.top()),
@@ -1148,11 +1155,12 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 43] {
+    fn targets(&self) -> [(Rect, Produces); 44] {
         use Produces::{Along, AlongV, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
         let s = &self.slots;
         [
+            (self.clip, Fixed(Hit::DismissClip)),
             (self.record, Fixed(Hit::Record)),
             (self.stop, Fixed(Hit::Stop)),
             (self.setup, Fixed(Hit::OpenSetup)),
@@ -1308,6 +1316,13 @@ pub enum Hit {
     /// scaling cannot disagree.
     SetMetronomeGain(f32),
     /// The three effect sends, 0..=1.
+    /// Acknowledge the clip warning and put every clip latch out.
+    ///
+    /// A latch that clears itself is one the performer never sees, because
+    /// they were looking at their hands. A latch with no way to clear it is
+    /// one that stays lit for the rest of the session and stops meaning
+    /// anything — which is the same failure, slower.
+    DismissClip,
     /// The master, as a FADER POSITION 0..=1 — not a gain. Same curve as the
     /// four faders, because it is one; it just wears a knob.
     SetMaster(f32),
@@ -1357,7 +1372,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 45] = [
+    pub const ALL: [Hit; 46] = [
         Hit::Record,
         Hit::Stop,
         Hit::OpenSetup,
@@ -1394,6 +1409,7 @@ impl Hit {
         Hit::SetSlotGain(4, Hit::MIDWAY),
         Hit::SetMetronomeGain(Hit::MIDWAY),
         Hit::SetMaster(Hit::MIDWAY),
+        Hit::DismissClip,
         Hit::SetFx(Fx::Reverb, Hit::MIDWAY),
         Hit::SetFx(Fx::Delay, Hit::MIDWAY),
         Hit::SetFx(Fx::Chorus, Hit::MIDWAY),
@@ -1469,6 +1485,7 @@ impl Hit {
             Hit::SetMetronomeGain(_) => "Click level",
             Hit::SetFx(fx, _) => fx.describe(),
             Hit::SetMaster(_) => "Master  -  right-click to type, double-click for 0 dB",
+            Hit::DismissClip => "It clipped  -  click to acknowledge",
             Hit::SetInputGain(_) => "Input level",
             Hit::SetTempo(_) => "Tempo",
             Hit::EditTimeSignature => "Time signature",
@@ -1513,6 +1530,11 @@ impl Hit {
     /// which is 0 dB, and the tempo to 120.
     pub fn reset_to(self) -> Option<Hit> {
         Some(match self {
+            // **The limiter is the exception and it is not an inconsistency.**
+            // Its knob is a threshold, so "not applied" is fully clockwise —
+            // above everything, catching nothing — where every other knob's
+            // "not applied" is fully anticlockwise.
+            Hit::SetFx(Fx::Limiter, _) => Hit::SetFx(Fx::Limiter, 1.0),
             Hit::SetFx(fx, _) => Hit::SetFx(fx, 0.0),
             Hit::SetTempo(_) => Hit::SetTempo(DEFAULT_BPM),
             Hit::SetMaster(_) => Hit::SetMaster(gain_to_fader(1.0)),
@@ -3331,19 +3353,12 @@ const MASTER_RED_DB: f32 = -6.0;
 /// Segments in each ladder.
 const MASTER_SEGMENTS: usize = 22;
 
-/// The reduction that fills the wash behind the readout completely, in dB.
-///
-/// Twelve. Past this it stays full: the difference between 12 dB of reduction
-/// and 20 is not a decision anybody makes from a glance at a meter, and the
-/// wash is a glance.
-const MASTER_GR_FLOOR_DB: f32 = 12.0;
-
 /// The ladder's colours, lit. Unlit is these at a tenth.
 const LED_GREEN: Color32 = Color32::from_rgb(0x3d, 0xc0, 0x5a);
 const LED_AMBER: Color32 = Color32::from_rgb(0xe0, 0xa8, 0x22);
 const LED_RED: Color32 = Color32::from_rgb(0xd6, 0x38, 0x28);
 
-/// The wash behind the readout that says the limiter is working.
+/// The strip behind the scale that says the limiter is working.
 ///
 /// **Not green.** Reduction is not a level and there is no amount of it that
 /// is "good"; a colour that said otherwise would be a claim about somebody's
@@ -3454,6 +3469,27 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
         );
     }
 
+    // **The reduction is a strip behind the scale, and the scale is its
+    // readout.** It hangs from 0 and reaches down by however many decibels the
+    // limiter took off, against the same numbers the ladders are read against
+    // — so 6 dB of reduction reaches the -6, and it needs no number of its own.
+    // It had a column, and a column for something that is usually zero is a
+    // column the meters could have had.
+    if l.master_scale.is_positive() && view.gr_db > 0.0 {
+        let inner = l.master_bars.shrink(1.0);
+        let down = (view.gr_db / -MASTER_FLOOR_DB).clamp(0.0, 1.0) * inner.height();
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(l.master_scale.left(), inner.top()),
+                Pos2::new(l.master_scale.right(), inner.top() + down),
+            ),
+            1.0,
+            // Translucent: the numbers are drawn over it and have to stay
+            // readable, which is the whole reason it lives here.
+            Color32::from_rgba_unmultiplied(LED_GR.r(), LED_GR.g(), LED_GR.b(), 96),
+        );
+    }
+
     // The scale, read against the bars.
     if l.master_scale.is_positive() {
         let face = l.master_scale;
@@ -3497,14 +3533,6 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
         // The same recess the ladders sit in, so the readout reads as part of
         // the meter rather than as a caption under it.
         painter.rect_filled(r, 1.0, METER_FACE);
-        let gr = (view.gr_db / MASTER_GR_FLOOR_DB).clamp(0.0, 1.0);
-        if gr > 0.0 {
-            painter.rect_filled(
-                Rect::from_min_max(r.min, Pos2::new(r.right(), r.top() + gr * r.height())),
-                1.0,
-                LED_GR,
-            );
-        }
         let peak = m.peak();
         let out = if peak <= 0.0 {
             "-inf".to_owned()
@@ -3514,7 +3542,7 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
         let size = fit_text(
             Rect::from_min_size(r.min, Vec2::new(l.master_bars.width(), r.height())),
             "-88.8",
-            r.height() * 0.80,
+            r.height() * 0.88,
         );
         if size >= MIN_TEXT {
             // **One colour, and it is not red.** The number sits on a recess
@@ -3593,10 +3621,10 @@ const MASTER_COL: f32 = 0.78;
 /// The readout strip under the ladders, as a share of the column's height,
 /// clamped into points.
 ///
-/// **Taller than the number needs**, because the number is not the only thing
-/// in it: the limiter's reduction fills this box downward from the top, and a
-/// box the height of its own text can only ever show that as a hairline.
-const MASTER_READOUT_H: f32 = 0.11;
+/// **Back to the height of its own number** now that the reduction is drawn
+/// behind the scale instead of in here. What that box was holding open is
+/// space below the meters, and the ladders have it.
+const MASTER_READOUT_H: f32 = 0.05;
 
 /// The dB scale's share of the master column's width. The ladders take the
 /// rest — all of it, since the reduction stopped needing a column of its own.
@@ -3934,7 +3962,7 @@ fn draw_status(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
     // Latched, so it is still there after Stop. An indicator that clears itself
     // is one the performer never sees, because they were looking at their hands
     // when it happened.
-    if view.meters.clipped || view.clip_warning {
+    if view.showing_clip() {
         text_line(painter, l.clip, "CLIPPED", p.rec, true);
     }
 }
@@ -4284,15 +4312,50 @@ mod tests {
 
     /// Both ends of a knob's travel are reachable, and up is more.
     /// **A filter knob reads in hertz, and a send still reads in percent.**
+    /// **The clip warning is a press target exactly while it is on screen.**
+    ///
+    /// A rect with nothing drawn in it is a hole in the band that swallows
+    /// presses meant for the row underneath; a warning with no way to dismiss
+    /// it stays lit for the rest of the session and stops meaning anything.
+    #[test]
+    fn the_clip_warning_can_be_dismissed_only_while_it_is_showing() {
+        let r = band(1300.0);
+        // Not clipping: no rectangle, and a press there is not a dismiss.
+        let quiet = idle();
+        assert!(!quiet.showing_clip());
+        let l = Layout::new(r, &quiet);
+        assert!(!l.clip.is_positive(), "the clip warning has a target unlit");
+
+        // Clipping on the live meter — what the VU paints itself red from.
+        let mut hot = idle();
+        hot.meters.clipped = true;
+        assert!(hot.showing_clip());
+        let l = Layout::new(r, &hot);
+        assert!(l.clip.is_positive(), "nothing to press while it is lit");
+        assert_eq!(hit_test(r, &hot, l.clip.center()), Some(Hit::DismissClip));
+
+        // And from the take summary, which arrives by a different path and
+        // lights the same word.
+        let mut warned = idle();
+        warned.clip_warning = true;
+        assert!(warned.showing_clip());
+        let l = Layout::new(r, &warned);
+        assert!(l.clip.is_positive());
+        assert_eq!(hit_test(r, &warned, l.clip.center()), Some(Hit::DismissClip));
+    }
+
     /// **Every knob resets to the position where it is doing nothing** —
     /// except the two that are not effects, which have a resting value of
     /// their own.
     #[test]
     fn a_double_click_puts_every_knob_back() {
         for fx in Fx::ALL {
+            // The limiter's dial is a threshold: not applied is fully
+            // clockwise, where it is above everything and catches nothing.
+            let rest = if fx == Fx::Limiter { 1.0 } else { 0.0 };
             assert_eq!(
                 Hit::SetFx(fx, 0.77).reset_to(),
-                Some(Hit::SetFx(fx, 0.0)),
+                Some(Hit::SetFx(fx, rest)),
                 "{} does not reset to nothing applied",
                 fx.title()
             );
@@ -5118,8 +5181,13 @@ mod tests {
                     Hit::EditTimeSignature,
                     Hit::NameField,
                 ];
+                // `DismissClip` is a target only while the warning is on
+                // screen, which the idle fixture is not — see
+                // `the_clip_warning_can_be_dismissed_only_while_it_is_showing`,
+                // which is where that half is proved.
                 if IN_THE_MENU.iter().any(|m| m.is_same_control(want))
                     || want == Hit::ToggleMetronomeInTake
+                    || want == Hit::DismissClip
                 {
                     assert!(
                         l.targets().into_iter().all(|(rect, k)| {

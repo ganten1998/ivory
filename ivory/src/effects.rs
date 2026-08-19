@@ -856,20 +856,22 @@ impl Filter {
 
 // ── the limiter ─────────────────────────────────────────────────────────────
 
-/// What the limiter knob spans, in dBFS of THRESHOLD.
+/// What the limiter knob spans, in dBFS of THRESHOLD: fully left to fully
+/// right.
 ///
-/// **The knob is where the limiter starts working**, and it reads in decibels
-/// because that is the only unit the question has an answer in. Zero is the
-/// top and means the limiter is out of the circuit entirely — the same rule
-/// every other knob on this panel follows, where nothing turned is nothing
-/// applied. Turned down, the reconstructed true peak is held under whatever
-/// the dial says: -1 dB on it is the -1 dBTP delivery ceiling.
+/// **This one dial runs the other way and it is the only one that does.**
+/// Every other knob here is off at the bottom of its travel; a threshold is
+/// off at the TOP, fully clockwise, where it is above everything and catches
+/// nothing. That is what a threshold control is on hardware and it is what
+/// makes twelve o'clock -24 dB — the middle of the dial being the middle of
+/// the range only works if the range runs the way the dial does.
+pub const LIMITER_DB: (f32, f32) = (-48.0, 0.0);
+
+/// Below this many dB of threshold the limiter is doing something.
 ///
-/// There is no makeup gain and deliberately so. Something that got quieter
-/// because you asked for it to be limited, and then got louder again because
-/// the limiter decided that is what you meant, is a control that cannot be
-/// reasoned about. The master knob is two inches away.
-pub const LIMITER_DB: (f32, f32) = (0.0, -30.0);
+/// A hair under zero rather than zero, so the resting position is genuinely
+/// out of the circuit rather than a limiter that never quite catches anything.
+const LIMITER_IN_AT_DB: f32 = -0.05;
 
 /// What the release row spans, in milliseconds.
 const RELEASE_MS: (f32, f32) = (20.0, 600.0);
@@ -1087,8 +1089,8 @@ const OFF: f32 = 0.0005;
 /// knob is a few hundred block boundaries.
 const KNOB_SLEW: f32 = 0.0004;
 
-/// How much of each effect, straight off the three knobs.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// How much of each effect, straight off the knobs.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sends {
     pub reverb: f32,
     pub delay: f32,
@@ -1099,8 +1101,31 @@ pub struct Sends {
     /// more of the effect on every other knob here and a filter knob that
     /// alone ran backwards would be the one everybody got wrong.
     pub lpf: f32,
-    /// How hard the signal is driven into the ceiling. 0 is bypass.
+    /// The limiter's threshold, across [`LIMITER_DB`]. **1.0 is bypass**, not
+    /// 0.0: see the constant. This is the one field here whose resting value
+    /// is the top of its range.
     pub limiter: f32,
+}
+
+impl Default for Sends {
+    /// Everything off — which for the limiter means fully clockwise.
+    fn default() -> Self {
+        Self {
+            reverb: 0.0,
+            delay: 0.0,
+            chorus: 0.0,
+            hpf: 0.0,
+            lpf: 0.0,
+            limiter: 1.0,
+        }
+    }
+}
+
+impl Sends {
+    /// This position's threshold, in dBFS.
+    pub fn threshold_db(limiter: f32) -> f32 {
+        LIMITER_DB.0 + (LIMITER_DB.1 - LIMITER_DB.0) * limiter.clamp(0.0, 1.0)
+    }
 }
 
 /// The three effects on the instrument bus.
@@ -1186,13 +1211,17 @@ impl Effects {
         };
         // Every knob at rest AND every mix arrived there: nothing to do, and
         // nothing ringing that would be cut off by not doing it.
+        // **The limiter's "off" is the top of its travel**, unlike everything
+        // else here. Getting this backwards would leave the whole effects
+        // block running on a panel with nothing switched on — or, far worse,
+        // skip a limiter that was set to -48 dB.
         let quiet = |m: &Sends| {
             m.reverb < OFF
                 && m.delay < OFF
                 && m.chorus < OFF
                 && m.hpf < OFF
                 && m.lpf < OFF
-                && m.limiter < OFF
+                && Sends::threshold_db(m.limiter) >= LIMITER_IN_AT_DB
         };
         if quiet(&want) && quiet(&self.mix) {
             if !self.idle {
@@ -1269,7 +1298,8 @@ impl Effects {
         //
         // It stays because it costs one comparison a block and stops being
         // free the day anything sets `mix` instead of easing it.
-        let limiter_on = want.limiter > OFF || self.mix.limiter > OFF;
+        let limiter_on = Sends::threshold_db(want.limiter) < LIMITER_IN_AT_DB
+            || Sends::threshold_db(self.mix.limiter) < LIMITER_IN_AT_DB;
         if !limiter_on {
             self.limiter.clear();
         }
@@ -1285,10 +1315,21 @@ impl Effects {
                 self.lpf[ch].clear();
             }
         }
-        let threshold = {
-            let db = LIMITER_DB.0 + (LIMITER_DB.1 - LIMITER_DB.0) * self.mix.limiter;
-            10f32.powf(db / 20.0)
-        };
+        // The threshold, and the makeup that pays for it.
+        //
+        // **Lowering the threshold makes it LOUDER**, which is the whole point
+        // of the control and the reason it is not just an attenuator: whatever
+        // the limiter takes off the top is given back to everything, so the
+        // quiet parts come up and the loud parts stay where the ceiling is.
+        // A limiter you turn down to get less level is one nobody would reach
+        // for twice.
+        //
+        // The makeup is exactly the threshold, inverted, so the output sits at
+        // 0 dBTP however far the dial is turned. Trimming below that is the
+        // master's job, which is the next knob along.
+        let threshold_db = Sends::threshold_db(self.mix.limiter);
+        let threshold = 10f32.powf(threshold_db / 20.0);
+        let makeup = 10f32.powf(-threshold_db / 20.0);
         let knee_db = KNEE_DB.0 + (KNEE_DB.1 - KNEE_DB.0) * p.limiter_knee;
 
         for f in 0..frames {
@@ -1351,6 +1392,8 @@ impl Effects {
                 out = self
                     .limiter
                     .process(out, threshold, knee_db, p.limiter_release);
+                out[0] *= makeup;
+                out[1] *= makeup;
                 if self.limiter.gain < self.gr {
                     self.gr = self.limiter.gain;
                 }
@@ -1492,7 +1535,10 @@ mod tests {
         fx.process(&mut last, 2_048, 2, sends, &p, 120.0);
         let after = last.iter().fold(0.0f32, |a, b| a.max(b.abs()));
         let reported = fx.gain_reduction_db();
-        let measured = -20.0 * (after / before).log10();
+        // What the LIMITER did, which is what the meter reports — the makeup
+        // gain is a separate stage and is not reduction.
+        let makeup_db = 12.0;
+        let measured = -20.0 * (after / before).log10() + makeup_db;
         assert!(
             (reported - measured).abs() < 0.5,
             "it reported {reported:.2} dB of reduction and applied {measured:.2}"
@@ -1505,19 +1551,22 @@ mod tests {
         assert_eq!(fx.gain_reduction_db(), 0.0, "the reading did not reset");
     }
 
-    /// **The threshold is a guarantee, not an average.**
+    /// **The output brickwalls at 0 dBTP, wherever the threshold is.**
     ///
-    /// Measured on the reconstructed waveform rather than on the samples,
-    /// because that is where the claim lives: a buffer whose samples all sit
-    /// under the threshold can still hand a converter a curve that goes over,
-    /// and "true peak" is exactly the promise that it does not.
+    /// The limiter holds the reconstructed peak at the threshold and the
+    /// makeup gives back exactly that much, so what leaves sits at full scale
+    /// however far the dial is turned. Measured on the reconstructed waveform
+    /// rather than on the samples, because that is where the claim lives: a
+    /// buffer whose samples all sit under full scale can still hand a
+    /// converter a curve that goes over, and "true peak" is the promise that
+    /// it does not.
     #[test]
-    fn the_limiter_holds_a_true_peak_threshold() {
+    fn the_limiter_holds_a_true_peak_ceiling_at_every_threshold() {
         // 7 kHz at 48 k is a little over six samples a cycle: the peaks land
         // between samples most of the time, which is the case a sample-peak
         // limiter gets wrong.
         for (hz, amp) in [(7_000.0, 1.0), (11_000.0, 0.9), (997.0, 1.0)] {
-            for want_db in [-1.0_f32, -6.0, -18.0] {
+            for want_db in [-1.0_f32, -6.0, -18.0, -36.0] {
                 let mut fx = Effects::new(SR);
                 let p = Params::default();
                 let sends = Sends {
@@ -1536,33 +1585,96 @@ mod tests {
                 }
                 let got_db = 20.0 * worst.log10();
                 assert!(
-                    got_db <= want_db + 0.35,
-                    "{hz} Hz reconstructed to {got_db:.2} dBTP against a \
+                    got_db <= 0.35,
+                    "{hz} Hz reconstructed to {got_db:.2} dBTP with a \
                      {want_db:.1} dB threshold"
                 );
                 // And it is passing signal, not just being quiet.
                 assert!(
-                    got_db > want_db - 3.0,
+                    got_db > -3.0,
                     "{hz} Hz only reached {got_db:.2} dBTP - nothing is getting through"
                 );
             }
         }
     }
 
-    /// **Zero on the dial is zero decibels, and zero decibels is out.**
+    /// **Fully right is 0 dB, and 0 dB is out of the circuit.**
     ///
-    /// Every other knob here does nothing at zero. A limiter whose "off"
-    /// still took a decibel off the top would be the one control that lied
-    /// about its own resting position.
+    /// The one dial here that rests at the TOP of its travel. Twelve o'clock
+    /// is the middle of the range because the range runs the way the dial
+    /// does — if these three ever stop agreeing, the knob is lying about where
+    /// the limiter is.
     #[test]
-    fn the_limiter_at_zero_is_out_of_the_circuit() {
-        assert_eq!(LIMITER_DB.0, 0.0, "the top of the dial is not 0 dB");
+    fn the_limiter_dial_runs_from_off_at_the_top() {
+        assert_eq!(Sends::threshold_db(1.0), 0.0, "fully right is not 0 dB");
+        assert_eq!(Sends::threshold_db(0.5), -24.0, "twelve o'clock is not -24 dB");
+        assert_eq!(Sends::threshold_db(0.0), -48.0, "fully left is not -48 dB");
+
+        // And at rest it does nothing at all, bit for bit.
         let p = Params::default();
         let mut fx = Effects::new(SR);
         let mut buf = sine(2_048, 1_000.0, 1.0, 0);
         let before = buf.clone();
         fx.process(&mut buf, 2_048, 2, Sends::default(), &p, 120.0);
         assert_eq!(buf, before, "the limiter did something at 0 dB");
+        assert_eq!(
+            Sends::default().limiter,
+            1.0,
+            "a default Sends has the limiter switched IN"
+        );
+    }
+
+    /// **Lowering the threshold makes it louder.**
+    ///
+    /// This is the whole reason the control exists and the thing it was built
+    /// without: what the limiter takes off the top is given back to
+    /// everything, so the quiet parts come up and the loud parts stay at the
+    /// ceiling. A limiter you turn down to get less level is one nobody would
+    /// reach for twice.
+    #[test]
+    fn lowering_the_threshold_raises_the_level() {
+        let p = Params::default();
+        // A steady tone well under full scale, so there is headroom for the
+        // makeup to use. **No transient bursts**: with a quarter-second
+        // release a spike holds the gain down long after it has gone, which is
+        // the limiter behaving correctly and a terrible way to measure level.
+        let energy = |limiter: f32| {
+            let mut fx = Effects::new(SR);
+            let sends = Sends {
+                limiter,
+                ..Sends::default()
+            };
+            let mut sum = 0.0f64;
+            let mut n = 0u64;
+            for block in 0..60 {
+                let mut buf = sine(2_048, 220.0, 0.25, block * 2_048);
+                fx.process(&mut buf, 2_048, 2, sends, &p, 120.0);
+                // Once the knob has slewed and the release has settled.
+                if block >= 50 {
+                    for v in &buf {
+                        sum += f64::from(*v) * f64::from(*v);
+                        n += 1;
+                    }
+                }
+            }
+            10.0 * (sum / n as f64).max(1e-30).log10()
+        };
+        // -12 dBFS in. At rest it comes out at -12; at a -24 dB threshold it
+        // is pulled down 12 and pushed back up 24, so it arrives at the
+        // ceiling — twelve decibels louder for turning the knob left.
+        let off = energy(1.0);
+        let mid = energy(0.5);
+        assert!(
+            mid > off + 9.0,
+            "at -24 dB it measured {mid:.1} dB against {off:.1} with the limiter out"
+        );
+        // And further down does not make it quieter again, which is the whole
+        // failure this test exists for.
+        let deep = energy(0.0);
+        assert!(
+            deep >= mid - 0.5,
+            "at -48 dB it measured {deep:.1} dB, below the {mid:.1} at -24"
+        );
     }
 
     /// **Three slopes, and they are the slopes they are named after.**

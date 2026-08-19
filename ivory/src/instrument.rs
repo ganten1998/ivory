@@ -970,7 +970,10 @@ impl Shared {
             reverb_mix: AtomicU32::new(0.0f32.to_bits()),
             hpf_mix: AtomicU32::new(0.0f32.to_bits()),
             lpf_mix: AtomicU32::new(0.0f32.to_bits()),
-            limiter_mix: AtomicU32::new(0.0f32.to_bits()),
+            // **One, not zero.** The limiter's dial is a threshold and its
+            // resting position is fully clockwise; starting this at zero is a
+            // -48 dB threshold on an engine nobody has touched yet.
+            limiter_mix: AtomicU32::new(1.0f32.to_bits()),
             delay_mix: AtomicU32::new(0.0f32.to_bits()),
             chorus_mix: AtomicU32::new(0.0f32.to_bits()),
             params: Mutex::new(crate::effects::Params::default()),
@@ -1236,6 +1239,19 @@ struct Renderer {
     /// removed. See `dx7/` for the synth and `builtin.rs` for what it grew out
     /// of.
     builtin: crate::dx7::Dx7,
+    /// The built-in's own output, before its slot gain.
+    ///
+    /// **It needs a buffer of its own for the same reason a plugin does.** The
+    /// FM renders by ADDING into whatever it is handed, so rendering it
+    /// straight onto the bus leaves no moment at which its contribution is
+    /// separable — and therefore no moment at which a fader can be applied to
+    /// it. That is exactly what happened: the DX7's slot fader moved a number
+    /// that reached the settings, the engine and the meter, and never once
+    /// reached the audio.
+    builtin_scratch: Vec<f32>,
+    /// Where the built-in's slot gain has slewed to. Same treatment as a
+    /// plugin's: stepping a gain at a block boundary is a click.
+    builtin_gain: f32,
     /// Reverb, delay and chorus on the instrument sum. Free at rest.
     effects: crate::effects::Effects,
     /// The renderer's OWN copy of the parameters.
@@ -1473,7 +1489,7 @@ impl Renderer {
 
             let widths = self.render_slots(n);
             self.sum_slots(n, &widths, &slot_targets);
-            self.render_builtin(n, &widths);
+            self.render_builtin(n, &widths, &slot_targets);
 
             // **Here, and this position is the feature.** Downstream of every
             // instrument, so a VST3 and the built-in FM are treated alike;
@@ -1622,7 +1638,7 @@ impl Renderer {
     /// chose. `widths` is what actually rendered this block, which is the
     /// honest test — a slot holding a faulted plugin is an empty slot as far as
     /// the bus is concerned.
-    fn render_builtin(&mut self, frames: usize, widths: &[usize; SLOTS]) {
+    fn render_builtin(&mut self, frames: usize, widths: &[usize; SLOTS], targets: &[f32; SLOTS]) {
         // Asked for by name, or nothing else is playing. The second is what
         // makes a fresh install audible; the first is what makes the picker's
         // top entry mean something once a plugin has been loaded elsewhere.
@@ -1661,13 +1677,39 @@ impl Renderer {
                 self.builtin.set_pedal(c.value >= 64);
             }
         }
+        // **The gain is advanced whether or not anything is rendered.** A
+        // fader moved while the patch is silent has to have arrived by the
+        // time the next note does, or the first note after every rest comes in
+        // at the old level and slides.
+        let target = self
+            .builtin_slot
+            .and_then(|i| targets.get(i).copied())
+            .unwrap_or(1.0);
+        let coeff = self.gain_coeff;
         if !self.builtin.active() {
+            for _ in 0..frames {
+                self.builtin_gain += (target - self.builtin_gain) * coeff;
+            }
             return;
         }
-        let Some(mix) = self.mix.get_mut(..frames * TAP_CHANNELS) else {
+        let want = frames * TAP_CHANNELS;
+        let (Some(mix), Some(scratch)) = (
+            self.mix.get_mut(..want),
+            self.builtin_scratch.get_mut(..want),
+        ) else {
             return;
         };
-        self.builtin.render(mix, frames, TAP_CHANNELS);
+        // Its own buffer, then summed with its slot's gain — the same shape
+        // as a plugin, because it is one slot among five and the fader must
+        // not care which kind of instrument is in it.
+        scratch.fill(0.0);
+        self.builtin.render(scratch, frames, TAP_CHANNELS);
+        for i in 0..frames {
+            self.builtin_gain += (target - self.builtin_gain) * coeff;
+            let g = self.builtin_gain;
+            mix[i * TAP_CHANNELS] += scratch[i * TAP_CHANNELS] * g;
+            mix[i * TAP_CHANNELS + 1] += scratch[i * TAP_CHANNELS + 1] * g;
+        }
     }
 
     fn render_slots(&mut self, frames: usize) -> [usize; SLOTS] {
@@ -2125,6 +2167,8 @@ impl Engine {
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             builtin: crate::dx7::Dx7::new(rate as f32),
+            builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            builtin_gain: 1.0,
             effects: crate::effects::Effects::new(rate as f32),
             effect_params: crate::effects::Params::default(),
             builtin_slot: None,
@@ -4345,6 +4389,8 @@ mod tests {
                 }
             }),
             mix: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            builtin_gain: 1.0,
             midi,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
@@ -4428,6 +4474,40 @@ mod tests {
     ///
     /// Two patches chosen to be unmistakably different: an organ (algorithm 32,
     /// six carriers, no modulation) against the tine piano.
+    /// **The built-in's slot fader moves the built-in.**
+    ///
+    /// It did not, and it looked exactly like a working control: the number
+    /// reached the settings, the engine and the meter. What it never reached
+    /// was the audio — the FM renders by ADDING into the bus, so it went
+    /// straight on with no gain applied while every plugin beside it went
+    /// through `mix_in` with its own. Reported as "the level slider does
+    /// nothing for the DX7 but works for VSTs", which is precisely what that
+    /// is.
+    #[test]
+    fn the_builtin_is_moved_by_its_own_slot_fader() {
+        let level = |gain: f32| {
+            let (mut r, mut tx, shared) = renderer_with_midi(2);
+            shared.builtin_slot.store(0, Ordering::Relaxed);
+            shared.set_slot_gain(0, gain);
+            r.builtin_gain = gain;
+            queue(&mut tx, 0, [0x90, 60, 100]);
+            let mut out = vec![0.0_f32; 2 * 4096];
+            r.render(&mut out, 0, 0);
+            out.iter().fold(0.0_f32, |m, s| m.max(s.abs()))
+        };
+
+        let unity = level(1.0);
+        assert!(unity > 0.01, "the built-in was silent at unity");
+        let half = level(0.5);
+        assert!(
+            (half / unity - 0.5).abs() < 0.05,
+            "half gain came out at {:.3} of unity",
+            half / unity
+        );
+        let off = level(0.0);
+        assert!(off < unity * 0.02, "the fader at zero still let {off} through");
+    }
+
     #[test]
     fn choosing_a_patch_changes_what_comes_out() {
         use crate::dx7::{Op, Voice};

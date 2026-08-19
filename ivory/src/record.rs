@@ -1032,6 +1032,29 @@ impl Session {
         self.last.as_ref()
     }
 
+    /// Put out every clip latch the band can show, because the user just said
+    /// they have seen it.
+    ///
+    /// **All of them, or the light does not go out.** The indicator is an OR
+    /// across three latches that arrive by three different paths — the live
+    /// input tracker, the instrument bus's own, and the take summary — and
+    /// clearing two of three is a dismiss button that appears not to work.
+    /// The engine's is cleared by the caller, which is the only one holding it.
+    pub fn clear_clip(&mut self) {
+        self.clipped = false;
+        for m in [
+            self.audio.as_ref().map(|a| &a.meters),
+            self.plugin_audio.as_ref().map(|p| &p.meters),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Ok(mut m) = m.lock() {
+                m.clear_clip();
+            }
+        }
+    }
+
     pub fn clipped(&self) -> bool {
         self.clipped
     }

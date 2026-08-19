@@ -330,11 +330,14 @@ fn a_filter_knob_reads_out_where_its_filter_actually_is() {
         crate::effects::LIMITER_DB.0,
         crate::effects::LIMITER_DB.1
     );
+    // Fully right is off, twelve o'clock is -24, fully left is -48.
     assert_eq!(
-        ivory_ui::recorder_panel::knob_reading(*limiter, 0.0),
+        ivory_ui::recorder_panel::knob_reading(*limiter, 1.0),
         "0.0 dB",
         "the limiter's resting position is not 0 dB"
     );
+    assert_eq!(ivory_ui::recorder_panel::knob_reading(*limiter, 0.5), "-24.0 dB");
+    assert_eq!(ivory_ui::recorder_panel::knob_reading(*limiter, 0.0), "-48.0 dB");
 
     for (key, range) in [
         ("hpf_mix", crate::effects::HPF_HZ),
@@ -1077,6 +1080,17 @@ impl DesktopApp {
                     self.recorder.session.toggle(&root, name.as_deref(), wait, spec);
                 }
                 R::Stop => self.recorder.session.stop(),
+                // **Every latch, or the light does not go out.** The warning
+                // is an OR across the input tracker, the take summary and the
+                // instrument bus's own — and the VU paints itself red from the
+                // first of those, so a dismiss that missed one would look like
+                // a button that does nothing.
+                R::DismissClip => {
+                    self.recorder.session.clear_clip();
+                    if let Some(e) = self.recorder.engine.as_ref() {
+                        e.clear_clip();
+                    }
+                }
                 R::Audition { notes, on } => {
                     // **All of them at one instant.** The events are stamped
                     // once and pushed together, so a four-note chord arrives as

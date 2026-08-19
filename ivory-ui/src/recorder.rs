@@ -310,6 +310,12 @@ pub struct RecorderView<'a> {
 }
 
 impl RecorderView<'_> {
+    /// Whether the clip warning is on screen — and therefore whether it is
+    /// something a press can land on.
+    pub fn showing_clip(&self) -> bool {
+        self.meters.clipped || self.clip_warning
+    }
+
     /// A view with nothing configured, for tests and for the first frame.
     pub fn empty() -> RecorderView<'static> {
         RecorderView {
@@ -604,6 +610,8 @@ pub enum RecorderRequest {
     /// distinct Stop control and "the button that stops it" must not also be
     /// able to start one.
     Stop,
+    /// Put out every clip latch: the user has seen it.
+    DismissClip,
     /// Open slot `n`'s OWN editor — the plugin's window, with its presets and
     /// its knobs.
     ///

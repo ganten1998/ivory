@@ -1,7 +1,8 @@
 # Ivory 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-19. **The app is now called TANGENT.** Newest work is
-§2j: one gesture set across all eight knobs, and the limiter as a threshold.
+§2k: the limiter's makeup gain, the DX7 fader bug, and a dismissable CLIPPED.
+Before it, §2j: one gesture set across all eight knobs.
 Before it, §2i (the master column) and §2h (six effect knobs, the true-peak
 limiter, video without a camera).
 Before it, §2d: the fretboard voicing solver and the guitar view. §2c before it has the
@@ -982,6 +983,67 @@ top**, over the same dark recess the ladders sit in, with the output number in
 cream on top of it. The number is one colour and it is not red: it has to read
 on near-black AND on amber, and the ladder beside it already says whether the
 level is a problem. The ladders got the freed width.
+
+---
+
+## 2k. 2026-08-19 (last) — makeup gain, and two bugs worth the space
+
+Shipped as **4.15.0**.
+
+### The limiter got its makeup gain, because it was wrong without it
+
+Asked why lowering the threshold did not make it louder, and the answer was
+that 2j built it without makeup on purpose and said so in the commit. **That
+was the wrong call.** A threshold on a limiter is a loudness control: what it
+takes off the top is given back to everything, so the quiet parts come up and
+the loud parts stay at the ceiling. Without makeup it is an attenuator with
+extra steps, and nobody would reach for it twice.
+
+`makeup = -threshold_dB` exactly, so the output brickwalls at 0 dBTP however
+far the dial is turned. A -1 dBTP delivery is the master at -1, which is the
+next knob along.
+
+### The dial runs the other way
+
+`LIMITER_DB = (-48.0, 0.0)`: fully left -48, twelve o'clock **-24**, fully
+right 0 dB and out of the circuit. This is the only knob in the band whose
+resting position is the top of its travel, and it is not an inconsistency — a
+threshold is off when it is above everything.
+
+That inversion is load-bearing in five places, and the tests caught every one:
+`Sends::default()` (a manual impl now, `limiter: 1.0`), `Shared::new`'s atomic,
+`Effects::quiet()`, `Hit::reset_to`, and the settings default. **`SETTINGS_VERSION`
+8 → 9**: a file written before this says `limiter_mix: 0.0`, which under the
+new reading is a -48 dB threshold — every take slammed flat on a control the
+user never touched.
+
+### Gain reduction moved behind the scale
+
+It was a wash inside the readout box, which needed the box held open to show
+anything. It is a thin strip behind the dB scale now, hanging from 0 and
+reaching down by however many decibels came off — **read against the numbers
+that are already there**, so 6 dB of reduction reaches the -6 and it needs no
+readout of its own. The readout box went back to the height of its own number
+and the ladders took the space.
+
+### Two bugs
+
+**The DX7's slot fader did nothing.** Reported as "works for VSTs, not for the
+built-in", and that is exactly what it was: `render_builtin` ADDS into the bus,
+so the FM went straight on with no gain applied while every plugin beside it
+went through `mix_in` with its own. The number reached the settings, the engine
+and the meter, and never reached the audio. It has a scratch buffer and a
+slewed gain now, the same shape as a plugin.
+`the_builtin_is_moved_by_its_own_slot_fader` fails with "half gain came out at
+1.000 of unity" if the multiply is removed.
+
+**CLIPPED is clickable.** A latch that clears itself is one the performer never
+sees; a latch with no way to clear it stays lit all session and stops meaning
+anything. `Hit::DismissClip` clears all three latches — the live input tracker
+(which is what paints the VU red), the take summary, and the instrument bus's
+own atomic. Clearing two of three would be a button that appears not to work.
+Its rect exists only while the warning is on screen, because a target with
+nothing drawn in it swallows presses meant for the row underneath.
 
 ---
 
