@@ -562,6 +562,20 @@ pub enum RecorderRequest {
     /// egui frame still on the stack is the same re-entrancy the folder picker
     /// avoids.
     OpenPluginEditor(usize),
+    /// Open the patch editor on what the built-in is playing: the host
+    /// answers with `IvoryApp::set_patch_edit`.
+    EditPatch {
+        slot: usize,
+    },
+    /// One row of the patch moved. See `dx7::edit` for what the address means.
+    SetPatchParam {
+        group: usize,
+        index: usize,
+        value: i32,
+    },
+    SetPatchName(String),
+    /// Write the patch being edited into the user's own bank.
+    SavePatch,
     /// Play patch `index` of the loaded cartridge in `slot`'s built-in.
     /// `usize::MAX` means the patch compiled into the app.
     ChoosePatch {

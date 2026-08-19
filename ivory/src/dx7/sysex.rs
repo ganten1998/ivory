@@ -102,6 +102,56 @@ impl Cartridge {
         Self::parse(&bytes, &name)
     }
 
+    /// A bank of `voices`, padded to thirty-two with the default patch.
+    ///
+    /// **Padded rather than refused.** A user's own bank starts with one patch
+    /// in it, and a format that only holds exactly thirty-two would mean
+    /// inventing a "partial cartridge" concept that nothing else in the world
+    /// understands.
+    pub fn of(name: &str, voices: Vec<Voice>) -> Self {
+        let mut voices = voices;
+        voices.truncate(VOICES);
+        while voices.len() < VOICES {
+            voices.push(Voice::default());
+        }
+        Self {
+            voices,
+            name: name.to_owned(),
+            checksum_ok: true,
+        }
+    }
+
+    /// The 4104 bytes of a 32-voice bulk dump.
+    ///
+    /// **A real one.** What comes out of here loads into Dexed, into a TX802,
+    /// and into a DX7 — which is the difference between an editor and a toy,
+    /// and it costs nothing beyond writing the inverse of the parser that was
+    /// already here.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut d = vec![0u8; BULK_LEN];
+        d[..6].copy_from_slice(&[0xF0, 0x43, 0x00, 0x09, 0x20, 0x00]);
+        for (i, v) in self.voices.iter().take(VOICES).enumerate() {
+            d[6 + i * PACKED..6 + (i + 1) * PACKED].copy_from_slice(&v.pack());
+        }
+        // Seven-bit two's complement over the data, which is what the DX7
+        // writes and what `parse` checks.
+        let sum: u32 = d[6..6 + VOICES * PACKED]
+            .iter()
+            .map(|b| u32::from(*b))
+            .sum();
+        d[BULK_LEN - 2] = ((sum.wrapping_neg()) & 0x7f) as u8;
+        d[BULK_LEN - 1] = 0xF7;
+        d
+    }
+
+    /// Write it to disk, creating the folder if it is not there.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        std::fs::write(path, self.to_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
     /// Every patch's name, for a picker.
     pub fn names(&self) -> Vec<String> {
         self.voices.iter().map(Voice::display_name).collect()
@@ -180,6 +230,87 @@ mod tests {
         let mut d = synthetic(true);
         d.extend_from_slice(&[0x00; 512]);
         assert!(Cartridge::parse(&d, "bank").is_ok());
+    }
+
+    /// **What is written reads back as itself**, and a real parser agrees it
+    /// is a cartridge: the header, the length, the terminator and the checksum
+    /// are all checked by `parse`, which is the same code that reads other
+    /// people's banks.
+    #[test]
+    fn a_written_cartridge_reads_back_as_the_same_patches() {
+        let mut a = Voice::default();
+        a.set_name("MINE 1");
+        a.algorithm = 17;
+        a.feedback = 5;
+        a.ops[0].output_level = 93;
+        a.ops[3].coarse = 11;
+        let mut b = Voice::default();
+        b.set_name("MINE 2");
+        b.transpose = 30;
+
+        let cart = Cartridge::of("user", vec![a, b]);
+        let bytes = cart.to_bytes();
+        assert_eq!(bytes.len(), BULK_LEN);
+
+        let back = Cartridge::parse(&bytes, "user").expect("what we wrote is a cartridge");
+        assert!(back.checksum_ok, "the checksum we wrote does not check out");
+        assert_eq!(back.voices[0], a);
+        assert_eq!(back.voices[1], b);
+        // And the rest is the default patch, not silence.
+        assert_eq!(back.voices[31], Voice::default());
+        assert_eq!(back.names()[0], "MINE 1");
+    }
+
+    /// **A patch built by hand survives the whole trip**: edited row by row,
+    /// packed into a bank, written, read back by the same parser other
+    /// people's cartridges go through, and still the patch that was made.
+    ///
+    /// This is the assertion the editor exists for. Every step of it has its
+    /// own test; what this catches is the seam between them.
+    #[test]
+    fn a_hand_built_patch_survives_a_save_and_a_reload() {
+        use super::super::edit;
+
+        let mut v = Voice::default();
+        v.set_name("HANDMADE");
+        // Move something in every group, including both halves of a shared
+        // packed byte and a choice with named values.
+        edit::apply(&mut v, 0, 0, 71); // OP1 rate 1
+        edit::apply(&mut v, 0, 19, 5); // OP1 rate scaling
+        edit::apply(&mut v, 0, 13, 11); // OP1 detune, which shares its byte
+        edit::apply(&mut v, 2, 8, 84); // OP3 output level
+        edit::apply(&mut v, 5, 10, 1); // OP6 fixed frequency
+        edit::apply(&mut v, edit::GLOBAL, 0, 21); // algorithm 22
+        edit::apply(&mut v, edit::GLOBAL, 15, 4); // LFO wave: sine
+        edit::apply(&mut v, edit::GLOBAL, 18, 30); // transpose
+
+        let dir = std::env::temp_dir().join("tangent-patch-trip");
+        let path = dir.join("my-patches.syx");
+        let _ = std::fs::remove_file(&path);
+        Cartridge::of("mine", vec![v])
+            .save(&path)
+            .expect("the bank was written");
+
+        let back = Cartridge::load(&path).expect("and read back");
+        assert!(back.checksum_ok);
+        assert_eq!(back.voices[0], v, "the patch changed on the way to disk");
+        assert_eq!(back.names()[0], "HANDMADE");
+        // And the editor shows what was set, rather than what it started from.
+        let shown = edit::to_edit(&back.voices[0], "");
+        assert_eq!(shown.groups[0].params[0].value, 71);
+        assert_eq!(shown.groups[0].params[19].value, 5);
+        assert_eq!(shown.groups[0].params[13].value, 11);
+        assert_eq!(shown.groups[edit::GLOBAL].params[0].value, 21);
+        assert_eq!(shown.algorithm, 21, "the diagram followed the algorithm");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// More than a bank's worth is truncated rather than refused, and fewer is
+    /// padded. Neither is an error a person can do anything about.
+    #[test]
+    fn a_bank_is_always_thirty_two_voices() {
+        assert_eq!(Cartridge::of("x", Vec::new()).voices.len(), 32);
+        assert_eq!(Cartridge::of("x", vec![Voice::default(); 40]).voices.len(), 32);
     }
 
     /// **Against the real world.** Ten thousand cartridges off the internet,

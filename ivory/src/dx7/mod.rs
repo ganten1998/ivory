@@ -11,6 +11,7 @@
 //! pitch and every velocity, with no loop points and no zone boundaries.
 
 pub mod algorithms;
+pub mod edit;
 pub mod synth;
 pub mod sysex;
 pub mod voice;

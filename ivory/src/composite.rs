@@ -905,6 +905,15 @@ mod shot {
         // **After a frame, not before.** A panel hangs off its knob, and where
         // the knob is is not known until the band has been drawn once — so a
         // panel opened before that has no anchor and closes itself.
+        if std::env::var("IVORY_SHOT_EDITOR").is_ok() {
+            app.open_patch_editor_for_shot();
+            for _ in 0..2 {
+                if let Err(e) = shoot(&app) {
+                    eprintln!("frame: {e}");
+                    return;
+                }
+            }
+        }
         if let Ok(which) = std::env::var("IVORY_SHOT_FX") {
             app.open_effect_panel(match which.as_str() {
                 "delay" => ivory_ui::recorder_panel::Fx::Delay,

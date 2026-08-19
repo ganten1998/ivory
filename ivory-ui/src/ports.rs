@@ -126,6 +126,51 @@ pub struct EffectDefaults {
     pub default_division: String,
 }
 
+/// One editable parameter of a patch.
+///
+/// **Untyped on purpose, like every other thing the host pushes in.**
+/// `ivory-ui` cannot name a `Voice` and has no business knowing what keyboard
+/// level scaling is; it draws a row with a name and a number in it and reports
+/// which number changed. What that means to six operators is the DSP's problem,
+/// on the other side of the firewall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchParam {
+    pub name: String,
+    pub value: i32,
+    pub max: i32,
+    /// Names for each value, when the parameter is a CHOICE rather than a
+    /// number: an LFO wave is "triangle", not 0. Empty means a plain number.
+    pub choices: Vec<String>,
+    /// A word after the number — "Hz", "semitones". Empty for most.
+    pub unit: String,
+}
+
+/// One page of the patch editor: the six operators, and the patch itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatchGroup {
+    pub title: String,
+    pub params: Vec<PatchParam>,
+}
+
+/// Everything the patch editor shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatchEdit {
+    /// The patch's own name, ten characters in the format.
+    pub name: String,
+    /// 0..=31. Shown as 1..=32, the way every chart prints it.
+    pub algorithm: usize,
+    /// Where each operator's output goes: 0 is the speaker, 1..=6 is the
+    /// operator it modulates. Pushed in because the routing table lives with
+    /// the synth, and the diagram is the one thing this editor draws.
+    pub routing: [u8; 6],
+    /// Which operator the feedback loop is taken from, 1-based.
+    pub feedback_op: u8,
+    pub groups: Vec<PatchGroup>,
+    /// Where a Save would write, for the editor to say so. Empty until the
+    /// host knows.
+    pub bank_path: String,
+}
+
 /// What the host found in a DX7 cartridge, for the picker to show.
 ///
 /// **Names, not voices.** `ivory-ui` cannot parse SysEx and has no business

@@ -262,6 +262,72 @@ impl Voice {
         v.name.copy_from_slice(&p[118..128]);
         v
     }
+
+    /// The inverse: 155 parameters back into the 128 packed bytes.
+    ///
+    /// **So a patch made here is a patch a DX7 can play.** An editor that could
+    /// only keep its work in this app's own settings would be a toy; what comes
+    /// out of `Cartridge::to_bytes` is an ordinary SysEx bank, which loads into
+    /// Dexed, into a TX802, and into the machine itself.
+    ///
+    /// Every field is masked on the way out as well as on the way in. A value
+    /// out of range cannot corrupt a NEIGHBOURING parameter here — the two that
+    /// share a byte would otherwise bleed into each other, and the symptom is a
+    /// patch that changes its detune when you edit its rate scaling.
+    pub fn pack(&self) -> [u8; 128] {
+        let mut p = [0u8; 128];
+        for i in 0..6 {
+            // OP6 first in the file, OP1 first in `ops` — see the module docs.
+            let op = &self.ops[5 - i];
+            let b = &mut p[i * 17..i * 17 + 17];
+            for k in 0..4 {
+                b[k] = op.rate[k] & 0x7f;
+                b[4 + k] = op.level[k] & 0x7f;
+            }
+            b[8] = op.break_point & 0x7f;
+            b[9] = op.left_depth & 0x7f;
+            b[10] = op.right_depth & 0x7f;
+            b[11] = (op.left_curve & 0x03) | ((op.right_curve & 0x03) << 2);
+            b[12] = (op.rate_scaling & 0x07) | ((op.detune & 0x0f) << 3);
+            b[13] = (op.amp_mod_sens & 0x03) | ((op.vel_sens & 0x07) << 2);
+            b[14] = op.output_level & 0x7f;
+            b[15] = u8::from(op.fixed) | ((op.coarse & 0x1f) << 1);
+            b[16] = op.fine & 0x7f;
+        }
+        for k in 0..4 {
+            p[102 + k] = self.pitch_rate[k] & 0x7f;
+            p[106 + k] = self.pitch_level[k] & 0x7f;
+        }
+        p[110] = self.algorithm & 0x1f;
+        p[111] = (self.feedback & 0x07) | (u8::from(self.osc_sync) << 3);
+        p[112] = self.lfo_speed & 0x7f;
+        p[113] = self.lfo_delay & 0x7f;
+        p[114] = self.lfo_pitch_depth & 0x7f;
+        p[115] = self.lfo_amp_depth & 0x7f;
+        p[116] = u8::from(self.lfo_sync)
+            | ((self.lfo_wave & 0x07) << 1)
+            | ((self.pitch_mod_sens & 0x07) << 4);
+        p[117] = self.transpose & 0x3f;
+        // The name as stored, with anything a DX7 cannot show made a space.
+        // Seven-bit ASCII is what the format carries, and a high byte here is
+        // a name that reads as garbage on the instrument.
+        for (dst, src) in p[118..128].iter_mut().zip(self.name) {
+            let c = src & 0x7f;
+            *dst = if (0x20..0x7f).contains(&c) { c } else { b' ' };
+        }
+        p
+    }
+
+    /// Set the name from text, padded and trimmed to the ten bytes the format
+    /// has room for.
+    pub fn set_name(&mut self, text: &str) {
+        let mut out = [b' '; 10];
+        for (dst, c) in out.iter_mut().zip(text.chars()) {
+            let b = c as u32;
+            *dst = if (0x20..0x7f).contains(&b) { b as u8 } else { b' ' };
+        }
+        self.name = out;
+    }
 }
 
 #[cfg(test)]
@@ -322,6 +388,66 @@ mod tests {
         let v = Voice::unpack(&p);
         assert_eq!(v.ops[0].output_level, 66, "ops[0] is not OP1");
         assert_eq!(v.ops[5].output_level, 11, "ops[5] is not OP6");
+    }
+
+    /// **Pack is the exact inverse of unpack, for every patch there is.**
+    ///
+    /// Driven from random bytes rather than from a handful of chosen values:
+    /// the risk in this file is a bit field packed into the wrong range, and a
+    /// range that is wrong for one value is usually right for zero. Unpacking
+    /// masks everything, so `unpack -> pack` must reproduce the masked bytes
+    /// exactly.
+    #[test]
+    fn packing_is_the_inverse_of_unpacking() {
+        // A cheap deterministic sequence — this needs coverage, not entropy,
+        // and a test that depends on `rand` is a test that depends on `rand`.
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 33) as u8
+        };
+        for _ in 0..200 {
+            let mut raw = [0u8; 128];
+            for b in &mut raw {
+                *b = next();
+            }
+            // Names are text in the format, and `pack` says so by replacing
+            // anything unprintable with a space. Compare like with like.
+            for b in &mut raw[118..128] {
+                *b = b' ' + (*b % 60);
+            }
+            let v = Voice::unpack(&raw);
+            let out = v.pack();
+            // The masked form of the input: what `unpack` could actually have
+            // seen. Unused bits are not information and are not preserved.
+            let want = Voice::unpack(&out).pack();
+            assert_eq!(out, want, "a second round trip changed the bytes");
+            assert_eq!(
+                Voice::unpack(&out),
+                v,
+                "the packed patch did not read back as itself"
+            );
+        }
+    }
+
+    /// A name is ten bytes of printable ASCII, whatever it is set from.
+    #[test]
+    fn a_name_is_padded_trimmed_and_printable() {
+        let mut v = Voice::default();
+        v.set_name("Rhodes");
+        assert_eq!(v.display_name(), "Rhodes");
+        assert_eq!(v.name.len(), 10);
+
+        v.set_name("a very long patch name indeed");
+        assert_eq!(v.display_name(), "a very lon");
+
+        v.set_name("caf\u{e9}\u{301}\n\t");
+        assert!(
+            v.name.iter().all(|b| (0x20..0x7f).contains(b)),
+            "an unprintable byte reached the name"
+        );
     }
 
     /// A name field full of rubbish must not reach the picker as rubbish.

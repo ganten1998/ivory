@@ -79,6 +79,28 @@ pub enum Dialog {
         /// point of the lenient parser is that this is rare and specific.
         error: String,
     },
+    /// Build a patch by hand: every number a DX7 stores, and a picture of the
+    /// algorithm.
+    ///
+    /// **No envelope curves and no animation.** A DX7 has a two-line display
+    /// and a membrane keypad, and patches were made on it for forty years by
+    /// people who could hear what a rate of 62 does. Drawing the envelope
+    /// would be a picture of the numbers rather than the sound, and it would
+    /// be the thing the eye went to instead of the ear. The one thing worth a
+    /// diagram is the ALGORITHM, because which operator feeds which is a fact
+    /// about the patch that no list of numbers makes visible.
+    PatchEditor {
+        slot: usize,
+        /// Everything on show, pushed in by the host — see `ports::PatchEdit`.
+        patch: crate::ports::PatchEdit,
+        /// Which operator's page is open. 0..=5 are OP1..OP6 and 6 is the
+        /// patch itself.
+        group: usize,
+        /// The name being typed, kept as text so it can pass through empty.
+        name: String,
+        /// What the last Save said, good or bad.
+        note: String,
+    },
     /// Choose the VST3 instrument Tangent plays through.
     ///
     /// **The list is a directory listing and nothing more** — see the "plugin
@@ -322,6 +344,25 @@ pub enum DialogAction {
     /// Raise a file panel for a `.syx` cartridge. The dialog stays open: the
     /// answer comes back into it.
     LoadCartridge,
+    /// Open the patch editor on whatever the built-in is playing.
+    EditPatch {
+        slot: usize,
+    },
+    /// One row of the patch moved. Addressed by GROUP and INDEX — see
+    /// `dx7::edit`, where that order is defined.
+    SetPatchParam {
+        group: usize,
+        index: usize,
+        value: i32,
+    },
+    /// Rename the patch being edited.
+    SetPatchName(String),
+    /// Write the patch being edited into the user's own bank.
+    SavePatch,
+    /// Back from the editor to the list of patches.
+    ShowPatches {
+        slot: usize,
+    },
     SetExport(ExportSpec),
     /// As above, and write it to the settings file so every later take starts
     /// from it. This is the "Use these settings for every take" tick, and it
@@ -1557,6 +1598,181 @@ impl Dialog {
     }
 }
 
+// ── the patch editor ────────────────────────────────────────────────────────
+
+/// **Wide and short, so it fits inside the window it belongs to.** The
+/// parameters are in columns rather than one tall list — see the editor's own
+/// comment — which is what lets a whole operator be on screen at once.
+const EDITOR_W: f32 = 780.0;
+const EDITOR_H: f32 = 470.0;
+
+/// How many columns the parameters are laid out in.
+///
+/// Three: an operator has twenty-one numbers and three sevens is a block a
+/// glance takes in. Two makes the window tall again and four makes each column
+/// too narrow for "Pitch mod sens" and a number beside it.
+const PARAM_COLS: usize = 3;
+
+/// Characters the format has room for. Ten, and not one more.
+const NAME_LEN: usize = 10;
+
+/// Draw the algorithm: which operator feeds which, and which one feeds itself.
+///
+/// **Laid out from the routing, not from thirty-two stored pictures.** The
+/// routing is what the synth plays; a table of drawings would be a second
+/// description of the same fact, and the way those drift is a diagram that
+/// lies about the sound.
+///
+/// Carriers sit on the bottom line with their output under them, and each
+/// operator stands directly above the one it modulates. An operator with two
+/// modulators has them side by side above it, which is how every chart on the
+/// front of a DX7 is drawn.
+fn draw_algorithm(painter: &egui::Painter, rect: Rect, patch: &crate::ports::PatchEdit, t: &DialogTheme) {
+    if !rect.is_positive() {
+        return;
+    }
+    let dest = patch.routing;
+    // Who modulates whom. `children[i]` are the operators feeding operator
+    // `i + 1`; `children[6]` would be the carriers, which are kept separately
+    // because they are the roots rather than a node's children.
+    let mut children: [Vec<usize>; 6] = Default::default();
+    let mut carriers: Vec<usize> = Vec::new();
+    for (i, d) in dest.iter().enumerate() {
+        if *d == 0 {
+            carriers.push(i);
+        } else if let Some(list) = children.get_mut(usize::from(*d) - 1) {
+            list.push(i);
+        }
+    }
+    // How many columns a subtree needs, and how deep it goes.
+    fn span(op: usize, children: &[Vec<usize>; 6]) -> usize {
+        let n: usize = children[op].iter().map(|c| span(*c, children)).sum();
+        n.max(1)
+    }
+    fn depth(op: usize, children: &[Vec<usize>; 6]) -> usize {
+        1 + children[op]
+            .iter()
+            .map(|c| depth(*c, children))
+            .max()
+            .unwrap_or(0)
+    }
+    let cols: usize = carriers.iter().map(|c| span(*c, &children)).sum::<usize>().max(1);
+    let rows: usize = carriers
+        .iter()
+        .map(|c| depth(*c, &children))
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    // A cell per column and per row, with the output line under the bottom.
+    //
+    // **Cells are square-ish and the whole thing is centred**, rather than each
+    // column taking a share of whatever width the panel has. Two stacks spread
+    // across five hundred points is a diagram with a hole in the middle: what
+    // says "these two feed the same output" is them being NEAR each other.
+    let out_h = rect.height() * 0.12;
+    let grid = Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.bottom() - out_h));
+    let ch = grid.height() / rows as f32;
+    let cw = (grid.width() / cols as f32).min(ch * 1.5);
+    let used = cw * cols as f32;
+    let grid = Rect::from_min_size(
+        Pos2::new(grid.center().x - used * 0.5, grid.top()),
+        Vec2::new(used, grid.height()),
+    );
+    let side = (cw.min(ch) * 0.66).max(6.0);
+    let font = FontId::new((side * 0.52).max(6.0), fonts::courier_bold());
+
+    // Place every operator: a column centre and a row from the bottom.
+    let mut at = [Pos2::ZERO; 6];
+    fn place(
+        op: usize,
+        col: &mut f32,
+        row: usize,
+        children: &[Vec<usize>; 6],
+        grid: Rect,
+        cw: f32,
+        ch: f32,
+        at: &mut [Pos2; 6],
+    ) -> f32 {
+        let kids = &children[op];
+        let x = if kids.is_empty() {
+            let x = grid.left() + (*col + 0.5) * cw;
+            *col += 1.0;
+            x
+        } else {
+            let xs: Vec<f32> = kids
+                .iter()
+                .map(|c| place(*c, col, row + 1, children, grid, cw, ch, at))
+                .collect();
+            (xs.iter().sum::<f32>()) / xs.len() as f32
+        };
+        at[op] = Pos2::new(x, grid.bottom() - (row as f32 + 0.5) * ch);
+        x
+    }
+    let mut col = 0.0_f32;
+    for c in &carriers {
+        place(*c, &mut col, 0, &children, grid, cw, ch, &mut at);
+    }
+
+    // The wires first, so the boxes sit on top of their ends.
+    let wire = Stroke::new(1.0_f32, t.text.gamma_multiply(0.7));
+    for (i, d) in dest.iter().enumerate() {
+        let from = at[i];
+        let to = if *d == 0 {
+            Pos2::new(from.x, rect.bottom() - out_h * 0.35)
+        } else {
+            at[usize::from(*d) - 1]
+        };
+        painter.line_segment([from, to], wire);
+    }
+    // The boxes.
+    for (i, p) in at.iter().enumerate() {
+        let r = Rect::from_center_size(*p, Vec2::splat(side));
+        painter.rect_filled(r, 2.0, t.bg);
+        // A carrier is drawn heavier: its output is what you hear, and that is
+        // the first thing to read off one of these.
+        let heavy = dest[i] == 0;
+        painter.rect_stroke(
+            r,
+            2.0,
+            Stroke::new(if heavy { 2.0 } else { 1.0 }, t.text),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            *p,
+            egui::Align2::CENTER_CENTER,
+            format!("{}", i + 1),
+            font.clone(),
+            t.text,
+        );
+        // The feedback loop, as a small arc over the operator it is taken
+        // from. One per algorithm, always.
+        if usize::from(patch.feedback_op) == i + 1 {
+            let top = r.center().y - side * 0.5;
+            let x0 = r.center().x + side * 0.5;
+            let x1 = x0 + side * 0.42;
+            for seg in [
+                [Pos2::new(x0, top + side * 0.25), Pos2::new(x1, top + side * 0.25)],
+                [Pos2::new(x1, top + side * 0.25), Pos2::new(x1, top - side * 0.25)],
+                [Pos2::new(x1, top - side * 0.25), Pos2::new(r.center().x, top - side * 0.25)],
+                [Pos2::new(r.center().x, top - side * 0.25), Pos2::new(r.center().x, top)],
+            ] {
+                painter.line_segment(seg, wire);
+            }
+        }
+    }
+    // And the name of the thing, bottom left.
+    let label = format!("ALGORITHM {}", patch.algorithm + 1);
+    let size = (out_h * 0.72).max(6.0);
+    painter.text(
+        Pos2::new(rect.left(), rect.bottom()),
+        egui::Align2::LEFT_BOTTOM,
+        &label,
+        FontId::new(size, fonts::courier_bold()),
+        t.text,
+    );
+}
+
 // ── the patch picker ────────────────────────────────────────────────────────
 
 /// Voices in a DX7 cartridge. The format has exactly this many, always.
@@ -1920,6 +2136,249 @@ pub fn show(
             )
         }
 
+        Dialog::PatchEditor {
+            slot,
+            patch,
+            group,
+            name,
+            note,
+        } => {
+            let t = theme(dark_mode);
+            let slot = *slot;
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Tangent DX7 - patch",
+                Vec2::new(EDITOR_W, EDITOR_H),
+                Vec2::new(420.0, 400.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.visuals_mut().extreme_bg_color = t.bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    let faint = t.text.gamma_multiply(0.72);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(PLUGIN_MARGIN))
+                        .show(ui, |ui| {
+                            // ── the name, and where it would be saved ───────
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Name").font(bold(11.0)).color(t.text));
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(name)
+                                        .font(bold(12.0))
+                                        .text_color(t.text)
+                                        .char_limit(NAME_LEN)
+                                        .desired_width(150.0),
+                                );
+                                if resp.changed() {
+                                    action = Some(DialogAction::SetPatchName(name.clone()));
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .add(Button::new(
+                                            RichText::new("Save to my bank")
+                                                .font(bold(11.0))
+                                                .color(t.text),
+                                        ))
+                                        .clicked()
+                                    {
+                                        action = Some(DialogAction::SavePatch);
+                                    }
+                                });
+                            });
+                            if !note.is_empty() {
+                                ui.label(
+                                    RichText::new(note.as_str())
+                                        .font(bold(PLUGIN_NOTE_PT))
+                                        .color(faint),
+                                );
+                            }
+                            ui.add_space(4.0);
+
+                            // ── the algorithm, drawn ────────────────────────
+                            //
+                            // The one picture in here. Everything else is a
+                            // number, which is what making a patch on the
+                            // instrument was; but which operator feeds which is
+                            // a fact no list of numbers shows.
+                            let h = (ui.available_height() * 0.30).clamp(80.0, 150.0);
+                            let (rect, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), h),
+                                egui::Sense::hover(),
+                            );
+                            draw_algorithm(ui.painter(), rect, patch, &t);
+                            ui.add_space(4.0);
+
+                            // ── which page ──────────────────────────────────
+                            ui.horizontal_wrapped(|ui| {
+                                for (i, g) in patch.groups.iter().enumerate() {
+                                    if ui
+                                        .selectable_label(
+                                            *group == i,
+                                            RichText::new(&g.title)
+                                                .font(bold(12.0))
+                                                .color(t.text),
+                                        )
+                                        .clicked()
+                                    {
+                                        *group = i;
+                                    }
+                                }
+                            });
+                            ui.add_space(2.0);
+
+                            // ── the numbers ─────────────────────────────────
+                            //
+                            // **Columns, not one long list.** Twenty-one rows
+                            // stacked is a window taller than the one behind
+                            // it, and a patch is a thing you read across: the
+                            // envelope beside the frequency beside the
+                            // scaling, all of it at once, the way the chart on
+                            // the instrument's own lid is laid out. Scrolling
+                            // for the last operator parameter is scrolling
+                            // away from the one you are comparing it to.
+                            let g = (*group).min(patch.groups.len().saturating_sub(1));
+                            let bottom = 30.0;
+                            let list_h = (ui.available_height() - bottom).max(60.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(list_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    let Some(page) = patch.groups.get_mut(g) else {
+                                        return;
+                                    };
+                                    let n = page.params.len();
+                                    let per = n.div_ceil(PARAM_COLS);
+                                    // The column's own width, taken before any
+                                    // of them is entered: inside a column
+                                    // `available_width` is the column's, and
+                                    // inside a row it is what the row has left.
+                                    //
+                                    // **Both halves are budgeted, and they add
+                                    // up to less than a column.** A label and
+                                    // a combo box that between them are wider
+                                    // than the column they are in do not clip:
+                                    // they widen the whole `Ui`, and the first
+                                    // thing to fall off the far side is the
+                                    // Done button four rows below.
+                                    let col_w =
+                                        (ui.available_width() / PARAM_COLS as f32 - 14.0)
+                                            .max(60.0);
+                                    let label_w = col_w * 0.56;
+                                    let field_w = col_w * 0.40;
+                                    let mut edited: Option<(usize, i32)> = None;
+                                    ui.columns(PARAM_COLS, |cols| {
+                                        for (c, col) in cols.iter_mut().enumerate() {
+                                            for i in (c * per)..((c + 1) * per).min(n) {
+                                                let param = &mut page.params[i];
+                                                let before = param.value;
+                                                col.horizontal(|ui| {
+                                                    ui.add_sized(
+                                                        [label_w, 18.0],
+                                                        egui::Label::new(
+                                                            RichText::new(&param.name)
+                                                                .font(bold(11.0))
+                                                                .color(t.text),
+                                                        ),
+                                                    );
+                                                    if param.choices.is_empty() {
+                                                        // A number, dragged or
+                                                        // typed. The
+                                                        // instrument's own way
+                                                        // in.
+                                                        ui.add(
+                                                            egui::DragValue::new(
+                                                                &mut param.value,
+                                                            )
+                                                            .range(0..=param.max)
+                                                            .speed(0.25),
+                                                        );
+                                                        if !param.unit.is_empty() {
+                                                            ui.label(
+                                                                RichText::new(&param.unit)
+                                                                    .font(bold(10.0))
+                                                                    .color(faint),
+                                                            );
+                                                        }
+                                                    } else {
+                                                        // A choice: the panel
+                                                        // names it, so a
+                                                        // number would be
+                                                        // worse.
+                                                        let idx = param.value.clamp(
+                                                            0,
+                                                            param.choices.len() as i32 - 1,
+                                                        )
+                                                            as usize;
+                                                        egui::ComboBox::from_id_salt((g, i))
+                                                            .width(field_w)
+                                                            .selected_text(
+                                                                RichText::new(
+                                                                    &param.choices[idx],
+                                                                )
+                                                                .font(bold(10.0))
+                                                                .color(t.text),
+                                                            )
+                                                            .show_ui(ui, |ui| {
+                                                                for (v, label) in param
+                                                                    .choices
+                                                                    .iter()
+                                                                    .enumerate()
+                                                                {
+                                                                    ui.selectable_value(
+                                                                        &mut param.value,
+                                                                        v as i32,
+                                                                        RichText::new(label)
+                                                                            .font(bold(11.0))
+                                                                            .color(t.text),
+                                                                    );
+                                                                }
+                                                            });
+                                                    }
+                                                });
+                                                if param.value != before {
+                                                    edited = Some((i, param.value));
+                                                }
+                                            }
+                                        }
+                                    });
+                                    // **Reported as it moves.** A patch editor
+                                    // that only applied on OK would make every
+                                    // change a guess: what you turn is what you
+                                    // hear.
+                                    if let Some((index, value)) = edited {
+                                        action = Some(DialogAction::SetPatchParam {
+                                            group: g,
+                                            index,
+                                            value,
+                                        });
+                                    }
+                                });
+
+                            ui.add_space((ui.available_height() - 26.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(Button::new(RichText::new("Done").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                                if ui
+                                    .add(Button::new(
+                                        RichText::new("Patches...").color(t.text),
+                                    ))
+                                    .clicked()
+                                {
+                                    // Back to the list, which is where a patch
+                                    // to start from comes from.
+                                    action = Some(DialogAction::ShowPatches { slot });
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
         Dialog::PatchPicker {
             slot,
             bank,
@@ -1969,6 +2428,21 @@ pub fn show(
                                         .clicked()
                                     {
                                         action = Some(DialogAction::LoadCartridge);
+                                    }
+                                    // **Edit what is playing**, which is the
+                                    // only patch anybody wants to start from.
+                                    // Beside Load, because between them they
+                                    // are the two ways a patch gets here: off
+                                    // a cartridge, or out of your own hands.
+                                    if ui
+                                        .add(Button::new(
+                                            RichText::new("Edit...")
+                                                .font(bold(11.0))
+                                                .color(t.text),
+                                        ))
+                                        .clicked()
+                                    {
+                                        action = Some(DialogAction::EditPatch { slot });
                                     }
                                 });
                             });

@@ -2123,6 +2123,36 @@ impl IvoryApp {
         self.save_settings_soon();
     }
 
+    /// Open the patch editor with a patch in it. For the screenshot hook,
+    /// which has no host to fill it in.
+    pub fn open_patch_editor_for_shot(&mut self) {
+        self.dialog = Some(dialogs::Dialog::PatchEditor {
+            slot: 0,
+            patch: crate::ports::PatchEdit {
+                name: "E.PIANO 1".to_owned(),
+                algorithm: 4,
+                routing: [0, 1, 0, 3, 0, 5],
+                feedback_op: 6,
+                groups: vec![crate::ports::PatchGroup {
+                    title: "OP1".to_owned(),
+                    params: (0..8)
+                        .map(|i| crate::ports::PatchParam {
+                            name: format!("Rate {}", i + 1),
+                            value: 60 + i,
+                            max: 99,
+                            choices: Vec::new(),
+                            unit: String::new(),
+                        })
+                        .collect(),
+                }],
+                bank_path: "~/.config/ivory/my-patches.syx".to_owned(),
+            },
+            group: 0,
+            name: "E.PIANO 1".to_owned(),
+            note: String::new(),
+        });
+    }
+
     /// Open an effect's panel. For the host's screenshot hook, which drives
     /// the same state a right-click sets.
     pub fn open_effect_panel(&mut self, fx: recorder_panel::Fx) {
@@ -2324,6 +2354,34 @@ impl IvoryApp {
             self.open_patch_picker(slot);
         } else {
             self.request_recorder(recorder::RecorderRequest::OpenPluginEditor(slot));
+        }
+    }
+
+    /// The host has read the patch being edited. Show it.
+    ///
+    /// **Pushed in, like everything else that crosses the firewall.** The UI
+    /// draws rows with numbers in them; what a number means to six operators
+    /// is the synth's business. See `dx7::edit`.
+    ///
+    /// The open PAGE and the caret in the name field survive, because this
+    /// arrives after every keystroke and a page that reset itself on each one
+    /// would make the editor unusable.
+    pub fn set_patch_edit(&mut self, edit: crate::ports::PatchEdit, note: Option<String>) {
+        let Some(dialogs::Dialog::PatchEditor {
+            patch, name, note: n, ..
+        }) = self.dialog.as_mut()
+        else {
+            return;
+        };
+        // The name is what the user is typing, not what the patch says: the
+        // format trims to ten characters and pads with spaces, and echoing
+        // that back mid-word would fight the keyboard.
+        if name.is_empty() && !edit.name.is_empty() {
+            name.clone_from(&edit.name);
+        }
+        *patch = edit;
+        if let Some(said) = note {
+            *n = said;
         }
     }
 
@@ -3853,7 +3911,12 @@ impl IvoryApp {
         self.detection_tick(true);
     }
 
-    fn apply_dialog_action(&mut self, action: DialogAction) {
+    /// Apply what a dialog asked for.
+    ///
+    /// Public so the host's `IVORY_OPEN_EDITOR` hook can drive it: the patch
+    /// editor is two clicks in and there is no other way to reach it from a
+    /// script.
+    pub fn apply_dialog_action(&mut self, action: DialogAction) {
         match action {
             DialogAction::SetBufferFrames(frames) => {
                 self.settings.record_buffer_frames = i64::from(frames.unwrap_or(0));
@@ -3882,6 +3945,36 @@ impl IvoryApp {
                 self.settings.dx7_patch = if index == usize::MAX { 0 } else { index };
                 self.save_settings_soon();
                 self.request_recorder(recorder::RecorderRequest::ChoosePatch { slot, index });
+            }
+            DialogAction::EditPatch { slot } => {
+                // Opened empty; the host fills it in on the next frame, the
+                // same way it fills the cartridge. See `set_patch_edit`.
+                self.dialog = Some(dialogs::Dialog::PatchEditor {
+                    slot,
+                    patch: crate::ports::PatchEdit::default(),
+                    group: 0,
+                    name: String::new(),
+                    note: String::new(),
+                });
+                self.request_recorder(recorder::RecorderRequest::EditPatch { slot });
+            }
+            DialogAction::ShowPatches { slot } => self.open_patch_picker(slot),
+            DialogAction::SetPatchParam {
+                group,
+                index,
+                value,
+            } => {
+                self.request_recorder(recorder::RecorderRequest::SetPatchParam {
+                    group,
+                    index,
+                    value,
+                });
+            }
+            DialogAction::SetPatchName(name) => {
+                self.request_recorder(recorder::RecorderRequest::SetPatchName(name));
+            }
+            DialogAction::SavePatch => {
+                self.request_recorder(recorder::RecorderRequest::SavePatch);
             }
             DialogAction::LoadCartridge => {
                 if !self.caps.native_file_dialogs {

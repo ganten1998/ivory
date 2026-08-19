@@ -242,6 +242,14 @@ pub struct DesktopApp {
     /// plugin picker's paths-not-modules.
     #[cfg(feature = "recorder")]
     cartridge: Option<crate::dx7::Cartridge>,
+    /// The patch the editor is working on, if it is open.
+    ///
+    /// **A copy, not a reference into the cartridge.** Editing is not choosing:
+    /// what is being built here may never be saved, and it must not modify the
+    /// bank it started from. What it does do is play, immediately — see
+    /// `SetPatchParam`.
+    #[cfg(feature = "recorder")]
+    editing: Option<crate::dx7::Voice>,
 }
 
 /// [`effect_defaults`], for the offscreen screenshot test.
@@ -623,7 +631,10 @@ impl DesktopApp {
         // driving it by hand makes every measurement a different measurement.
         //   IVORY_OPEN_EDITOR=1 dist/Tangent.app/Contents/MacOS/tangent
         if !self.recorder.dev_editor_done
-            && std::env::var("IVORY_OPEN_EDITOR").as_deref() == Ok("1")
+            && matches!(
+                std::env::var("IVORY_OPEN_EDITOR").as_deref(),
+                Ok("1") | Ok("patch")
+            )
         {
             let due = self
                 .recorder
@@ -636,6 +647,13 @@ impl DesktopApp {
                 // patch picker as readily as a VST3's window. A hook that called
                 // the engine directly could only ever reproduce half the bugs.
                 self.app.open_slot_editor(0);
+                // `=patch` goes one further, to the patch EDITOR, which is
+                // otherwise two clicks in and cannot be reached from a script.
+                if std::env::var("IVORY_OPEN_EDITOR").as_deref() == Ok("patch") {
+                    self.app.apply_dialog_action(ivory_ui::dialogs::DialogAction::EditPatch {
+                        slot: 0,
+                    });
+                }
                 eprintln!("IVORY_OPEN_EDITOR: opened slot 1");
             }
             ctx.request_repaint();
@@ -891,6 +909,40 @@ impl DesktopApp {
                         }
                     }
                 }
+                R::EditPatch { slot: _ } => {
+                    // Whatever is playing, which is what somebody means by
+                    // "edit this patch". A fresh install starts from the
+                    // default, which is a patch rather than silence.
+                    let v = self.editing.unwrap_or_else(|| self.current_voice());
+                    self.editing = Some(v);
+                    self.push_patch_edit(None);
+                }
+                R::SetPatchParam {
+                    group,
+                    index,
+                    value,
+                } => {
+                    if let Some(v) = self.editing.as_mut() {
+                        crate::dx7::edit::apply(v, group, index, value);
+                        let v = *v;
+                        // **Heard as it is turned.** An editor that only
+                        // applied on OK makes every change a guess.
+                        if let Some(e) = self.recorder.engine.as_mut() {
+                            e.set_builtin_voice(v);
+                        }
+                        self.push_patch_edit(None);
+                    }
+                }
+                R::SetPatchName(name) => {
+                    if let Some(v) = self.editing.as_mut() {
+                        v.set_name(&name);
+                        self.push_patch_edit(None);
+                    }
+                }
+                R::SavePatch => {
+                    let said = self.save_patch();
+                    self.push_patch_edit(Some(said));
+                }
                 R::ChoosePatch { slot: _, index } => {
                     // `usize::MAX` is the built-in row. Anything else indexes
                     // the cartridge, and a stale index from a settings file
@@ -928,6 +980,75 @@ impl DesktopApp {
                 }
             }
             ctx.request_repaint();
+        }
+    }
+
+    /// The patch the built-in is playing right now.
+    fn current_voice(&self) -> crate::dx7::Voice {
+        let (_, patch) = self.app.dx7_choice();
+        self.cartridge
+            .as_ref()
+            .and_then(|c| c.voices.get(patch))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Where a patch made here is written.
+    ///
+    /// **Beside the settings, not in them.** It is a SysEx bank: an ordinary
+    /// one, which Dexed and a real DX7 will both open. A patch editor whose
+    /// work could only be read back by this app would be a worse deal than the
+    /// hardware offered in 1983.
+    fn user_bank_path() -> std::path::PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        home.join(".config").join("ivory").join("my-patches.syx")
+    }
+
+    /// Hand the editor what it is editing.
+    fn push_patch_edit(&mut self, note: Option<String>) {
+        let Some(v) = self.editing else { return };
+        let path = Self::user_bank_path();
+        let edit = crate::dx7::edit::to_edit(&v, &path.to_string_lossy());
+        self.app.set_patch_edit(edit, note);
+    }
+
+    /// Write the patch being edited into the user's own bank.
+    ///
+    /// **Appended, never overwritten.** A save that replaced the last one
+    /// would lose the version somebody was happy with an hour ago, and a bank
+    /// holds thirty-two: the oldest is dropped only once it is truly full, and
+    /// the message says so.
+    fn save_patch(&mut self) -> String {
+        let Some(v) = self.editing else {
+            return String::new();
+        };
+        let path = Self::user_bank_path();
+        let mut voices: Vec<crate::dx7::Voice> = crate::dx7::Cartridge::load(&path)
+            .map(|c| c.voices)
+            .unwrap_or_default();
+        // Everything after the last patch anybody saved is the padding this
+        // wrote last time. Trimming it is what makes "append" mean append.
+        while voices.last() == Some(&crate::dx7::Voice::default()) {
+            voices.pop();
+        }
+        let full = voices.len() >= 32;
+        if full {
+            voices.remove(0);
+        }
+        voices.push(v);
+        let cart = crate::dx7::Cartridge::of("my-patches", voices);
+        match cart.save(&path) {
+            Ok(()) => {
+                let where_to = path
+                    .file_name()
+                    .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+                if full {
+                    format!("Saved to {where_to}. The bank was full, so the oldest went.")
+                } else {
+                    format!("Saved \"{}\" to {where_to}.", v.display_name())
+                }
+            }
+            Err(e) => format!("Could not save: {e}"),
         }
     }
 
@@ -1478,6 +1599,8 @@ impl DesktopApp {
             }),
             #[cfg(feature = "recorder")]
             cartridge: None,
+            #[cfg(feature = "recorder")]
+            editing: None,
         };
         // What the effects ship as, so the panel can draw a slider for a
         // parameter nobody has moved. See `ports::EffectDefaults`: the DSP owns
