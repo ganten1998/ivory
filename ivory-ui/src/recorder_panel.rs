@@ -351,17 +351,6 @@ struct Layout {
     /// Its icon: a click imports a file, a right-click opens the waveform.
     track_icon: Rect,
 
-    /// **Never positive, and that is the point.** `Hit::PickAudio` has to
-    /// appear in [`Layout::targets`] — every variant does, and a test proves
-    /// it — but it is not a press target in the band: the input is chosen by
-    /// right-clicking the microphone, because a device belongs to the control
-    /// it feeds. See `input_icon`.
-    ///
-    /// The camera used to be here too. It is the PREVIEW now, on a left click,
-    /// because the picture is the whole of what a camera does here and a box
-    /// that says "Select Camera" had better be the thing you press.
-    audio: Rect,
-
     /// The microphone icon at the head of the input fader.
     ///
     /// Not a press target — a right-click on it opens the audio input's
@@ -655,7 +644,6 @@ impl Layout {
             metronome_row: Rect::NOTHING,
             input_row: Rect::NOTHING,
             click: Rect::NOTHING,
-            audio: Rect::NOTHING,
             input_icon: Rect::NOTHING,
             track_row: Rect::NOTHING,
             track_icon: Rect::NOTHING,
@@ -1259,6 +1247,13 @@ impl Layout {
             (cap(self.fx[3]), Fixed(Hit::Type(NumField::Fx(Fx::Hpf)))),
             (cap(self.fx[4]), Fixed(Hit::Type(NumField::Fx(Fx::Lpf)))),
             (cap(self.fx[5]), Fixed(Hit::Type(NumField::Fx(Fx::Limiter)))),
+            // The microphone is its input's picker, on the same terms as the
+            // preview below: the device belongs to the control it feeds, and
+            // it is the icon at the head of the fader it feeds.
+            (
+                if self.rolling { Rect::NOTHING } else { self.input_icon },
+                Fixed(Hit::PickAudio),
+            ),
             // **The picture is the picker.** Not while a take is rolling: the
             // camera cannot be changed mid-take, and the dialog it opens is
             // modal over the one gesture that matters then, which is Stop.
@@ -1331,7 +1326,6 @@ impl Layout {
             (self.reveal, Fixed(Hit::RevealFolder)),
             (self.default_tick, Fixed(Hit::ToggleDefaultDir)),
             (self.open_when_done, Fixed(Hit::ToggleOpenWhenDone)),
-            (self.audio, Fixed(Hit::PickAudio)),
             (self.count_in, Fixed(Hit::CycleCountIn)),
             // Turned like the sends, and typed into on a DOUBLE click — see
             // `draw_tempo`. `SetTempo` carries beats rather than 0..=1, so the
@@ -1501,6 +1495,14 @@ impl Hit {
             Hit::SetInputGain(_) => Hit::SetInputGain(v),
             Hit::SetTrackGain(_) => Hit::SetTrackGain(v),
             Hit::SetSlotGain(i, _) => Hit::SetSlotGain(i, v),
+            // **The tempo, which was missing.** Every other knob's drag goes
+            // through here to turn "how far the hand has moved" into a value;
+            // without an arm the tempo fell to `other => other` and every
+            // frame of a drag re-applied the hit the PRESS produced — which is
+            // absolute, so the knob jumped to wherever it was first touched
+            // and then would not move. It has never been relatively draggable;
+            // the other seven becoming consistent is what made it obvious.
+            Hit::SetTempo(_) => Hit::SetTempo(knob_to_tempo(v)),
             other => other,
         }
     }
@@ -4545,6 +4547,44 @@ mod tests {
 
     /// Both ends of a knob's travel are reachable, and up is more.
     /// **A filter knob reads in hertz, and a send still reads in percent.**
+    /// **The tempo drags relatively, like every other knob.**
+    ///
+    /// It never did: `with_value` had no arm for it, so every frame of a drag
+    /// re-applied the hit the PRESS produced — which is absolute. The knob
+    /// jumped to wherever it was first touched and then would not move.
+    #[test]
+    fn the_tempo_knob_travels_with_the_hand() {
+        // A drag is `control_value` plus how far the hand has moved, put
+        // through `with_value`. Half way up the dial is half way up the range.
+        let mid = Hit::SetTempo(0.0).with_value(0.5);
+        let Hit::SetTempo(bpm) = mid else {
+            panic!("the tempo lost its value: {mid:?}")
+        };
+        assert!(
+            (bpm - (MIN_BPM + (MAX_BPM - MIN_BPM) * 0.5)).abs() < 0.01,
+            "half travel is {bpm} BPM"
+        );
+        // Both ends, and the round trip through the position it reports.
+        assert_eq!(Hit::SetTempo(0.0).with_value(0.0), Hit::SetTempo(MIN_BPM));
+        assert_eq!(Hit::SetTempo(0.0).with_value(1.0), Hit::SetTempo(MAX_BPM));
+        for bpm in [40.0_f64, 92.5, 120.0, 200.0] {
+            let back = Hit::SetTempo(0.0).with_value(tempo_knob_position(bpm));
+            let Hit::SetTempo(got) = back else { panic!() };
+            assert!((got - bpm).abs() < 0.01, "{bpm} came back as {got}");
+        }
+        // **And every control that travels goes through it.** The tempo was
+        // the one that did not, and nothing said so. Two different values, so
+        // this asks whether the value is USED rather than whether it happens
+        // to differ from whatever `Hit::ALL` was built with.
+        for h in Hit::ALL.into_iter().filter(|h| h.is_draggable()) {
+            assert_ne!(
+                h.with_value(0.2),
+                h.with_value(0.8),
+                "{h:?} ignores the value a drag hands it"
+            );
+        }
+    }
+
     /// **The clip latch is cleared by pressing the meter it is shown on.**
     ///
     /// It was a word in the status line, which is a second place to look for a
@@ -4567,6 +4607,24 @@ mod tests {
         let l = Layout::new(r, &rolling);
         assert!(l.meter.is_positive());
         assert_eq!(hit_test(r, &rolling, l.meter.center()), Some(Hit::DismissClip));
+    }
+
+    /// **Both devices are chosen from the control they feed**, on a left
+    /// click, and neither while a take is rolling.
+    #[test]
+    fn the_microphone_is_its_own_picker() {
+        let r = band(1300.0);
+        let v = idle();
+        let l = Layout::new(r, &v);
+        assert!(l.input_icon.is_positive(), "no microphone icon");
+        assert_eq!(hit_test(r, &v, l.input_icon.center()), Some(Hit::PickAudio));
+
+        let rolling = rolling();
+        assert_ne!(
+            hit_test(r, &rolling, Layout::new(r, &rolling).input_icon.center()),
+            Some(Hit::PickAudio),
+            "the picker is reachable during a take"
+        );
     }
 
     /// **Pressing the preview chooses the camera** — and only at rest.
@@ -5590,12 +5648,11 @@ mod tests {
                 // a session, and the band is what your hands are on while a
                 // take runs. `SetTempo` is here because the tempo BOX is a
                 // control and the value is not — see `Hit::EditTempo`.
-                const IN_THE_MENU: [Hit; 9] = [
+                const IN_THE_MENU: [Hit; 8] = [
                     Hit::ChooseFolder,
                     Hit::RevealFolder,
                     Hit::ToggleDefaultDir,
                     Hit::ToggleOpenWhenDone,
-                    Hit::PickAudio,
                     Hit::CycleCountIn,
                     Hit::Export,
                     Hit::EditTimeSignature,

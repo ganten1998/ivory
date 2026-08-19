@@ -901,6 +901,13 @@ impl DesktopApp {
             if !self.recorder.session.has_meter_source() {
                 state.meters = state.master;
             }
+            // **And the lamp means "something clipped", whatever the needle is
+            // showing.** With an input selected the VU meters the INPUT, so a
+            // built-in FM driven into the ceiling clipped the output and lit
+            // nothing at all — "choose a mic and clipping is not possible",
+            // on both platforms, for the same reason. The needle still answers
+            // one question; the lamp beside it was always the other one.
+            state.meters.clipped |= state.master.clipped;
         } else {
             state.master = ivory_ui::recorder::Meters::SILENT;
             state.gr_db = 0.0;
@@ -1628,11 +1635,32 @@ impl DesktopApp {
         false
     }
 
-    /// Put fullscreen back after a picker that had to leave it.
+    /// Put fullscreen back after a picker that had to leave it — **and not
+    /// while one is still open.**
+    ///
+    /// This is what 4.18.0 got wrong, and it turned a bad bug into a worse
+    /// one. On a box with no portal the picker is our own `Dialog::FileBrowser`,
+    /// which is a CHILD VIEWPORT — a second window. The sequence was: leave
+    /// fullscreen, open the browser next frame, and then, on the frame after
+    /// that, find no pending request and put fullscreen straight back. Under
+    /// i3 a fullscreen window sits above everything, so the browser was buried
+    /// the instant it appeared — and `app.rs` ignores all main-window input
+    /// while a dialog is open, so `Z` did nothing either. Not a hang: a modal
+    /// nobody could see, with the keyboard locked out. Force quit was the only
+    /// way back, which is exactly what was reported.
     fn restore_fullscreen(&mut self, ctx: &egui::Context) {
-        if std::mem::take(&mut self.refullscreen) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        if !self.refullscreen {
+            return;
         }
+        // Still something on screen, or still something waiting to be shown.
+        if self.app.open_dialog().is_some()
+            || self.deferred_file.is_some()
+            || self.deferred_dir.is_some()
+        {
+            return;
+        }
+        self.refullscreen = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
     }
 
     /// Whether a NATIVE file dialog will actually appear.

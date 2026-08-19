@@ -1501,16 +1501,8 @@ impl IvoryApp {
                 // the band with no box of its own: it is set once and it was
                 // taking a caption and a tick in the busiest row there is.
                 // Everywhere else on the band, a right-click opens the menu.
-                // **And right-clicking the microphone opens the audio
-                // input's picker.** Same idea, one row down: the device
-                // belongs to the fader it feeds, and it was reachable only
-                // from a menu led by subjects that are mostly about the piano.
                 if let Some(r) = recorder_rect.filter(|r| r.contains(pos)) {
                     let view = self.recorder_layout_view();
-                    if recorder_panel::input_icon(r, &view).is_some_and(|i| i.contains(pos)) {
-                        self.apply_recorder_hit(recorder_panel::Hit::PickAudio);
-                        return;
-                    }
                     // **And right-clicking the waveform icon opens the
                     // waveform.** A left click imports; where the file starts
                     // and stops is a question about a picture, and the row is
@@ -1518,14 +1510,6 @@ impl IvoryApp {
                     if recorder_panel::track_icon(r, &view).is_some_and(|i| i.contains(pos)) {
                         self.track_open = true;
                         self.track_drag = None;
-                        return;
-                    }
-                    // **And right-clicking the picture chooses the camera.**
-                    // Same rule again: the device belongs to the control it
-                    // feeds, and the preview is the whole of what a camera
-                    // does here.
-                    if recorder_panel::preview_rect(r, &view).is_some_and(|i| i.contains(pos)) {
-                        self.apply_recorder_hit(recorder_panel::Hit::PickCamera);
                         return;
                     }
                     if recorder_panel::hit_test(r, &view, pos)
