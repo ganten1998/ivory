@@ -874,15 +874,37 @@ mod shot {
         settings.show_recorder = true;
         settings.reverb_mix = 0.42;
         settings.delay_mix = 0.18;
+        settings.chorus_mix = 0.66;
         settings.metronome_gain = 0.5;
         settings.input_gain = 1.0;
         settings.plugin_slots[0] = Some(ivory_ui::dialogs::BUILTIN_PATH.to_owned());
-        let app = IvoryApp::new(c.context(), settings, ivory_ui::host::Caps::DESKTOP);
-        // Two frames: the first lays out and the second draws what it decided.
+        let mut app = IvoryApp::new(c.context(), settings, ivory_ui::host::Caps::DESKTOP);
+        app.set_effect_defaults(crate::desktop::effect_defaults_for_shot());
+        let mut shoot = |app: &IvoryApp| {
+            c.frame(app, Layout::default(), DisplayShows::default(), false, true, None)
+                .map(|_| ())
+        };
+        // The first frame lays out and the second draws what it decided.
         for _ in 0..2 {
-            if let Err(e) = c.frame(&app, Layout::default(), DisplayShows::default(), false, true, None) {
+            if let Err(e) = shoot(&app) {
                 eprintln!("frame: {e}");
                 return;
+            }
+        }
+        // **After a frame, not before.** A panel hangs off its knob, and where
+        // the knob is is not known until the band has been drawn once — so a
+        // panel opened before that has no anchor and closes itself.
+        if let Ok(which) = std::env::var("IVORY_SHOT_FX") {
+            app.open_effect_panel(match which.as_str() {
+                "delay" => ivory_ui::recorder_panel::Fx::Delay,
+                "chorus" => ivory_ui::recorder_panel::Fx::Chorus,
+                _ => ivory_ui::recorder_panel::Fx::Reverb,
+            });
+            for _ in 0..2 {
+                if let Err(e) = shoot(&app) {
+                    eprintln!("frame: {e}");
+                    return;
+                }
             }
         }
         let Some(px) = c.last_frame() else {

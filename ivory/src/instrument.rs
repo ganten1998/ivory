@@ -858,10 +858,20 @@ struct Shared {
     /// one constant rather than a fourth field in four structs.
     slot_gains: [AtomicU32; SLOTS],
     metro_gain: AtomicU32,
-    /// The two effect knobs, 0..=1. On the instrument bus only — see
+    /// The three effect knobs, 0..=1. On the instrument bus only — see
     /// `effects.rs` for what that includes and what it deliberately does not.
     reverb_mix: AtomicU32,
     delay_mix: AtomicU32,
+    chorus_mix: AtomicU32,
+    /// What each effect is set to, behind a lock.
+    ///
+    /// **A lock, unlike the knobs above.** There are eleven of these and they
+    /// only move when somebody opens a menu, so the renderer reaches for them
+    /// once a block and only when `params_dirty` says something changed. Eleven
+    /// atomics would be eleven names to keep in step for a value that is read
+    /// as a whole or not at all.
+    params: Mutex<crate::effects::Params>,
+    params_dirty: AtomicBool,
     metro_on: AtomicBool,
     metro_in_take: AtomicBool,
     /// The COUNT-IN's clicks belong in the take, whatever `metro_in_take` says.
@@ -943,6 +953,9 @@ impl Shared {
             // whole cost at zero.
             reverb_mix: AtomicU32::new(0.0f32.to_bits()),
             delay_mix: AtomicU32::new(0.0f32.to_bits()),
+            chorus_mix: AtomicU32::new(0.0f32.to_bits()),
+            params: Mutex::new(crate::effects::Params::default()),
+            params_dirty: AtomicBool::new(false),
             metro_on: AtomicBool::new(false),
             // THE default the owner called out: the click is a monitor signal,
             // not a take signal.
@@ -987,14 +1000,31 @@ impl Shared {
         }
     }
 
-    /// Both effect knobs at once, 0..=1.
+    /// All three effect knobs at once, 0..=1.
     ///
     /// Sanitised here rather than at the point of use, for the same reason the
     /// gains are: a NaN reaching a feedback loop does not stay in one sample.
-    fn set_effects(&self, reverb: f32, delay: f32) {
+    fn set_effects(&self, sends: crate::effects::Sends) {
         let sane = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
-        self.reverb_mix.store(sane(reverb).to_bits(), Ordering::Relaxed);
-        self.delay_mix.store(sane(delay).to_bits(), Ordering::Relaxed);
+        self.reverb_mix
+            .store(sane(sends.reverb).to_bits(), Ordering::Relaxed);
+        self.delay_mix
+            .store(sane(sends.delay).to_bits(), Ordering::Relaxed);
+        self.chorus_mix
+            .store(sane(sends.chorus).to_bits(), Ordering::Relaxed);
+    }
+
+    /// What the effects are set to. Picked up by the renderer next block.
+    ///
+    /// **Only when it CHANGED.** This is pushed every frame with the gains, and
+    /// taking a lock sixty times a second to write the same eleven numbers is a
+    /// lock the audio thread can contend with for nothing.
+    fn set_effect_params(&self, p: crate::effects::Params) {
+        let Ok(mut g) = self.params.lock() else { return };
+        if *g != p {
+            *g = p;
+            self.params_dirty.store(true, Ordering::Release);
+        }
     }
 
     /// The instrument fault line, naming the slots so the other two are not
@@ -1181,8 +1211,14 @@ struct Renderer {
     /// removed. See `dx7/` for the synth and `builtin.rs` for what it grew out
     /// of.
     builtin: crate::dx7::Dx7,
-    /// Reverb and delay on the instrument sum. Costs nothing at rest.
+    /// Reverb, delay and chorus on the instrument sum. Free at rest.
     effects: crate::effects::Effects,
+    /// The renderer's OWN copy of the parameters.
+    ///
+    /// Refreshed from `Shared` only when the dirty flag says to, so the audio
+    /// thread never blocks on a lock in the common case and never blocks at
+    /// all: a `try_lock` that fails simply means next block.
+    effect_params: crate::effects::Params,
     /// Whether a slot has asked for the built-in by name. When none has, it
     /// still plays if nothing else does; when one has, it plays regardless.
     builtin_slot: Option<usize>,
@@ -1419,13 +1455,26 @@ impl Renderer {
             // upstream of the tap, so what is recorded is what was heard;
             // upstream of the click and the input monitor, so neither of those
             // ends up in a room they were never in.
+            // A parameter change, if one is waiting and the lock is free this
+            // block. Same shape as the DX7's pending voice, and for the same
+            // reason: the audio thread waits for nothing.
+            if self.shared.params_dirty.load(Ordering::Acquire) {
+                if let Ok(g) = self.shared.params.try_lock() {
+                    self.effect_params = *g;
+                    self.shared.params_dirty.store(false, Ordering::Release);
+                }
+            }
             if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
                 self.effects.process(
                     mix,
                     n,
                     TAP_CHANNELS,
-                    Shared::f32_of(&self.shared.reverb_mix),
-                    Shared::f32_of(&self.shared.delay_mix),
+                    crate::effects::Sends {
+                        reverb: Shared::f32_of(&self.shared.reverb_mix),
+                        delay: Shared::f32_of(&self.shared.delay_mix),
+                        chorus: Shared::f32_of(&self.shared.chorus_mix),
+                    },
+                    &self.effect_params,
                     f64::from_bits(self.shared.bpm.load(Ordering::Relaxed)),
                 );
             }
@@ -2031,6 +2080,7 @@ impl Engine {
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             builtin: crate::dx7::Dx7::new(rate as f32),
             effects: crate::effects::Effects::new(rate as f32),
+            effect_params: crate::effects::Params::default(),
             builtin_slot: None,
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
             tap: tap_tx,
@@ -2732,9 +2782,14 @@ impl Engine {
         self.shared.set_slot_gain(slot, linear);
     }
 
-    /// The two effect knobs, 0..=1.
-    pub fn set_effects(&self, reverb: f32, delay: f32) {
-        self.shared.set_effects(reverb, delay);
+    /// The three effect knobs, 0..=1.
+    pub fn set_effects(&self, sends: crate::effects::Sends) {
+        self.shared.set_effects(sends);
+    }
+
+    /// What each effect is set to.
+    pub fn set_effect_params(&self, params: crate::effects::Params) {
+        self.shared.set_effect_params(params);
     }
 
     pub fn set_metronome_gain(&self, linear: f32) {
@@ -4233,6 +4288,7 @@ mod tests {
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             builtin: crate::dx7::Dx7::new(RATE as f32),
             effects: crate::effects::Effects::new(RATE as f32),
+            effect_params: crate::effects::Params::default(),
             builtin_slot: None,
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
             tap,
@@ -4371,7 +4427,10 @@ mod tests {
     fn the_effect_knobs_reach_both_the_device_and_the_take() {
         let tail = |reverb: f32| {
             let (mut r, mut tx, _) = renderer_with_midi(2);
-            r.shared.set_effects(reverb, 0.0);
+            r.shared.set_effects(crate::effects::Sends {
+                reverb,
+                ..crate::effects::Sends::default()
+            });
             queue(&mut tx, 0, [0x90, 60, 100]);
             let mut out = vec![0.0_f32; 2 * 4096];
             r.render(&mut out, 0, 0);

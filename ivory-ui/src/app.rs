@@ -162,6 +162,12 @@ pub struct IvoryApp {
     /// Where the bands were actually drawn, which is centred in the pane.
     /// Child windows and in-canvas dialogs centre on this.
     last_drawn: Rect,
+    /// Where the recorder band was last drawn, or `NOTHING` when it was not.
+    ///
+    /// Recorded rather than recomputed: the band's position depends on which
+    /// other bands are showing and on the 16:9 fit, and a caller that worked
+    /// it out again would be a second layout to keep in step with the first.
+    last_band: Rect,
     /// A barre the user drew by dragging along a fret, and the drag in
     /// progress. Only ever set by that gesture.
     manual_barre: Option<ivory_core::voicing::Barre>,
@@ -237,7 +243,13 @@ pub struct IvoryApp {
     /// rather than a queue on purpose: these are all user gestures, at most one
     /// happens per frame, and a queue would let a stuck host accumulate a
     /// backlog of Record presses to replay.
-    recorder_request: Option<recorder::RecorderRequest>,
+    /// What the band has asked the host for, oldest first.
+    ///
+    /// **A queue and not a slot.** One gesture can be two requests: latching a
+    /// chord on the keyboard while another is already latched sends the
+    /// note-offs and the note-ons in the same frame, and a slot would silently
+    /// drop whichever came first. The host already drained in a loop.
+    recorder_request: std::collections::VecDeque<recorder::RecorderRequest>,
     /// A folder the host has been asked to choose. Drained after the frame so
     /// the native panel's nested run loop never starts inside an egui frame.
     dir_request: Option<crate::ports::DirRequest>,
@@ -303,6 +315,18 @@ pub struct IvoryApp {
     /// The Setup button was pressed; the menu opens after the frame, where the
     /// window origin needed to place it is known.
     setup_open: bool,
+    /// The effect panel a right-click on a knob opened, if any.
+    ///
+    /// One at a time, like `dialog`: three panels at once over a band this
+    /// small is three panels covering each other.
+    fx_open: Option<recorder_panel::Fx>,
+    /// The row of that panel a drag is on, once one has started. `&'static
+    /// str` because it is the settings KEY — the same thing the panel reports
+    /// and the host reads back, so a drag cannot end up writing to a row it
+    /// did not start on.
+    fx_drag: Option<&'static str>,
+    /// What the effects ship as. Empty until the host says; see the type.
+    fx_defaults: crate::ports::EffectDefaults,
     /// Notes sounding because a gesture is holding them: the audition key, or
     /// a mouse button on a key or a fret.
     ///
@@ -311,7 +335,19 @@ pub struct IvoryApp {
     /// released when the gesture ends, including when the window loses focus:
     /// a note that outlives the gesture that started it rings forever, and the
     /// only way to stop it is to quit the app.
-    sounding: Vec<u8>,
+    /// What the app is currently making the instrument sound, in DISPLAY
+    /// pitches. Reconciled once a frame against [`IvoryApp::wanted_sound`].
+    ///
+    /// **One set for three gestures**, and that is what keeps them from
+    /// fighting: a note held down with the mouse, a chord latched by
+    /// keytoggle, and the Space audition can all want the same pitch, and only
+    /// the union's EDGES become note-ons and note-offs. Sending them
+    /// separately double-triggers the overlap and leaves the instrument
+    /// holding a note the app believes it stopped.
+    sounding: std::collections::BTreeSet<u8>,
+    /// The note under a mouse button that is still down, with keytoggle off.
+    /// One at a time: a press replaces whatever the last one was.
+    clicked: std::collections::BTreeSet<u8>,
     /// Whether the audition key was down last frame, so a hold is one note-on
     /// rather than one per frame. Key auto-repeat retriggered the chord dozens
     /// of times a second before this.
@@ -387,7 +423,29 @@ struct Grab {
     hit: recorder_panel::Hit,
     from: Pos2,
     moved: bool,
+    /// What the control read when it was grabbed, 0..=1.
+    ///
+    /// Only a knob uses it. See [`KNOB_TRAVEL`]: a knob is dragged RELATIVELY,
+    /// so the value it lands on is this plus how far the hand has moved, and
+    /// something has to remember where it started.
+    from_value: f32,
 }
+
+/// Points of vertical travel for a knob's whole sweep.
+///
+/// **A knob is dragged relatively, unlike every fader in this band.** A fader
+/// is a picture of a thing at a position and dragging it means putting it
+/// where the pointer is; its track is a couple of hundred points long, so that
+/// is precise enough. A knob is thirty points across, and mapping its own
+/// height to the full range gives about three percent per pixel — the control
+/// the owner described as hard to land on a number.
+///
+/// So the pointer's DISTANCE from where it grabbed drives the value, and this
+/// is how far it has to move for the full sweep. Wider than the knob by a
+/// factor of ten, and unbounded by the knob's rectangle: the hand can leave
+/// the control entirely and keep turning, which is what every mixer's plugin
+/// does and what makes a small knob usable at all.
+const KNOB_TRAVEL: f32 = 260.0;
 
 /// How far the pointer has to travel before a press counts as a drag.
 ///
@@ -514,6 +572,7 @@ impl IvoryApp {
             pending_resize: None,
             last_pane: Vec2::ZERO,
             last_drawn: Rect::NOTHING,
+            last_band: Rect::NOTHING,
             manual_barre: None,
             barre_drag: None,
             demo_menu_done: false,
@@ -547,7 +606,7 @@ impl IvoryApp {
             recorder_guard: None,
             startup_recorder_detach_at,
             recorder: recorder::RecorderState::default(),
-            recorder_request: None,
+            recorder_request: std::collections::VecDeque::new(),
             dir_request: None,
             file_request: None,
             cartridge: crate::ports::CartridgeInfo::default(),
@@ -561,7 +620,11 @@ impl IvoryApp {
             menu_over_recorder: false,
             menu_over_staff: false,
             setup_open: false,
-            sounding: Vec::new(),
+            fx_open: None,
+            fx_drag: None,
+            fx_defaults: crate::ports::EffectDefaults::default(),
+            sounding: std::collections::BTreeSet::new(),
+            clicked: std::collections::BTreeSet::new(),
             audition_held: false,
             audio_status: recorder::AudioStatus::default(),
             fullscreen_sent: None,
@@ -860,8 +923,20 @@ impl IvoryApp {
         }
     }
 
-    /// Keys drawn as active: MIDI-held notes plus manual (keytoggle) notes.
+    /// Everything drawn as active: what is lit, plus whatever is sounding.
     fn display_notes(&self) -> HashSet<u8> {
+        let mut set = self.lit_notes();
+        // A note being sounded is a note being played, so it lights up like
+        // one. Added AFTER the transpose rather than before: `sounding` is
+        // already in display pitches, and transposing it a second time lit
+        // phantom keys a whole interval above the ones being played.
+        set.extend(self.sounding.iter().copied());
+        set
+    }
+
+    /// Keys lit by the keyboard and by keytoggle: the picture before any
+    /// gesture of this app's own sounds anything.
+    fn lit_notes(&self) -> HashSet<u8> {
         // Dev/marketing hook: pin a voicing with no keyboard attached, for
         // store screenshots and for eyeballing display work (a glow or a
         // segment readout can only be judged lit). Environment-gated, so a
@@ -880,11 +955,15 @@ impl IvoryApp {
         if self.settings.keytoggle_enabled {
             set.extend(self.manual_notes.iter().copied());
         }
-        // A note being auditioned is a note being played, so it lights up like
-        // one. `sounding` is already in the app's own tuning, so it is added
-        // BEFORE the transpose that the rest of this set has yet to receive.
-        set.extend(self.sounding.iter().copied());
         transposed(&set, self.settings.transpose)
+    }
+
+    /// The notes keytoggle is holding, in display pitches.
+    fn latched_notes(&self) -> HashSet<u8> {
+        if !self.settings.keytoggle_enabled {
+            return HashSet::new();
+        }
+        transposed(&self.manual_notes, self.settings.transpose)
     }
 
     /// What the theory band draws, from the notes already on screen.
@@ -1020,7 +1099,11 @@ impl IvoryApp {
     /// painting — the live ones, or the composite's override. `None` when
     /// detection is off in that copy, which is what lets the staff take the
     /// readout strip's height back.
-    /// The view the band's LAYOUT depends on, which is all `setup_rect` needs.
+    /// Everything the band draws and hit-tests from.
+    ///
+    /// One builder for all of it. The arguments were identical at seven call
+    /// sites, which is seven places to forget a new one — and the one being
+    /// forgotten silently is a band that draws from stale state.
     fn recorder_layout_view(&self) -> recorder::RecorderView<'_> {
         self.recorder.view(
             self.settings.record_take_name.as_deref().unwrap_or_default(),
@@ -1028,6 +1111,12 @@ impl IvoryApp {
             self.num_edit.as_ref(),
             self.settings.knobs(),
             self.settings.record_hide_elapsed,
+            // Which control is being turned right now, so a knob can show its
+            // number while a hand is on it. `moved`, not merely grabbed: a
+            // press that has not travelled yet is on its way to being a tap.
+            self.grabbed
+                .filter(|g| g.moved)
+                .and_then(|g| recorder_panel::num_field(g.hit)),
         )
     }
 
@@ -1236,19 +1325,23 @@ impl IvoryApp {
                 // reaching the sixteenth meant a right-click anywhere else
                 // followed by a hunt down a list of subjects that are mostly
                 // about the piano.
+                // **Right-clicking a knob opens the effect behind it.** The
+                // knob is one number, how much, because during a take that is
+                // the only one anybody reaches for; everything that shapes the
+                // sound is in the panel. Checked before the band's own menu,
+                // which is what a right-click anywhere else means.
+                if let Some(fx) = self.fx_under(recorder_rect, pos) {
+                    self.fx_open = Some(fx);
+                    self.fx_drag = None;
+                    return;
+                }
                 // **Right-clicking the metronome sets whether the click goes
                 // into the FILE**, and opens no menu. It is the one control in
                 // the band with no box of its own: it is set once and it was
                 // taking a caption and a tick in the busiest row there is.
                 // Everywhere else on the band, a right-click opens the menu.
                 if let Some(r) = recorder_rect.filter(|r| r.contains(pos)) {
-                    let view = self.recorder.view(
-                        self.settings.record_take_name.as_deref().unwrap_or_default(),
-                        self.name_focused,
-                        self.num_edit.as_ref(),
-                        self.settings.knobs(),
-                        self.settings.record_hide_elapsed,
-                    );
+                    let view = self.recorder_layout_view();
                     if recorder_panel::hit_test(r, &view, pos)
                         == Some(recorder_panel::Hit::ToggleMetronome)
                     {
@@ -1323,7 +1416,20 @@ impl IvoryApp {
         // ended up. Outside the band, over another window, anywhere: the
         // release is what ends the gesture, not where it happened.
         if pointer_released {
-            self.silence();
+            self.clicked.clear();
+        }
+
+        // The effect panel, on the same terms as the take settings below it.
+        if let Some(fx) = self.fx_open {
+            if primary_pressed || (pointer_down && self.fx_drag.is_some()) {
+                if let Some(pos) = pointer {
+                    self.press_in_fx_panel(ui.max_rect(), fx, pos, primary_pressed);
+                }
+                return;
+            }
+            if pointer_released {
+                self.fx_drag = None;
+            }
         }
 
         // **The popup eats the press, wherever it lands.** Inside, it is a
@@ -1368,13 +1474,7 @@ impl IvoryApp {
                     }
                     let hit = recorder_panel::hit_test(
                         r,
-                        &self.recorder.view(
-                            self.settings.record_take_name.as_deref().unwrap_or_default(),
-                            self.name_focused,
-                            self.num_edit.as_ref(),
-                            self.settings.knobs(),
-                            self.settings.record_hide_elapsed,
-                        ),
+                        &self.recorder_layout_view(),
                         pos,
                     );
                     // Remember a dragged control for as long as the button is
@@ -1384,6 +1484,7 @@ impl IvoryApp {
                         hit: h,
                         from: pos,
                         moved: false,
+                        from_value: self.control_value(h),
                     });
                     // A press anywhere in the band that is not the name field
                     // takes focus off it, which is what makes clicking away
@@ -1502,7 +1603,11 @@ impl IvoryApp {
                         })
                     };
                     if let Some(note) = hit {
-                        self.sound(vec![note]);
+                        // One at a time. Dragging across the keyboard is not a
+                        // glissando here: the press replaces whatever the last
+                        // one sounded, and letting go ends it.
+                        self.clicked.clear();
+                        self.clicked.insert(note);
                         return;
                     }
                 }
@@ -1725,37 +1830,73 @@ impl IvoryApp {
             return;
         }
         self.audition_held = down;
-        if down {
-            let mut notes: Vec<u8> = self.display_notes().into_iter().collect();
-            // Low to high, so a chord reaches the instrument as a chord rather
-            // than in whatever order a hash set happened to hold it.
-            notes.sort_unstable();
-            self.sound(notes);
-        } else {
-            self.silence();
-        }
     }
 
-    /// Begin sounding `notes`, and remember them so they can be stopped.
-    fn sound(&mut self, notes: Vec<u8>) {
-        if notes.is_empty() || !self.sounding.is_empty() {
-            return;
+    /// Every note a GESTURE of this app's own is asking to sound, right now.
+    ///
+    /// Three sources, unioned rather than sent separately:
+    ///
+    /// - **keytoggle's latch**, which outlives the click that made it. The
+    ///   switch decides whether a click LEAVES the note behind, not whether it
+    ///   makes a sound: a picture of a piano whose keys light up silently is
+    ///   the wrong answer either way.
+    /// - **a mouse button still down** with keytoggle off, which sounds until
+    ///   it is let go.
+    /// - **the Space audition**, which is the whole picture, held.
+    ///
+    /// MIDI notes are not in here. They reach the instrument through the MIDI
+    /// path already, and sounding them again from the app would be a second
+    /// note-on for a key somebody is holding down.
+    fn wanted_sound(&self) -> std::collections::BTreeSet<u8> {
+        let mut want = std::collections::BTreeSet::new();
+        // **Nothing latches while a take is rolling.** A note the app is
+        // holding is not a note anybody played, and it would land in the file
+        // as though it were. The performance is the take.
+        if !self.recorder.state.is_active() {
+            want.extend(self.latched_notes());
         }
-        self.sounding = notes.clone();
-        self.request_recorder(recorder::RecorderRequest::Audition { notes, on: true });
+        want.extend(self.clicked.iter().copied());
+        if self.audition_held {
+            want.extend(self.lit_notes());
+        }
+        want
     }
 
-    /// Stop whatever a gesture was holding. Safe to call when nothing is.
-    fn silence(&mut self) {
-        if self.sounding.is_empty() {
+    /// Make the instrument sound exactly what [`wanted_sound`] asks for.
+    ///
+    /// **Once a frame, from a diff**, rather than at each mutation — so every
+    /// path that can change the set is covered by construction instead of by
+    /// remembering to call something: a key, a fret, a chord vertex on the
+    /// lattice, Clear, Space, letting go of the mouse, switching keytoggle
+    /// off, or starting a take.
+    ///
+    /// [`wanted_sound`]: IvoryApp::wanted_sound
+    fn reconcile_sound(&mut self) {
+        let want = self.wanted_sound();
+        if want == self.sounding {
             return;
         }
-        let notes = std::mem::take(&mut self.sounding);
-        self.request_recorder(recorder::RecorderRequest::Audition { notes, on: false });
+        let off: Vec<u8> = self.sounding.difference(&want).copied().collect();
+        let on: Vec<u8> = want.difference(&self.sounding).copied().collect();
+        self.sounding = want;
+        // **Off before on.** Releasing a pitch and re-taking it in the same
+        // frame has to arrive in that order, or the instrument ends up holding
+        // a note this app believes it stopped. The two are separate requests
+        // because `Audition` carries one direction, which is why the queue is
+        // a queue.
+        if !off.is_empty() {
+            self.request_recorder(recorder::RecorderRequest::Audition {
+                notes: off,
+                on: false,
+            });
+        }
+        if !on.is_empty() {
+            self.request_recorder(recorder::RecorderRequest::Audition { notes: on, on: true });
+        }
     }
 
     pub fn take_recorder_request(&mut self) -> Option<recorder::RecorderRequest> {
-        self.recorder_request.take()
+        self.recorder_request.pop_front()
     }
 
     /// Add a folder to the list of places VST3 bundles are looked for.
@@ -1796,18 +1937,187 @@ impl IvoryApp {
         self.dir_request.take()
     }
 
+    /// Which effect's knob is under `pos`, if any.
+    fn fx_under(&self, band: Option<Rect>, pos: Pos2) -> Option<recorder_panel::Fx> {
+        let band = band.filter(|r| r.contains(pos))?;
+        let view = self.recorder_layout_view();
+        recorder_panel::Fx::ALL.into_iter().find(|fx| {
+            recorder_panel::knob_rect(band, &view, fx.hit()).is_some_and(|r| r.contains(pos))
+        })
+    }
+
+    /// Where the open effect panel hangs from: its own knob.
+    fn fx_anchor(&self, fx: recorder_panel::Fx) -> Rect {
+        let view = self.recorder_layout_view();
+        recorder_panel::knob_rect(self.last_band, &view, fx.hit()).unwrap_or(Rect::NOTHING)
+    }
+
+    /// A press or a drag inside the open effect panel.
+    ///
+    /// **A drag stays on the row it started on.** Once `fx_drag` names a key,
+    /// every later position sets THAT key, wherever the pointer has slid to —
+    /// the same rule the band's own faders follow, and for the same reason: a
+    /// hand that drifts up a row must not start setting the row above.
+    fn press_in_fx_panel(
+        &mut self,
+        screen: Rect,
+        fx: recorder_panel::Fx,
+        pos: Pos2,
+        pressed: bool,
+    ) {
+        let anchor = self.fx_anchor(fx);
+        if let Some(key) = self.fx_drag {
+            if let Some(v) = recorder_panel::fx_value_at(screen, anchor, fx, key, pos) {
+                self.set_effect_param(key, v);
+            }
+            return;
+        }
+        if !pressed {
+            return;
+        }
+        match recorder_panel::fx_hit_test(screen, anchor, fx, pos) {
+            Some(recorder_panel::FxHit::Set { key, value }) => {
+                self.fx_drag = Some(key);
+                self.set_effect_param(key, value);
+            }
+            Some(recorder_panel::FxHit::NextDivision) => self.next_delay_division(),
+            Some(recorder_panel::FxHit::Reset(fx)) => self.reset_effect(fx),
+            Some(recorder_panel::FxHit::Close) => self.fx_open = None,
+            // A press on the panel's own chrome is swallowed; one outside it
+            // closes the panel and does nothing else.
+            None => {
+                if !recorder_panel::fx_popup_rect(screen, anchor).contains(pos) {
+                    self.fx_open = None;
+                }
+            }
+        }
+    }
+
+    /// Write one effect parameter, 0..=1.
+    fn set_effect_param(&mut self, key: &str, value: f32) {
+        let v = f64::from(value.clamp(0.0, 1.0));
+        self.settings
+            .effect_params
+            .insert(key.to_owned(), serde_json::Value::from(v));
+        self.save_settings_soon();
+    }
+
+    /// Open an effect's panel. For the host's screenshot hook, which drives
+    /// the same state a right-click sets.
+    pub fn open_effect_panel(&mut self, fx: recorder_panel::Fx) {
+        self.fx_open = Some(fx);
+    }
+
+    /// What the effects ship as. Told by the host; see [`EffectDefaults`].
+    ///
+    /// [`EffectDefaults`]: crate::ports::EffectDefaults
+    pub fn set_effect_defaults(&mut self, defaults: crate::ports::EffectDefaults) {
+        self.fx_defaults = defaults;
+    }
+
+    /// Step the delay to the next named division.
+    fn next_delay_division(&mut self) {
+        let list = &self.fx_defaults.divisions;
+        if list.is_empty() {
+            return;
+        }
+        let now = self.delay_division_key();
+        let i = list.iter().position(|(k, _)| *k == now).unwrap_or(0);
+        let next = list[(i + 1) % list.len()].0.clone();
+        self.settings
+            .effect_params
+            .insert("delay_division".to_owned(), serde_json::Value::from(next));
+        self.save_settings();
+    }
+
+    /// The delay's division key, as stored or as it ships.
+    fn delay_division_key(&self) -> String {
+        self.settings
+            .effect_params
+            .get("delay_division")
+            .and_then(serde_json::Value::as_str)
+            .filter(|k| self.fx_defaults.divisions.iter().any(|(d, _)| d == k))
+            .map_or_else(
+                || self.fx_defaults.default_division.clone(),
+                str::to_owned,
+            )
+    }
+
+    /// What the delay's time row shows.
+    fn delay_division_label(&self) -> String {
+        let key = self.delay_division_key();
+        self.fx_defaults
+            .divisions
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map_or(key, |(_, label)| label.clone())
+    }
+
+    /// Put one effect back to what it shipped as.
+    ///
+    /// By REMOVING the keys rather than writing the defaults into the file: a
+    /// parameter that is not in the settings is a parameter at its default,
+    /// which is the same rule that makes an old file load without a migration.
+    fn reset_effect(&mut self, fx: recorder_panel::Fx) {
+        for (key, _) in fx.rows() {
+            if !key.is_empty() {
+                self.settings.effect_params.shift_remove(key);
+            }
+        }
+        self.save_settings();
+    }
+
+    /// What one effect parameter reads, for the panel to draw.
+    fn effect_param(&self, key: &str) -> f32 {
+        self.settings
+            .effect_params
+            .get(key)
+            .or_else(|| self.fx_defaults.values.get(key))
+            .and_then(serde_json::Value::as_f64)
+            // Half, for a key nothing has an opinion about. Only reachable
+            // before the host has said anything, which on the desktop is never
+            // and in a plugin is always — and a plugin has no effects panel.
+            .map_or(0.5, |v| v as f32)
+    }
+
+    /// What a value-carrying control reads right now, 0..=1.
+    ///
+    /// Only the knobs answer, because only the knobs are dragged relatively
+    /// and need somewhere to start from. Everything else returns zero and does
+    /// not use it.
+    fn control_value(&self, hit: recorder_panel::Hit) -> f32 {
+        match hit {
+            recorder_panel::Hit::SetReverb(_) => self.settings.reverb_mix as f32,
+            recorder_panel::Hit::SetDelay(_) => self.settings.delay_mix as f32,
+            recorder_panel::Hit::SetChorus(_) => self.settings.chorus_mix as f32,
+            _ => 0.0,
+        }
+    }
+
     /// The dialog on screen, if any. The host reads it to keep a slot row in
     /// step with the picker that belongs to it.
     pub fn open_dialog(&self) -> Option<&dialogs::Dialog> {
         self.dialog.as_ref()
     }
 
-    /// The two effect sends, 0..=1, for the host to hand the audio thread.
-    pub fn effect_sends(&self) -> (f32, f32) {
-        (
+    /// The three effect sends, 0..=1, for the host to hand the audio thread.
+    pub fn effect_sends(&self) -> [f32; 3] {
+        [
             self.settings.reverb_mix as f32,
             self.settings.delay_mix as f32,
-        )
+            self.settings.chorus_mix as f32,
+        ]
+    }
+
+    /// What each effect is set to, as the flat map the settings file holds.
+    ///
+    /// **Untyped on purpose.** `ivory-ui` cannot name an `effects::Params` —
+    /// that type lives in the binary, behind the firewall, with the DSP it
+    /// belongs to. The UI's job is to hold numbers a person moved and write
+    /// them down; deciding what "reverb size 0.62" means to eight comb filters
+    /// is not its business.
+    pub fn effect_params(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.settings.effect_params
     }
 
     /// The cartridge path and patch the host should restore at launch.
@@ -2031,6 +2341,10 @@ impl IvoryApp {
             }
             Hit::SetDelay(v) => {
                 self.settings.delay_mix = f64::from(v.clamp(0.0, 1.0));
+                self.save_settings_soon();
+            }
+            Hit::SetChorus(v) => {
+                self.settings.chorus_mix = f64::from(v.clamp(0.0, 1.0));
                 self.save_settings_soon();
             }
             Hit::SetSlotGain(slot, p) => {
@@ -2396,6 +2710,7 @@ impl IvoryApp {
             // curve to invert. "40" is four tenths wet.
             F::Reverb => recorder::parse_percent(&edit.text).map(Hit::SetReverb),
             F::Delay => recorder::parse_percent(&edit.text).map(Hit::SetDelay),
+            F::Chorus => recorder::parse_percent(&edit.text).map(Hit::SetChorus),
         };
         if let Some(hit) = hit {
             self.apply_recorder_hit(hit);
@@ -2488,7 +2803,7 @@ impl IvoryApp {
         if !self.caps.capture_devices {
             return;
         }
-        self.recorder_request = Some(request);
+        self.recorder_request.push_back(request);
     }
 
     /// Ask the host to raise a folder picker.
@@ -4093,12 +4408,16 @@ impl IvoryApp {
                     // viewer will try to click.
                     name_focused: false,
                     editing: None,
+                    // The composite's own copy: nothing is focused, nothing
+                    // is being typed into and no hand is on a knob, because
+                    // there is no pointer in a video frame.
                     ..self.recorder.view(
                         s.record_take_name.as_deref().unwrap_or_default(),
                         false,
                         None,
                         s.knobs(),
                         s.record_hide_elapsed,
+                        None,
                     )
                 },
                 &s,
@@ -4332,6 +4651,10 @@ impl IvoryApp {
         // accepted — a dialog opening mid-chord must stop the chord, not
         // abandon it.
         self.audition_tick(&ctx);
+        // And everything a gesture wants sounding, for the same reason: every
+        // path that can change that set has run by now, and this is the one
+        // place that has to notice.
+        self.reconcile_sound();
 
         // Track our position on the monitor for global menu placement, child
         // window centring, and so the main window reopens where it was left.
@@ -4518,6 +4841,7 @@ impl IvoryApp {
         };
         let recorder_rect_for_hit: Option<Rect> =
             (recorder_h > 0.0).then(|| band_at(0.0, recorder_h));
+        self.last_band = recorder_rect_for_hit.unwrap_or(Rect::NOTHING);
         if recorder_rect_for_hit.is_none() {
             // A band that is not on screen cannot hold a focused field. Without
             // this, hiding the Recorder with R mid-edit leaves the field open
@@ -4532,13 +4856,7 @@ impl IvoryApp {
             recorder_panel::draw(
                 ui.painter(),
                 rect,
-                &self.recorder.view(
-                    self.settings.record_take_name.as_deref().unwrap_or_default(),
-                    self.name_focused,
-                    self.num_edit.as_ref(),
-                    self.settings.knobs(),
-                    self.settings.record_hide_elapsed,
-                ),
+                &self.recorder_layout_view(),
                 &self.settings,
             );
             // **The heart.** It moved here from the chord strip, which is off
@@ -4643,6 +4961,27 @@ impl IvoryApp {
         // would float on top of its own dimming. Only the thanks card comes
         // later, and only because a card raised from a heart you can still see
         // is a card that belongs in front.
+        // The effect panels, on the same terms and for the same reasons.
+        if let Some(fx) = self.fx_open {
+            let anchor = self.fx_anchor(fx);
+            if anchor.is_positive() {
+                let division = self.delay_division_label();
+                recorder_panel::draw_fx(
+                    ui.painter(),
+                    ui.max_rect(),
+                    anchor,
+                    fx,
+                    &|key| self.effect_param(key),
+                    &division,
+                    &self.settings,
+                );
+            } else {
+                // No knob, no panel. The band can be hidden or too small to
+                // draw knobs in, and a panel left latched over nothing is a
+                // panel with no way back to the control it belongs to.
+                self.fx_open = None;
+            }
+        }
         if self.setup_open {
             if let Some(rect) = recorder_rect_for_hit {
                 let view = self.recorder_layout_view();
@@ -4706,33 +5045,33 @@ impl IvoryApp {
                 // Only once it IS a drag. A press that has not moved yet sets
                 // nothing, so that letting go of it can mean something else.
                 if self.grabbed.is_some_and(|g| g.moved) {
-                    let view = self.recorder.view(
-                        self.settings.record_take_name.as_deref().unwrap_or_default(),
-                        self.name_focused,
-                        self.num_edit.as_ref(),
-                        self.settings.knobs(),
-                        self.settings.record_hide_elapsed,
-                    );
-                    // **The free axis is the one the control travels on**, and
-                    // the other is pinned to where the grab started. Pinning
-                    // the wrong one does not merely make a control fussy: every
-                    // probe reports the same value and the knob cannot be moved
-                    // at all.
-                    let probe = match recorder_panel::drag_axis(rect, &view, grab.hit) {
-                        Some(recorder_panel::DragAxis::Vertical) => Pos2::new(
-                            grab.from.x,
-                            pos.y.clamp(rect.top(), rect.bottom() - 0.5),
-                        ),
-                        _ => Pos2::new(
-                            pos.x.clamp(rect.left(), rect.right() - 0.5),
-                            grab.from.y,
-                        ),
-                    };
-                    if let Some(now) = recorder_panel::hit_test(rect, &view, probe) {
-                        // Same CONTROL, not the same value: the whole point is
-                        // that the value changed.
-                        if now.is_same_control(grab.hit) {
-                            self.apply_recorder_hit(now);
+                    let view = self.recorder_layout_view();
+                    match recorder_panel::drag_axis(rect, &view, grab.hit) {
+                        // **A knob turns by how far the hand has MOVED**, not
+                        // by where it ended up — see `KNOB_TRAVEL`. The pointer
+                        // is free to leave the control, and leave the band, and
+                        // go on turning it.
+                        Some(recorder_panel::DragAxis::Vertical) => {
+                            let moved = (grab.from.y - pos.y) / KNOB_TRAVEL;
+                            let v = (grab.from_value + moved).clamp(0.0, 1.0);
+                            self.apply_recorder_hit(grab.hit.with_value(v));
+                        }
+                        // A fader goes where the pointer is, along its own
+                        // track. The other axis is pinned to where the grab
+                        // started, so a hand that drifts up keeps the gesture
+                        // instead of dropping it.
+                        _ => {
+                            let probe = Pos2::new(
+                                pos.x.clamp(rect.left(), rect.right() - 0.5),
+                                grab.from.y,
+                            );
+                            if let Some(now) = recorder_panel::hit_test(rect, &view, probe) {
+                                // Same CONTROL, not the same value: the whole
+                                // point is that the value changed.
+                                if now.is_same_control(grab.hit) {
+                                    self.apply_recorder_hit(now);
+                                }
+                            }
                         }
                     }
                 }
@@ -4858,13 +5197,7 @@ impl IvoryApp {
         // four: a big framing view of the camera on a second monitor while the
         // piano stays where it is.
         if self.recorder_window_visible && self.caps.detachable {
-            let view = self.recorder.view(
-                self.settings.record_take_name.as_deref().unwrap_or_default(),
-                self.name_focused,
-                self.num_edit.as_ref(),
-                self.settings.knobs(),
-                self.settings.record_hide_elapsed,
-            );
+            let view = self.recorder_layout_view();
             let outcome = recorder_panel::show_detached_window(
                 &ctx,
                 self.recorder_builder_size,
@@ -5398,6 +5731,502 @@ mod tests {
                     repeat: false,
                     modifiers: egui::Modifiers::NONE,
                 }],
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        app.take_recorder_request()
+    }
+
+    /// **Keytoggle plays, and keeps playing.** The switch decides whether a
+    /// click leaves the note BEHIND, not whether it makes a sound. Placing a
+    /// note used to light a key silently, which is the wrong answer for a
+    /// picture of a piano.
+    #[test]
+    fn a_latched_note_sounds_until_it_is_unlatched() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = true;
+
+        app.manual_notes.insert(64);
+        assert_eq!(
+            run_frame(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Audition {
+                notes: vec![64],
+                on: true
+            }),
+            "placing a note did not sound it"
+        );
+        // Frame after frame, nothing more is sent: it is already sounding, and
+        // a note-on every frame is a machine gun.
+        assert!(run_frame(&ctx, &mut app).is_none());
+        assert!(run_frame(&ctx, &mut app).is_none());
+
+        // A second note joins it, and only the second one is sent.
+        app.manual_notes.insert(67);
+        assert_eq!(
+            run_frame(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Audition {
+                notes: vec![67],
+                on: true
+            }),
+            "the note already sounding was retriggered"
+        );
+
+        // Clicking one off releases that one alone.
+        app.manual_notes.remove(&64);
+        assert_eq!(
+            run_frame(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Audition {
+                notes: vec![64],
+                on: false
+            })
+        );
+        assert!(run_frame(&ctx, &mut app).is_none(), "67 was disturbed");
+    }
+
+    /// Switching keytoggle off releases what it was holding. Otherwise the
+    /// chord rings for ever with nothing on screen to say why.
+    #[test]
+    fn turning_keytoggle_off_releases_the_latch() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = true;
+        app.manual_notes.extend([60, 64]);
+        let _ = run_frame(&ctx, &mut app);
+
+        app.settings.keytoggle_enabled = false;
+        assert_eq!(
+            run_frame(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Audition {
+                notes: vec![60, 64],
+                on: false
+            }),
+            "the latch outlived the switch that made it"
+        );
+    }
+
+    /// **A take records a performance, not the app's own held notes.** A latch
+    /// left over from choosing a voicing would land in the file as though
+    /// somebody had played it.
+    #[test]
+    fn a_rolling_take_silences_the_latch() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = true;
+        app.manual_notes.insert(60);
+        let _ = run_frame(&ctx, &mut app);
+
+        app.recorder.state = recorder::RecordState::Rolling;
+        assert_eq!(
+            run_frame(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Audition {
+                notes: vec![60],
+                on: false
+            }),
+            "the latch played into the take"
+        );
+    }
+
+    /// **The overlap is sent once.** A latched note that Space also wants must
+    /// not get a second note-on, and letting go of Space must not stop it —
+    /// that is the bug one set exists to make impossible.
+    #[test]
+    fn space_does_not_retrigger_what_is_already_latched() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = true;
+        app.manual_notes.insert(60);
+        let _ = run_frame(&ctx, &mut app);
+
+        assert!(space(&ctx, &mut app).is_none(), "60 was sounded twice");
+        assert!(key_up(&ctx, &mut app).is_none(), "Space stopped the latch");
+        // And it really is still held: unlatching it is what stops it.
+        app.manual_notes.clear();
+        assert!(matches!(
+            run_frame(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Audition { on: false, .. })
+        ));
+    }
+
+    /// A transposed note sounds and lights at the transposed pitch, once.
+    ///
+    /// The regression: `sounding` held display pitches and was then transposed
+    /// a SECOND time on its way into `display_notes`, lighting phantom keys an
+    /// interval above the ones being played.
+    #[test]
+    fn transpose_is_applied_once_to_what_is_sounding() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = true;
+        app.settings.transpose = 2;
+        app.manual_notes.insert(60);
+        assert_eq!(
+            run_frame(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Audition {
+                notes: vec![62],
+                on: true
+            }),
+            "the latch did not follow the transpose"
+        );
+        let lit = app.display_notes();
+        assert_eq!(
+            lit,
+            [62].into_iter().collect::<HashSet<u8>>(),
+            "a phantom key lit an interval above the one playing"
+        );
+    }
+
+    /// **A knob turns by distance, not by position.** Its own cell is thirty
+    /// points tall; mapping that to the whole range is three percent a pixel,
+    /// which is the control the owner could not land on a number. The pointer
+    /// has to be able to leave the knob, leave the band, and go on turning.
+    ///
+    /// Driven through real pointer events rather than by building a `Grab` by
+    /// hand, because the half of this that broke first was the gesture and not
+    /// the arithmetic.
+    #[test]
+    fn a_knob_turns_by_how_far_the_hand_moved_and_not_by_where_it_is() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.reverb_mix = 0.5;
+
+        let cell = knob_cell(&app, recorder_panel::Hit::SetReverb(0.0));
+        let from = cell.center();
+        press(&ctx, &mut app, from);
+        assert!(
+            app.grabbed
+                .is_some_and(|g| g.hit.is_same_control(recorder_panel::Hit::SetReverb(0.0))),
+            "pressing the knob did not grab it"
+        );
+
+        // A quarter of the travel UP is a quarter more, wherever that lands —
+        // and it lands far outside the knob, which is the point.
+        let to = Pos2::new(from.x, from.y - KNOB_TRAVEL * 0.25);
+        assert!(
+            !cell.contains(to),
+            "the test exercises nothing: {KNOB_TRAVEL} fits inside the knob"
+        );
+        move_to(&ctx, &mut app, to);
+        assert!(
+            (app.settings.reverb_mix - 0.75).abs() < 0.01,
+            "a quarter of the travel gave {}",
+            app.settings.reverb_mix
+        );
+
+        // And the knob says so while the hand is on it: a number, not a name.
+        assert_eq!(
+            app.recorder_layout_view().turning,
+            Some(recorder::NumField::Reverb),
+            "a knob being turned does not show its reading"
+        );
+    }
+
+    /// Both ends are reachable, and neither wraps.
+    #[test]
+    fn a_knob_stops_at_both_ends_of_its_travel() {
+        for (start, push, want) in [(0.5_f64, -3.0_f32, 1.0_f64), (0.5, 3.0, 0.0)] {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.delay_mix = start;
+            let from = knob_cell(&app, recorder_panel::Hit::SetDelay(0.0)).center();
+            press(&ctx, &mut app, from);
+            move_to(
+                &ctx,
+                &mut app,
+                Pos2::new(from.x, from.y + KNOB_TRAVEL * push),
+            );
+            assert!(
+                (app.settings.delay_mix - want).abs() < 1.0e-6,
+                "three sweeps landed on {}, not {want}",
+                app.settings.delay_mix
+            );
+        }
+    }
+
+    /// A desktop app with the band up and nothing modal in front of it.
+    ///
+    /// The Welcome card is a dialog, and a dialog swallows every press in the
+    /// main window — so a pointer test on a plain `headless()` passes the press
+    /// to nothing at all and asserts about a gesture that never happened.
+    fn headless_with_band(caps: Caps) -> (egui::Context, IvoryApp) {
+        let mut s = Settings::default();
+        s.show_welcome = false;
+        s.show_recorder = true;
+        let (ctx, mut app) = headless_with(caps, s);
+        app.dialog = None;
+        // **One frame before anybody points at anything.** egui learns a
+        // widget's rectangle by drawing it, so interaction on the very first
+        // frame is interaction with a surface it has never heard of.
+        pointer_frame(&ctx, &mut app, Vec::new());
+        app.dialog = None;
+        (ctx, app)
+    }
+
+    /// Where a knob is in the band this app last drew.
+    ///
+    /// `last_band` and not a rectangle assumed to be at the top of the window:
+    /// where the band lands depends on which other bands are showing, and a
+    /// test that guessed was pressing empty canvas three hundred points above
+    /// the control it meant to grab.
+    fn knob_cell(app: &IvoryApp, hit: recorder_panel::Hit) -> Rect {
+        let band = app.last_band;
+        assert!(band.is_positive(), "the band was never drawn");
+        let v = app.recorder_layout_view();
+        recorder_panel::knob_rect(band, &v, hit).expect("the knob has a rectangle")
+    }
+
+    fn pointer_frame(ctx: &egui::Context, app: &mut IvoryApp, events: Vec<egui::Event>) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+    }
+
+    /// Press and HOLD at `pos`. The button is never released, so the frames
+    /// after this one still see it down — which is what a drag is.
+    fn press(ctx: &egui::Context, app: &mut IvoryApp, pos: Pos2) {
+        pointer_frame(
+            ctx,
+            app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+
+    fn move_to(ctx: &egui::Context, app: &mut IvoryApp, pos: Pos2) {
+        pointer_frame(ctx, app, vec![egui::Event::PointerMoved(pos)]);
+    }
+
+    // ── the effect panels ───────────────────────────────────────────────────
+
+    /// An app with the band up and the effect defaults the host would push.
+    fn headless_with_fx(caps: Caps) -> (egui::Context, IvoryApp) {
+        let (ctx, mut app) = headless_with_band(caps);
+        app.set_effect_defaults(crate::ports::EffectDefaults {
+            values: [
+                ("reverb_size", 0.62),
+                ("reverb_damp", 0.35),
+                ("reverb_width", 0.70),
+                ("delay_feedback", 0.42),
+                ("delay_tone", 0.55),
+                ("delay_width", 0.60),
+                ("chorus_rate", 0.28),
+                ("chorus_depth", 0.55),
+                ("chorus_width", 0.85),
+                ("chorus_tone", 0.45),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), serde_json::Value::from(v)))
+            .collect(),
+            divisions: [
+                ("quarter", "1/4"),
+                ("dotted-eighth", "1/8 dotted"),
+                ("eighth", "1/8"),
+            ]
+            .into_iter()
+            .map(|(k, l)| (k.to_owned(), l.to_owned()))
+            .collect(),
+            default_division: "dotted-eighth".to_owned(),
+        });
+        (ctx, app)
+    }
+
+    /// **Right-clicking a knob opens the effect behind it**, and the right one.
+    /// The three knobs are stacked and forty points apart; a panel that opened
+    /// the wrong effect would look like the panel simply not working.
+    #[test]
+    fn right_clicking_a_knob_opens_that_effect() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        for (fx, hit) in [
+            (recorder_panel::Fx::Reverb, recorder_panel::Hit::SetReverb(0.0)),
+            (recorder_panel::Fx::Delay, recorder_panel::Hit::SetDelay(0.0)),
+            (recorder_panel::Fx::Chorus, recorder_panel::Hit::SetChorus(0.0)),
+        ] {
+            let at = knob_cell(&app, hit).center();
+            assert_eq!(
+                app.fx_under(Some(app.last_band), at),
+                Some(fx),
+                "{} is not under its own knob",
+                fx.title()
+            );
+        }
+        // And nothing opens from the panel between them.
+        let band = app.last_band;
+        assert_eq!(app.fx_under(Some(band), band.center()), None);
+        assert_eq!(app.fx_under(None, band.center()), None);
+    }
+
+    /// Every row sets its own parameter, and the value follows the position.
+    #[test]
+    fn each_row_of_a_panel_sets_its_own_parameter() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        let fx = recorder_panel::Fx::Chorus;
+        app.fx_open = Some(fx);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let anchor = app.fx_anchor(fx);
+        assert!(anchor.is_positive(), "the panel has nothing to hang off");
+
+        for (key, _) in fx.rows() {
+            // The row is found by ASKING the panel, not by guessing: the
+            // layout owns where the rows are and this test must not restate
+            // it, or it would pass while the panel drew them somewhere else.
+            let at = row_probe(screen, anchor, fx, key, 1.0);
+            app.press_in_fx_panel(screen, fx, at, true);
+            app.fx_drag = None;
+            assert!(
+                (app.effect_param(key) - 1.0).abs() < 0.02,
+                "{key} came out at {} after a press at the top of its row",
+                app.effect_param(key)
+            );
+
+            let at = row_probe(screen, anchor, fx, key, 0.0);
+            app.press_in_fx_panel(screen, fx, at, true);
+            app.fx_drag = None;
+            assert!(
+                app.effect_param(key) < 0.02,
+                "{key} came out at {} at the bottom",
+                app.effect_param(key)
+            );
+        }
+    }
+
+    /// **A drag stays on the row it started on.** The rows are twenty points
+    /// apart, and a hand that drifts up while dragging must not start setting
+    /// the parameter above — the same rule the band's faders follow.
+    #[test]
+    fn a_drag_inside_a_panel_does_not_wander_onto_the_row_above() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        let fx = recorder_panel::Fx::Chorus;
+        app.fx_open = Some(fx);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let anchor = app.fx_anchor(fx);
+
+        // Grab the DEPTH row (the second) at its middle.
+        let start = row_probe(screen, anchor, fx, "chorus_depth", 0.5);
+        app.press_in_fx_panel(screen, fx, start, true);
+        assert_eq!(app.fx_drag, Some("chorus_depth"));
+        let rate_before = app.effect_param("chorus_rate");
+
+        // Now slide up onto the RATE row and along it.
+        let wandered = row_probe(screen, anchor, fx, "chorus_rate", 0.95);
+        app.press_in_fx_panel(screen, fx, wandered, false);
+        assert!(
+            (app.effect_param("chorus_rate") - rate_before).abs() < 1.0e-6,
+            "the drag wandered onto Rate and set it"
+        );
+        assert!(
+            app.effect_param("chorus_depth") > 0.8,
+            "the drag stopped following the row it started on"
+        );
+    }
+
+    /// Reset puts an effect back and leaves the others alone.
+    #[test]
+    fn reset_restores_one_effect_and_only_that_one() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        app.set_effect_param("chorus_depth", 0.05);
+        app.set_effect_param("reverb_size", 0.05);
+        app.reset_effect(recorder_panel::Fx::Chorus);
+        assert!(
+            (app.effect_param("chorus_depth") - 0.55).abs() < 1.0e-6,
+            "chorus depth did not go back to what it ships as"
+        );
+        assert!(
+            (app.effect_param("reverb_size") - 0.05).abs() < 1.0e-6,
+            "resetting the chorus reached into the reverb"
+        );
+        // By REMOVING the key, so an old file and a reset file read alike.
+        assert!(!app.settings.effect_params.contains_key("chorus_depth"));
+    }
+
+    /// The delay's time steps through its divisions and wraps.
+    #[test]
+    fn the_delay_time_steps_through_its_divisions() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        assert_eq!(app.delay_division_label(), "1/8 dotted");
+        app.next_delay_division();
+        assert_eq!(app.delay_division_label(), "1/8");
+        app.next_delay_division();
+        assert_eq!(app.delay_division_label(), "1/4", "it did not wrap");
+
+        // A division a later build wrote, which this one does not know, reads
+        // as the default rather than as an empty box.
+        app.settings.effect_params.insert(
+            "delay_division".to_owned(),
+            serde_json::Value::from("some-future-division"),
+        );
+        assert_eq!(app.delay_division_label(), "1/8 dotted");
+    }
+
+    /// A press outside the panel closes it and does nothing else.
+    #[test]
+    fn a_press_outside_the_panel_closes_it() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        let fx = recorder_panel::Fx::Reverb;
+        app.fx_open = Some(fx);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let anchor = app.fx_anchor(fx);
+        let before = app.effect_param("reverb_size");
+
+        let panel = recorder_panel::fx_popup_rect(screen, anchor);
+        let outside = Pos2::new(panel.right() + 40.0, panel.bottom() + 40.0);
+        app.press_in_fx_panel(screen, fx, outside, true);
+        assert!(app.fx_open.is_none(), "the panel stayed open");
+        assert!((app.effect_param("reverb_size") - before).abs() < 1.0e-6);
+    }
+
+    /// A point `t` of the way along `key`'s track, found by asking the panel.
+    fn row_probe(
+        screen: Rect,
+        anchor: Rect,
+        fx: recorder_panel::Fx,
+        key: &str,
+        t: f32,
+    ) -> Pos2 {
+        // Walk the panel until the row reports itself, then take the point at
+        // `t` along it. Asking rather than restating the layout is the whole
+        // point: a test that recomputed the rows would pass while the panel
+        // drew them somewhere else.
+        let panel = recorder_panel::fx_popup_rect(screen, anchor);
+        let steps = 400;
+        for i in 0..=steps {
+            let y = panel.top() + panel.height() * i as f32 / steps as f32;
+            let probe = Pos2::new(panel.center().x, y);
+            if recorder_panel::fx_row_at(screen, anchor, fx, probe) == Some(key) {
+                // Now sweep across to find the ends of the track.
+                let mut lo = f32::MAX;
+                let mut hi = f32::MIN;
+                for j in 0..=steps {
+                    let x = panel.left() + panel.width() * j as f32 / steps as f32;
+                    let at = Pos2::new(x, y);
+                    if let Some(v) = recorder_panel::fx_value_at(screen, anchor, fx, key, at) {
+                        if recorder_panel::fx_row_at(screen, anchor, fx, at) == Some(key) {
+                            if v <= 0.001 {
+                                lo = lo.min(x);
+                            }
+                            if v >= 0.999 {
+                                hi = hi.max(x);
+                            }
+                        }
+                    }
+                }
+                assert!(lo < hi, "{key} has no track to drag along");
+                return Pos2::new(lo + (hi - lo) * t, y);
+            }
+        }
+        panic!("{key} has no row in the {} panel", fx.title())
+    }
+
+    /// One frame with no input at all, and whatever it asked for.
+    fn run_frame(ctx: &egui::Context, app: &mut IvoryApp) -> Option<recorder::RecorderRequest> {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                 ..Default::default()
             },
             |ctx| app.frame(ctx),
@@ -6046,24 +6875,33 @@ mod tests {
         // and it is the only way a placed note is one of the notes on screen.
         app.settings.keytoggle_enabled = true;
         app.manual_notes.insert(60);
+        // **The latch sounds it before Space is ever touched.** Placing a note
+        // with keytoggle on plays it and leaves it playing, so the first
+        // request out is the latch's, not the audition's.
         assert!(
             matches!(
                 space(&ctx, &mut app),
-                Some(recorder::RecorderRequest::Audition { .. })
+                Some(recorder::RecorderRequest::Audition { on: true, .. })
             ),
-            "with nothing rolling, Space sounds what is lit"
+            "with nothing rolling, a lit note sounds"
         );
-        // The chord is HELD, so a frame with the key up is its release. It is
-        // asserted rather than merely drained: a hold that never lets go is
-        // the failure this whole model exists to prevent.
+        // And letting go of Space does NOT stop it, because Space was never
+        // what was holding it. This is the difference the toggle names.
+        assert!(
+            key_up(&ctx, &mut app).is_none(),
+            "letting go of Space unlatched a note keytoggle was holding"
+        );
+        // The hold that DOES have to let go is the latch itself. It is
+        // asserted rather than merely drained: a note that never stops is the
+        // failure this whole model exists to prevent.
+        app.manual_notes.clear();
         assert!(
             matches!(
-                key_up(&ctx, &mut app),
+                run_frame(&ctx, &mut app),
                 Some(recorder::RecorderRequest::Audition { on: false, .. })
             ),
-            "letting go of the key did not release the chord"
+            "clearing the note did not release it"
         );
-        app.manual_notes.clear();
 
         app.name_focused = true;
         assert_eq!(
@@ -6859,4 +7697,5 @@ mod geometry_tests {
         assert!(wm_overrode_size(Vec2::new(700.0, 150.0), asked));
     }
 }
+
 

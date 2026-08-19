@@ -319,13 +319,14 @@ struct Layout {
     input_row: Rect,
     click: Rect,
 
-    /// The two effect knobs, stacked between the faders and the meters.
+    /// The three effect knobs, stacked between the faders and the meters.
     ///
     /// The whole CELL, label included, and the whole cell is the drag target:
     /// a knob is thirty points across and a control you can only grab by its
     /// own diameter is a control you keep missing.
     reverb: Rect,
     delay: Rect,
+    chorus: Rect,
 
     /// The supporter heart, bottom-right of the band.
     ///
@@ -603,6 +604,7 @@ impl Layout {
             click: Rect::NOTHING,
             reverb: Rect::NOTHING,
             delay: Rect::NOTHING,
+            chorus: Rect::NOTHING,
             setup: Rect::NOTHING,
             dest: Rect::NOTHING,
             reveal: Rect::NOTHING,
@@ -821,18 +823,25 @@ impl Layout {
         // band`, which is where the dB reading stops fitting. At 0.31 it does
         // not, at the narrowest band this app will draw.
         let col = slice_h(m, 0.00, 0.34);
-        let knobs = slice_h(m, 0.36, 0.45);
+        let knobs = slice_h(m, 0.36, 0.46);
         // Stacked, because the column that was available is tall and narrow.
         // The gaps are inside the cells: each is a knob with a word over it,
         // and `draw_knob` centres the pair in what it is handed.
-        let (reverb, delay) = (slice_v(knobs, 0.06, 0.50), slice_v(knobs, 0.52, 0.96));
+        let cells = [
+            slice_v(knobs, 0.02, 0.32),
+            slice_v(knobs, 0.35, 0.65),
+            slice_v(knobs, 0.68, 0.98),
+        ];
         // **A control nobody can see is not a control.** `draw_knob` refuses a
         // cell too small to be a knob rather than drawing a smudge, so the
         // layout has to refuse it too — otherwise the band keeps a live drag
         // target over blank panel. One predicate, asked by both.
-        if knob_fits(reverb) && knob_fits(delay) {
-            self.reverb = reverb;
-            self.delay = delay;
+        //
+        // All three or none: two knobs where there should be three is worse
+        // than none, because the missing one is the one somebody goes looking
+        // for.
+        if cells.iter().copied().all(knob_fits) {
+            [self.reverb, self.delay, self.chorus] = cells;
         }
         // Tall rows in a narrow column. Moving the pair off the meters bought
         // width to give away and none to spare, so the legibility comes back
@@ -1054,7 +1063,7 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 39] {
+    fn targets(&self) -> [(Rect, Produces); 40] {
         use Produces::{Along, AlongV, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
         let s = &self.slots;
@@ -1094,6 +1103,7 @@ impl Layout {
             // studio turns and the direction the two faders beside them move.
             (self.reverb, AlongV(Hit::SetReverb)),
             (self.delay, AlongV(Hit::SetDelay)),
+            (self.chorus, AlongV(Hit::SetChorus)),
             (self.click, Fixed(Hit::ToggleMetronome)),
             (self.dest, Fixed(Hit::ChooseFolder)),
             (self.reveal, Fixed(Hit::RevealFolder)),
@@ -1206,9 +1216,10 @@ pub enum Hit {
     /// and it lives there so that the fader's travel and the audio path's
     /// scaling cannot disagree.
     SetMetronomeGain(f32),
-    /// The two effect sends, 0..=1.
+    /// The three effect sends, 0..=1.
     SetReverb(f32),
     SetDelay(f32),
+    SetChorus(f32),
     SetInputGain(f32),
     /// Tempo dragged, already clamped to `MIN_BPM..=MAX_BPM`.
     SetTempo(f64),
@@ -1227,13 +1238,32 @@ impl Hit {
     /// of a dragged control is that the value depends on where you pressed.
     const MIDWAY: f32 = 0.5;
 
+    /// The same control, carrying `v` instead.
+    ///
+    /// For a caller that computed the value itself rather than reading it off
+    /// a position — which is what a relative drag does. Anything that carries
+    /// no 0..=1 value comes back unchanged.
+    #[must_use]
+    pub fn with_value(self, v: f32) -> Hit {
+        let v = v.clamp(0.0, 1.0);
+        match self {
+            Hit::SetReverb(_) => Hit::SetReverb(v),
+            Hit::SetDelay(_) => Hit::SetDelay(v),
+            Hit::SetChorus(_) => Hit::SetChorus(v),
+            Hit::SetMetronomeGain(_) => Hit::SetMetronomeGain(v),
+            Hit::SetInputGain(_) => Hit::SetInputGain(v),
+            Hit::SetSlotGain(i, _) => Hit::SetSlotGain(i, v),
+            other => other,
+        }
+    }
+
     /// Every control, which is what the reachability test iterates. The
     /// exhaustive match in [`Hit::label`] is what makes adding a variant
     /// without adding it here a compile error rather than an untested control.
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 40] = [
+    pub const ALL: [Hit; 41] = [
         Hit::Record,
         Hit::Stop,
         Hit::OpenSetup,
@@ -1271,6 +1301,7 @@ impl Hit {
         Hit::SetMetronomeGain(Hit::MIDWAY),
         Hit::SetReverb(Hit::MIDWAY),
         Hit::SetDelay(Hit::MIDWAY),
+        Hit::SetChorus(Hit::MIDWAY),
         Hit::SetInputGain(Hit::MIDWAY),
         Hit::SetTempo((MIN_BPM + MAX_BPM) * 0.5),
         Hit::EditTimeSignature,
@@ -1340,6 +1371,7 @@ impl Hit {
             Hit::SetMetronomeGain(_) => "Click level",
             Hit::SetReverb(_) => "Reverb, on every instrument",
             Hit::SetDelay(_) => "Delay, in time with the tempo",
+            Hit::SetChorus(_) => "Chorus, in true stereo",
             Hit::SetInputGain(_) => "Input level",
             Hit::SetTempo(_) => "Tempo",
             Hit::EditTimeSignature => "Time signature",
@@ -1358,6 +1390,7 @@ impl Hit {
                 | Hit::SetMetronomeGain(_)
                 | Hit::SetReverb(_)
                 | Hit::SetDelay(_)
+                | Hit::SetChorus(_)
                 | Hit::SetInputGain(_)
                 | Hit::SetTempo(_)
         )
@@ -1406,6 +1439,7 @@ pub fn num_field(hit: Hit) -> Option<NumField> {
         Hit::SetMetronomeGain(_) => Some(NumField::Metronome),
         Hit::SetReverb(_) => Some(NumField::Reverb),
         Hit::SetDelay(_) => Some(NumField::Delay),
+        Hit::SetChorus(_) => Some(NumField::Chorus),
         Hit::SetInputGain(_) => Some(NumField::Input),
         Hit::SetTempo(_) => Some(NumField::Tempo),
         _ => None,
@@ -1566,6 +1600,21 @@ fn up(r: Rect, pos: Pos2) -> f32 {
 /// that knows the band's geometry.
 pub fn heart_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
     Layout::new(rect, view).heart
+}
+
+/// Where a knob is, for a caller that needs to reason about the gesture.
+///
+/// `None` when the band is too small to draw it — which is also when it must
+/// not be draggable. Same predicate the painter uses.
+pub fn knob_rect(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<Rect> {
+    let l = Layout::new(rect, view);
+    let r = match hit {
+        Hit::SetReverb(_) => l.reverb,
+        Hit::SetDelay(_) => l.delay,
+        Hit::SetChorus(_) => l.chorus,
+        _ => return None,
+    };
+    r.is_positive().then_some(r)
 }
 
 pub fn setup_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
@@ -1887,8 +1936,10 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
     for (cell, v, label, field) in [
         (l.reverb, view.reverb, "REVERB", NumField::Reverb),
         (l.delay, view.delay, "DELAY", NumField::Delay),
+        (l.chorus, view.chorus, "CHORUS", NumField::Chorus),
     ] {
-        draw_knob(painter, cell, v, label, typing_for(view, field), p);
+        let turning = view.turning == Some(field);
+        draw_knob(painter, cell, v, label, typing_for(view, field), turning, p);
     }
     // **Whether the click ends up in the FILE has no control of its own.** It
     // is set once a year and it was sitting in the busiest row of the band
@@ -3110,25 +3161,46 @@ const KNOB_CAP: Color32 = Color32::from_rgb(0x1c, 0x6f, 0xd6);
 const KNOB_MIN_R: f32 = 7.0;
 
 /// The label's share of a knob cell, and its bounds in points.
-const KNOB_LABEL: (f32, f32, f32) = (0.26, 5.0, 11.0);
+const KNOB_LABEL: (f32, f32, f32) = (0.26, 6.0, 11.0);
 
-/// The face a knob would get in `cell`, or `None` if there is not room for one.
+/// What a knob gets out of its cell: where the face goes, how big it is, and
+/// how much was left for the word above it.
+struct KnobFace {
+    face: Rect,
+    radius: f32,
+    /// Points reserved for the label. **Zero means there is no room for one**,
+    /// and the face takes the whole cell.
+    label_h: f32,
+}
+
+/// How a knob would be laid out in `cell`, or `None` if there is no room.
 ///
 /// **The layout and the painter both ask this**, which is what keeps them from
 /// disagreeing about whether a knob is there — the failure that leaves a drag
 /// target on blank panel.
-fn knob_face(cell: Rect) -> Option<(Rect, f32)> {
+///
+/// **The word yields before the knob does.** In a short band the label eats a
+/// third of the cell to say something nobody can read at five points, and what
+/// is lost is the control. So below the label's own minimum the face takes
+/// everything: a knob with no caption is still a knob, still grabbable, and
+/// still says what it is set to the moment a hand is on it.
+fn knob_face(cell: Rect) -> Option<KnobFace> {
     if !cell.is_positive() {
         return None;
     }
     let (share, lo, hi) = KNOB_LABEL;
-    let cap_h = (cell.height() * share).clamp(lo, hi);
+    let wanted = cell.height() * share;
+    let label_h = if wanted >= lo { wanted.min(hi) } else { 0.0 };
     let face = Rect::from_min_max(
-        Pos2::new(cell.left(), cell.top() + cap_h),
+        Pos2::new(cell.left(), cell.top() + label_h),
         Pos2::new(cell.right(), cell.bottom()),
     );
-    let rad = face.width().min(face.height()) * 0.5;
-    (rad >= KNOB_MIN_R).then_some((face, rad))
+    let radius = face.width().min(face.height()) * 0.5;
+    (radius >= KNOB_MIN_R).then_some(KnobFace {
+        face,
+        radius,
+        label_h,
+    })
 }
 
 fn knob_fits(cell: Rect) -> bool {
@@ -3149,6 +3221,7 @@ fn draw_knob(
     value: f32,
     label: &str,
     typing: Option<&str>,
+    turning: bool,
     p: &Palette,
 ) {
     if !cell.is_positive() {
@@ -3158,27 +3231,41 @@ fn draw_knob(
     // Sized off the CELL rather than measured off the text, because a knob that
     // changed size with the length of the word over it would leave these two
     // different sizes.
-    let Some((face, rad)) = knob_face(cell) else {
+    let Some(KnobFace {
+        face,
+        radius: rad,
+        label_h,
+    }) = knob_face(cell)
+    else {
         return;
     };
-    let (share, lo, hi) = KNOB_LABEL;
-    let cap_h = (cell.height() * share).clamp(lo, hi);
-    let words = FontId::new((cap_h * 0.86).max(5.0), fonts::courier_bold());
-    // **The name gives way to the number while somebody is typing one.** There
-    // is nowhere else on a knob to put characters, and a field that shows
-    // nothing while it is being typed into is a field that looks broken. The
-    // caret is drawn rather than implied, for the same reason.
-    let (text, ink) = match typing {
-        Some(typed) => (format!("{typed}_"), p.ink),
-        None => (label.to_owned(), p.faint),
+    // **The name gives way to the number while a hand is on it.** There is
+    // nowhere else on a knob to put characters, and a knob with no readout is
+    // one you set by ear and then cannot repeat. Whole percent: a knob is not
+    // a control anybody lands on a tenth of one, and the extra digits are
+    // noise moving under a moving hand.
+    let (text, ink) = match (typing, turning) {
+        (Some(typed), _) => (Some(format!("{typed}_")), p.ink),
+        (None, true) => (
+            Some(format!("{:.0}%", value.clamp(0.0, 1.0) * 100.0)),
+            p.ink,
+        ),
+        // The name only when there is a strip to put it in. See `knob_face`:
+        // the word is what gives way in a short band, not the control.
+        (None, false) => ((label_h > 0.0).then(|| label.to_owned()), p.faint),
     };
-    painter.text(
-        Pos2::new(cell.center().x, cell.top()),
-        Align2::CENTER_TOP,
-        &text,
-        words,
-        ink,
-    );
+    if let Some(text) = text {
+        // A reading has to be drawn even when there is no label strip — it is
+        // the whole point of the gesture — so it borrows the top of the face.
+        let strip = label_h.max(KNOB_LABEL.1);
+        painter.text(
+            Pos2::new(cell.center().x, cell.top()),
+            Align2::CENTER_TOP,
+            &text,
+            FontId::new((strip * 0.86).max(5.0), fonts::courier_bold()),
+            ink,
+        );
+    }
     let c = Pos2::new(face.center().x, face.top() + rad);
     let t = value.clamp(0.0, 1.0);
     // Straight down is the middle of the missing quarter, so the sweep runs
@@ -3696,7 +3783,7 @@ mod tests {
     /// The two effect knobs are in it for the same reason the faders are: they
     /// are a mix, they cost the audio thread nothing to move, and riding the
     /// reverb through a take is a thing a person does on purpose.
-    const SURVIVORS: [Hit; 16] = [
+    const SURVIVORS: [Hit; 17] = [
         Hit::Stop,
         Hit::SetSlotGain(0, 0.0),
         Hit::SetSlotGain(1, 0.0),
@@ -3712,6 +3799,7 @@ mod tests {
         Hit::SetInputGain(0.0),
         Hit::SetReverb(0.0),
         Hit::SetDelay(0.0),
+        Hit::SetChorus(0.0),
         Hit::ToggleMetronome,
     ];
 
@@ -5076,6 +5164,10 @@ mod tests {
                                 // caught rather than only being drawn mid-way.
                                 reverb: 0.0,
                                 delay: 1.0,
+                                chorus: 0.5,
+                                // A knob mid-turn, so the sweep also covers a
+                                // knob showing a number instead of its name.
+                                turning: Some(NumField::Reverb),
                                 metronome_on: true,
                                 metronome_in_take: dark,
                                 tempo_bpm: 92.5,
@@ -5320,6 +5412,261 @@ impl SetupLayout {
 /// [`Rect::NOTHING`] when there is no room for it. The app needs this to know
 /// whether a press landed inside the popup or outside it, which is the whole of
 /// "click away to dismiss".
+// ── the effect panels ───────────────────────────────────────────────────────
+//
+// A right-click on a knob opens the effect behind it. The knob itself is one
+// number — how much — because during a take that is the only one anybody
+// reaches for; everything that shapes the sound lives here, where it can be
+// read and set once and left alone.
+//
+// One layout for all three, because they are the same shape: a title, four
+// rows, a Reset. What differs is what the rows are CALLED and, for the delay's
+// first row, that it steps through named divisions rather than sliding.
+
+/// Which effect a panel belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fx {
+    Reverb,
+    Delay,
+    Chorus,
+}
+
+impl Fx {
+    pub const ALL: [Fx; 3] = [Fx::Reverb, Fx::Delay, Fx::Chorus];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Fx::Reverb => "REVERB",
+            Fx::Delay => "DELAY",
+            Fx::Chorus => "CHORUS",
+        }
+    }
+
+    /// A line under the title saying what the thing IS. Two of these name real
+    /// hardware, because that is the fastest way to say what a sound is to
+    /// somebody who has heard one.
+    pub fn subtitle(self) -> &'static str {
+        match self {
+            Fx::Reverb => "eight combs into four allpasses",
+            Fx::Delay => "in time with the tempo",
+            Fx::Chorus => "true stereo, after the Boss CE-1",
+        }
+    }
+
+    /// The knob this panel hangs off.
+    pub fn hit(self) -> Hit {
+        match self {
+            Fx::Reverb => Hit::SetReverb(0.0),
+            Fx::Delay => Hit::SetDelay(0.0),
+            Fx::Chorus => Hit::SetChorus(0.0),
+        }
+    }
+
+    /// The four rows, in order: the settings key each writes, and its label.
+    ///
+    /// **Keys, not indices.** They are what goes in the settings file and what
+    /// the host reads back, so a row that is renamed or reordered here cannot
+    /// silently start writing to a different parameter.
+    pub fn rows(self) -> [(&'static str, &'static str); 4] {
+        match self {
+            Fx::Reverb => [
+                ("reverb_size", "Size"),
+                ("reverb_damp", "Damping"),
+                ("reverb_width", "Width"),
+                ("", ""),
+            ],
+            Fx::Delay => [
+                ("delay_division", "Time"),
+                ("delay_feedback", "Repeats"),
+                ("delay_tone", "Tone"),
+                ("delay_width", "Width"),
+            ],
+            Fx::Chorus => [
+                ("chorus_rate", "Rate"),
+                ("chorus_depth", "Depth"),
+                ("chorus_width", "Width"),
+                ("chorus_tone", "Tone"),
+            ],
+        }
+    }
+}
+
+/// A row of an effect panel, and how it is set.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FxHit {
+    /// Drag along the row to set `key` to 0..=1.
+    Set { key: &'static str, value: f32 },
+    /// The delay's time: step to the next named division.
+    NextDivision,
+    /// Put this effect back to what it shipped as.
+    Reset(Fx),
+    Close,
+}
+
+const FX_W: (f32, f32, f32) = (0.20, 250.0, 360.0);
+const FX_ASPECT: f32 = 0.78;
+
+/// Where everything in an effect panel goes.
+struct FxLayout {
+    panel: Rect,
+    title: Rect,
+    close: Rect,
+    /// One per row of [`Fx::rows`], empty ones included so the indices line up.
+    rows: [Rect; 4],
+    reset: Rect,
+}
+
+impl FxLayout {
+    const NONE: Self = Self {
+        panel: Rect::NOTHING,
+        title: Rect::NOTHING,
+        close: Rect::NOTHING,
+        rows: [Rect::NOTHING; 4],
+        reset: Rect::NOTHING,
+    };
+
+    /// Hung off the knob that opened it, and clamped onto the screen.
+    ///
+    /// Below the knob when there is room and above it when there is not: the
+    /// knobs sit in the top band, so "below" is nearly always right, and the
+    /// clamp is what stops a panel running off the bottom of a short window.
+    fn new(screen: Rect, anchor: Rect) -> Self {
+        if !screen.is_positive() || !anchor.is_positive() {
+            return Self::NONE;
+        }
+        let w = (screen.width() * FX_W.0).clamp(FX_W.1, FX_W.2.min(screen.width()));
+        let h = (w * FX_ASPECT).min(screen.height() * 0.80);
+        // Centred on the knob rather than left-aligned to it: a knob is thirty
+        // points wide and a panel is three hundred, so hanging one off the
+        // left edge of the other puts it visibly off to one side.
+        let mut panel = Rect::from_min_size(
+            Pos2::new(anchor.center().x - w * 0.5, anchor.bottom() + h * 0.05),
+            Vec2::new(w, h),
+        );
+        let dx = (screen.left() - panel.left()).max(0.0) - (panel.right() - screen.right()).max(0.0);
+        let dy = (screen.top() - panel.top()).max(0.0) - (panel.bottom() - screen.bottom()).max(0.0);
+        panel = panel.translate(Vec2::new(dx, dy));
+
+        let pad = (h * 0.06).clamp(4.0, 14.0);
+        let body = panel.shrink(pad);
+        if !body.is_positive() {
+            return Self {
+                panel,
+                ..Self::NONE
+            };
+        }
+        let title_h = body.height() * 0.20;
+        let title = Rect::from_min_max(body.min, Pos2::new(body.right(), body.top() + title_h));
+        // Square, at the top right of the title band. A word would need three
+        // times the width and this panel does not have it — and an X in the
+        // corner is the one piece of chrome nobody has to be taught.
+        let close_w = (title.height() * 0.52).min(body.width() * 0.16);
+        let close = Rect::from_min_size(
+            Pos2::new(title.right() - close_w, title.top()),
+            Vec2::splat(close_w),
+        );
+        // Four rows and the Reset, evenly. Equal heights because a panel whose
+        // rows are all different sizes reads as a form somebody assembled.
+        let rest = Rect::from_min_max(Pos2::new(body.left(), title.bottom()), body.max);
+        let pitch = rest.height() / 5.0;
+        let row = |i: usize| {
+            Rect::from_min_size(
+                Pos2::new(rest.left(), rest.top() + pitch * i as f32),
+                Vec2::new(rest.width(), pitch * 0.86),
+            )
+        };
+        Self {
+            panel,
+            title,
+            close,
+            rows: [row(0), row(1), row(2), row(3)],
+            // Right-aligned and narrow: it is the one destructive thing here
+            // and it should not look like another row of settings.
+            reset: {
+                let r = row(4);
+                Rect::from_min_max(
+                    Pos2::new(r.right() - r.width() * 0.36, r.top()),
+                    r.max,
+                )
+            },
+        }
+    }
+
+    /// The draggable track inside a row: the part after the label.
+    fn track(row: Rect) -> Rect {
+        slice_h(row, FX_TRACK.0, FX_TRACK.1)
+    }
+}
+
+/// Where a row's track starts and ends, as a share of the row.
+///
+/// The label takes the left and the reading takes the right, exactly as a
+/// fader row does — so the two kinds of control in this app look like each
+/// other rather than like two people's work.
+const FX_TRACK: (f32, f32) = (0.40, 0.86);
+
+/// Where an effect panel goes, for a caller that has to swallow presses.
+pub fn fx_popup_rect(screen: Rect, anchor: Rect) -> Rect {
+    FxLayout::new(screen, anchor).panel
+}
+
+/// What a press inside an effect panel means.
+///
+/// `None` for a press on the panel's own chrome, which the caller still
+/// swallows: a panel you can click through is one that closes when you meant
+/// to press something in it.
+pub fn fx_hit_test(screen: Rect, anchor: Rect, fx: Fx, pos: Pos2) -> Option<FxHit> {
+    let l = FxLayout::new(screen, anchor);
+    if !l.panel.contains(pos) {
+        return None;
+    }
+    if l.close.contains(pos) {
+        return Some(FxHit::Close);
+    }
+    if l.reset.contains(pos) {
+        return Some(FxHit::Reset(fx));
+    }
+    for (i, (key, _)) in fx.rows().into_iter().enumerate() {
+        if key.is_empty() || !l.rows[i].contains(pos) {
+            continue;
+        }
+        // The delay's time is a list of names, not a continuum: there is no
+        // position along a track that means "a dotted eighth".
+        if key == "delay_division" {
+            return Some(FxHit::NextDivision);
+        }
+        let track = FxLayout::track(l.rows[i]);
+        return Some(FxHit::Set {
+            key,
+            value: along(track, pos),
+        });
+    }
+    None
+}
+
+/// Which row of `fx` a point is on, for a caller continuing a drag.
+///
+/// A drag inside a panel has to keep setting the row it STARTED on, even once
+/// the pointer has slid onto the row above — the same reason `is_same_control`
+/// exists for the band.
+pub fn fx_row_at(screen: Rect, anchor: Rect, fx: Fx, pos: Pos2) -> Option<&'static str> {
+    match fx_hit_test(screen, anchor, fx, pos)? {
+        FxHit::Set { key, .. } => Some(key),
+        _ => None,
+    }
+}
+
+/// The value a point along `key`'s row would set, wherever the pointer is.
+///
+/// Clamped into the track rather than refused, so a hand that slides off the
+/// end of a row pins the value instead of dropping the gesture.
+pub fn fx_value_at(screen: Rect, anchor: Rect, fx: Fx, key: &str, pos: Pos2) -> Option<f32> {
+    let l = FxLayout::new(screen, anchor);
+    let i = fx.rows().iter().position(|(k, _)| *k == key)?;
+    let track = FxLayout::track(l.rows[i]);
+    track.is_positive().then(|| along(track, pos))
+}
+
 pub fn setup_popup_rect(screen: Rect, anchor: Rect) -> Rect {
     SetupLayout::new(screen, anchor).panel
 }
@@ -5363,6 +5710,136 @@ pub fn setup_hit_test(
 }
 
 /// Draw the take-settings popup over `screen`, hung off the cog at `anchor`.
+/// Draw an effect's panel over `screen`, hung off the knob at `anchor`.
+///
+/// `values` answers what each key is set to, and `division` is the delay's
+/// time. Both come from the caller because this crate does not own the
+/// settings file — the same reason every other painter here takes a view.
+pub fn draw_fx(
+    painter: &Painter,
+    screen: Rect,
+    anchor: Rect,
+    fx: Fx,
+    values: &dyn Fn(&str) -> f32,
+    division: &str,
+    s: &Settings,
+) {
+    let l = FxLayout::new(screen, anchor);
+    if !l.panel.is_positive() {
+        return;
+    }
+    let p = palette(s);
+    // The same scrim the take settings use: it is what says the panel is in
+    // FRONT of the window rather than being another band that appeared.
+    painter.rect_filled(screen, 0.0, Color32::from_black_alpha(96));
+    painter.rect_filled(l.panel, 4.0, p.bg);
+    painter.rect_stroke(l.panel, 4.0, Stroke::new(1.0_f32, p.ink), StrokeKind::Inside);
+
+    if l.title.is_positive() {
+        let size = fit_text(l.title, fx.title(), l.title.height() * 0.42);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(l.title.left(), l.title.top() + l.title.height() * 0.30),
+                Align2::LEFT_CENTER,
+                fx.title(),
+                font(size),
+                p.ink,
+            );
+        }
+        // What the thing is, under its name. Faint, because it is read once.
+        let sub = fit_text(l.title, fx.subtitle(), l.title.height() * 0.26);
+        if sub >= MIN_TEXT {
+            painter.text(
+                Pos2::new(l.title.left(), l.title.top() + l.title.height() * 0.74),
+                Align2::LEFT_CENTER,
+                fx.subtitle(),
+                font(sub),
+                p.faint,
+            );
+        }
+        draw_word_button(painter, l.close, &["X"], &p);
+    }
+
+    for (i, (key, label)) in fx.rows().into_iter().enumerate() {
+        let row = l.rows[i];
+        if key.is_empty() || !row.is_positive() {
+            continue;
+        }
+        let size = fit_text(slice_h(row, 0.0, FX_TRACK.0), label, row.height() * 0.52);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(row.left(), row.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                font(size),
+                p.ink,
+            );
+        }
+        let track = FxLayout::track(row);
+        let reading = Rect::from_min_max(Pos2::new(track.right(), row.top()), row.max);
+        if key == "delay_division" {
+            // A name, in a box, that steps to the next one when pressed. Drawn
+            // as a button rather than as a track, because it is one: there is
+            // no position along a line that means "a dotted eighth".
+            let box_r = Rect::from_min_max(
+                Pos2::new(track.left(), row.top() + row.height() * 0.14),
+                Pos2::new(reading.right(), row.bottom() - row.height() * 0.14),
+            );
+            painter.rect_filled(box_r, 2.0, p.field);
+            let size = fit_text(box_r.shrink(box_r.width() * 0.06), division, box_r.height() * 0.62);
+            if size >= MIN_TEXT {
+                painter.text(box_r.center(), Align2::CENTER_CENTER, division, font(size), p.ink);
+            }
+            continue;
+        }
+
+        let v = values(key).clamp(0.0, 1.0);
+        // The track: a well with the set part filled, exactly as a fader's is.
+        let h = (row.height() * 0.22).max(2.0);
+        let well = Rect::from_center_size(track.center(), Vec2::new(track.width(), h));
+        painter.rect_filled(well, h * 0.5, p.well);
+        if v > 0.0 {
+            let filled = Rect::from_min_size(well.min, Vec2::new(well.width() * v, h));
+            painter.rect_filled(filled, h * 0.5, p.accent);
+        }
+        // And the handle, so it is obviously a thing to be dragged.
+        let knob_w = (row.height() * 0.20).max(3.0);
+        let x = well.left() + well.width() * v;
+        painter.rect_filled(
+            Rect::from_center_size(
+                Pos2::new(x.clamp(well.left() + knob_w * 0.5, well.right() - knob_w * 0.5), well.center().y),
+                Vec2::new(knob_w, row.height() * 0.66),
+            ),
+            1.5,
+            p.ink,
+        );
+        let text = format!("{:.0}%", v * 100.0);
+        let size = fit_text(reading, &text, row.height() * 0.46);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(reading.right(), row.center().y),
+                Align2::RIGHT_CENTER,
+                &text,
+                font(size),
+                p.faint,
+            );
+        }
+    }
+
+    if l.reset.is_positive() {
+        let size = fit_text(l.reset, "Reset", l.reset.height() * 0.52);
+        if size >= MIN_TEXT {
+            painter.rect_stroke(
+                l.reset,
+                2.0,
+                Stroke::new(1.0_f32, p.faint),
+                StrokeKind::Inside,
+            );
+            painter.text(l.reset.center(), Align2::CENTER_CENTER, "Reset", font(size), p.ink);
+        }
+    }
+}
+
 pub fn draw_setup(
     painter: &Painter,
     screen: Rect,
@@ -5499,4 +5976,5 @@ pub fn draw_setup(
         draw_tick(painter, r, cap, on, &p);
     }
 }
+
 

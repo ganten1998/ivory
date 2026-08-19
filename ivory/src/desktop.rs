@@ -244,6 +244,84 @@ pub struct DesktopApp {
     cartridge: Option<crate::dx7::Cartridge>,
 }
 
+/// [`effect_defaults`], for the offscreen screenshot test.
+#[cfg(all(test, feature = "recorder"))]
+pub fn effect_defaults_for_shot() -> ivory_ui::ports::EffectDefaults {
+    effect_defaults()
+}
+
+/// What the effects ship as, for the panel that draws them.
+///
+/// Built from `Params::default()` rather than written out again, so the panel
+/// and the audio cannot disagree about where a slider starts.
+#[cfg(feature = "recorder")]
+fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
+    use crate::effects::{Division, Params};
+    let d = Params::default();
+    let mut values = serde_json::Map::new();
+    for (key, v) in [
+        ("reverb_size", d.reverb_size),
+        ("reverb_damp", d.reverb_damp),
+        ("reverb_width", d.reverb_width),
+        ("delay_feedback", d.delay_feedback),
+        ("delay_tone", d.delay_tone),
+        ("delay_width", d.delay_width),
+        ("chorus_rate", d.chorus_rate),
+        ("chorus_depth", d.chorus_depth),
+        ("chorus_width", d.chorus_width),
+        ("chorus_tone", d.chorus_tone),
+    ] {
+        values.insert(key.to_owned(), serde_json::Value::from(f64::from(v)));
+    }
+    ivory_ui::ports::EffectDefaults {
+        values,
+        divisions: Division::ALL
+            .into_iter()
+            .map(|x| (x.key().to_owned(), x.label().to_owned()))
+            .collect(),
+        default_division: d.delay_division.key().to_owned(),
+    }
+}
+
+/// Turn the settings file's flat map into the parameters the DSP wants.
+///
+/// **The translation lives here, on the binary's side of the firewall.**
+/// `ivory-ui` holds a map of numbers somebody moved and knows nothing about
+/// comb filters; this is where a name becomes a field. A key that is missing,
+/// or is the wrong kind of value, leaves that parameter at its default — which
+/// is what makes a settings file written by an older build load without a
+/// migration, and one written by a newer build load without an error.
+#[cfg(feature = "recorder")]
+fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate::effects::Params {
+    use crate::effects::{Division, Params};
+    let mut p = Params::default();
+    let num = |key: &str| map.get(key).and_then(serde_json::Value::as_f64).map(|v| v as f32);
+    for (key, dst) in [
+        ("reverb_size", &mut p.reverb_size),
+        ("reverb_damp", &mut p.reverb_damp),
+        ("reverb_width", &mut p.reverb_width),
+        ("delay_feedback", &mut p.delay_feedback),
+        ("delay_tone", &mut p.delay_tone),
+        ("delay_width", &mut p.delay_width),
+        ("chorus_rate", &mut p.chorus_rate),
+        ("chorus_depth", &mut p.chorus_depth),
+        ("chorus_width", &mut p.chorus_width),
+        ("chorus_tone", &mut p.chorus_tone),
+    ] {
+        if let Some(v) = num(key) {
+            *dst = v;
+        }
+    }
+    if let Some(d) = map
+        .get("delay_division")
+        .and_then(serde_json::Value::as_str)
+        .and_then(Division::from_key)
+    {
+        p.delay_division = d;
+    }
+    p.sane()
+}
+
 /// A parsed cartridge as the picker wants it: names and a bank, no voices.
 #[cfg(feature = "recorder")]
 fn cartridge_info(cart: &crate::dx7::Cartridge, error: &str) -> ivory_ui::ports::CartridgeInfo {
@@ -995,8 +1073,16 @@ impl DesktopApp {
         // Pushed every frame with the gains, and for the same reason: the
         // settings are the one live value, so a knob dragged, a project loaded
         // and a settings file hand-edited all arrive by the same path.
-        let (reverb, delay) = self.app.effect_sends();
-        e.set_effects(reverb, delay);
+        let [reverb, delay, chorus] = self.app.effect_sends();
+        e.set_effects(crate::effects::Sends {
+            reverb,
+            delay,
+            chorus,
+        });
+        // The parameters too, and `set_effect_params` is what makes this cheap:
+        // it compares before it takes the lock, so pushing the same eleven
+        // numbers sixty times a second costs one comparison.
+        e.set_effect_params(effect_params_from(self.app.effect_params()));
         e.set_metronome_enabled(self.app.metronome_on());
         e.set_metronome_in_take(self.app.metronome_in_take());
         e.set_tempo(self.app.tempo_bpm());
@@ -1375,6 +1461,11 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             cartridge: None,
         };
+        // What the effects ship as, so the panel can draw a slider for a
+        // parameter nobody has moved. See `ports::EffectDefaults`: the DSP owns
+        // these numbers and the UI cannot reach them.
+        #[cfg(feature = "recorder")]
+        me.app.set_effect_defaults(effect_defaults());
         // The cartridge from last time, if it is still where it was. **Silently
         // when it is not**: cartridges live in sample folders that get
         // reorganised, and an error dialog at launch about a file somebody

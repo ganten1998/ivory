@@ -254,9 +254,15 @@ pub struct RecorderView<'a> {
     /// The four faders, as LINEAR gains (not fader positions). See
     /// [`gain_to_fader`] for turning one into a knob angle.
     pub gains: Gains,
-    /// The two effect sends, 0..=1, as the knobs are drawn.
+    /// The three effect sends, 0..=1, as the knobs are drawn.
     pub reverb: f32,
     pub delay: f32,
+    pub chorus: f32,
+    /// The control a hand is on right now, if any. A knob shows its number
+    /// while it is being turned and its name the rest of the time: there is
+    /// nowhere on a knob to keep both, and the number is only wanted while it
+    /// is changing.
+    pub turning: Option<NumField>,
     /// The click is on. Independent of `metronome_in_take`.
     pub metronome_on: bool,
     /// The click is mixed into the recording as well as the monitors.
@@ -312,6 +318,8 @@ impl RecorderView<'_> {
             gains: Gains::default(),
             reverb: 0.0,
             delay: 0.0,
+            chorus: 0.0,
+            turning: None,
             metronome_on: false,
             metronome_in_take: false,
             tempo_bpm: DEFAULT_BPM,
@@ -430,6 +438,7 @@ impl RecorderState {
         editing: Option<&'a NumEdit>,
         knobs: Knobs,
         hide_elapsed: bool,
+        turning: Option<NumField>,
     ) -> RecorderView<'a> {
         let label = |name: &'a Option<String>, missing: bool| match name.as_deref() {
             None => DeviceLabel::None,
@@ -461,6 +470,8 @@ impl RecorderState {
             time_signature: knobs.time_signature,
             reverb: knobs.reverb,
             delay: knobs.delay,
+            chorus: knobs.chorus,
+            turning,
             camera: label(&self.camera_name, self.camera_missing),
             audio: label(&self.audio_name, self.audio_missing),
             preview: self.preview,
@@ -486,10 +497,11 @@ pub struct Knobs {
     pub count_in_beats: u32,
     pub count_in_bars: u32,
     pub time_signature: TimeSignature,
-    /// The two effect sends, 0..=1. See `effects.rs` in the binary for what
+    /// The three effect sends, 0..=1. See `effects.rs` in the binary for what
     /// they reach: every instrument, and nothing else.
     pub reverb: f32,
     pub delay: f32,
+    pub chorus: f32,
 }
 
 impl Default for Knobs {
@@ -503,6 +515,7 @@ impl Default for Knobs {
             count_in_bars: 1,
             reverb: 0.0,
             delay: 0.0,
+            chorus: 0.0,
             time_signature: TimeSignature::default(),
         }
     }
@@ -1407,11 +1420,12 @@ pub enum NumField {
     Slot(usize),
     Metronome,
     Input,
-    /// The two effect sends, typed as a PERCENT. Every other field here is
+    /// The three effect sends, typed as a PERCENT. Every other field here is
     /// typed in the unit it is displayed in, and "40" for four tenths wet is
     /// the only reading of a send anybody has ever wanted to write.
     Reverb,
     Delay,
+    Chorus,
     Tempo,
     /// The time signature. Typed rather than dragged — "6/8" is two numbers and
     /// a slash, and there is no continuum between 4/4 and 7/8 to drag along.

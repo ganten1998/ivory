@@ -424,10 +424,18 @@ pub struct Settings {
     /// Linear gain per slot. Linear because that is what the audio path
     /// multiplies by; the band converts to dB to draw.
     pub plugin_gains: [f64; crate::recorder::SLOTS],
-    /// The two effect knobs, 0..=1. Both off by default: a first launch has to
+    /// The three effect knobs, 0..=1. All off by default: a first launch has to
     /// sound like the instrument, not like a room.
     pub reverb_mix: f64,
     pub delay_mix: f64,
+    pub chorus_mix: f64,
+    /// What each effect is set to, under its right-click menu.
+    ///
+    /// **Stored as a flat map of 0..=1 values**, keyed by the same names the
+    /// menu uses, so a build that learns a new parameter reads an old file
+    /// without a migration and an old build ignores a new key. The one entry
+    /// that is not a number is the delay's division, which is a name.
+    pub effect_params: Map<String, Value>,
     /// The DX7 cartridge the built-in instrument last had loaded, if any.
     ///
     /// A path, and it may well not exist next launch: cartridges live in
@@ -616,6 +624,8 @@ impl Default for Settings {
             plugin_gains: [1.0; crate::recorder::SLOTS],
             reverb_mix: 0.0,
             delay_mix: 0.0,
+            chorus_mix: 0.0,
+            effect_params: Map::new(),
             dx7_cartridge: String::new(),
             dx7_patch: 0,
             metronome_gain: 0.5,
@@ -1108,9 +1118,13 @@ impl Settings {
                 s.plugin_gains[0] = g;
             }
         }
+        if let Some(Value::Object(m)) = map.shift_remove("effect_params") {
+            s.effect_params = m;
+        }
         for (key, dst) in [
             ("reverb_mix", &mut s.reverb_mix),
             ("delay_mix", &mut s.delay_mix),
+            ("chorus_mix", &mut s.chorus_mix),
         ] {
             if let Some(v) = map.shift_remove(key).and_then(|v| v.as_f64()) {
                 // Clamped on read: this multiplies into a feedback loop, and a
@@ -1542,7 +1556,15 @@ impl Settings {
                     .collect(),
             ),
         );
-        for (key, v) in [("reverb_mix", self.reverb_mix), ("delay_mix", self.delay_mix)] {
+        map.insert(
+            "effect_params".into(),
+            Value::Object(self.effect_params.clone()),
+        );
+        for (key, v) in [
+            ("reverb_mix", self.reverb_mix),
+            ("delay_mix", self.delay_mix),
+            ("chorus_mix", self.chorus_mix),
+        ] {
             if let Some(n) = serde_json::Number::from_f64(v) {
                 map.insert(key.into(), Value::Number(n));
             }
@@ -1832,6 +1854,7 @@ impl Settings {
             time_signature: self.time_signature(),
             reverb: self.reverb_mix as f32,
             delay: self.delay_mix as f32,
+            chorus: self.chorus_mix as f32,
         }
     }
 
@@ -2234,6 +2257,9 @@ mod tests {
         s.dx7_cartridge = "/Users/x/Sysex/ROM1A.syx".to_owned();
         s.reverb_mix = 0.35;
         s.delay_mix = 0.2;
+        s.chorus_mix = 0.6;
+        s.effect_params
+            .insert("reverb_size".into(), Value::from(0.8));
         s.dx7_patch = 12;
         s.extra.insert(
             "a_key_from_a_later_build".into(),

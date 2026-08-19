@@ -106,6 +106,26 @@ pub struct FileRequest {
     pub purpose: FilePurpose,
 }
 
+/// What the effects ship as, pushed in by the host.
+///
+/// **The DSP owns these numbers, and it is on the other side of the firewall.**
+/// `ivory-ui` draws a panel of sliders and has no idea what a comb filter's
+/// feedback should be; writing a second copy of the defaults here to draw the
+/// sliders at the right place would be two tables to keep in step, and the
+/// symptom of them drifting is a panel that reads 62% while the audio does
+/// something else. So the host hands them over once, the same way it hands
+/// over the device list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectDefaults {
+    /// Parameter key to its default, as the settings file would store it.
+    pub values: serde_json::Map<String, serde_json::Value>,
+    /// The delay's divisions, `(key, label)`, in the order the panel steps
+    /// through them.
+    pub divisions: Vec<(String, String)>,
+    /// Which of those is the default.
+    pub default_division: String,
+}
+
 /// What the host found in a DX7 cartridge, for the picker to show.
 ///
 /// **Names, not voices.** `ivory-ui` cannot parse SysEx and has no business
