@@ -1634,15 +1634,7 @@ impl DesktopApp {
     #[cfg(feature = "recorder")]
     fn finish_dir_choice(&mut self, purpose: ivory_ui::ports::DirPurpose, dir: std::path::PathBuf) {
         match purpose {
-            // The tick is left where the user had it. Choosing a folder is not
-            // a statement about whether to go on choosing it, and silently
-            // ticking "use this by default" because somebody picked a folder
-            // once is how a temporary destination becomes permanent without
-            // anyone deciding it should.
-            ivory_ui::ports::DirPurpose::RecordRoot => {
-                let remember = self.app.record_dir_is_default();
-                self.app.set_record_dir(dir, remember);
-            }
+            ivory_ui::ports::DirPurpose::RecordRoot => self.app.set_record_dir(dir),
             ivory_ui::ports::DirPurpose::PluginFolder => self.app.add_plugin_folder(dir),
         }
     }
@@ -2441,11 +2433,12 @@ impl DesktopApp {
                 &audio,
                 app.chosen_audio_uid(),
                 app.audio_explicitly_off(),
+                app.exposed_input_channels(),
             );
             // No `explicitly_off` for the camera: absent already means no
             // camera there, because opening one turns on a light and a camera
             // nobody asked for must never be opened.
-            crate::devices::restore(&camera, app.chosen_camera_uid(), false);
+            crate::devices::restore(&camera, app.chosen_camera_uid(), false, &[]);
             app.set_capture_devices(Some(Box::new(inputs)));
             app.set_cameras(Some(Box::new(cams)));
             app.set_audio_setup(Some(Box::new(crate::devices::Setup::new(&audio))));

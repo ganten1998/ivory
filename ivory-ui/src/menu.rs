@@ -78,7 +78,6 @@ pub enum MenuAction {
     /// The take's destination and devices, which moved out of the band.
     ChooseFolder,
     RevealFolder,
-    ToggleDefaultDir,
     ToggleOpenWhenDone,
     PickCamera,
     PickAudio,
@@ -246,7 +245,6 @@ pub struct MenuView {
     /// How many folders the user has added to the plugin search list.
     pub extra_plugin_folders: usize,
     /// The take folder is remembered between sessions.
-    pub record_dir_is_default: bool,
     /// The take's folder opens when it finishes.
     pub open_when_done: bool,
     /// The sheet music band is showing.
@@ -464,7 +462,7 @@ pub struct MenuState {
     /// Which submenu is showing, as an index into `subs`. At most one, which
     /// is why they can all share a single viewport id.
     submenu_open: Option<usize>,
-    /// A submenu the pointer is on but which has not been switched to yet.
+    /// The state the pointer is asking for, and when it started asking.
     ///
     /// **The diagonal-travel fix.** Submenus open to the RIGHT, so reaching one
     /// means moving right and usually down or up — and every row crossed on the
@@ -473,10 +471,13 @@ pub struct MenuState {
     /// whichever row the path happened to end on. The owner's report was that
     /// hovering anything gave the TOP category about eight times in ten.
     ///
-    /// So a switch to a DIFFERENT submenu waits until the pointer has stayed on
-    /// the new row. Opening the first one is instant, because there is nothing
-    /// being travelled away from.
-    pending_sub: Option<(usize, Instant)>,
+    /// `Some(i)` is a submenu to open and `None` is "close what is showing", so
+    /// opening, switching and closing all wait the same way. See
+    /// `settle_submenu` for why none of the three may be instant.
+    pending_sub: Option<(Option<usize>, Instant)>,
+    /// Where the pointer has been sitting, and since when, in the menu's own
+    /// coordinates. `note_rest` owns it; nothing else may write it.
+    rest: Option<(Pos2, Instant)>,
     /// Where the pointer first was, in the menu's own coordinates.
     ///
     /// **The menu opens AT the cursor**, so on the frame it appears the pointer
@@ -504,24 +505,77 @@ pub struct MenuState {
     caps: Caps,
 }
 
-/// Stable surface identities. On the desktop these are viewport ids; in a
-/// plugin they are `Area` ids. One string each, so the two paths cannot drift.
+/// Whether the pointer has come to REST, tracked here rather than read from
+/// egui.
+///
+/// `input.pointer.velocity()` looks like the obvious answer and is a trap. It
+/// is `Vec2::ZERO` until three positions have been sampled over at least ten
+/// milliseconds, and the history is CLEARED whenever the pointer leaves the
+/// window (`Event::PointerGone`, `input_state`). So it reports "not moving"
+/// for the first two frames of every gesture, and again on every crossing
+/// between the menu window and its panel — which is exactly when a menu must
+/// not act. That is what let a pointer travelling towards one submenu open
+/// whichever row it was passing over.
+///
+/// This asks the only question that matters and cannot be faked by a gap in
+/// the samples: has the pointer been within `REST_SLOP` of one place for
+/// `REST_FOR`? A hand pushing a mouse across a row moves further than the slop
+/// every frame and can never accumulate the time.
+fn note_rest(rest: &mut Option<(Pos2, Instant)>, pointer: Option<Pos2>, now: Instant) -> bool {
+    let Some(p) = pointer else {
+        // Not in this window at all, so not resting in it. Starting over on
+        // the way back in is the point: re-entry is a crossing, not an arrival.
+        *rest = None;
+        return false;
+    };
+    match *rest {
+        Some((anchor, since)) if (p - anchor).length() <= REST_SLOP => {
+            now.duration_since(since) >= REST_FOR
+        }
+        _ => {
+            *rest = Some((p, now));
+            false
+        }
+    }
+}
+
 /// Decide which submenu is open, given what the pointer is on.
 ///
 /// Its own function because it is the whole of the bug the owner reported and
-/// none of it is about drawing: hovering a submenu opened the TOP category
-/// about eight times in ten, because reaching a panel that opens to the RIGHT
-/// means crossing the rows in between, and each one hovered.
+/// none of it is about drawing: reaching for a submenu opened a different one,
+/// the TOP category most often, because a panel that opens to the RIGHT is
+/// reached by travelling across the rows in between and every one of them
+/// hovers on the way past.
 ///
-/// Returns whether a switch is still pending, so the caller can ask for the
+/// **Every change of state waits, and they are all the same change.** Opening
+/// the first submenu, switching to another and closing on a plain row are one
+/// mechanism with one rule: the wanted state is remembered, and it commits
+/// when the pointer comes to rest or after `SUB_SWITCH_DWELL` on the same
+/// target. The version before this one made opening the FIRST submenu instant,
+/// on the reasoning that with nothing open there was no journey to protect.
+/// But the menu opens UNDER the cursor with nothing open, so "the first one"
+/// is whichever row the menu happened to land on, and it opened the moment the
+/// pointer twitched — six points of movement, less than half a row. That is
+/// the jump to the top of the menu.
+///
+/// Closing waits for the same reason. A plain row used to shut the panel on
+/// the frame it was crossed, so travelling from one category to another past
+/// an ordinary row destroyed the panel window and built it again — visible as
+/// a flicker everywhere and, on Windows, as a white flash.
+///
+/// `clicked` is the deliberate answer and skips all of it: pressing a category
+/// opens it on that frame, whatever the pointer is doing.
+///
+/// Returns whether a change is still pending, so the caller can ask for the
 /// frame that will complete it.
 fn settle_submenu(
     open: &mut Option<usize>,
-    pending: &mut Option<(usize, Instant)>,
+    pending: &mut Option<(Option<usize>, Instant)>,
     hovered: Option<usize>,
     hovered_plain_row: bool,
     armed: bool,
     still: bool,
+    clicked: bool,
     now: Instant,
 ) -> bool {
     // **Nothing at all until the pointer has moved.** The menu is placed under
@@ -530,57 +584,51 @@ fn settle_submenu(
     if !armed {
         return false;
     }
-    match hovered {
-        // Already showing: nothing to decide, and any pending switch is stale.
-        Some(i) if *open == Some(i) => {
+    // A press says which one, and says it now. This is the escape hatch: when
+    // the dwell feels wrong, clicking the category is exact.
+    if let Some(i) = hovered.filter(|_| clicked) {
+        *open = Some(i);
+        *pending = None;
+        return false;
+    }
+    // What the pointer is asking for: a submenu, or none at all. Being over
+    // NOTHING is not an answer — the gap between the menu and its panel is
+    // "nothing", and closing there would put the panel out of reach on any
+    // host that does not place the two flush.
+    let want = match (hovered, hovered_plain_row) {
+        (Some(i), _) => Some(i),
+        (None, true) => None,
+        (None, false) => {
+            *pending = None;
+            return false;
+        }
+    };
+    if want == *open {
+        // Already showing, and any half-finished change is stale — which is
+        // what coming back to the open row means.
+        *pending = None;
+        return false;
+    }
+    if still {
+        *open = want;
+        *pending = None;
+        return false;
+    }
+    match *pending {
+        Some((w, at)) if w == want && now.duration_since(at) >= SUB_SWITCH_DWELL => {
+            *open = want;
             *pending = None;
             false
         }
-        // Nothing open yet, so there is no journey to protect. Instant, because
-        // a delay on the FIRST submenu would just feel like lag.
-        Some(i) if open.is_none() => {
-            *open = Some(i);
-            *pending = None;
-            false
-        }
-        // A different one, with a submenu already open. The case that was
-        // firing by accident.
-        // A pointer that has STOPPED on a row has arrived; one still moving is
-        // in transit across it. Stillness rather than elapsed time is what
-        // makes this work at all: a stationary pointer produces no events, so a
-        // switch waiting only on a timer can sit unfinished on the row you
-        // meant to leave.
-        Some(i) if still => {
-            *open = Some(i);
-            *pending = None;
-            false
-        }
-        Some(i) => match *pending {
-            Some((j, at)) if j == i && now.duration_since(at) >= SUB_SWITCH_DWELL => {
-                *open = Some(i);
-                *pending = None;
-                false
-            }
-            Some((j, _)) if j == i => true,
-            _ => {
-                *pending = Some((i, now));
-                true
-            }
-        },
-        None => {
-            *pending = None;
-            // A plain row — one with no submenu — closes whatever is open. The
-            // pointer being nowhere at all does not: that is what passing over
-            // the gap between the menu and the panel looks like.
-            if hovered_plain_row {
-                *open = None;
-            }
-            false
+        Some((w, _)) if w == want => true,
+        _ => {
+            *pending = Some((want, now));
+            true
         }
     }
 }
 
-/// How long the pointer must stay on a different submenu row before it opens.
+/// How long the pointer must stay on a different row before the menu acts.
 ///
 /// Short enough to feel immediate when it is where you meant to go, long enough
 /// to survive crossing two or three rows on the way to the one that is already
@@ -590,13 +638,27 @@ fn settle_submenu(
 /// the LEFT because it was clamped against the screen edge.
 const SUB_SWITCH_DWELL: std::time::Duration = std::time::Duration::from_millis(140);
 
+/// How far the pointer may drift and still count as resting in one place.
+///
+/// One point. A mouse that has been let go sends no events at all, so this is
+/// only about sub-pixel drift and trackpad jitter; anything a hand is pushing
+/// crosses it within a single frame.
+const REST_SLOP: f32 = 1.0;
+
+/// How long it must stay there. Four frames at 60 Hz: imperceptible once you
+/// have arrived, and unreachable while you are still moving.
+const REST_FOR: std::time::Duration = std::time::Duration::from_millis(60);
+
 /// How far the pointer must move before the menu will act on what it is over.
 ///
 /// Small: the point is only to tell "the menu appeared under my cursor" from
-/// "I moved onto a row". Half a row is plenty and a whole row would make the
-/// first deliberate hover feel dead.
+/// "I moved onto a row". It no longer has to carry the whole fix on its own —
+/// nothing opens without a rest or a dwell now — so it stays at half a row,
+/// where a whole row would make the first deliberate hover feel dead.
 const ARM_SLOP: f32 = 6.0;
 
+/// Stable surface identities. On the desktop these are viewport ids; in a
+/// plugin they are `Area` ids. One string each, so the two paths cannot drift.
 const MENU_ID: &str = "ivory-menu";
 const SUBMENU_ID: &str = "ivory-menu-sub";
 
@@ -1270,6 +1332,7 @@ impl MenuState {
             subs,
             submenu_open: None,
             pending_sub: None,
+            rest: None,
             first_pointer: None,
             armed: false,
             monitor: monitor_size,
@@ -1448,6 +1511,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
 
     let mut hover_close_submenu = false;
     let mut hover_open_submenu: Option<usize> = None;
+    let mut clicked_submenu = false;
     // Where each submenu's parent row actually landed, in whatever coordinates
     // it was drawn in. Inline the menu may be inside a `ScrollArea`, so the
     // measured-at-open `row_top` is not where the row IS.
@@ -1469,14 +1533,10 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
     // viewport with its own input, so the parent context's pointer is not over
     // it and would report whatever the main window last saw.
     let mut pointer: Option<Pos2> = None;
-    let mut moving = false;
     let menu_report = crate::shell::surface(ctx, caps, &menu_spec, &mut |ui, want_close| {
+        // `latest_pos`, and NOT `velocity`, is the whole of what this frame
+        // needs to know about the pointer. See `note_rest`.
         pointer = ui.ctx().input(|i| i.pointer.latest_pos());
-        // Points per second. A pointer crossing rows on its way somewhere is
-        // moving; one that has arrived is not. `40` is slow enough that a
-        // deliberate slow drag still counts as moving and fast enough that the
-        // last twitch before stopping does not.
-        moving = ui.ctx().input(|i| i.pointer.velocity().length()) > 40.0;
         apply_menu_style(ui.style_mut(), c);
         scale_menu_font(ui.style_mut(), font_scale);
         let rect = ui.max_rect();
@@ -1514,6 +1574,11 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
                         if r.hovered() || r.clicked() {
                             hover_open_submenu = Some(sub_idx);
                         }
+                        // Reported apart from the hover: a press is a decision
+                        // and skips the dwell, a hover is a guess and does not.
+                        if r.clicked() {
+                            clicked_submenu = true;
+                        }
                         sub_row_rects.push(r.rect);
                         sub_idx += 1;
                     }
@@ -1537,18 +1602,27 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
             }
         }
     }
+    let now = Instant::now();
+    let still = note_rest(&mut state.rest, pointer, now);
     if settle_submenu(
         &mut state.submenu_open,
         &mut state.pending_sub,
         hover_open_submenu,
         hover_close_submenu,
         state.armed,
-        !moving,
-        Instant::now(),
+        still,
+        clicked_submenu,
+        now,
     ) {
         // Still waiting out the dwell. Ask for the frame that will end it, or a
         // pointer that has stopped moving would sit there forever.
         ctx.request_repaint_after(SUB_SWITCH_DWELL);
+    }
+    // And the frame that will notice it has come to rest. A pointer let go of
+    // produces no events at all, so without this the menu would only settle if
+    // something else happened to be animating.
+    if pointer.is_some() && !still {
+        ctx.request_repaint_after(REST_FOR);
     }
 
     // ── Submenu (sibling, Qt-style to the right) ──────────────────────────
@@ -1675,6 +1749,20 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// `settle_submenu` without the click, which is all but one of these.
+    fn settle(
+        open: &mut Option<usize>,
+        pending: &mut Option<(Option<usize>, Instant)>,
+        hovered: Option<usize>,
+        plain: bool,
+        armed: bool,
+        still: bool,
+        now: Instant,
+    ) -> bool {
+        settle_submenu(open, pending, hovered, plain, armed, still, false, now)
+    }
 
     fn view() -> MenuView {
         MenuView {
@@ -1706,7 +1794,6 @@ mod tests {
             recorder_on: false,
             camera_pane_on: false,
             extra_plugin_folders: 0,
-            record_dir_is_default: false,
             open_when_done: false,
             staff_on: true,
             staff_note_names: false,
@@ -2609,27 +2696,27 @@ mod tests {
         let mut open = None;
         let mut pending = None;
 
-        // The first one opens at once. A delay here would just feel like lag.
-        assert!(!settle_submenu(&mut open, &mut pending, Some(3), false, true, false, t0));
+        // Arriving on row 3 and stopping there opens it.
+        assert!(!settle(&mut open, &mut pending, Some(3), false, true, true, t0));
         assert_eq!(open, Some(3));
 
         // Now the pointer crosses rows 2, 1 and 0 on its way to the panel. None
         // of them may take over, because none was dwelt on.
         let mut t = t0;
         for row in [2usize, 1, 0] {
-            t += std::time::Duration::from_millis(20);
+            t += Duration::from_millis(20);
             assert!(
-                settle_submenu(&mut open, &mut pending, Some(row), false, true, false, t),
+                settle(&mut open, &mut pending, Some(row), false, true, false, t),
                 "row {row} should have started a wait, not a switch"
             );
             assert_eq!(open, Some(3), "row {row} stole the submenu in transit");
         }
 
         // Arriving and STAYING is a different thing, and it does switch.
-        let arrive = t + std::time::Duration::from_millis(20);
-        assert!(settle_submenu(&mut open, &mut pending, Some(0), false, true, false, arrive));
+        let arrive = t + Duration::from_millis(20);
+        assert!(settle(&mut open, &mut pending, Some(0), false, true, false, arrive));
         let settled = arrive + SUB_SWITCH_DWELL;
-        assert!(!settle_submenu(&mut open, &mut pending, Some(0), false, true, false, settled));
+        assert!(!settle(&mut open, &mut pending, Some(0), false, true, false, settled));
         assert_eq!(open, Some(0), "a deliberate hover must still work");
     }
 
@@ -2694,22 +2781,20 @@ mod tests {
         let mut pending = None;
 
         // Not armed: the pointer has not moved since the menu appeared.
-        assert!(!settle_submenu(
-            &mut open, &mut pending, Some(0), false, false, true, t
-        ));
+        assert!(!settle(&mut open, &mut pending, Some(0), false, false, true, t));
         assert_eq!(open, None, "the top submenu opened without being pointed at");
 
         // Still not, however long it sits there.
-        let later = t + std::time::Duration::from_secs(2);
-        assert!(!settle_submenu(
-            &mut open, &mut pending, Some(0), false, false, true, later
-        ));
+        let later = t + Duration::from_secs(2);
+        assert!(!settle(&mut open, &mut pending, Some(0), false, false, true, later));
         assert_eq!(open, None);
 
-        // Move, and the same hover works immediately.
-        assert!(!settle_submenu(
-            &mut open, &mut pending, Some(0), false, true, true, later
-        ));
+        // Move, and it is armed — but a moving pointer still opens nothing.
+        assert!(settle(&mut open, &mut pending, Some(0), false, true, false, later));
+        assert_eq!(open, None, "arming alone opened the row under the cursor");
+
+        // Come to rest on it, and it is a choice.
+        assert!(!settle(&mut open, &mut pending, Some(0), false, true, true, later));
         assert_eq!(open, Some(0));
     }
 
@@ -2725,14 +2810,10 @@ mod tests {
         let mut open = Some(4);
         let mut pending = None;
         // Moving across row 1: no switch.
-        assert!(settle_submenu(
-            &mut open, &mut pending, Some(1), false, true, false, t
-        ));
+        assert!(settle(&mut open, &mut pending, Some(1), false, true, false, t));
         assert_eq!(open, Some(4));
         // Stopped on it: switch, on this very frame.
-        assert!(!settle_submenu(
-            &mut open, &mut pending, Some(1), false, true, true, t
-        ));
+        assert!(!settle(&mut open, &mut pending, Some(1), false, true, true, t));
         assert_eq!(open, Some(1));
     }
 
@@ -2742,10 +2823,118 @@ mod tests {
     fn returning_to_the_open_row_cancels_a_pending_switch() {
         let t = Instant::now();
         let mut open = Some(2);
-        let mut pending = Some((5, t));
-        assert!(!settle_submenu(&mut open, &mut pending, Some(2), false, true, false, t));
+        let mut pending = Some((Some(5), t));
+        assert!(!settle(&mut open, &mut pending, Some(2), false, true, false, t));
         assert_eq!(open, Some(2));
         assert!(pending.is_none(), "the abandoned switch was still armed");
+    }
+
+    /// **The gesture the owner reported: reaching for a submenu opens the
+    /// top one.**
+    ///
+    /// The menu opens under the cursor with nothing showing, so the cursor is
+    /// already on the first row; flicking down towards row 7 hovers every row
+    /// in between on the way past. The code before this one opened the first
+    /// row it saw, because "nothing is open yet" was read as "there is no
+    /// journey to protect" — the journey had barely started.
+    #[test]
+    fn a_flick_down_the_menu_opens_nothing_on_the_way() {
+        let mut t = Instant::now();
+        let mut open = None;
+        let mut pending = None;
+        for row in [0usize, 1, 2, 3, 4, 5, 6] {
+            t += Duration::from_millis(16);
+            settle(&mut open, &mut pending, Some(row), false, true, false, t);
+            assert_eq!(
+                open, None,
+                "row {row} opened while the pointer was passing over it"
+            );
+        }
+        // And landing is still landing.
+        t += Duration::from_millis(16);
+        settle(&mut open, &mut pending, Some(7), false, true, true, t);
+        assert_eq!(open, Some(7), "the row the pointer stopped on did not open");
+    }
+
+    /// A press is a decision, and decisions do not wait.
+    ///
+    /// The dwell is a guess about intent; a click is the intent itself. It is
+    /// also the escape hatch — whatever the pointer heuristics do on a machine
+    /// nobody has tested, clicking the category is exact.
+    #[test]
+    fn a_click_on_a_category_opens_it_without_waiting() {
+        let t = Instant::now();
+        let mut open = Some(2);
+        let mut pending = Some((Some(9), t));
+        assert!(!settle_submenu(
+            &mut open,
+            &mut pending,
+            Some(5),
+            false,
+            true,
+            false,
+            true,
+            t
+        ));
+        assert_eq!(open, Some(5), "a click was made to wait for a dwell");
+        assert!(pending.is_none(), "the click left a stale wait behind");
+    }
+
+    /// **Stillness is ours, because egui's is not stillness.**
+    ///
+    /// `pointer.velocity()` is `Vec2::ZERO` until three positions have been
+    /// sampled over ten milliseconds, so it reads "stopped" for the first two
+    /// frames of every gesture. A menu that trusted it was told the pointer had
+    /// arrived exactly while it was crossing rows.
+    #[test]
+    fn a_pointer_still_travelling_is_never_at_rest() {
+        let mut rest = None;
+        let mut t = Instant::now();
+        let mut p = Pos2::new(10.0, 10.0);
+        for _ in 0..60 {
+            t += Duration::from_millis(16);
+            p.y += 10.0;
+            assert!(
+                !note_rest(&mut rest, Some(p), t),
+                "a pointer moving ten points a frame was called still"
+            );
+        }
+        // Let go of, and it arrives within a handful of frames.
+        for _ in 0..5 {
+            t += Duration::from_millis(16);
+            note_rest(&mut rest, Some(p), t);
+        }
+        assert!(
+            note_rest(&mut rest, Some(p), t),
+            "a pointer that was let go of never settled"
+        );
+    }
+
+    /// Coming back in from the panel is a crossing, not an arrival.
+    ///
+    /// This is the case egui cannot answer at all: `PointerGone` CLEARS the
+    /// velocity history, so the first frames after re-entry report a perfectly
+    /// motionless pointer — over whichever row it happens to have re-entered
+    /// on, which is how a submenu changed under a hand that was reaching for
+    /// the one already open.
+    #[test]
+    fn leaving_the_window_starts_the_rest_over() {
+        let mut rest = None;
+        let t0 = Instant::now();
+        let p = Pos2::new(10.0, 10.0);
+        assert!(!note_rest(&mut rest, Some(p), t0));
+        let settled = t0 + REST_FOR + Duration::from_millis(1);
+        assert!(
+            note_rest(&mut rest, Some(p), settled),
+            "a pointer sitting in one place was never noticed"
+        );
+
+        assert!(!note_rest(&mut rest, None, settled));
+        let back = settled + Duration::from_millis(16);
+        assert!(
+            !note_rest(&mut rest, Some(Pos2::new(10.0, 120.0)), back),
+            "re-entering the menu counted as having arrived"
+        );
     }
 
     /// A plain row closes the submenu; being over NOTHING does not.
@@ -2758,11 +2947,19 @@ mod tests {
         let t = Instant::now();
         let mut open = Some(1);
         let mut pending = None;
-        assert!(!settle_submenu(&mut open, &mut pending, None, false, true, false, t));
+        assert!(!settle(&mut open, &mut pending, None, false, true, false, t));
         assert_eq!(open, Some(1), "the gap between menu and panel closed it");
 
-        assert!(!settle_submenu(&mut open, &mut pending, None, true, true, false, t));
-        assert_eq!(open, None, "a plain row should have closed it");
+        // **Crossing a plain row is a journey too.** Closing on the frame it is
+        // crossed destroys the panel's window and builds it again as soon as
+        // the next category is reached: a flicker on every host and a white
+        // flash on Windows, for a row nobody was pointing at.
+        assert!(settle(&mut open, &mut pending, None, true, true, false, t));
+        assert_eq!(open, Some(1), "a plain row crossed in transit closed the panel");
+
+        // Stopping on one is pointing at it, and that does close it.
+        assert!(!settle(&mut open, &mut pending, None, true, true, true, t));
+        assert_eq!(open, None, "a plain row rested on should have closed it");
     }
 
 

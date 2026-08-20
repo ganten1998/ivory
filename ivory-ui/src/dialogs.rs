@@ -207,30 +207,32 @@ pub enum Dialog {
         /// How many inputs the selected device has, so the channel row can say
         /// whether there is anything to choose between.
         input_channels: u16,
-        /// Which input, or pair, is being recorded. `None` is the whole device.
-        pick: Option<(u16, Option<u16>)>,
+        /// The inputs of it the picker is offering as rows of their own.
+        exposed: Vec<(u16, Option<u16>)>,
     },
-    /// **Which of an interface's inputs to record.**
+    /// **Which of an interface's inputs the microphone picker should offer.**
     ///
-    /// Its own dialog rather than more rows in the microphone picker, because
-    /// what it offers is not a list. An eight-in interface has eight mono
-    /// choices and fifty-six ordered pairs, and the pair somebody wants is
-    /// routinely 2/3 — a stereo source patched across the middle because input
-    /// 1 has a vocal in it. Fifty-six rows in a device list is not a chooser,
-    /// and a list of only the adjacent pairs would answer a different question
-    /// from the one being asked.
+    /// Two columns of tick boxes, and ticking is the whole interaction: MONO
+    /// down the left, one box per input, and STEREO down the right, one box
+    /// per adjacent pair — 1/2, 2/3, 3/4, so a stereo source patched across
+    /// the middle of the box is as reachable as one on the first two inputs.
     ///
-    /// So: one section per shape. MONO is the inputs, one button each. STEREO
-    /// is two rows — a left and a right — because picking the two ends
-    /// independently is the only arrangement that can express every pair
-    /// including the crossed ones, in as many clicks as there are decisions.
+    /// **Any number of them at once, and that is the point.** The version
+    /// before this one was a chooser: one input, or one pair, and picking the
+    /// room mic meant giving up the pair the piano is on. They are not
+    /// alternatives — they are separate microphones that happen to arrive down
+    /// one cable — so every ticked box becomes a row of its own in the picker,
+    /// named for the interface and the inputs it holds, and the picker goes on
+    /// doing what it already did: saying which one is open.
     InputChannels {
-        /// What the device is called, for the title.
+        /// What the device is called, for the title and for every row it puts
+        /// in the picker.
         device: String,
         /// How many inputs it has.
         channels: u16,
-        /// The live choice: left, and a right when it is a pair.
-        pick: Option<(u16, Option<u16>)>,
+        /// The ticked boxes. `(a, None)` is a mono input, `(a, Some(b))` a
+        /// pair.
+        exposed: Vec<(u16, Option<u16>)>,
     },
     /// Shown at startup until dismissed with its checkbox. Tangent is free; this
     /// asks for support without gating anything, so it must never feel like a
@@ -382,8 +384,9 @@ pub enum DialogAction {
     /// changes which driver stack they are opened against, so the device
     /// selected under the old system may not exist under the new one.
     SetAudioSystem(Option<String>),
-    /// Record this input, this pair, or the whole device (`None`).
-    SetInputChannels(Option<(u16, Option<u16>)>),
+    /// Offer exactly these inputs of the selected device as picker rows.
+    /// Empty means the device on its own, which is where everybody starts.
+    SetInputChannels(Vec<(u16, Option<u16>)>),
     /// Open the channel chooser for the device now selected.
     ChooseInputChannels,
     /// Open the microphone picker from Setup. The device half of "the audio
@@ -906,6 +909,12 @@ const AUDIO_W: f32 = 430.0;
 /// The channel chooser. Wide enough for eight buttons on a row, so a
 /// sixteen-in interface is two rows and not five.
 const CHANNELS_W: f32 = 460.0;
+
+/// As tall as the chooser is ever allowed to get. Past this the two columns
+/// scroll: a thirty-two-in interface would otherwise ask for a dialog taller
+/// than the screen, and a dialog that runs off the bottom has an OK button
+/// nobody can reach.
+const CHANNELS_MAX_H: f32 = 560.0;
 /// Taller since the panel became Setup: four choice blocks and their captions
 /// where there was one. The body scrolls, so this is the size at which nothing
 /// HAS to — a machine whose interface offers all six rates is the tallest case,
@@ -3295,7 +3304,7 @@ pub fn show(
             system,
             rates,
             input_channels,
-            pick,
+            exposed,
         } => {
             let t = theme(dark_mode);
             show_dialog_viewport(
@@ -3531,15 +3540,23 @@ pub fn show(
                             );
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    RichText::new(match *pick {
-                                        None if *input_channels > 0 => {
-                                            format!("all {input_channels}")
+                                    RichText::new(if exposed.is_empty() {
+                                        match *input_channels {
+                                            0 => "the whole device".to_owned(),
+                                            n => format!("all {n}, as one device"),
                                         }
-                                        None => "the whole device".to_owned(),
-                                        Some((a, None)) => format!("input {}", a + 1),
-                                        Some((a, Some(b))) => {
-                                            format!("inputs {}/{}", a + 1, b + 1)
-                                        }
+                                    } else {
+                                        // Named, not counted. "3 shown" makes
+                                        // somebody open the chooser to find out
+                                        // which three.
+                                        exposed
+                                            .iter()
+                                            .map(|&(a, b)| match b {
+                                                None => format!("{}", a + 1),
+                                                Some(b) => format!("{}/{}", a + 1, b + 1),
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
                                     })
                                     .font(plain(11.0))
                                     .color(t.text),
@@ -3568,7 +3585,7 @@ pub fn show(
                             });
                             ui.label(
                                 RichText::new(if *input_channels >= 3 {
-                                    "one input, or any pair - 2/3 as readily as 1/2"
+                                    "each one ticked is its own row in the mic picker"
                                 } else {
                                     "for an interface with more than two inputs"
                                 })
@@ -3592,14 +3609,16 @@ pub fn show(
         Dialog::InputChannels {
             device,
             channels,
-            pick,
+            exposed,
         } => {
             let t = theme(dark_mode);
             let n = *channels;
-            // Tall enough for two sections of buttons that wrap. Eighteen
-            // inputs is three rows of six at this width, twice over.
-            let rows = (f32::from(n) / 8.0).ceil().max(1.0);
-            let h = 240.0 + rows * 62.0;
+            // Two columns, one row per input. Tall enough for the longer of
+            // them — mono has `n` boxes, stereo `n - 1` — and no taller,
+            // with a scroll for an interface with more inputs than a dialog
+            // can hold.
+            let listed = f32::from(n.max(1));
+            let h = (190.0 + listed * 24.0).min(CHANNELS_MAX_H);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -3618,101 +3637,110 @@ pub fn show(
                         .show(ui, |ui| {
                             ui.label(RichText::new(device.as_str()).font(bold(11.0)).color(t.text));
                             ui.label(
-                                RichText::new(format!("{n} inputs, numbered as they are on the box"))
-                                    .font(plain(10.0))
-                                    .color(dim),
+                                RichText::new(format!(
+                                    "{n} inputs, numbered as they are on the box"
+                                ))
+                                .font(plain(10.0))
+                                .color(dim),
                             );
-                            ui.add_space(10.0);
+                            ui.add_space(8.0);
 
-                            // ── the whole device ─────────────────────────────
-                            if ui
-                                .selectable_label(pick.is_none(), "Everything, as it comes")
-                                .clicked()
-                            {
-                                *pick = None;
-                                action = Some(DialogAction::SetInputChannels(None));
-                            }
-                            ui.add_space(10.0);
-
-                            // ── mono ─────────────────────────────────────────
-                            ui.label(RichText::new("MONO").font(bold(11.0)).color(t.text));
-                            ui.horizontal_wrapped(|ui| {
-                                for c in 0..n {
-                                    let on = *pick == Some((c, None));
-                                    if ui.selectable_label(on, format!("{}", c + 1)).clicked() {
-                                        *pick = Some((c, None));
-                                        action =
-                                            Some(DialogAction::SetInputChannels(Some((c, None))));
-                                    }
+                            // Ticked boxes are collected and reported once, at
+                            // the end of the frame. Reporting from inside the
+                            // loop would mean the row after the one that was
+                            // just clicked is laid out against a set that no
+                            // longer matches what is drawn.
+                            let mut want = exposed.clone();
+                            let mut toggle = |want: &mut Vec<(u16, Option<u16>)>,
+                                              pick: (u16, Option<u16>),
+                                              on: bool| {
+                                want.retain(|p| *p != pick);
+                                if on {
+                                    want.push(pick);
                                 }
-                            });
-                            ui.label(
-                                RichText::new("one input, recorded as mono")
-                                    .font(plain(10.0))
-                                    .color(dim),
-                            );
-                            ui.add_space(10.0);
-
-                            // ── stereo ───────────────────────────────────────
-                            //
-                            // **Two rows, not a list of pairs.** Eight inputs
-                            // make fifty-six ordered pairs; picking the two
-                            // ends independently expresses every one of them,
-                            // including the crossed ones, in two clicks.
-                            ui.label(RichText::new("STEREO").font(bold(11.0)).color(t.text));
-                            let (mut l, mut r) = match *pick {
-                                Some((a, Some(b))) => (Some(a), Some(b)),
-                                // Coming from mono or from nothing: the mono
-                                // choice seeds the left, which is what somebody
-                                // switching from "input 3" to a pair means.
-                                Some((a, None)) => (Some(a), None),
-                                None => (None, None),
                             };
-                            let mut changed = false;
-                            for (label, side, other) in [
-                                ("LEFT ", &mut l, false),
-                                ("RIGHT", &mut r, true),
-                            ] {
-                                ui.horizontal_wrapped(|ui| {
+
+                            ui.horizontal_top(|ui| {
+                                let col = (CHANNELS_W - 60.0) / 2.0;
+                                ui.vertical(|ui| {
+                                    ui.set_width(col);
                                     ui.label(
-                                        RichText::new(label).font(plain(10.0)).color(dim),
+                                        RichText::new("MONO").font(bold(11.0)).color(t.text),
                                     );
-                                    for c in 0..n {
-                                        let on = *side == Some(c);
-                                        if ui.selectable_label(on, format!("{}", c + 1)).clicked()
-                                        {
-                                            *side = Some(c);
-                                            changed = true;
-                                        }
-                                    }
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("mono-inputs")
+                                        .max_height(ui.available_height() - 44.0)
+                                        .show(ui, |ui| {
+                                            for c in 0..n {
+                                                let pick = (c, None);
+                                                let mut on = exposed.contains(&pick);
+                                                if ui
+                                                    .checkbox(
+                                                        &mut on,
+                                                        RichText::new(format!("{}", c + 1))
+                                                            .font(plain(11.0))
+                                                            .color(t.text),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    toggle(&mut want, pick, on);
+                                                }
+                                            }
+                                        });
                                 });
-                                let _ = other;
+                                ui.vertical(|ui| {
+                                    ui.set_width(col);
+                                    ui.label(
+                                        RichText::new("STEREO").font(bold(11.0)).color(t.text),
+                                    );
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("stereo-pairs")
+                                        .max_height(ui.available_height() - 44.0)
+                                        .show(ui, |ui| {
+                                            // **Every adjacent pair, including
+                                            // the odd starts.** 2/3 is a stereo
+                                            // source patched across the middle
+                                            // of the box because input 1 has
+                                            // something else in it, and it is
+                                            // as ordinary as 1/2.
+                                            for c in 0..n.saturating_sub(1) {
+                                                let pick = (c, Some(c + 1));
+                                                let mut on = exposed.contains(&pick);
+                                                if ui
+                                                    .checkbox(
+                                                        &mut on,
+                                                        RichText::new(format!(
+                                                            "{}/{}",
+                                                            c + 1,
+                                                            c + 2
+                                                        ))
+                                                        .font(plain(11.0))
+                                                        .color(t.text),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    toggle(&mut want, pick, on);
+                                                }
+                                            }
+                                        });
+                                });
+                            });
+
+                            if want != *exposed {
+                                want.sort_by_key(|&(a, b)| (a, b.unwrap_or(a)));
+                                *exposed = want.clone();
+                                action = Some(DialogAction::SetInputChannels(want));
                             }
-                            if changed {
-                                if let (Some(a), Some(b)) = (l, r) {
-                                    *pick = Some((a, Some(b)));
-                                    action = Some(DialogAction::SetInputChannels(Some((
-                                        a,
-                                        Some(b),
-                                    ))));
-                                } else if let Some(a) = l {
-                                    // Only one end chosen so far: it is a mono
-                                    // selection until the other arrives, rather
-                                    // than nothing at all — so the panel is
-                                    // never showing a choice that is not live.
-                                    *pick = Some((a, None));
-                                    action =
-                                        Some(DialogAction::SetInputChannels(Some((a, None))));
-                                }
-                            }
+
+                            ui.add_space(6.0);
                             ui.label(
                                 RichText::new(
-                                    "any two, in any order - 2/3 as readily as 1/2",
+                                    "each one ticked is its own row in the mic picker;\n\
+                                     the interface itself is always offered",
                                 )
                                 .font(plain(10.0))
                                 .color(dim),
                             );
-
                             ui.add_space((ui.available_height() - 30.0).max(0.0));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui

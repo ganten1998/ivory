@@ -1366,7 +1366,6 @@ impl IvoryApp {
             recorder_on: self.settings.show_recorder,
             camera_pane_on: self.settings.show_camera_pane,
             extra_plugin_folders: self.settings.plugin_paths.len(),
-            record_dir_is_default: self.settings.record_dir_is_default,
             open_when_done: self.settings.record_open_when_done,
             staff_on: self.settings.theory_views().contains(theory_panel::View::Staff),
             staff_note_names: self.settings.staff_note_names,
@@ -2932,7 +2931,7 @@ impl IvoryApp {
             systems,
             system: self.settings.audio_system().map(str::to_owned),
             rates,
-            pick: self.audio_setup.as_ref().and_then(|s| s.channels()),
+            exposed: self.audio_setup.as_ref().map(|s| s.exposed()).unwrap_or_default(),
             // The DEVICE's width, not the open stream's: a stream with one
             // input picked out of eight is one channel wide, and laying the
             // chooser out from that would offer exactly the channel already
@@ -2953,7 +2952,7 @@ impl IvoryApp {
                 .as_ref()
                 .map_or_else(|| "the input".to_owned(), |(n, _)| n.clone()),
             channels: setup.input_channels(),
-            pick: setup.channels(),
+            exposed: setup.exposed(),
         });
     }
 
@@ -3028,14 +3027,6 @@ impl IvoryApp {
                 self.save_settings();
             }
             Hit::ChooseFolder => self.ask_for_a_folder(),
-            Hit::ToggleDefaultDir => {
-                self.settings.record_dir_is_default = !self.settings.record_dir_is_default;
-                // Unticking it does NOT forget the folder. The tick means "keep
-                // using this next time"; clearing the path as well would throw
-                // away the choice the user just made in the act of saying they
-                // did not want it to be permanent.
-                self.save_settings();
-            }
             Hit::RevealFolder => self.reveal_record_folder(None),
             Hit::ToggleOpenWhenDone => {
                 self.settings.record_open_when_done = !self.settings.record_open_when_done;
@@ -3178,11 +3169,6 @@ impl IvoryApp {
         self.settings.record_root()
     }
 
-    /// Whether the chosen folder is meant to survive the session.
-    pub fn record_dir_is_default(&self) -> bool {
-        self.settings.record_dir_is_default
-    }
-
     /// The typed take name, if any.
     pub fn take_name(&self) -> Option<&str> {
         self.settings.record_take_name.as_deref()
@@ -3256,14 +3242,22 @@ impl IvoryApp {
         self.settings.record_camera_uid.as_deref()
     }
 
+    /// The inputs of an interface the picker should offer as rows of their
+    /// own, as the host's own opaque uids. Handed back verbatim at startup.
+    pub fn exposed_input_channels(&self) -> &[String] {
+        &self.settings.record_input_channels
+    }
+
     /// Answer a [`crate::ports::DirRequest`].
     ///
-    /// `remember` is the "Default" tick, and it is passed in rather than read
-    /// from settings because the host is answering a question the user asked
-    /// before the tick's current value was necessarily what they meant.
-    pub fn set_record_dir(&mut self, dir: std::path::PathBuf, remember: bool) {
+    /// **Unconditionally remembered, and it always was.** There used to be a
+    /// "Default" tick beside the folder and a `remember` flag threaded through
+    /// here to carry it — but the path was written to settings either way and
+    /// `record_root` read it either way, so the tick set a value nothing
+    /// consulted. It is gone, and the folder does what it looked like it was
+    /// doing all along.
+    pub fn set_record_dir(&mut self, dir: std::path::PathBuf) {
         self.settings.record_dir = Some(dir.to_string_lossy().into_owned());
-        self.settings.record_dir_is_default = remember;
         self.save_settings();
     }
 
@@ -4114,9 +4108,6 @@ impl IvoryApp {
             }
             MenuAction::ChooseFolder => self.apply_recorder_hit(recorder_panel::Hit::ChooseFolder),
             MenuAction::RevealFolder => self.apply_recorder_hit(recorder_panel::Hit::RevealFolder),
-            MenuAction::ToggleDefaultDir => {
-                self.apply_recorder_hit(recorder_panel::Hit::ToggleDefaultDir);
-            }
             MenuAction::ToggleOpenWhenDone => {
                 self.apply_recorder_hit(recorder_panel::Hit::ToggleOpenWhenDone);
             }
@@ -4535,16 +4526,22 @@ impl IvoryApp {
                 self.settings.audio_system = name.unwrap_or_default();
                 self.save_settings();
             }
-            DialogAction::SetInputChannels(pick) => {
+            DialogAction::SetInputChannels(picks) => {
                 if let Some(s) = self.audio_setup.as_mut() {
-                    s.set_channels(pick);
+                    // The host hands back the whole opaque list, every device
+                    // included — see `AudioSetup::set_exposed`. Written here
+                    // rather than left in the device object, because a set of
+                    // microphones that has to be rebuilt at every launch is not
+                    // a setup, it is a chore.
+                    self.settings.record_input_channels = s.set_exposed(picks.clone());
+                    self.save_settings();
                 }
-                // Live in the open dialog too, or the buttons do not light up
-                // until it is closed and opened again.
-                if let Some(dialogs::Dialog::InputChannels { pick: live, .. })
-                | Some(dialogs::Dialog::AudioSetup { pick: live, .. }) = self.dialog.as_mut()
+                // Live in the open dialog too, or the boxes do not tick until
+                // it is closed and opened again.
+                if let Some(dialogs::Dialog::InputChannels { exposed: live, .. })
+                | Some(dialogs::Dialog::AudioSetup { exposed: live, .. }) = self.dialog.as_mut()
                 {
-                    *live = pick;
+                    *live = picks;
                 }
             }
             DialogAction::ChooseInputChannels => self.open_input_channels(),
@@ -5394,6 +5391,19 @@ impl IvoryApp {
         if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("setup") {
             self.demo_menu_done = true;
             self.setup_open = true;
+        }
+        // And the input chooser, which needs hardware nobody developing this
+        // has: it only offers itself on an interface with more than two
+        // inputs. A fake eighteen-in device is the only way to look at the two
+        // columns at the size they will really be.
+        //   IVORY_INLINE=channels /Applications/Tangent.app/Contents/MacOS/tangent
+        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("channels") {
+            self.demo_menu_done = true;
+            self.dialog = Some(dialogs::Dialog::InputChannels {
+                device: "Scarlett 18i20 USB".to_owned(),
+                channels: 18,
+                exposed: vec![(0, Some(1)), (3, Some(4)), (5, None)],
+            });
         }
 
         self.process_midi_events();
@@ -6339,22 +6349,22 @@ mod tests {
         headless_with(caps, Settings::default())
     }
 
-    /// **The channel chooser opens, draws, and every pair is reachable.**
+    /// **The chooser opens, draws, and holds many inputs at once.**
     ///
-    /// Drawn for real: it is two wrapped rows of buttons per section, which is
-    /// where egui id clashes live, and a chooser that panics on an eighteen-in
-    /// interface would only be discovered by somebody who owns one.
+    /// Drawn for real: it is two scrolling columns of tick boxes, which is
+    /// where egui id clashes live, and a chooser that panicked on an
+    /// eighteen-in interface would only be discovered by somebody who owns one.
     ///
-    /// The claim it asserts is the one the feature exists for — that 2/3 is as
-    /// reachable as 1/2, in either order — expressed as: every ordered pair of
-    /// distinct inputs can be set and read back.
+    /// The claim it asserts is the one the feature exists for, in the owner's
+    /// words: mono 6 and 1/2 and 4/5 at the SAME time. A chooser that could
+    /// only ever hold one of them is what this replaced.
     #[test]
-    fn the_channel_chooser_opens_and_reaches_every_pair() {
+    fn the_channel_chooser_holds_several_inputs_at_once() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.dialog = Some(dialogs::Dialog::InputChannels {
             device: "Scarlett 18i20 USB".to_owned(),
-            channels: 8,
-            pick: None,
+            channels: 18,
+            exposed: Vec::new(),
         });
         let run = |ctx: &egui::Context, app: &mut IvoryApp| {
             let _ = ctx.run(
@@ -6376,28 +6386,34 @@ mod tests {
             "the chooser closed itself while drawing"
         );
 
-        // Every ordered pair, plus every mono, plus the whole device. The
-        // dialog holds the live choice so the buttons light up before the
-        // device has reopened.
-        for a in 0..8_u16 {
-            for b in 0..8_u16 {
-                app.apply_dialog_action(DialogAction::SetInputChannels(Some((a, Some(b)))));
-                let Some(dialogs::Dialog::InputChannels { pick, .. }) = &app.dialog else {
-                    panic!("the chooser vanished");
-                };
-                assert_eq!(*pick, Some((a, Some(b))), "the pair {a}/{b} did not stick");
-            }
-            app.apply_dialog_action(DialogAction::SetInputChannels(Some((a, None))));
-            let Some(dialogs::Dialog::InputChannels { pick, .. }) = &app.dialog else {
-                panic!("the chooser vanished");
-            };
-            assert_eq!(*pick, Some((a, None)));
-        }
-        app.apply_dialog_action(DialogAction::SetInputChannels(None));
-        let Some(dialogs::Dialog::InputChannels { pick, .. }) = &app.dialog else {
+        // The owner's own example, exactly.
+        let want = vec![(0_u16, Some(1_u16)), (3, Some(4)), (5, None)];
+        app.apply_dialog_action(DialogAction::SetInputChannels(want.clone()));
+        let Some(dialogs::Dialog::InputChannels { exposed, .. }) = &app.dialog else {
             panic!("the chooser vanished");
         };
-        assert_eq!(*pick, None, "the whole device is not reachable again");
+        assert_eq!(*exposed, want, "the three did not all stick");
+
+        // And it draws them without a panic or an id clash.
+        for _ in 0..2 {
+            run(&ctx, &mut app);
+        }
+
+        // Untick one, keep the rest. This is the half a one-choice picker
+        // could not express at all.
+        let fewer = vec![(0_u16, Some(1_u16)), (5, None)];
+        app.apply_dialog_action(DialogAction::SetInputChannels(fewer.clone()));
+        let Some(dialogs::Dialog::InputChannels { exposed, .. }) = &app.dialog else {
+            panic!("the chooser vanished");
+        };
+        assert_eq!(*exposed, fewer);
+
+        // Empty is a legal answer: the interface itself is always offered.
+        app.apply_dialog_action(DialogAction::SetInputChannels(Vec::new()));
+        let Some(dialogs::Dialog::InputChannels { exposed, .. }) = &app.dialog else {
+            panic!("the chooser vanished");
+        };
+        assert!(exposed.is_empty(), "unticking everything did not stick");
     }
 
     /// **Input monitoring is off at every launch, and cannot be otherwise.**
@@ -6529,10 +6545,10 @@ mod tests {
         assert_eq!(app.buffer_frames(), Some(512));
         app.apply_dialog_action(DialogAction::SetAudioSystem(Some("CoreAudio".to_owned())));
         assert_eq!(app.audio_system().as_deref(), Some("CoreAudio"));
-        // The channel choice goes to the HOST's device selection, not to the
-        // settings — the uid grammar stays on that side of the firewall — so
-        // there is nothing to read back here without a device attached.
-        app.apply_dialog_action(DialogAction::SetInputChannels(Some((2, Some(3)))));
+        // The exposed inputs go through the HOST, which hands back the opaque
+        // uids to store — so with no device attached there is nothing to read
+        // back, and the assertion that matters is that it does not panic.
+        app.apply_dialog_action(DialogAction::SetInputChannels(vec![(2, Some(3))]));
 
         // And "the device" half: Setup hands off to the one picker there is,
         // rather than carrying a second copy of the device list.

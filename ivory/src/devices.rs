@@ -58,6 +58,19 @@ pub struct Selection {
     /// the settled result of choosing None, and only the second one means "the
     /// camera has already been closed, do not close it again".
     pub settled: bool,
+    /// Inputs the picker offers as rows of their own, as channel uids.
+    ///
+    /// **A set, not a choice, and that is the whole design.** An interface's
+    /// inputs are not alternatives: the piano is on 1/2, a room mic is on 6,
+    /// and which of them a take wants changes between takes. So the chooser
+    /// says which ones EXIST as far as the picker is concerned, one row each,
+    /// and the picker still says which one is open — the same relationship the
+    /// device list already has with the device that is running.
+    ///
+    /// Spans every device, not just the one selected: unplugging an interface
+    /// must not forget how it was set up, and `list` only ever emits a row for
+    /// a device it can actually see.
+    pub exposed: Vec<String>,
 }
 
 impl Selection {
@@ -148,6 +161,62 @@ fn channel_uid(key: &str, pick: ChannelPick) -> String {
     }
 }
 
+/// A device's name with the input it is showing, for a picker row and for the
+/// band's own label.
+///
+/// One function so the two can never word it differently: choosing
+/// "Scarlett  -  inputs 1/2" in the picker and reading something else in the
+/// band is how somebody ends up unsure which input a take actually holds.
+fn with_channel(name: &str, pick: ChannelPick) -> String {
+    match pick {
+        ChannelPick::Mono(a) => format!("{name}  -  input {}", a + 1),
+        ChannelPick::Stereo(a, b) => format!("{name}  -  inputs {}/{}", a + 1, b + 1),
+    }
+}
+
+/// Where a pick sorts among its device's rows: by first input, then by width.
+fn pick_order(pick: ChannelPick) -> (u16, u16) {
+    match pick {
+        ChannelPick::Mono(a) => (a, a),
+        ChannelPick::Stereo(a, b) => (a, b),
+    }
+}
+
+/// Follow each device with the inputs of it the user asked to see.
+///
+/// **Rows, not a mode.** The alternative was what this replaced: one hidden
+/// "which input" setting attached to the selected device, so recording the
+/// room mic meant opening a panel and changing it back afterwards. An
+/// interface's inputs are separate sources; they belong in the list of sources
+/// beside the interface itself, and picking one is picking a microphone.
+fn with_exposed(found: Vec<DeviceInfo>, exposed: &[String]) -> Vec<DeviceInfo> {
+    let mut out: Vec<DeviceInfo> = Vec::with_capacity(found.len());
+    for d in found {
+        let mut extras: Vec<(ChannelPick, String)> = exposed
+            .iter()
+            .filter_map(|uid| {
+                let (key, pick) = split_channel(uid);
+                (key == d.uid).then_some(()).and(pick).map(|p| (p, uid.clone()))
+            })
+            .collect();
+        extras.sort_by_key(|(p, _)| pick_order(*p));
+        extras.dedup_by(|a, b| a.1 == b.1);
+        let name = d.name.clone();
+        out.push(d);
+        for (pick, uid) in extras {
+            out.push(DeviceInfo {
+                uid,
+                name: with_channel(&name, pick),
+                // The system default is the DEVICE. A row for one of its
+                // inputs is this app's invention and the OS has no opinion
+                // about it, so it never wears that badge.
+                default: false,
+            });
+        }
+    }
+    out
+}
+
 impl CaptureDevices for AudioInputs {
     fn list(&self) -> Vec<DeviceInfo> {
         // Not cached, deliberately: an interface plugged in while the Recorder
@@ -188,7 +257,7 @@ impl CaptureDevices for AudioInputs {
             });
         }
         if !out.is_empty() {
-            return out;
+            return with_exposed(out, &lock(&self.0).exposed);
         }
         for d in found {
             // The uid is the name-plus-occurrence key, not the bare name:
@@ -201,7 +270,7 @@ impl CaptureDevices for AudioInputs {
                 default: d.is_default,
             });
         }
-        out
+        with_exposed(out, &lock(&self.0).exposed)
     }
 
     fn open(&mut self, uid: &str) -> Result<(), String> {
@@ -230,10 +299,7 @@ impl CaptureDevices for AudioInputs {
         // channel number, where the stream falls back to everything and this
         // still names the input that was asked for. Re-picking settles it.
         match sel.wanted.as_deref().and_then(|u| split_channel(u).1) {
-            Some(ChannelPick::Mono(a)) => Some(format!("{name}  -  input {}", a + 1)),
-            Some(ChannelPick::Stereo(a, b)) => {
-                Some(format!("{name}  -  inputs {}/{}", a + 1, b + 1))
-            }
+            Some(pick) => Some(with_channel(&name, pick)),
             None => Some(name),
         }
     }
@@ -344,31 +410,78 @@ impl ivory_ui::ports::AudioSetup for Setup {
             .unwrap_or(0)
     }
 
-    fn channels(&self) -> Option<(u16, Option<u16>)> {
-        let uid = lock(&self.0).wanted.clone()?;
-        match split_channel(&uid).1? {
-            ChannelPick::Mono(a) => Some((a, None)),
-            ChannelPick::Stereo(a, b) => Some((a, Some(b))),
-        }
+    fn exposed(&self) -> Vec<(u16, Option<u16>)> {
+        let sel = lock(&self.0);
+        let Some(uid) = sel.wanted.as_deref() else {
+            return Vec::new();
+        };
+        // The device the picker is pointed at, whether or not the row it is
+        // pointed at is one of its channels.
+        let (key, _) = split_channel(uid);
+        let mut picks: Vec<ChannelPick> = sel
+            .exposed
+            .iter()
+            .filter_map(|u| {
+                let (k, p) = split_channel(u);
+                (k == key).then_some(()).and(p)
+            })
+            .collect();
+        picks.sort_by_key(|p| pick_order(*p));
+        picks.dedup();
+        picks
+            .into_iter()
+            .map(|p| match p {
+                ChannelPick::Mono(a) => (a, None),
+                ChannelPick::Stereo(a, b) => (a, Some(b)),
+            })
+            .collect()
     }
 
-    fn set_channels(&mut self, pick: Option<(u16, Option<u16>)>) {
+    fn set_exposed(&mut self, picks: Vec<(u16, Option<u16>)>) -> Vec<String> {
         let mut sel = lock(&self.0);
         let Some(uid) = sel.wanted.clone() else {
-            return;
+            return sel.exposed.clone();
         };
-        // Rebuilt from the KEY, so choosing twice does not stack suffixes.
-        let (key, _) = split_channel(&uid);
-        sel.wanted = Some(match pick {
-            None => key.to_owned(),
-            Some((a, None)) => channel_uid(key, ChannelPick::Mono(a)),
-            Some((a, Some(b))) => channel_uid(key, ChannelPick::Stereo(a, b)),
-        });
-        // A channel change reopens the stream, exactly as a device change
-        // does: the pick is applied where the callback's buffer enters the
-        // app, and that is decided when the stream is built.
-        sel.explicit = true;
-        sel.error = None;
+        let (key, open_pick) = split_channel(&uid);
+        let key = key.to_owned();
+        // Everything belonging to some OTHER device is left exactly as it is.
+        // The chooser only ever shows one interface, and a panel that silently
+        // forgot the others would lose a setup every time somebody swapped a
+        // box over.
+        let mut all: Vec<String> = sel
+            .exposed
+            .iter()
+            .filter(|u| split_channel(u).0 != key)
+            .cloned()
+            .collect();
+        let mut mine: Vec<String> = picks
+            .into_iter()
+            .map(|(a, b)| {
+                channel_uid(
+                    &key,
+                    match b {
+                        Some(b) => ChannelPick::Stereo(a, b),
+                        None => ChannelPick::Mono(a),
+                    },
+                )
+            })
+            .collect();
+        mine.sort();
+        mine.dedup();
+        all.extend(mine.iter().cloned());
+        sel.exposed = all.clone();
+        // **A row that has just stopped existing must not stay selected.**
+        // Unticking the input you are recording leaves the picker pointing at
+        // a row that is no longer in the list; falling back to the whole device
+        // keeps a microphone open, which is the difference between a tidy-up
+        // and a silent take.
+        if open_pick.is_some() && !mine.contains(&uid) {
+            sel.wanted = Some(key);
+            // The stream reopens, exactly as a device change does.
+            sel.explicit = true;
+            sel.error = None;
+        }
+        all
     }
 
     fn rates(&self) -> Vec<u32> {
@@ -486,6 +599,9 @@ pub fn selection(shared: &Shared) -> Selection {
         open_name: sel.open_name.clone(),
         error: sel.error.clone(),
         settled: sel.settled,
+        // Not the reconciler's business: it opens what `wanted` names, and
+        // which OTHER rows the picker offers changes nothing about that.
+        exposed: Vec::new(),
     }
 }
 
@@ -495,7 +611,7 @@ pub fn selection(shared: &Shared) -> Selection {
 /// because the reconciler only ever acts on a difference and `wanted` would
 /// start empty — so the app would silently fall back to the system default and
 /// look like it had forgotten the choice.
-pub fn restore(shared: &Shared, uid: Option<&str>, explicitly_off: bool) {
+pub fn restore(shared: &Shared, uid: Option<&str>, explicitly_off: bool, exposed: &[String]) {
     let mut sel = lock(shared);
     // `explicitly_off` is what makes "None - record MIDI only" survive a
     // restart. Deriving `explicit` from `uid.is_some()` alone would turn an
@@ -503,12 +619,139 @@ pub fn restore(shared: &Shared, uid: Option<&str>, explicitly_off: bool) {
     // microphone for somebody who said not to.
     sel.explicit = uid.is_some() || explicitly_off;
     sel.wanted = uid.map(str::to_owned);
+    // Kept even for devices that are not plugged in right now: `list` shows a
+    // row only for hardware it can see, and an interface that comes back
+    // should come back set up the way it was left.
+    sel.exposed = exposed.to_vec();
 }
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn a_device(uid: &str, name: &str) -> DeviceInfo {
+        DeviceInfo {
+            uid: uid.to_owned(),
+            name: name.to_owned(),
+            default: false,
+        }
+    }
+
+    /// **Every ticked input is a row of its own, and they coexist.**
+    ///
+    /// The owner's requirement in their words: mono 6 and 1/2 and 4/5 must all
+    /// show up in the input selector at the SAME time, each named for the
+    /// interface and the inputs it holds. The chooser this replaced could hold
+    /// exactly one of the three.
+    #[test]
+    fn every_exposed_input_is_its_own_row() {
+        let key = "Scarlett 18i20#0";
+        let exposed: Vec<String> = vec![
+            channel_uid(key, ChannelPick::Mono(5)),
+            channel_uid(key, ChannelPick::Stereo(0, 1)),
+            channel_uid(key, ChannelPick::Stereo(3, 4)),
+        ];
+        let rows = with_exposed(
+            vec![
+                a_device(key, "Scarlett 18i20"),
+                a_device("MacBook Pro Microphone#0", "MacBook Pro Microphone"),
+            ],
+            &exposed,
+        );
+        let names: Vec<&str> = rows.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Scarlett 18i20",
+                "Scarlett 18i20  -  inputs 1/2",
+                "Scarlett 18i20  -  inputs 4/5",
+                "Scarlett 18i20  -  input 6",
+                "MacBook Pro Microphone",
+            ],
+            "the picker did not offer all three at once, under the interface"
+        );
+        // Every row still opens something distinct: the uids are what the
+        // reconciler acts on, and two rows sharing one would be two names for
+        // the same microphone.
+        let mut uids: Vec<&str> = rows.iter().map(|d| d.uid.as_str()).collect();
+        let n = uids.len();
+        uids.sort_unstable();
+        uids.dedup();
+        assert_eq!(uids.len(), n, "two rows named the same input");
+    }
+
+    /// A remembered input for hardware that is not plugged in shows nothing,
+    /// and is not forgotten either.
+    ///
+    /// Both halves matter: a row for an absent interface is a microphone that
+    /// cannot be opened, and dropping the setting because the box was unplugged
+    /// would mean setting it up again every time it comes back.
+    #[test]
+    fn an_absent_interface_contributes_no_rows_and_loses_nothing() {
+        let gone = channel_uid("Scarlett 18i20#0", ChannelPick::Stereo(0, 1));
+        let rows = with_exposed(
+            vec![a_device("MacBook Pro Microphone#0", "MacBook Pro Microphone")],
+            std::slice::from_ref(&gone),
+        );
+        assert_eq!(rows.len(), 1, "a row appeared for hardware that is not here");
+
+        let (_a, shared) = AudioInputs::new();
+        restore(&shared, None, false, std::slice::from_ref(&gone));
+        assert_eq!(
+            lock(&shared).exposed,
+            vec![gone],
+            "the setup was thrown away with the cable"
+        );
+    }
+
+    /// **Unticking the input you are recording leaves a microphone open.**
+    ///
+    /// The row vanishes from the list the moment the box is cleared, so a
+    /// selection left pointing at it is pointing at nothing. Falling back to
+    /// the interface itself is the difference between a tidy-up and a silent
+    /// take nobody noticed until playback.
+    #[test]
+    fn unticking_the_open_input_falls_back_to_the_whole_device() {
+        use ivory_ui::ports::AudioSetup as _;
+        let key = "Scarlett 18i20#0";
+        let (_a, shared) = AudioInputs::new();
+        let pair = channel_uid(key, ChannelPick::Stereo(0, 1));
+        restore(&shared, Some(&pair), false, &[pair.clone()]);
+
+        let mut setup = Setup::new(&shared);
+        assert_eq!(setup.exposed(), vec![(0, Some(1))]);
+
+        // Tick a different one and clear the one that is open.
+        let left = setup.set_exposed(vec![(5, None)]);
+        assert_eq!(left, vec![channel_uid(key, ChannelPick::Mono(5))]);
+        assert_eq!(
+            lock(&shared).wanted.as_deref(),
+            Some(key),
+            "the picker was left pointing at a row that no longer exists"
+        );
+        assert!(lock(&shared).explicit, "the stream will not be reopened");
+    }
+
+    /// One interface's boxes are not the other's.
+    #[test]
+    fn setting_up_one_interface_leaves_the_others_alone() {
+        use ivory_ui::ports::AudioSetup as _;
+        let other = channel_uid("Behringer UMC1820#0", ChannelPick::Mono(7));
+        let (_a, shared) = AudioInputs::new();
+        restore(&shared, Some("Scarlett 18i20#0"), false, &[other.clone()]);
+
+        let mut setup = Setup::new(&shared);
+        assert!(
+            setup.exposed().is_empty(),
+            "the Scarlett inherited the Behringer's inputs"
+        );
+        let all = setup.set_exposed(vec![(0, Some(1))]);
+        assert!(
+            all.contains(&other),
+            "the Behringer's input was forgotten while the Scarlett was set up"
+        );
+    }
 
     #[test]
     fn choosing_a_device_does_not_open_it() {
@@ -600,18 +843,18 @@ mod tests {
 
         // Seeded from settings, both ways round: an explicit "None"...
         let (_b, restarted) = AudioInputs::new();
-        restore(&restarted, None, true);
+        restore(&restarted, None, true, &[]);
         assert_eq!(audio_selection(&restarted), None);
 
         // ...and a file from somebody who never chose. Same answer.
         let (_c, fresh) = AudioInputs::new();
-        restore(&fresh, None, false);
+        restore(&fresh, None, false, &[]);
         assert_eq!(audio_selection(&fresh), None);
 
         // A chosen device is still opened, which is the half that must not
         // regress while fixing the other one.
         let (_d, picked) = AudioInputs::new();
-        restore(&picked, Some("Scarlett 2i2#0"), false);
+        restore(&picked, Some("Scarlett 2i2#0"), false, &[]);
         assert!(matches!(
             audio_selection(&picked),
             Some(AudioChoice {
@@ -671,7 +914,7 @@ mod tests {
         use ivory_record::audio::InputSelection;
         let node = "alsa_input.usb-Focusrite_Scarlett_Solo_USB_Y771VU50AAEF28-00.pro-input-0";
         let (_a, shared) = AudioInputs::new();
-        restore(&shared, Some(&format!("{PIPEWIRE_UID}{node}")), false);
+        restore(&shared, Some(&format!("{PIPEWIRE_UID}{node}")), false, &[]);
         let choice = audio_selection(&shared).expect("a device was chosen");
         assert_eq!(
             choice.selection,
@@ -686,6 +929,7 @@ mod tests {
             &with_ch,
             Some(&channel_uid(&format!("{PIPEWIRE_UID}{node}"), ChannelPick::Stereo(1, 2))),
             false,
+            &[],
         );
         let choice = audio_selection(&with_ch).expect("a device was chosen");
         assert_eq!(
@@ -705,7 +949,7 @@ mod tests {
             &DeviceKey::named("Scarlett 18i20 USB").to_setting(),
             ChannelPick::Mono(2),
         );
-        restore(&shared, Some(&uid), false);
+        restore(&shared, Some(&uid), false, &[]);
         let choice = audio_selection(&shared).expect("a device was chosen");
         assert_eq!(
             choice.selection,
@@ -721,7 +965,7 @@ mod tests {
     fn a_malformed_channel_still_opens_the_device() {
         use ivory_record::audio::{DeviceKey, InputSelection};
         let (_a, shared) = AudioInputs::new();
-        restore(&shared, Some(&format!("Scarlett{CHANNEL_SEP}left")), false);
+        restore(&shared, Some(&format!("Scarlett{CHANNEL_SEP}left")), false, &[]);
         let choice = audio_selection(&shared).expect("the device still opens");
         assert_eq!(
             choice.selection,
@@ -736,7 +980,7 @@ mod tests {
     fn a_remembered_device_is_stale_at_startup_so_it_gets_opened() {
         use ivory_record::audio::InputSelection;
         let (_a, shared) = AudioInputs::new();
-        restore(&shared, Some("Scarlett 2i2#0"), false);
+        restore(&shared, Some("Scarlett 2i2#0"), false, &[]);
         assert!(selection(&shared).is_stale());
         assert!(matches!(
             audio_selection(&shared),

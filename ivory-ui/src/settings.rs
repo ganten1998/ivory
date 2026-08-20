@@ -315,10 +315,6 @@ pub struct Settings {
     ///
     /// [`record_root`]: Settings::record_root
     pub record_dir: Option<String>,
-    /// The "set as default" tick next to the folder. False means the folder was
-    /// chosen for this session and the picker will open there next time without
-    /// the choice being permanent.
-    pub record_dir_is_default: bool,
     /// Whether the "a chosen camera means video" default has already been
     /// applied to this settings file.
     ///
@@ -353,6 +349,14 @@ pub struct Settings {
     pub record_camera_uid: Option<String>,
     /// The audio input's stable UID. Same reasoning.
     pub record_audio_device: Option<String>,
+    /// Inputs of an interface the microphone picker offers as rows of their
+    /// own, as uids.
+    ///
+    /// **Opaque here, exactly like `record_audio_device` above.** The grammar
+    /// belongs to the host — `ivory-ui` cannot spell one and must not learn to
+    /// — so these are stored verbatim and handed straight back at startup. See
+    /// `ports::AudioSetup::set_exposed`.
+    pub record_input_channels: Vec<String>,
     /// What a take is made of: `auto`, `input`, `plugin` or `both`.
     ///
     /// **A NEW key, and the old `record_audio_source` is deliberately left
@@ -657,13 +661,13 @@ impl Default for Settings {
             recorder_win_x: None,
             recorder_win_y: None,
             record_dir: None,
-            record_dir_is_default: false,
             video_default_applied: false,
             shows_default_applied: false,
             record_open_when_done: false,
             record_take_name: None,
             record_camera_uid: None,
             record_audio_device: None,
+            record_input_channels: Vec::new(),
             record_sources: "auto".to_owned(),
             record_input_off: false,
             record_count_in_beats: 4,
@@ -1150,11 +1154,6 @@ impl Settings {
         take_opt_str(&mut map, "record_dir", &mut s.record_dir);
         take_bool(
             &mut map,
-            "record_dir_is_default",
-            &mut s.record_dir_is_default,
-        );
-        take_bool(
-            &mut map,
             "record_open_when_done",
             &mut s.record_open_when_done,
         );
@@ -1171,6 +1170,13 @@ impl Settings {
         take_opt_str(&mut map, "record_take_name", &mut s.record_take_name);
         take_opt_str(&mut map, "record_camera_uid", &mut s.record_camera_uid);
         take_opt_str(&mut map, "record_audio_device", &mut s.record_audio_device);
+        if let Some(Value::Array(v)) = map.shift_remove("record_input_channels") {
+            s.record_input_channels = v
+                .into_iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .filter(|x| !x.trim().is_empty())
+                .collect();
+        }
         take_bool(&mut map, "record_input_off", &mut s.record_input_off);
         if let Some(v) = map.shift_remove("record_sources") {
             if let Some(t) = v.as_str() {
@@ -1665,8 +1671,13 @@ impl Settings {
             }
         }
         map.insert(
-            "record_dir_is_default".into(),
-            Value::Bool(self.record_dir_is_default),
+            "record_input_channels".into(),
+            Value::Array(
+                self.record_input_channels
+                    .iter()
+                    .map(|u| Value::String(u.clone()))
+                    .collect(),
+            ),
         );
         map.insert(
             "record_open_when_done".into(),

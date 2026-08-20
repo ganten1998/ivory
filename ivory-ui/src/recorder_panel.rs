@@ -381,7 +381,6 @@ struct Layout {
     /// you click the left of it and a Finder window when you click the right is
     /// a box nobody can predict.
     reveal: Rect,
-    default_tick: Rect,
     name: Rect,
     /// Live grey text under the name field. Teaches the naming scheme without
     /// a help page, and is not clickable.
@@ -655,8 +654,7 @@ impl Layout {
             setup: Rect::NOTHING,
             dest: Rect::NOTHING,
             reveal: Rect::NOTHING,
-            default_tick: Rect::NOTHING,
-            name: Rect::NOTHING,
+                name: Rect::NOTHING,
             folder: Rect::NOTHING,
             disk: Rect::NOTHING,
                     count_in: Rect::NOTHING,
@@ -1194,7 +1192,7 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 62] {
+    fn targets(&self) -> [(Rect, Produces); 61] {
         use Produces::{Along, AlongV, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
         // The dB at the end of a fader row, which is the box you type into.
@@ -1324,7 +1322,6 @@ impl Layout {
             (self.click, Fixed(Hit::ToggleMetronome)),
             (self.dest, Fixed(Hit::ChooseFolder)),
             (self.reveal, Fixed(Hit::RevealFolder)),
-            (self.default_tick, Fixed(Hit::ToggleDefaultDir)),
             (self.open_when_done, Fixed(Hit::ToggleOpenWhenDone)),
             (self.count_in, Fixed(Hit::CycleCountIn)),
             // Turned like the sends, and typed into on a DOUBLE click — see
@@ -1397,7 +1394,6 @@ pub enum Hit {
     ChooseFolder,
     /// Show the destination folder in the file manager.
     RevealFolder,
-    ToggleDefaultDir,
     /// Show the take's folder as soon as the take is finished.
     ToggleOpenWhenDone,
     NameField,
@@ -1513,13 +1509,12 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 49] = [
+    pub const ALL: [Hit; 48] = [
         Hit::Record,
         Hit::Stop,
         Hit::OpenSetup,
         Hit::ChooseFolder,
         Hit::RevealFolder,
-        Hit::ToggleDefaultDir,
         Hit::ToggleOpenWhenDone,
         Hit::NameField,
         Hit::PickCamera,
@@ -1611,7 +1606,6 @@ impl Hit {
             Hit::Stop => "Stop",
             Hit::ChooseFolder => "Choose folder",
             Hit::RevealFolder => "Show the folder",
-            Hit::ToggleDefaultDir => "Use this folder by default",
             Hit::ToggleOpenWhenDone => "Show the take when it is finished",
             Hit::NameField => "Take name",
             Hit::PickCamera => "Camera",
@@ -4504,7 +4498,6 @@ mod tests {
                 ("name", l.name),
                 ("dest", l.dest),
                 ("reveal", l.reveal),
-                ("default", l.default_tick),
                 ("folder", l.folder),
                 ("disk", l.disk),
                 ("count-in", l.count_in),
@@ -5853,10 +5846,9 @@ mod tests {
                 // a session, and the band is what your hands are on while a
                 // take runs. `SetTempo` is here because the tempo BOX is a
                 // control and the value is not — see `Hit::EditTempo`.
-                const IN_THE_MENU: [Hit; 8] = [
+                const IN_THE_MENU: [Hit; 7] = [
                     Hit::ChooseFolder,
                     Hit::RevealFolder,
-                    Hit::ToggleDefaultDir,
                     Hit::ToggleOpenWhenDone,
                     Hit::CycleCountIn,
                     Hit::Export,
@@ -6923,7 +6915,6 @@ struct SetupLayout {
     name: Rect,
     dest: Rect,
     reveal: Rect,
-    default_tick: Rect,
     folder: Rect,
     disk: Rect,
     count_in: Rect,
@@ -6945,7 +6936,6 @@ impl SetupLayout {
         name: Rect::NOTHING,
         dest: Rect::NOTHING,
         reveal: Rect::NOTHING,
-        default_tick: Rect::NOTHING,
         folder: Rect::NOTHING,
         disk: Rect::NOTHING,
         count_in: Rect::NOTHING,
@@ -7028,10 +7018,15 @@ impl SetupLayout {
             // What the take is called: the first thing about it, and the first
             // row here.
             name: r0,
-            // Where takes go, how to see it, and whether it is the default.
-            dest: slice_h(r1, 0.00, 0.54),
-            reveal: slice_h(r1, 0.57, 0.74),
-            default_tick: slice_h(r1, 0.77, 1.00),
+            // Where takes go, and how to see it.
+            //
+            // **The folder gets the width the "Default" tick used to have.**
+            // That tick set a flag nothing read: the folder was written to
+            // settings and reused next launch whether it was on or off, so it
+            // was a switch wired to itself, sitting on the one row that needed
+            // the room. A path is long and it is the thing being read.
+            dest: slice_h(r1, 0.00, 0.79),
+            reveal: slice_h(r1, 0.82, 1.00),
             // What the next take will be called, and whether it will fit.
             // Answers rather than questions, so they carry no box — and a
             // HALF-HEIGHT row, because `text_line` sizes itself to whatever it
@@ -7059,13 +7054,12 @@ impl SetupLayout {
     }
 
     /// Every clickable region and what it means. The popup's [`Layout::targets`].
-    fn targets(&self) -> [(Rect, Hit); 11] {
+    fn targets(&self) -> [(Rect, Hit); 10] {
         [
             (self.name, Hit::NameField),
             (self.close, Hit::CloseSetup),
             (self.dest, Hit::ChooseFolder),
             (self.reveal, Hit::RevealFolder),
-            (self.default_tick, Hit::ToggleDefaultDir),
             (self.count_in, Hit::CycleCountIn),
             (self.time_sig, Hit::EditTimeSignature),
             (self.export, Hit::Export),
@@ -7723,13 +7717,6 @@ pub fn draw_setup(
     // SHOW rather than OPEN, for the reason the tick beside Export has: nothing
     // is opened, a folder is shown.
     draw_word_button(painter, l.reveal, &["SHOW FOLDER", "SHOW"], &p);
-    draw_tick(
-        painter,
-        l.default_tick,
-        "Default",
-        s.record_dir_is_default,
-        &p,
-    );
 
     text_line(painter, l.folder, view.folder_preview, p.faint, false);
     // Disk as a DURATION. "214 GB free" means nothing to a pianist and "~58

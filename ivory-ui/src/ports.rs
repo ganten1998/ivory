@@ -94,22 +94,26 @@ pub trait AudioSetup: Send {
     /// How many inputs the selected device has. 0 when nothing is selected.
     fn input_channels(&self) -> u16;
 
-    /// Which input, or pair of inputs, is being recorded.
+    /// Which inputs of the selected device the microphone picker offers as
+    /// rows of their own.
     ///
-    /// `None` is the whole device. `Some((a, None))` is input `a` as mono;
-    /// `Some((a, Some(b)))` is the pair — which need not be adjacent and need
-    /// not be in order, because 2/3 and 3/2 are both things people patch.
+    /// **A set, not a choice.** `(a, None)` is input `a` on its own; `(a,
+    /// Some(b))` is the pair. Any number of them, mono and stereo together —
+    /// the piano on 1/2 and a room mic on 6 are two microphones, not two
+    /// settings of one, and the picker is where you say which one to record.
     ///
     /// Zero-based, like every index. What the UI prints is one-based, because
     /// that is what is on the front of the interface.
-    fn channels(&self) -> Option<(u16, Option<u16>)>;
+    fn exposed(&self) -> Vec<(u16, Option<u16>)>;
 
-    /// Record this input, this pair, or the whole device.
+    /// Offer exactly these, and hand back what has to be remembered.
     ///
     /// **The uid grammar stays on the host's side of the firewall.** A choice
     /// is a pair of numbers here and a string there; `ivory-ui` cannot spell
-    /// the string and must not learn to.
-    fn set_channels(&mut self, pick: Option<(u16, Option<u16>)>);
+    /// the string and must not learn to — so the return is opaque, stored
+    /// verbatim in the settings file and handed straight back at startup,
+    /// exactly as the chosen device's own uid already is.
+    fn set_exposed(&mut self, picks: Vec<(u16, Option<u16>)>) -> Vec<String>;
 }
 
 /// A folder the app has asked the host to choose.
