@@ -327,7 +327,11 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   # file shared by three platforms, so a name in it is a claim this stage has
   # to be able to meet — and the way that breaks is silently, one release at a
   # time, on the platform nobody packs by hand.
-  for promised in tangent install.sh README.txt LICENSE; do
+  # tangent.desktop and tangent.png are on the list since 4.20.0: the installer
+  # now ASKS whether you want desktop integration, and with neither file in the
+  # stage it silently never asks. A missing feature that produces no output at
+  # all is exactly the kind this loop exists to catch.
+  for promised in tangent install.sh README.txt LICENSE tangent.desktop tangent.png; do
     if [ ! -e "$stage/$promised" ]; then
       echo "!! the readme promises $promised and the stage has no such file"
       rm -rf "$stage"; return 1
