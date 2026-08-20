@@ -1,7 +1,10 @@
 # Ivory 2.0 — Handoff / Resume Document
 
-**Last updated:** 2026-08-19. **The app is now called TANGENT.** Newest work is
-§2o: the fullscreen freeze, diagnosed over ssh on the Linux box. Before it,
+**Last updated:** 2026-08-20. **The app is now called TANGENT.** Newest work is
+§2t: the submenu that opened the wrong row, two Windows-only white flashes, the
+channel chooser as tick boxes, and one tick that was wired to itself. Before it,
+§2s: the potato pass. Before it, §2r: the takes with no instrument in them.
+Before it, §2o: the fullscreen freeze, diagnosed over ssh on the Linux box. Before it,
 §2n: the clip lamp and the take report. Before it,
 §2m: Linux hardening. Before it, §2l: the backing-track player. Before it, §2k: the limiter's makeup gain, the
 DX7 fader bug, and a dismissable CLIPPED.
@@ -1685,6 +1688,148 @@ The capture pushes into a shallow ring of its own (120 ms, not the take's four
 seconds) which the renderer drains EVERY block whether or not anybody is
 listening — so switching on plays now rather than a second of backlog.
 Listen-only by construction: the take comes off a different ring.
+
+---
+
+## 2t. 2026-08-20 — the menu that opened the wrong submenu, and two Windows-only flashes
+
+Shipped as **4.23.0**. Two bug reports and two changes the owner asked for
+alongside them.
+
+### Reaching for a submenu opened a different one, most often the top
+
+The owner, on every platform: "main context is fine, but as soon as you try to
+select a submenu, things get wonky and it sometimes just jumps to the top
+option." This is the third attempt at this bug and the first one that is
+actually about the mechanism rather than about the symptom.
+
+**What was wrong, in two parts.**
+
+1. `settle_submenu` had a branch that opened a submenu INSTANTLY when nothing
+   was open yet, reasoning that with no panel showing there is no journey to
+   protect. But the menu opens UNDER the cursor with nothing open, so "the
+   first one" is whichever row the menu happened to land beneath — and
+   `ARM_SLOP` is six points, less than half a row. Six points of movement in
+   any direction and the top row's submenu was up. That IS the jump to the top.
+
+2. `still` came from `input.pointer.velocity()`, which is not stillness.
+   `egui/src/input_state/mod.rs` computes it as `Vec2::ZERO` until three
+   positions have been sampled over at least ten milliseconds, and clears the
+   history outright on `Event::PointerGone`. So it reads "stopped" for the
+   first two frames of EVERY gesture, and again every time the pointer crosses
+   between the menu window and its panel — which on the desktop is two separate
+   OS windows with two separate pointer streams. The one moment a menu must not
+   act on what it is over is exactly the moment egui said the pointer had
+   arrived.
+
+**The fix.** `note_rest` keeps the pointer's own anchor and timestamp: still
+means "within `REST_SLOP` (one point) of one place for `REST_FOR` (60 ms)". A
+hand pushing a mouse crosses one point per frame at a hundred points per second,
+so a travelling pointer can never accumulate the time, and a gap in the samples
+cannot fake it. `settle_submenu` then treats opening, switching and CLOSING as
+one thing: the wanted state is remembered and commits on a rest or after
+`SUB_SWITCH_DWELL`. Nothing is instant except a CLICK on a category, which is
+new and is the deterministic escape hatch.
+
+Closing waits now too, and that is not a detail: a plain row used to shut the
+panel on the frame it was crossed, so travelling from one category to another
+past an ordinary row DESTROYED the panel's window and built it again — see the
+next section for what that costs on Windows.
+
+Verified on the real app with `cliclick`, not only in tests: right-click, travel
+down nine rows to Capo (Capo opens, nothing else did), move right into the panel
+and down to Fret 3 (the panel stays), travel back up nine rows to Colors (Colors
+opens). Screenshots at each step.
+
+### Windows: white flashes, and two independent causes
+
+Reported by a tester, Windows only, "app seems to MOSTLY work, but intermittent
+white flashes occur when using it". Neither cause can be seen from a Mac or a
+Linux box, which is why both had survived.
+
+**1. Every subprocess opened a console window.** The app is
+`#![windows_subsystem = "windows"]`, so it has NO console — and Windows gives a
+console-subsystem child one of its own, with a window, unless the parent passes
+`CREATE_NO_WINDOW`. ffmpeg is a console program. So starting a video take, muxing
+one at the end, and loading a backing track each put a console on the screen.
+Redirecting the child's handles does not help; the console is allocated at
+process start regardless of where they point.
+
+`ivory_record::proc::command` is now the only way this workspace spawns anything,
+and `proc::tests::nothing_spawns_a_child_the_long_way_round` is a SOURCE SCAN
+that fails the build if `Command::new` reappears outside test code. A scan
+rather than a behaviour test on purpose: the bug is invisible on the two
+platforms this is developed on, so neither a reviewer nor a running test can
+catch it.
+
+**2. Child viewports were born visible.** eframe starts its own main window with
+`with_visible(false)` and reveals it after the first frame — the comment in
+`eframe/src/native/glow_integration.rs` says, in as many words, "to fix white
+flash on startup". A child viewport gets no such treatment, and this app's menu,
+submenu panel and every dialog ARE child viewports that appear and disappear
+while somebody is using it. `shell::surface` now creates them hidden and reveals
+them on the next pass, tracking `(born, last drawn)` pass numbers in egui memory
+— consecutive calls differ by exactly one pass, because not drawing a surface is
+what destroys it, so a gap is a reliable "this one is new".
+
+A surface that asked for focus is sent `ViewportCommand::Focus` on the reveal
+pass. `with_active` is a creation-time attribute and an invisible window is not
+one anybody can focus, so without this a dialog could come up unable to hear
+Escape.
+
+**Still unproven, and say so when reporting:** neither fix has been seen to work
+on Windows, because there is no Windows machine here. The console-window one is
+certain in mechanism; the viewport one is the documented cause of the same
+symptom in eframe's own code. If flashes remain, the question to ask the tester
+is WHEN — while a take runs (ffmpeg), or when a menu or dialog opens (viewport).
+
+### The channel chooser is a set of tick boxes, not a choice
+
+The owner: "the channel selector MUST be a checkbox — On the left downwards,
+Mono Inputs to check. On the right downwards, Stereo to check — 1/2 2/3 3/4 etc
+and when selected — the chosen ones — EVEN IF MULTIPLE e.g. i selected mono 6
+and 1/2 4/5 must be exposed in the INPUT SELECTOR."
+
+4.22.0's chooser answered a different question: WHICH input to record, one at a
+time, hidden inside the selected device. That is wrong about the hardware. An
+interface's inputs are not alternatives — the piano is on 1/2 and a room mic is
+on 6, and which one a take wants changes between takes. So they are microphones,
+and microphones belong in the microphone picker.
+
+`Selection::exposed` is a set of channel uids spanning every device.
+`AudioInputs::list` follows each device it can see with a row per exposed input
+(`with_exposed`), named by `with_channel` — the same function the band's own
+label uses, so the picker and the band can never word it differently. The
+chooser is two columns of tick boxes: MONO 1..n down the left, STEREO 1/2, 2/3,
+3/4 … down the right, any number ticked at once.
+
+Two things worth knowing before changing it:
+
+- **Unticking the input that is OPEN falls back to the whole device**
+  (`set_exposed`). The row leaves the list the moment the box is cleared, so a
+  selection left pointing at it points at nothing — and the difference is a
+  silent take nobody notices until playback.
+- **Other devices' boxes are never touched.** The chooser only ever shows one
+  interface; a panel that quietly forgot the others would lose a setup every
+  time somebody swapped a box over.
+
+The uids are stored verbatim in `record_input_channels` and handed straight back
+to `devices::restore` at startup, exactly as the chosen device's own uid already
+is. The grammar stays on the host's side of the firewall; `ivory-ui` cannot
+spell one and must not learn to.
+
+`IVORY_INLINE=channels` opens it against a fake eighteen-in interface, because
+the chooser only offers itself above two inputs and nobody developing this owns
+such a box.
+
+### The "Default" tick beside the folder was wired to itself
+
+The owner asked what it did. The answer is nothing: `set_record_dir` wrote
+`record_dir` unconditionally and `Settings::record_root` read it regardless, so
+the folder was remembered whether the box was ticked or not. Its doc comment
+described behaviour that did not exist. Removed — the setting, the `Hit`, the
+`MenuAction` and the `remember` parameter threaded through the host — and the
+FOLDER field took the width it was using (`0.00..0.79` where it had `0.00..0.54`).
 
 ---
 
