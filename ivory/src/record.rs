@@ -49,7 +49,7 @@ use ivory_record::take::{self, Manifest, Take, WallTime};
 use ivory_record::wav::{Bext, SampleFormat, WavSpec, WavWriter};
 use ivory_ui::recorder::{ExportSpec, Level, Meters as UiMeters, RecordState};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -286,9 +286,51 @@ impl TakeSource {
     }
 }
 
+/// Scale an interleaved block towards `target`, and say where the gain got to.
+///
+/// **Per FRAME, not per sample.** Stepping the pole once per sample across an
+/// interleaved buffer applies a slightly different gain to the left and the
+/// right of the same frame — which is a stereo image that swings while the
+/// fader moves. Every channel of a frame gets the same number.
+///
+/// Pulled out of `Writer::apply_input_gain` so the two things that are easy to
+/// get wrong — that, and stepping rather than sliding — can be asserted without
+/// a capture device in the room.
+fn walk_gain(buf: &mut [f32], channels: usize, target: f32, mut now: f32, coeff: f32) -> f32 {
+    let ch = channels.max(1);
+    for frame in buf.chunks_exact_mut(ch) {
+        now += (target - now) * coeff;
+        for s in frame.iter_mut() {
+            *s *= now;
+        }
+    }
+    now
+}
+
+/// How fast a fader move reaches the samples: one pole, 10 ms.
+///
+/// The same shape and time constant `instrument.rs` uses for its own gains, so
+/// the microphone fader and the instrument faders feel like the same control.
+/// Long enough to be inaudible, short enough that nobody notices a lag.
+fn gain_slew_coefficient(rate: f64) -> f32 {
+    if !(rate.is_finite() && rate > 0.0) {
+        return 1.0;
+    }
+    (1.0 - (-1.0 / (rate * 0.010)).exp()) as f32
+}
+
 /// The writer thread's own state.
 struct Writer {
     sink: audio::CaptureSink,
+    /// The fader's target, written by the UI thread. See `Session::input_gain`.
+    input_gain: Arc<AtomicU32>,
+    /// Where the gain has actually got to. **Slewed, not stepped**: this thread
+    /// works in blocks of a few milliseconds, and applying a fader's new value
+    /// to a whole block is a step discontinuity — a click on every frame of a
+    /// drag. One pole per sample, the same shape and time constant the engine's
+    /// own gains use.
+    input_gain_now: f32,
+    input_gain_coeff: f32,
     tracker: LevelTracker,
     clock: ClockTap,
     cursor: FrameCursor,
@@ -376,6 +418,20 @@ impl Writer {
                 if !self.source.uses_input() {
                     self.buf.iter_mut().for_each(|s| *s = 0.0);
                 }
+                // **The fader, before anything else touches the block.**
+                //
+                // Here and not later, because everything downstream has to see
+                // the same samples: the meter the user is watching, the file
+                // being written, and the video's audio track. A gain applied
+                // after the tracker would be a fader that changes the recording
+                // and not the meter, which is the confusing half of having no
+                // fader at all.
+                //
+                // After the zeroing above rather than before it: with the input
+                // not part of the take there is nothing to scale, and slewing
+                // towards a target through silence would leave the gain
+                // somewhere arbitrary when the input came back.
+                self.apply_input_gain();
                 // The instrument, summed into the same block.
                 //
                 // The INPUT is the rate master here and the plugin follows it:
@@ -416,6 +472,10 @@ impl Writer {
             }
             self.buf.clear();
             self.sink.drain_samples(&mut self.buf);
+            // The same gain between takes, so the meter reads what the fader
+            // says while nothing is recording — which is when anybody actually
+            // sets it.
+            self.apply_input_gain();
             self.tracker.absorb(&self.buf);
             // Keep the instrument's ring moving while idle, and throw the
             // audio away.
@@ -483,6 +543,34 @@ impl Writer {
     /// channel; a wider source is folded down to the channels there are, which
     /// keeps a stereo piano audible on a mono take instead of silently dropping
     /// its right hand.
+    /// Walk the block applying the microphone fader, one pole per sample.
+    ///
+    /// Interleaved, so the coefficient is applied per FRAME and every channel
+    /// of that frame gets the same gain — stepping per sample across an
+    /// interleaved buffer would pan the signal while the fader moved.
+    fn apply_input_gain(&mut self) {
+        let target = f32::from_bits(self.input_gain.load(Ordering::Relaxed));
+        let target = if target.is_finite() && target >= 0.0 {
+            target
+        } else {
+            1.0
+        };
+        // Nothing to do, and worth checking: unity is where this sits for
+        // everybody who has never touched the fader, and the walk below is per
+        // sample on the writer thread.
+        if (target - 1.0).abs() < 1.0e-6 && (self.input_gain_now - 1.0).abs() < 1.0e-6 {
+            return;
+        }
+        let ch = self.tracker.channels().max(1);
+        self.input_gain_now = walk_gain(
+            &mut self.buf,
+            ch,
+            target,
+            self.input_gain_now,
+            self.input_gain_coeff,
+        );
+    }
+
     fn mix_plugin(&mut self, frames: usize) {
         let Some(tap) = self.plugin.as_mut() else {
             return;
@@ -677,6 +765,7 @@ impl Audio {
         tap_home: mpsc::Sender<Box<crate::instrument::RecorderTap>>,
         buffer_frames: Option<u32>,
         sample_rate: Option<u32>,
+        input_gain: Arc<AtomicU32>,
     ) -> Result<Self, String> {
         // The user's buffer choice, or the device's own. Both streams get the
         // same one: they are two halves of one path, and a round-trip figure
@@ -742,6 +831,12 @@ impl Audio {
         tracker.warm_up(audio::CLIP_WARMUP_MS);
         let mut writer = Writer {
             sink,
+            input_gain: Arc::clone(&input_gain),
+            // Starts AT the target rather than at unity: the slew exists to
+            // stop a moving fader clicking, and a device opening at whatever
+            // the fader already says is not a move.
+            input_gain_now: f32::from_bits(input_gain.load(Ordering::Relaxed)),
+            input_gain_coeff: gain_slew_coefficient(f64::from(config.sample_rate)),
             tracker,
             clock: ClockTap::new(2_000_000_000),
             cursor: FrameCursor::new(),
@@ -980,6 +1075,19 @@ impl Summary {
 pub struct Session {
     timebase: Timebase,
     tap: Arc<RawMidiTap>,
+    /// **The microphone fader.** `f32` bits, shared with whatever writer thread
+    /// is currently draining the input.
+    ///
+    /// It lives on the Session rather than on [`Audio`] because it outlives the
+    /// device: changing the input rebuilds `Audio`, and a fader that reset to
+    /// unity every time somebody picked a different microphone would be a
+    /// setting that quietly stops being true.
+    ///
+    /// It had no consumer at all until 4.20.0. The fader was drawn, dragged and
+    /// persisted, and nothing in `ivory/src` ever read it — the owner reported
+    /// it as "moving it changes neither the VUs nor the recorded level", which
+    /// was exactly right.
+    input_gain: Arc<AtomicU32>,
     audio: Option<Audio>,
     /// Why the audio device is not open, if it is not.
     audio_error: Option<String>,
@@ -1063,6 +1171,7 @@ impl Session {
     pub fn new(tap: Arc<RawMidiTap>, timebase: Timebase) -> Self {
         let (tap_tx, tap_rx) = mpsc::channel();
         Self {
+            input_gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             timebase,
             tap,
             audio: None,
@@ -1137,6 +1246,21 @@ impl Session {
     /// So the copies are cleared here — that is what makes the lamp go dark on
     /// this frame rather than the next poll — and the command clears the
     /// sources, so it stays dark.
+    /// The microphone fader, as a linear gain.
+    ///
+    /// Applied on the writer thread to the input block, before the meter reads
+    /// it and before the file is written — so the number the fader shows is the
+    /// number the take gets, and moving it visibly moves the VUs. See
+    /// [`Session::input_gain`] for how long it was connected to nothing.
+    pub fn set_input_gain(&self, linear: f32) {
+        let sane = if linear.is_finite() && linear >= 0.0 {
+            linear.min(16.0)
+        } else {
+            1.0
+        };
+        self.input_gain.store(sane.to_bits(), Ordering::Relaxed);
+    }
+
     pub fn clear_clip(&mut self) {
         self.clipped = false;
         for (m, cmds) in [
@@ -1258,6 +1382,7 @@ impl Session {
             self.tap_tx.clone(),
             buffer_frames,
             sample_rate,
+            Arc::clone(&self.input_gain),
         ) {
             Ok(a) => {
                 if let Some(t) = tap {
@@ -2414,6 +2539,9 @@ mod tests {
         let stats = Arc::new(audio::CaptureStats::new());
         let (source, sink) = audio::capture_channel(channels, 48_000, 512, Arc::clone(&stats));
         let writer = Writer {
+            input_gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+            input_gain_now: 1.0,
+            input_gain_coeff: 1.0,
             sink,
             tracker: LevelTracker::new(channels, 48_000.0),
             clock: ClockTap::new(2_000_000_000),
@@ -2592,6 +2720,9 @@ mod tests {
         let stats = Arc::new(audio::CaptureStats::new());
         let (mut source, sink) = audio::capture_channel(CH, 1024, 64, Arc::clone(&stats));
         let mut writer = Writer {
+            input_gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+            input_gain_now: 1.0,
+            input_gain_coeff: 1.0,
             sink,
             tracker: LevelTracker::new(CH, 48_000.0),
             clock: ClockTap::new(2_000_000_000),
@@ -3251,6 +3382,82 @@ mod tests {
             1,
             "the window is bounded behind T0, not unbounded"
         );
+    }
+}
+
+#[cfg(test)]
+mod input_gain_tests {
+    use super::{gain_slew_coefficient, walk_gain};
+
+    /// **The fader reaches the samples, and slides rather than steps.**
+    ///
+    /// It reached nothing at all until 4.20.0: `gains.input` was packaged by
+    /// the settings, drawn on the fader, written by the drag, and read by
+    /// nobody in `ivory/src`. The owner's report was "moving the mic fader
+    /// changes neither the VUs nor the recorded level nor the master", which
+    /// was the whole truth.
+    #[test]
+    fn the_fader_scales_the_block_and_gets_there_smoothly() {
+        let coeff = gain_slew_coefficient(48_000.0);
+        // Half a second of stereo ones, which is far longer than the 10 ms the
+        // pole needs.
+        let mut buf = vec![1.0_f32; 2 * 24_000];
+        let end = walk_gain(&mut buf, 2, 0.5, 1.0, coeff);
+        assert!(
+            (end - 0.5).abs() < 1.0e-3,
+            "the gain settled at {end}, not at the fader"
+        );
+        // The tail is at the target...
+        assert!((buf[buf.len() - 1] - 0.5).abs() < 1.0e-3);
+        // ...and the head is NOT, which is the whole point: a block that
+        // arrived already at 0.5 would be the step this exists to avoid.
+        assert!(
+            buf[0] > 0.99,
+            "the gain stepped instead of sliding: first sample {}",
+            buf[0]
+        );
+
+        // **A drag is inaudible.** No neighbouring pair may differ by enough to
+        // click; at 48 kHz and a 10 ms pole the biggest step is tiny.
+        let worst = buf
+            .chunks_exact(2)
+            .zip(buf.chunks_exact(2).skip(1))
+            .map(|(a, b)| (a[0] - b[0]).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(worst < 0.01, "the biggest sample-to-sample jump is {worst}");
+    }
+
+    /// Both channels of a frame get the same gain, so a moving fader does not
+    /// swing the stereo image.
+    #[test]
+    fn a_moving_fader_does_not_pan() {
+        let coeff = gain_slew_coefficient(48_000.0);
+        let mut buf = vec![1.0_f32; 2 * 512];
+        walk_gain(&mut buf, 2, 0.0, 1.0, coeff);
+        for (i, frame) in buf.chunks_exact(2).enumerate() {
+            assert_eq!(frame[0], frame[1], "frame {i} was panned by the fader");
+        }
+    }
+
+    /// Unity leaves the samples exactly alone — not nearly alone.
+    #[test]
+    fn unity_is_a_no_op() {
+        let coeff = gain_slew_coefficient(44_100.0);
+        let mut buf: Vec<f32> = (0..64).map(|i| i as f32 * 0.01 - 0.3).collect();
+        let before = buf.clone();
+        let end = walk_gain(&mut buf, 2, 1.0, 1.0, coeff);
+        assert_eq!(buf, before, "unity changed the samples");
+        assert_eq!(end, 1.0);
+    }
+
+    /// A partial frame at the end of a block is left alone rather than scaled
+    /// as if it were whole — `chunks_exact_mut` drops it, which is the same
+    /// rule `CaptureSource::accept` follows for the same reason.
+    #[test]
+    fn a_trailing_partial_frame_is_not_scaled() {
+        let mut buf = vec![1.0_f32; 5];
+        walk_gain(&mut buf, 2, 0.0, 0.0, 1.0);
+        assert_eq!(buf[4], 1.0, "half a frame was scaled");
     }
 }
 

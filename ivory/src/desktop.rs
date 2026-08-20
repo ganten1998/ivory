@@ -1956,6 +1956,14 @@ impl DesktopApp {
         }
         e.set_metronome_gain(gains.metronome);
         e.set_master_gain(gains.master);
+        // **And the microphone, which used to stop here.** `gains.input` was
+        // packaged, drawn and dragged and had no consumer anywhere in
+        // `ivory/src`: the fader moved nothing at all. It goes to the SESSION
+        // rather than to the engine, because the engine has no input in it —
+        // the input stream belongs to `ivory-record` and is drained by the
+        // writer thread, which is where the gain has to be applied to reach
+        // both the meter and the file.
+        self.recorder.session.set_input_gain(gains.input);
         // The backing track's level and trim, pushed with the rest for the
         // same reason: the settings are the one live value, so a fader moved,
         // a project loaded and a hand-edited file all arrive by one path.
