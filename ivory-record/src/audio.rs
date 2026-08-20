@@ -380,6 +380,139 @@ pub struct InputDeviceInfo {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// PipeWire, on Linux
+// ───────────────────────────────────────────────────────────────────────────
+
+/// One capture node PipeWire knows about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipewireSource {
+    /// `node.name`. Stable across sessions, and what `PIPEWIRE_NODE` takes.
+    pub node: String,
+    /// `node.description` — what a person calls it.
+    pub description: String,
+    pub channels: Option<u16>,
+}
+
+/// Every capture node PipeWire can see.
+///
+/// **Why this exists at all.** On a PipeWire machine, ALSA-level enumeration
+/// cannot see the interfaces. PipeWire holds each card exclusively, so cpal's
+/// card walk opens `plughw:N` and gets `EBUSY` — measured on the owner's box,
+/// where `arecord -D plughw:1` says "Device or resource busy" for the Scarlett
+/// while the built-in opens fine, and which of the two is busy depends on what
+/// PipeWire happens to be routing at that moment. The one PCM that always
+/// opens is `pipewire` itself, which follows the system DEFAULT source — so
+/// the app offered exactly one input, called `pipewire`, that silently captured
+/// whatever the desktop was pointed at. "No sound from my interface" was the
+/// correct description of that.
+///
+/// **Why a subprocess and not the PipeWire library.** `pipewire-rs` links
+/// `libpipewire` and needs its headers at BUILD time, and the Linux artifacts
+/// are cross-compiled from a Mac — see `scripts/build-cross.sh`. Adding that
+/// dependency would trade a working release process for a tidier lookup.
+/// `pw-dump` ships with PipeWire itself, emits exactly this as JSON, and its
+/// absence is a clean fallback to the old behaviour rather than a build that
+/// cannot be made.
+///
+/// Empty on any failure at all — no PipeWire, no `pw-dump`, a JSON shape from
+/// a future version — and the caller falls back to cpal's own enumeration.
+#[cfg(target_os = "linux")]
+pub fn pipewire_sources() -> Vec<PipewireSource> {
+    let out = match std::process::Command::new("pw-dump")
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out) else {
+        return Vec::new();
+    };
+    let Some(objects) = json.as_array() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for o in objects {
+        if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let Some(props) = o.pointer("/info/props") else {
+            continue;
+        };
+        let class = props
+            .get("media.class")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
+        // Sources and duplex devices; NOT monitors of a sink, which are named
+        // as sources and are the loopback the owner used as a workaround. They
+        // are legitimate inputs and they are also how somebody accidentally
+        // records their own output, so they are listed — but a camera is not
+        // an audio source and `v4l2_input` nodes carry `Video/Source`.
+        if !class.starts_with("Audio/Source") && class != "Audio/Duplex" {
+            continue;
+        }
+        let Some(node) = props.get("node.name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        found.push(PipewireSource {
+            node: node.to_owned(),
+            description: props
+                .get("node.description")
+                .and_then(|d| d.as_str())
+                .unwrap_or(node)
+                .to_owned(),
+            channels: props
+                .get("audio.channels")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|c| u16::try_from(c).ok()),
+        });
+    }
+    found
+}
+
+/// Nothing to enumerate: CoreAudio and WASAPI list their own devices properly.
+#[cfg(not(target_os = "linux"))]
+pub fn pipewire_sources() -> Vec<PipewireSource> {
+    Vec::new()
+}
+
+/// The PCM that PipeWire always provides, whatever it is holding.
+const PIPEWIRE_PCM: &str = "pipewire";
+
+/// Run `f` with `PIPEWIRE_NODE` set, and put the environment back.
+///
+/// **The whole binding mechanism, and it is an environment variable because
+/// that is the only knob pipewire-alsa offers.** Verified on the owner's box:
+/// `PIPEWIRE_NODE=<node> arecord -D pipewire` captures from that node, by name
+/// or by id, while the same device is `EBUSY` through ALSA directly.
+///
+/// It has to wrap the ENUMERATION as well as the stream build, because cpal's
+/// ALSA host opens each device's PCM handles while listing them and the stream
+/// then reuses the handle that is already open — so a variable set after the
+/// lookup would arrive too late to bind anything.
+///
+/// `set_var` is process-global and this is a UI-thread call. Both audio streams
+/// are opened from that thread, one at a time, and nothing else in the process
+/// reads this variable — so the window in which it is set is a few
+/// milliseconds inside one function, with no other opener able to run.
+#[cfg(target_os = "linux")]
+fn with_pipewire_node<T>(node: &str, f: impl FnOnce() -> T) -> T {
+    let previous = std::env::var_os("PIPEWIRE_NODE");
+    std::env::set_var("PIPEWIRE_NODE", node);
+    let out = f();
+    match previous {
+        Some(v) => std::env::set_var("PIPEWIRE_NODE", v),
+        None => std::env::remove_var("PIPEWIRE_NODE"),
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn with_pipewire_node<T>(_node: &str, f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // The audio system
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -471,6 +604,14 @@ pub enum InputSelection {
     #[default]
     Default,
     Key(DeviceKey),
+    /// A PipeWire node, opened through the `pipewire` PCM bound to it.
+    ///
+    /// The only way to reach a real interface on a PipeWire machine: PipeWire
+    /// holds each card exclusively, so ALSA hands cpal `EBUSY` for everything
+    /// except the `pipewire` PCM itself — which follows the system default
+    /// source unless it is told which node to bind. See
+    /// [`pipewire_sources`] and [`with_pipewire_node`].
+    PipewireNode(String),
 }
 
 impl fmt::Display for InputSelection {
@@ -478,6 +619,7 @@ impl fmt::Display for InputSelection {
         match self {
             Self::Default => f.write_str("(system default)"),
             Self::Key(k) => fmt::Display::fmt(k, f),
+            Self::PipewireNode(n) => f.write_str(n),
         }
     }
 }
@@ -1596,6 +1738,14 @@ fn resolve(selection: &InputSelection) -> Result<cpal::Device, AudioError> {
     let host = host();
     match selection {
         InputSelection::Default => host.default_input_device().ok_or(AudioError::NoDefaultInput),
+        // The caller has already set `PIPEWIRE_NODE`; this just finds the PCM
+        // that honours it. Looked up by name rather than taken as the default,
+        // because the default may be `default` or `pulse` on any given box.
+        InputSelection::PipewireNode(_) => host
+            .input_devices()
+            .map_err(|e| AudioError::Enumeration(e.to_string()))?
+            .find(|d| d.name().is_ok_and(|n| n == PIPEWIRE_PCM))
+            .ok_or_else(|| AudioError::NotFound(DeviceKey::named(PIPEWIRE_PCM))),
         InputSelection::Key(key) => {
             let devices = host
                 .input_devices()
@@ -1685,14 +1835,32 @@ pub fn open_input(
     ring_seconds: f32,
     timebase: Timebase,
 ) -> Result<(InputStream, CaptureSink), AudioError> {
-    let device = resolve(selection)?;
-    let device_name = device.name().unwrap_or_else(|_| UNNAMED_DEVICE.to_string());
+    // **The binding covers the LOOKUP as well as the open.** cpal's ALSA host
+    // opens each device's PCM handles while enumerating, and the stream reuses
+    // the handle that is already open — so a variable set after `resolve` would
+    // arrive too late to bind anything. See `with_pipewire_node`.
+    let node = match selection {
+        InputSelection::PipewireNode(n) => n.clone(),
+        _ => String::new(),
+    };
+    let opened = with_pipewire_node(&node, || {
+        let device = resolve(selection)?;
+        let default_config = device.default_input_config().ok();
+        let ranges: Vec<_> = device
+            .supported_input_configs()
+            .map_err(|e| AudioError::Enumeration(e.to_string()))?
+            .collect();
+        Ok::<_, AudioError>((device, default_config, ranges))
+    });
+    let (device, default_config, ranges) = opened?;
+    let device_name = match selection {
+        // The NODE's name, not the PCM's. Every PipeWire input opens through a
+        // PCM called `pipewire`, so reporting that would put the same name on
+        // every device in the band, the take manifest and the status panel.
+        InputSelection::PipewireNode(n) => n.clone(),
+        _ => device.name().unwrap_or_else(|_| UNNAMED_DEVICE.to_string()),
+    };
 
-    let default_config = device.default_input_config().ok();
-    let ranges: Vec<_> = device
-        .supported_input_configs()
-        .map_err(|e| AudioError::Enumeration(e.to_string()))?
-        .collect();
     let offered: Vec<SampleFormat> = ranges.iter().map(|r| r.sample_format()).collect();
     let chosen = pick_input_config(ranges, wish, default_config.as_ref()).ok_or_else(|| {
         AudioError::NoUsableConfig {

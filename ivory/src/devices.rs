@@ -107,6 +107,13 @@ impl AudioInputs {
 /// serialises as `\u001f`, and is invisible in the file.
 const CHANNEL_SEP: char = '\u{1f}';
 
+/// Marks a uid as naming a PipeWire node rather than a cpal device.
+///
+/// Node names are `alsa_input.…`, `bluez_input.…`, `v4l2_input.…` — never this
+/// — and the uid is opaque and never shown, so a prefix is enough to tell the
+/// two grammars apart in a settings file that has to hold both.
+const PIPEWIRE_UID: &str = "pw:";
+
 /// Split a uid into the device's key and the input picked out of it, if any.
 ///
 /// A malformed channel — anything that is not a number — is treated as no
@@ -159,6 +166,48 @@ impl CaptureDevices for AudioInputs {
         };
         let reveal = REVEAL_CHANNELS.load(Ordering::Relaxed);
         let mut out = Vec::new();
+        // **PipeWire first, and on its own when it answers.**
+        //
+        // On a PipeWire machine, cpal's list is a lie of omission: PipeWire
+        // holds every card exclusively, ALSA returns `EBUSY` for each one, and
+        // the single PCM that opens is `pipewire` — which follows whatever the
+        // desktop's default source happens to be. The owner had a Scarlett
+        // plugged in, one entry in the picker called `pipewire`, and a
+        // recording of the laptop's built-in microphone.
+        //
+        // So when PipeWire answers, its answer REPLACES the cpal list rather
+        // than joining it: the cpal entries are the same hardware reached
+        // through a route that cannot be aimed, and offering both would be
+        // offering the broken one beside the working one with nothing to tell
+        // them apart. An empty answer — no PipeWire, no `pw-dump` — falls
+        // through to exactly what every earlier build did.
+        for src in ivory_record::audio::pipewire_sources() {
+            let uid = format!("{PIPEWIRE_UID}{}", src.node);
+            out.push(DeviceInfo {
+                uid: uid.clone(),
+                name: src.description.clone(),
+                // PipeWire has a default source, but `pw-dump` does not mark
+                // it in the node's own props. Left unmarked rather than
+                // guessed: a badge on the wrong row is worse than no badge.
+                default: false,
+            });
+            let Some(channels) = src.channels.filter(|c| *c >= MULTICHANNEL) else {
+                continue;
+            };
+            if !reveal {
+                continue;
+            }
+            for ch in 0..channels {
+                out.push(DeviceInfo {
+                    uid: channel_uid(&uid, ch),
+                    name: format!("{}  -  input {}", src.description, ch + 1),
+                    default: false,
+                });
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
         for d in found {
             // The uid is the name-plus-occurrence key, not the bare name:
             // `DeviceKey` exists because two identical interfaces report the
@@ -251,10 +300,11 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
     match sel.wanted.as_deref() {
         Some(uid) => {
             let (key, channel) = split_channel(uid);
-            Some(AudioChoice {
-                selection: InputSelection::Key(DeviceKey::from_setting(key)),
-                channel,
-            })
+            let selection = match key.strip_prefix(PIPEWIRE_UID) {
+                Some(node) => InputSelection::PipewireNode(node.to_owned()),
+                None => InputSelection::Key(DeviceKey::from_setting(key)),
+            };
+            Some(AudioChoice { selection, channel })
         }
         // **Nothing chosen means nothing opened.** There used to be a fallback
         // to `InputSelection::Default` here, for the case where the user had
@@ -594,6 +644,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **A PipeWire uid resolves to a node, not to a cpal device name.**
+    ///
+    /// The two grammars share one settings key, so the prefix is what keeps a
+    /// saved `alsa_input.usb-Focusrite…` from being looked up as an ALSA device
+    /// of that name — which does not exist, so the microphone would silently
+    /// revert to nothing on the next launch.
+    #[test]
+    fn a_pipewire_uid_names_a_node() {
+        use ivory_record::audio::InputSelection;
+        let node = "alsa_input.usb-Focusrite_Scarlett_Solo_USB_Y771VU50AAEF28-00.pro-input-0";
+        let (_a, shared) = AudioInputs::new();
+        restore(&shared, Some(&format!("{PIPEWIRE_UID}{node}")), false);
+        let choice = audio_selection(&shared).expect("a device was chosen");
+        assert_eq!(
+            choice.selection,
+            InputSelection::PipewireNode(node.to_owned())
+        );
+        assert_eq!(choice.channel, None);
+
+        // And with one of its inputs picked out. The channel suffix and the
+        // node prefix have to survive each other.
+        let (_b, with_ch) = AudioInputs::new();
+        restore(
+            &with_ch,
+            Some(&channel_uid(&format!("{PIPEWIRE_UID}{node}"), 1)),
+            false,
+        );
+        let choice = audio_selection(&with_ch).expect("a device was chosen");
+        assert_eq!(
+            choice.selection,
+            InputSelection::PipewireNode(node.to_owned()),
+            "the channel suffix ate the node name"
+        );
+        assert_eq!(choice.channel, Some(1));
     }
 
     /// A chosen channel reaches the stream open, with its device intact.

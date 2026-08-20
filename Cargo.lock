@@ -1631,6 +1631,7 @@ dependencies = [
  "objc2-core-video",
  "objc2-foundation 0.3.2",
  "rtrb",
+ "serde_json",
  "zune-jpeg",
 ]
 
