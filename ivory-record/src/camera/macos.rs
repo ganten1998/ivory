@@ -484,11 +484,19 @@ impl FrameDelegate {
         // against the stride and height rather than trusting them to agree.
         let src = unsafe { std::slice::from_raw_parts(base.cast::<u8>(), len) };
 
+        // **Timed, because the preview's rate is decided from it.** On this
+        // platform the conversion is a copy and the answer will be "every
+        // frame"; the measurement is what makes that a finding rather than an
+        // assumption. See `FrameSlot::want`.
+        let began = std::time::Instant::now();
         let mut buffer = ivars.slot.take_spare();
         if !bgra_to_rgba(src, width, height, stride, &mut buffer) {
             ivars.stats.note_unreadable();
             return;
         }
+        ivars
+            .slot
+            .note_convert_cost(began.elapsed().as_nanos() as u64);
 
         ivars.slot.publish(Frame {
             width,

@@ -640,27 +640,83 @@ struct SlotInner {
 pub struct FrameSlot {
     inner: Mutex<SlotInner>,
     stats: Arc<CameraStats>,
-    /// Nanoseconds that must pass between two CONVERTED frames.
+    /// Who is looking, which is what decides whether a frame is worth paying
+    /// for. A [`FrameWant`] as a `u8`.
     ///
     /// **The conversion is the cost, not the capture.** A dequeue is a handoff
     /// of an mmap'd pointer; turning MJPEG into RGBA is a JPEG decode of a
     /// 720p image, and the capture thread was doing one thirty times a second
     /// for as long as the band was open — 35.6% of a core on a 2013 MacBook
     /// Air, measured, with no take rolling and the camera pane hidden.
+    want: AtomicU8,
+    /// What one conversion costs on THIS machine, in nanoseconds, smoothed.
     ///
-    /// It was doing them for a preview box a few hundred points wide, which is
-    /// the waste: nobody frames a shot at 30 fps. So the RATE is demanded by
-    /// whoever is looking, and the thread skips the decode for frames that
-    /// arrive sooner than that. A take asks for every frame and gets every
-    /// frame; a preview asks for ten a second.
+    /// **Measured, because the first attempt at this guessed.** A preview was
+    /// pinned to ten a second on every host — a number picked from that
+    /// MacBook Air. But the cost it was paying for is a JPEG decode, and only
+    /// the V4L2 path does one: on macOS the "conversion" is a BGRA-to-RGBA
+    /// copy that costs a fraction of a millisecond, so the cap bought nothing
+    /// and spent two thirds of the preview's smoothness on it. The owner's
+    /// report was "camera in general is low framerate — very low", and it was
+    /// right.
     ///
-    /// `0` is every frame, [`u64::MAX`] is none at all. Both are meaningful:
-    /// the second is a camera that is open because it takes seconds to open,
-    /// with nothing on screen showing it.
-    want_every_ns: AtomicU64,
+    /// Zero means nothing has been timed yet, and the first frame is taken.
+    convert_ns: AtomicU64,
     /// Timebase reading of the last frame that WAS converted.
     converted_at_ns: AtomicU64,
 }
+
+/// How badly the frames are wanted.
+///
+/// Three states rather than a raw interval, because the interval a PREVIEW
+/// should use is not the host's business — it depends on what a conversion
+/// costs here, which only the thread doing them can know.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum FrameWant {
+    /// A camera that is open because opening takes seconds, with nothing on
+    /// screen showing it. No conversions at all.
+    None = 0,
+    /// Somebody is watching a preview box. As smooth as this machine can
+    /// afford — see [`FrameSlot::affordable_interval`].
+    Preview = 1,
+    /// A take with video. Every frame, whatever it costs: a dropped frame here
+    /// is a hole in a file somebody cannot re-record.
+    Every = 2,
+}
+
+/// The share of one core a PREVIEW may spend converting frames.
+///
+/// **Scaled by how many cores there are, floored at what the potato was
+/// already doing.** One thread at a third of a core is nothing on an
+/// eight-core desktop and a third of the whole machine on a two-core laptop,
+/// so a single percentage cannot be right for both.
+///
+/// The floor is where the number comes from and it is not arbitrary: the 2013
+/// MacBook Air that started all this spent 35.6% of a core decoding thirty
+/// frames a second, so one decode there costs about 11.9 ms — and 11.9 ms at
+/// twelve percent is a 99 ms interval, which is the ten a second that machine
+/// was hard-coded to. So the smallest machines keep exactly the behaviour that
+/// was measured for them, and every larger one is allowed to be smooth.
+///
+/// The ceiling is a refusal to let a preview eat a third of a core no matter
+/// how many there are; past that the honest answer is a smaller preview, not
+/// more CPU.
+fn preview_budget_percent() -> u64 {
+    static ANSWER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(2, |n| n.get()) as u64;
+        (4 * cores).clamp(12, 33)
+    })
+}
+
+/// The slowest a preview is ever allowed to get.
+///
+/// A guard on the arithmetic above, not a policy: a machine where one
+/// conversion costs a tenth of a second would otherwise be asked for one frame
+/// every second, and a preview that updates once a second is not a preview.
+/// Better to blow the budget than to show a slideshow.
+const PREVIEW_SLOWEST_NS: u64 = 200_000_000;
 
 impl FrameSlot {
     pub fn new(stats: Arc<CameraStats>) -> Self {
@@ -669,7 +725,8 @@ impl FrameSlot {
             stats,
             // Every frame until somebody says otherwise, which is what every
             // build before this one did.
-            want_every_ns: AtomicU64::new(0),
+            want: AtomicU8::new(FrameWant::Every as u8),
+            convert_ns: AtomicU64::new(0),
             converted_at_ns: AtomicU64::new(Self::NEVER),
         }
     }
@@ -677,9 +734,46 @@ impl FrameSlot {
     /// No frame has been converted yet. See [`should_convert`](Self::should_convert).
     const NEVER: u64 = u64::MAX;
 
-    /// Ask for frames no more often than this. See [`want_every_ns`](Self::want_every_ns).
-    pub fn want_every(&self, ns: u64) {
-        self.want_every_ns.store(ns, Ordering::Relaxed);
+    /// Say who is looking. See [`FrameWant`].
+    pub fn want(&self, want: FrameWant) {
+        self.want.store(want as u8, Ordering::Relaxed);
+    }
+
+    /// What one conversion just cost, for the budget to spend.
+    ///
+    /// **Slow up, fast down, and the asymmetry is the point.** A symmetric
+    /// average treats "this frame was slow" and "this frame was quick" as
+    /// equally good news, which gets the risk backwards: a preview that dips
+    /// for a moment because something else on the machine woke up costs
+    /// nothing, and a preview STUCK slow long after the machine went quiet is
+    /// the bug. So a rise moves an eighth of the way — a scheduler hiccup
+    /// barely registers, a machine that genuinely got busier is followed
+    /// within a second — and a fall moves half, which is back to full rate in
+    /// a handful of frames.
+    pub fn note_convert_cost(&self, ns: u64) {
+        let old = self.convert_ns.load(Ordering::Relaxed);
+        let next = match old {
+            0 => ns,
+            old if ns > old => old + (ns - old) / 8,
+            old => old - (old - ns) / 2,
+        };
+        self.convert_ns.store(next, Ordering::Relaxed);
+    }
+
+    /// How far apart a preview's frames have to be for the conversions to fit
+    /// in [`PREVIEW_BUDGET_PERCENT`] of one core.
+    ///
+    /// Zero — every frame — until something has been timed, so a preview comes
+    /// up at full rate and slows down if it turns out it has to, rather than
+    /// starting slow and never finding out that it need not be.
+    fn affordable_interval(&self) -> u64 {
+        let cost = self.convert_ns.load(Ordering::Relaxed);
+        if cost == 0 {
+            return 0;
+        }
+        cost.saturating_mul(100)
+            .saturating_div(preview_budget_percent())
+            .min(PREVIEW_SLOWEST_NS)
     }
 
     /// **Should the capture thread pay for this frame?**
@@ -693,10 +787,12 @@ impl FrameSlot {
     /// halves being separable is how a decimator ends up letting every frame
     /// through on some path nobody tested.
     pub fn should_convert(&self, host_ns: Nanos) -> bool {
-        let every = self.want_every_ns.load(Ordering::Relaxed);
-        if every == u64::MAX {
-            return false;
-        }
+        let every = match self.want.load(Ordering::Relaxed) {
+            x if x == FrameWant::None as u8 => return false,
+            x if x == FrameWant::Every as u8 => 0,
+            // A preview: whatever this machine can afford.
+            _ => self.affordable_interval(),
+        };
         let now = host_ns.max(0) as u64;
         let last = self.converted_at_ns.load(Ordering::Relaxed);
         // **The first frame of a stream always converts.** `NEVER` rather than
@@ -801,7 +897,7 @@ pub struct CameraStats {
     frames_dropped_late: AtomicU64,
     frames_unreadable: AtomicU64,
     /// Frames the capture thread deliberately did not convert. See
-    /// [`FrameSlot::want_every`].
+    /// [`FrameSlot::want`].
     frames_skipped: AtomicU64,
     device_state: AtomicU8,
 }
@@ -1051,13 +1147,9 @@ impl CameraStream {
         self.slot.latest()
     }
 
-    /// Ask the capture thread for frames no more often than `ns` apart.
-    ///
-    /// `0` is every frame — what a take with video needs. A preview asks for
-    /// far fewer: see [`FrameSlot::want_every`] for what the conversion costs
-    /// and why nobody frames a shot at thirty a second.
-    pub fn want_every(&self, ns: u64) {
-        self.slot.want_every(ns);
+    /// Tell the capture thread who is looking. See [`FrameWant`].
+    pub fn want(&self, want: FrameWant) {
+        self.slot.want(want);
     }
 
     /// A `Send` handle onto the same slot, for a thread that is not this one.
@@ -1155,26 +1247,119 @@ mod tests {
             );
         }
 
-        // Ten a second out of thirty. The first always converts — there is
-        // nothing to have been too soon after.
-        let slot = FrameSlot::new(Arc::new(CameraStats::new()));
-        slot.want_every(100_000_000);
-        let taken = (0..30).filter(|i| slot.should_convert(i * ns)).count();
-        assert!(
-            (9..=11).contains(&taken),
-            "asked for 10 a second out of 30 and got {taken} in one second"
-        );
-        // The first is one of them, always: a preview that came up blank for
-        // the first tenth of a second is what the sentinel above is for.
-        let fresh = FrameSlot::new(Arc::new(CameraStats::new()));
-        fresh.want_every(100_000_000);
-        assert!(fresh.should_convert(0), "the first frame was skipped");
-
-        // And none at all, which is a camera that is open because opening takes
+        // None at all, which is a camera that is open because opening takes
         // seconds, with nothing on screen showing it.
         let slot = FrameSlot::new(Arc::new(CameraStats::new()));
-        slot.want_every(u64::MAX);
+        slot.want(FrameWant::None);
         assert!(!(0..30).any(|i| slot.should_convert(i * ns)));
+    }
+
+    /// **What a preview costs is measured, not assumed — and this is the test
+    /// that says the two machines get different answers from one rule.**
+    ///
+    /// The version before this one asked every host for ten frames a second,
+    /// from a number measured on a 2013 MacBook Air's JPEG decode. Only the
+    /// V4L2 path decodes JPEG; on macOS a conversion is a BGRA-to-RGBA copy
+    /// costing half a millisecond, so the cap threw away two thirds of the
+    /// preview for nothing. The owner's report was "camera in general is low
+    /// framerate — very low".
+    #[test]
+    fn a_preview_is_as_smooth_as_the_machine_can_afford() {
+        let ns = 1_000_000_000 / 30;
+
+        // A machine where a conversion is half a millisecond: every frame.
+        let quick = FrameSlot::new(Arc::new(CameraStats::new()));
+        quick.want(FrameWant::Preview);
+        for i in 0..30 {
+            quick.note_convert_cost(500_000);
+            assert!(
+                quick.should_convert(i * ns),
+                "frame {i} was skipped on a machine that could afford it"
+            );
+        }
+
+        // A conversion costing 30 ms — a big frame on a slow box. That is 90%
+        // of a core at thirty a second, past any budget on any machine.
+        let slow = FrameSlot::new(Arc::new(CameraStats::new()));
+        slow.want(FrameWant::Preview);
+        for _ in 0..16 {
+            slow.note_convert_cost(30_000_000);
+        }
+        // The rule, stated directly, so this does not depend on how many cores
+        // the machine running the test happens to have.
+        let want = slow.affordable_interval();
+        assert_eq!(
+            want,
+            (30_000_000 * 100 / preview_budget_percent()).min(PREVIEW_SLOWEST_NS)
+        );
+        assert!(want > ns as u64, "a 30 ms conversion was called affordable at 30 fps");
+
+        // Some frames, and never all of them.
+        let taken = (0..30)
+            .filter(|i| {
+                let yes = slow.should_convert(i * ns);
+                if yes {
+                    slow.note_convert_cost(30_000_000);
+                }
+                yes
+            })
+            .count();
+        assert!(
+            (1..30).contains(&taken),
+            "a 30 ms conversion took {taken} frames a second out of 30"
+        );
+
+        // The first frame is always taken, whatever the budget: a preview that
+        // came up blank while it worked out how fast it could go would be a
+        // camera that looks broken for its first second.
+        let fresh = FrameSlot::new(Arc::new(CameraStats::new()));
+        fresh.want(FrameWant::Preview);
+        assert!(fresh.should_convert(0), "the first frame was skipped");
+
+        // And a take is not subject to any of it. A dropped frame there is a
+        // hole in a file nobody can re-record.
+        let take = FrameSlot::new(Arc::new(CameraStats::new()));
+        take.want(FrameWant::Every);
+        for _ in 0..16 {
+            take.note_convert_cost(50_000_000);
+        }
+        assert!(
+            (0..30).all(|i| take.should_convert(i * ns)),
+            "a take was decimated by the preview's budget"
+        );
+    }
+
+    /// One slow frame must not cost the preview anything it does not get back.
+    ///
+    /// The risk is asymmetric and so is the smoothing: a preview that dips for
+    /// a moment is nothing, a preview stuck slow after the machine went quiet
+    /// again is the whole bug this replaced.
+    #[test]
+    fn a_single_slow_frame_does_not_stick() {
+        let frame_ns = 1_000_000_000 / 30;
+        let slot = FrameSlot::new(Arc::new(CameraStats::new()));
+        for _ in 0..32 {
+            slot.note_convert_cost(500_000);
+        }
+        let settled = slot.affordable_interval();
+        assert!(settled < frame_ns, "half a millisecond could not afford 30 fps");
+
+        // Ten times as long, once — something else on the machine woke up.
+        slot.note_convert_cost(5_000_000);
+        assert!(
+            slot.affordable_interval() < frame_ns,
+            "one slow frame dropped a preview that can afford every frame"
+        );
+
+        // And it is gone within a handful of frames, not a session.
+        for _ in 0..6 {
+            slot.note_convert_cost(500_000);
+        }
+        let back = slot.affordable_interval();
+        assert!(
+            back <= settled + settled / 5,
+            "the preview took too long to recover: {back} against a settled {settled}"
+        );
     }
 
     /// A timebase that goes backwards must not lock the camera out forever.
@@ -1185,7 +1370,10 @@ mod tests {
     #[test]
     fn a_backwards_stamp_does_not_freeze_the_preview() {
         let slot = FrameSlot::new(Arc::new(CameraStats::new()));
-        slot.want_every(100_000_000);
+        slot.want(FrameWant::Preview);
+        for _ in 0..16 {
+            slot.note_convert_cost(12_000_000);
+        }
         assert!(slot.should_convert(10_000_000_000));
         // Far in the past, once.
         assert!(

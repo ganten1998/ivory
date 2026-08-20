@@ -367,6 +367,9 @@ fn capture_loop(
                 stats.note_skipped();
                 return Ok(());
             }
+            // **Timed, because the preview's rate is decided from it.** This is
+            // the JPEG decode the budget exists for; see `FrameSlot::want`.
+            let began = std::time::Instant::now();
             let bytes: &[u8] = &view;
             let mut dst = slot.take_spare();
             let ok = match pixel {
@@ -384,6 +387,7 @@ fn capture_loop(
                 stats.note_unreadable();
                 return Ok(());
             }
+            slot.note_convert_cost(began.elapsed().as_nanos() as u64);
             slot.publish(super::Frame {
                 width,
                 height,

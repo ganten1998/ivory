@@ -1609,14 +1609,16 @@ impl Session {
     /// per-take figure. The camera outlives the take (it opens with the band),
     /// so a per-take number is this read at Stop minus the same read at start;
     /// `TakeVideo` keeps the baseline.
-    /// How often the camera's frames are worth converting, in nanoseconds.
+    /// Who is looking at the camera.
     ///
-    /// The host decides: a take with video wants every frame, a preview box
-    /// wants a handful a second, and a camera open with nothing on screen
-    /// showing it wants none. See `camera::FrameSlot::want_every`.
-    pub fn set_camera_rate(&self, every_ns: u64) {
+    /// The host decides between the three: a take with video wants every
+    /// frame, a preview box wants whatever the machine can afford, and a
+    /// camera open with nothing on screen showing it wants none. How fast
+    /// "afford" is is measured on the capture thread, not decided here — see
+    /// `camera::FrameWant`.
+    pub fn set_camera_want(&self, want: ivory_record::camera::FrameWant) {
         if let Some(c) = self.camera.as_ref() {
-            c.want_every(every_ns);
+            c.want(want);
         }
     }
 
