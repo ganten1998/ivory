@@ -1000,6 +1000,21 @@ pub fn capture_channel_from(
     mark_slots: usize,
     stats: Arc<CaptureStats>,
 ) -> (CaptureSource, CaptureSink) {
+    capture_channel_monitored(device_channels, pick, ring_frames, mark_slots, stats, 0).0
+}
+
+/// As [`capture_channel_from`], with a shallow tap for live monitoring.
+///
+/// `monitor_frames` of 0 means no tap at all, which is what every caller that
+/// is not opening a real input wants.
+pub fn capture_channel_monitored(
+    device_channels: usize,
+    pick: Option<u16>,
+    ring_frames: usize,
+    mark_slots: usize,
+    stats: Arc<CaptureStats>,
+    monitor_frames: usize,
+) -> ((CaptureSource, CaptureSink), Option<Consumer<f32>>) {
     assert!(
         device_channels > 0,
         "a capture channel needs at least one channel"
@@ -1008,7 +1023,7 @@ pub fn capture_channel_from(
     let channels = if pick.is_some() { 1 } else { device_channels };
     let (sample_tx, sample_rx) = RingBuffer::<f32>::new(ring_frames.max(1) * channels);
     let (mark_tx, mark_rx) = RingBuffer::<TimingMark>::new(mark_slots.max(1));
-    let source = CaptureSource {
+    let mut source = CaptureSource {
         samples: sample_tx,
         marks: mark_tx,
         stats: Arc::clone(&stats),
@@ -1018,6 +1033,7 @@ pub fn capture_channel_from(
         frames: 0,
         stamp_epoch: None,
         scratch: vec![0.0; CHUNK_FRAMES * channels],
+        monitor: None,
     };
     let sink = CaptureSink {
         samples: sample_rx,
@@ -1025,7 +1041,12 @@ pub fn capture_channel_from(
         stats,
         channels,
     };
-    (source, sink)
+    let monitor = (monitor_frames > 0).then(|| {
+        let (tx, rx) = RingBuffer::<f32>::new(monitor_frames * channels);
+        source.monitor = Some(tx);
+        rx
+    });
+    ((source, sink), monitor)
 }
 
 /// The audio-callback half. Everything it needs and nothing that can block.
@@ -1050,6 +1071,18 @@ pub struct CaptureSource {
     frames: u64,
     stamp_epoch: Option<Nanos>,
     scratch: Vec<f32>,
+    /// A copy of every frame, for hearing the input live.
+    ///
+    /// **Its own ring, not the take's.** The take's ring is drained by the
+    /// writer thread on its own schedule and is four seconds deep on purpose;
+    /// a monitor needs the newest audio a few milliseconds after it arrives, so
+    /// it gets a shallow ring of its own and the two never wait on each other.
+    ///
+    /// Whether anybody is listening is not this side's business. The renderer
+    /// drains this every block regardless — see `Renderer::mix_monitor` — so a
+    /// monitor switched on plays what is happening now rather than whatever was
+    /// left in a ring that had been filling since the device opened.
+    monitor: Option<Producer<f32>>,
 }
 
 impl CaptureSource {
@@ -1129,6 +1162,17 @@ impl CaptureSource {
                 }
             }
             // Rule 1: round the room down to whole frames before asking.
+            // The monitor gets the same samples, at the same point: after the
+            // channel pick, before the take's ring. A push that does not fit is
+            // dropped and not counted — a listener missing a millisecond is not
+            // a take losing a frame, and putting the two in one counter would
+            // make an idle monitor look like a failing recorder.
+            if let Some(m) = self.monitor.as_mut() {
+                let _ = m.write_chunk_uninit(n.min(m.slots())).map(|c| {
+                    let filled = c.fill_from_iter(dst[..n].iter().copied());
+                    filled
+                });
+            }
             let room = self.samples.slots() / ch;
             let take = want.min(room);
             if take == 0 || self.samples.push_entire_slice(&dst[..take * ch]).is_err() {
@@ -1834,7 +1878,7 @@ pub fn open_input(
     wish: &ConfigWish,
     ring_seconds: f32,
     timebase: Timebase,
-) -> Result<(InputStream, CaptureSink), AudioError> {
+) -> Result<(InputStream, CaptureSink, Option<Consumer<f32>>), AudioError> {
     // **The binding covers the LOOKUP as well as the open.** cpal's ALSA host
     // opens each device's PCM handles while enumerating, and the stream reuses
     // the handle that is already open — so a variable set after `resolve` would
@@ -1889,12 +1933,18 @@ pub fn open_input(
     let mark_slots = (ring_frames / 64).clamp(64, 8192);
 
     let stats = Arc::new(CaptureStats::new());
-    let (source, sink) = capture_channel_from(
+    // **A shallow monitor ring: 120 ms.** Deep enough to ride a scheduling
+    // hiccup on either side, shallow enough that what you hear is what is
+    // happening. Latency is the two buffers, not this — the ring runs nearly
+    // empty in the steady state because the renderer drains it every block.
+    let monitor_frames = (rate as usize / 8).max(1024);
+    let ((source, sink), monitor) = capture_channel_monitored(
         channels,
         wish.pick_channel,
         ring_frames,
         mark_slots,
         Arc::clone(&stats),
+        monitor_frames,
     );
     let fault = Arc::new(Mutex::new(None));
 
@@ -1926,7 +1976,7 @@ pub fn open_input(
         fault,
     };
     input.play()?;
-    Ok((input, sink))
+    Ok((input, sink, monitor))
 }
 
 fn build_typed_stream(
@@ -2896,7 +2946,7 @@ mod tests {
     #[ignore = "opens a real audio device"]
     fn the_default_input_delivers_callbacks_and_fits_a_rate() {
         let timebase = Timebase::new();
-        let (input, mut sink) = open_input(
+        let (input, mut sink, _monitor) = open_input(
             &InputSelection::Default,
             &ConfigWish::default(),
             DEFAULT_RING_SECONDS,

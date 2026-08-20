@@ -2420,6 +2420,15 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
             if view.metronome_on { p.ink } else { p.faint },
         );
     }
+    // **And the microphone, in record red.** Same geometry, same corner, same
+    // argument one step louder: a setting that puts a click in your file may
+    // not be invisible, and one that puts your microphone through your speakers
+    // may not be quiet about it either. Monitoring is how a room feeds back.
+    if view.input_monitor && l.input_icon.is_positive() {
+        let r = l.input_icon;
+        let d = (r.height() * 0.16).clamp(2.0, 5.0);
+        painter.circle_filled(Pos2::new(r.right() - d, r.top() + d), d, p.rec);
+    }
 }
 
 // ── the instrument slots ───────────────────────────────────────────────────
@@ -5405,6 +5414,7 @@ mod tests {
             for state in STATES {
                 for preview in [None, Some(pv)] {
                     let v = RecorderView {
+                        input_monitor: false,
                         preview,
                         ..with_rack(state, racks()[1])
                     };
@@ -5594,6 +5604,7 @@ mod tests {
         for w in [320.0_f32, 640.0, 1300.0, 2600.0] {
             let r = band(w);
             let v = RecorderView {
+                input_monitor: false,
                 state: RecordState::Rolling,
                 ..idle()
             };
@@ -5652,6 +5663,7 @@ mod tests {
                     for hide in [false, true] {
                         for rack in racks() {
                             let v = RecorderView {
+                                input_monitor: false,
                                 hide_elapsed: hide,
                                 ..with_rack(state, rack)
                             };
@@ -5892,6 +5904,7 @@ mod tests {
         ] {
             for hide in [false, true] {
                 let v = RecorderView {
+                    input_monitor: false,
                     hide_elapsed: hide,
                     ..with_rack(state, racks()[1])
                 };
@@ -6202,6 +6215,7 @@ mod tests {
         let r = band(1300.0);
         for hide in [false, true] {
             let v = RecorderView {
+                input_monitor: false,
                 state: RecordState::CountIn { beat: 1, of: 4 },
                 hide_elapsed: hide,
                 ..RecorderView::empty()
@@ -6686,6 +6700,7 @@ mod tests {
                         for edit in typing_states() {
                             for rack in racks() {
                             let v = RecorderView {
+                                input_monitor: false,
                                 state,
                                 elapsed_s: 3725.0,
                                 meters: Meters {

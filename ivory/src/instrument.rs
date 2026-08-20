@@ -880,6 +880,15 @@ struct Shared {
     /// instrument bus" can be answered without one, which is the question
     /// `TakeSource::resolve` has to ask before every take.
     track_loaded: AtomicBool,
+    /// **Input monitoring: hear what the microphone hears.**
+    ///
+    /// Never persisted, anywhere. It is off at every launch by construction —
+    /// see `IvoryApp::input_monitor` — because the failure mode is a room full
+    /// of feedback the moment somebody turns their speakers on after a relaunch
+    /// they had forgotten was monitoring.
+    monitor_on: AtomicBool,
+    /// The monitor's own level, as a linear gain. The microphone fader.
+    monitor_gain: AtomicU32,
     /// Where the track starts and stops, in frames. `out` of zero means "to
     /// the end", so a clip with no trim needs no knowledge of its own length
     /// down here.
@@ -891,6 +900,12 @@ struct Shared {
     /// `pending_voice`: importing a file is a thing that happens once and can
     /// wait a block; a block that waits on a file import is a dropout.
     pending_track: std::sync::Mutex<Option<Option<Arc<ivory_record::decode::Clip>>>>,
+    /// A live-input ring on its way to the renderer, or `None` taking one away.
+    ///
+    /// Behind a mutex and picked up with `try_lock`, exactly like the backing
+    /// track: the ring's read end is `!Sync` and belongs to one thread, and the
+    /// audio thread may not wait on the UI thread to hand it over.
+    pending_monitor: std::sync::Mutex<Option<Option<(rtrb::Consumer<f32>, u16)>>>,
     /// The master, as a LINEAR gain. The last thing on the instrument bus,
     /// after the limiter, reaching both the device mix and the take — the same
     /// rule the effects follow.
@@ -1001,9 +1016,12 @@ impl Shared {
             track_gain: AtomicU32::new(1.0f32.to_bits()),
             track_playing: AtomicBool::new(false),
             track_loaded: AtomicBool::new(false),
+            monitor_on: AtomicBool::new(false),
+            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
             track_in: AtomicU64::new(0),
             track_out: AtomicU64::new(0),
             pending_track: std::sync::Mutex::new(None),
+            pending_monitor: std::sync::Mutex::new(None),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
             gr_db: AtomicU32::new(0),
             reverb_mix: AtomicU32::new(0.0f32.to_bits()),
@@ -1380,6 +1398,14 @@ struct Renderer {
     /// Smoothed click gain. One-pole per frame, exactly like each slot's.
     metro_gain: f32,
     gain_coeff: f32,
+    /// The live input, when one is open. Drained EVERY block whether or not
+    /// anybody is listening — see `mix_monitor`.
+    monitor: Option<rtrb::Consumer<f32>>,
+    /// How many channels that ring carries per frame.
+    monitor_channels: usize,
+    /// Slewed, so switching monitoring on is a fade rather than a bang.
+    monitor_gain: f32,
+    monitor_scratch: Vec<f32>,
 }
 
 impl Renderer {
@@ -1629,6 +1655,11 @@ impl Renderer {
             // borrows `self.mix` itself: a method taking `&mut self` cannot be
             // called while a slice of one of self's fields is still alive.
             self.mix_track(n);
+            // **After the effects and beside the backing track**, for the same
+            // reason: what arrives at the microphone is not something a reverb
+            // in this app was asked to process. Before the master, because the
+            // master is the master.
+            self.mix_monitor(n);
             if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
                 let master = Shared::f32_of(&self.shared.master_gain);
                 if (master - 1.0).abs() > 1.0e-6 {
@@ -1735,6 +1766,89 @@ impl Renderer {
     /// chose. `widths` is what actually rendered this block, which is the
     /// honest test — a slot holding a faulted plugin is an empty slot as far as
     /// the bus is concerned.
+    /// Add the live input to the bus, if monitoring is on.
+    ///
+    /// **The ring is drained every block whether or not anybody is
+    /// listening.** Left alone it would fill within a second of the device
+    /// opening and stay full, so switching monitoring on would play a second of
+    /// stale audio before catching up — and the input's callback would be
+    /// pushing into a ring that never had room, which is a drop counter ticking
+    /// for no reason. Drained-and-discarded is the same discipline the take's
+    /// instrument ring already follows between takes.
+    ///
+    /// **Listen-only.** Nothing here touches what the take records: the take is
+    /// written by the writer thread from the capture ring, which this does not
+    /// share. Turning monitoring on during a take changes what the player
+    /// hears and not one sample of the file.
+    fn mix_monitor(&mut self, frames: usize) {
+        // A ring arriving, or being taken away. `try_lock`, never `lock`.
+        if let Ok(mut pending) = self.shared.pending_monitor.try_lock() {
+            if let Some(next) = pending.take() {
+                match next {
+                    Some((ring, channels)) => {
+                        self.monitor = Some(ring);
+                        self.monitor_channels = usize::from(channels).max(1);
+                    }
+                    None => {
+                        self.monitor = None;
+                        self.monitor_channels = 0;
+                    }
+                }
+                // A new device fades in from silence rather than arriving at
+                // whatever the last one was playing at.
+                self.monitor_gain = 0.0;
+            }
+        }
+        let Some(ring) = self.monitor.as_mut() else {
+            return;
+        };
+        let ch_in = self.monitor_channels.max(1);
+        let want = frames * ch_in;
+        let got = ring.slots().min(want);
+        // Read into scratch first: the ring's chunk borrows it, and the mix
+        // below needs `self.mix` mutably at the same time.
+        let take = got.min(self.monitor_scratch.len());
+        let scratch = &mut self.monitor_scratch[..take];
+        let got = match ring.read_chunk(scratch.len()) {
+            Ok(chunk) => {
+                let (a, b) = chunk.as_slices();
+                scratch[..a.len()].copy_from_slice(a);
+                scratch[a.len()..a.len() + b.len()].copy_from_slice(b);
+                let n = a.len() + b.len();
+                chunk.commit_all();
+                n
+            }
+            Err(_) => 0,
+        };
+
+        let on = self.shared.monitor_on.load(Ordering::Relaxed);
+        let target = if on {
+            Shared::f32_of(&self.shared.monitor_gain)
+        } else {
+            0.0
+        };
+        // Silent and already faded out: the drain above was the whole job.
+        if !on && self.monitor_gain <= 1.0e-6 {
+            self.monitor_gain = 0.0;
+            return;
+        }
+        let frames_got = got / ch_in;
+        for i in 0..frames.min(frames_got) {
+            self.monitor_gain += (target - self.monitor_gain) * self.gain_coeff;
+            let at = i * TAP_CHANNELS;
+            for c in 0..TAP_CHANNELS {
+                // A mono input goes to both sides; a stereo one keeps its
+                // sides. Anything wider is folded down by taking the first two,
+                // which is what a monitor is for — hearing that something is
+                // arriving, not auditioning a surround mix.
+                let src = scratch[i * ch_in + c.min(ch_in - 1)];
+                if let Some(v) = self.mix.get_mut(at + c) {
+                    *v += src * self.monitor_gain;
+                }
+            }
+        }
+    }
+
     /// Add the backing track to the bus, if one is loaded and rolling.
     ///
     /// The clip is stereo at the device's rate — `decode` guarantees both — so
@@ -2382,6 +2496,10 @@ impl Engine {
             chunks: 0,
             metro_gain: 0.7,
             gain_coeff: gain_coefficient(f64::from(rate)),
+            monitor: None,
+            monitor_channels: 0,
+            monitor_gain: 0.0,
+            monitor_scratch: vec![0.0; widest * 4096],
         };
 
         let config = cpal::StreamConfig {
@@ -3117,6 +3235,30 @@ impl Engine {
     /// Roll the backing track, or stop it and rewind to the in-point.
     pub fn set_track_playing(&self, playing: bool) {
         self.shared.set_track_playing(playing);
+    }
+
+    /// Hear the live input, or stop hearing it.
+    ///
+    /// **Never restored from a settings file.** Off at every launch, because
+    /// the failure mode is somebody turning their speakers on after a relaunch
+    /// they had forgotten was monitoring, and getting a room full of feedback.
+    pub fn set_monitor_on(&self, on: bool) {
+        self.shared.monitor_on.store(on, Ordering::Relaxed);
+    }
+
+    /// The monitor's level — the microphone fader, which is also what scales
+    /// the input into the take.
+    pub fn set_monitor_gain(&self, linear: f32) {
+        self.shared
+            .monitor_gain
+            .store(sane_gain(linear).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Hand the renderer the live input's ring. `None` takes it away.
+    pub fn set_monitor(&mut self, tap: Option<(rtrb::Consumer<f32>, u16)>) {
+        if let Ok(mut g) = self.shared.pending_monitor.lock() {
+            *g = Some(tap);
+        }
     }
 
     /// The master, as a linear gain. See [`Shared::master_gain`].
@@ -4641,6 +4783,10 @@ mod tests {
         // renderer under test needs no partner threads at all.
         let (_, midi) = RingBuffer::<MidiEvent>::new(1024);
         Renderer {
+            monitor: None,
+            monitor_channels: 0,
+            monitor_gain: 0.0,
+            monitor_scratch: Vec::new(),
             track: None,
             track_pos: 0,
             track_gain: 1.0,

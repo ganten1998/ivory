@@ -282,6 +282,9 @@ pub struct RecorderView<'a> {
     /// click bleeding into the take is a ruined take, and it is the mistake
     /// nobody notices until they open the file.
     pub metronome_in_take: bool,
+    /// The live input is being heard. Never persisted — see
+    /// `IvoryApp::input_monitor`.
+    pub input_monitor: bool,
     /// Beats and tempo, shared by the click, the count-in and the SMF's tempo
     /// mark — one number, because a click at 90 against a file that says 120
     /// is a take nobody can edit afterwards.
@@ -323,6 +326,7 @@ impl RecorderView<'_> {
     /// A view with nothing configured, for tests and for the first frame.
     pub fn empty() -> RecorderView<'static> {
         RecorderView {
+            input_monitor: false,
             state: RecordState::Idle,
             elapsed_s: 0.0,
             meters: Meters::SILENT,
@@ -476,6 +480,7 @@ impl RecorderState {
             Some(n) => DeviceLabel::Open(n),
         };
         RecorderView {
+            input_monitor: false,
             state: self.state,
             elapsed_s: self.elapsed_s,
             meters: self.meters,

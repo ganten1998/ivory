@@ -328,6 +328,17 @@ pub struct IvoryApp {
     /// The Setup button was pressed; the menu opens after the frame, where the
     /// window origin needed to place it is known.
     setup_open: bool,
+    /// **Hearing the live input. Session-only, and that is the whole point.**
+    ///
+    /// It is not in `Settings` and is never written anywhere. A flag that
+    /// persisted and was cleared on load would be one refactor, one migration
+    /// bug or one hand-edited file away from coming back on — and the failure
+    /// is a room full of feedback the moment somebody turns their speakers on
+    /// after a relaunch they had forgotten was monitoring. A field with no path
+    /// to disk cannot do that.
+    ///
+    /// Off at every launch, by construction rather than by a clamp.
+    input_monitor: bool,
     /// The effect panel a right-click on a knob opened, if any.
     ///
     /// One at a time, like `dialog`: three panels at once over a band this
@@ -669,6 +680,7 @@ impl IvoryApp {
             menu_over_recorder: false,
             menu_over_staff: false,
             setup_open: false,
+            input_monitor: false,
             fx_open: None,
             track_open: false,
             track_drag: None,
@@ -1242,6 +1254,7 @@ impl IvoryApp {
         recorder::RecorderView {
             fx_units: self.fx_units(),
             track: &self.track,
+            input_monitor: self.input_monitor,
             ..self.recorder.view(
             self.settings.record_take_name.as_deref().unwrap_or_default(),
             self.name_focused,
@@ -1534,6 +1547,20 @@ impl IvoryApp {
                     {
                         self.settings.metronome_in_take = !self.settings.metronome_in_take;
                         self.save_settings();
+                        return;
+                    }
+                    // **And right-clicking the microphone hears it.** The same
+                    // shape as the metronome's: one setting, no box, a dot on
+                    // the icon while it is on — red, because monitoring your
+                    // own microphone through speakers is how a room starts
+                    // feeding back and it may not be a quiet state.
+                    //
+                    // `save_settings` is deliberately NOT called and there is
+                    // nothing to save: see `input_monitor`.
+                    if recorder_panel::hit_test(r, &view, pos)
+                        == Some(recorder_panel::Hit::PickAudio)
+                    {
+                        self.input_monitor = !self.input_monitor;
                         return;
                     }
                 }
@@ -2936,6 +2963,12 @@ impl IvoryApp {
     /// Whether a multichannel interface lists its inputs in the mic selector.
     pub fn audio_channels_in_picker(&self) -> bool {
         self.settings.audio_channels_in_picker
+    }
+
+    /// Whether the live input is being monitored. Never persisted; see the
+    /// field.
+    pub fn input_monitor(&self) -> bool {
+        self.input_monitor
     }
 
     /// Take a pending "show me this folder" request. Same contract.
@@ -6287,6 +6320,46 @@ mod tests {
 
     fn headless(caps: Caps) -> (egui::Context, IvoryApp) {
         headless_with(caps, Settings::default())
+    }
+
+    /// **Input monitoring is off at every launch, and cannot be otherwise.**
+    ///
+    /// The owner's requirement, in their words: "if I forget and turn my
+    /// speakers on and relaunch, I get a head full of feedback." So it is not a
+    /// setting that is cleared on load — that is one migration bug, one
+    /// refactor or one hand-edited `settings.json` away from coming back on —
+    /// it is session state with no path to disk at all.
+    ///
+    /// This test asserts the ABSENCE: that a running app with monitoring on
+    /// writes nothing about it, and that a fresh app built from those very
+    /// settings comes up silent.
+    #[test]
+    fn input_monitoring_never_survives_a_relaunch() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        assert!(!app.input_monitor(), "it was on at launch");
+
+        app.input_monitor = true;
+        app.save_settings();
+        let json = app.settings.to_json();
+        assert!(
+            !json.contains("monitor"),
+            "monitoring reached the settings file: {json}"
+        );
+
+        // The real guarantee: those settings, loaded into a new app.
+        let (_, fresh) = headless_with(Caps::DESKTOP, Settings::from_json(&json));
+        assert!(
+            !fresh.input_monitor(),
+            "monitoring survived a relaunch - this is the feedback bug"
+        );
+
+        // And a settings file that has been made to say so anyway cannot turn
+        // it on, because nothing reads such a key.
+        let meddled = Settings::from_json(
+            r#"{"input_monitor": true, "input_monitor_on": true, "monitor_on": true}"#,
+        );
+        let (_, hostile) = headless_with(Caps::DESKTOP, meddled);
+        assert!(!hostile.input_monitor(), "a hand-edited file turned it on");
     }
 
     /// **The video defaults drop once on a machine with no GPU driver, and

@@ -2008,6 +2008,14 @@ impl DesktopApp {
         // writer thread, which is where the gain has to be applied to reach
         // both the meter and the file.
         self.recorder.session.set_input_gain(gains.input);
+        // **The same number, the monitor's level.** The fader means "how loud
+        // is the microphone", and it means it in both places it can be heard:
+        // in the take and, when monitoring is on, out of the speakers.
+        e.set_monitor_gain(gains.input);
+        // Never read from a settings file — see `IvoryApp::input_monitor`. It
+        // is pushed every frame like every other monitor setting, and its value
+        // at launch is false because the field it comes from starts false.
+        e.set_monitor_on(self.app.input_monitor());
         // The backing track's level and trim, pushed with the rest for the
         // same reason: the settings are the one live value, so a fader moved,
         // a project loaded and a hand-edited file all arrive by one path.
@@ -2262,12 +2270,23 @@ impl DesktopApp {
             return;
         }
         match crate::devices::audio_selection(&self.recorder.audio) {
-            Some(choice) => self.recorder.session.open_input(
-                &choice.selection,
-                choice.channel,
-                self.app.buffer_frames(),
-                self.app.sample_rate(),
-            ),
+            Some(choice) => {
+                self.recorder.session.open_input(
+                    &choice.selection,
+                    choice.channel,
+                    self.app.buffer_frames(),
+                    self.app.sample_rate(),
+                );
+                // The live tap, to whoever can play it. Taken once per device:
+                // a new input builds a new ring, and the renderer fades the
+                // new one in from silence rather than continuing at whatever
+                // the last one was at.
+                if let Some(tap) = self.recorder.session.take_monitor() {
+                    if let Some(e) = self.recorder.engine.as_mut() {
+                        e.set_monitor(Some(tap));
+                    }
+                }
+            }
             // The user picked "None - record MIDI only". Mapping that to the
             // system default (which is what happened before `explicit` existed)
             // opened the built-in microphone and put its name in the band.

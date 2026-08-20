@@ -755,6 +755,8 @@ struct Audio {
     meters: Arc<Mutex<AudioMeters>>,
     running: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The live tap, until the engine takes it. See `Session::take_monitor`.
+    monitor: Option<(rtrb::Consumer<f32>, u16)>,
 }
 
 impl Audio {
@@ -785,7 +787,7 @@ impl Audio {
         // absurd headroom — and that is the point: the one thing that must
         // never happen is the ring filling because the machine hiccuped while
         // somebody was recording a take they cannot play again.
-        let (stream, sink) =
+        let (stream, sink, monitor) =
             audio::open_input(selection, &wish, 3.0, timebase).map_err(|e| e.to_string())?;
         let config = stream.config().clone();
         let channels = config.channels as usize;
@@ -951,6 +953,7 @@ impl Audio {
             meters,
             running,
             thread: Some(thread),
+            monitor: monitor.map(|m| (m, config.channels)),
         })
     }
 
@@ -1246,6 +1249,14 @@ impl Session {
     /// So the copies are cleared here — that is what makes the lamp go dark on
     /// this frame rather than the next poll — and the command clears the
     /// sources, so it stays dark.
+    /// Hand the live-monitor tap to whoever will play it, once.
+    ///
+    /// Taken rather than borrowed: the ring's read end belongs to exactly one
+    /// consumer, and that is the engine's render thread.
+    pub fn take_monitor(&mut self) -> Option<(rtrb::Consumer<f32>, u16)> {
+        self.audio.as_mut().and_then(|a| a.monitor.take())
+    }
+
     /// The microphone fader, as a linear gain.
     ///
     /// Applied on the writer thread to the input block, before the meter reads
