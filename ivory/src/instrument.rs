@@ -873,6 +873,13 @@ struct Shared {
     track_gain: AtomicU32,
     /// Whether the backing track should be rolling. Set by the transport.
     track_playing: AtomicBool,
+    /// A backing track has been handed over, playing or not.
+    ///
+    /// Read from the UI thread, which cannot see `Renderer::track` — that lives
+    /// on the audio thread. It exists so that "is there anything on the
+    /// instrument bus" can be answered without one, which is the question
+    /// `TakeSource::resolve` has to ask before every take.
+    track_loaded: AtomicBool,
     /// Where the track starts and stops, in frames. `out` of zero means "to
     /// the end", so a clip with no trim needs no knowledge of its own length
     /// down here.
@@ -993,6 +1000,7 @@ impl Shared {
             // whole cost at zero.
             track_gain: AtomicU32::new(1.0f32.to_bits()),
             track_playing: AtomicBool::new(false),
+            track_loaded: AtomicBool::new(false),
             track_in: AtomicU64::new(0),
             track_out: AtomicU64::new(0),
             pending_track: std::sync::Mutex::new(None),
@@ -1049,6 +1057,12 @@ impl Shared {
     /// panic into a dialog and `exit(1)`.
     /// Hand the renderer a backing track, or `None` to take one away.
     fn set_track(&self, clip: Option<Arc<ivory_record::decode::Clip>>) {
+        // Recorded HERE rather than when the renderer picks the clip up: the
+        // question it answers is "did the user choose a track", and they had
+        // by the time this was called. A flag set on the audio thread's next
+        // buffer would be false for anybody who loaded a track and pressed
+        // record inside the same frame.
+        self.track_loaded.store(clip.is_some(), Ordering::Relaxed);
         if let Ok(mut g) = self.pending_track.lock() {
             *g = Some(clip);
         }
@@ -2844,6 +2858,25 @@ impl Engine {
 
     pub fn any_plugin_loaded(&self) -> bool {
         self.loaded.iter().any(Option::is_some)
+    }
+
+    /// Whether ANY instrument is loaded — a VST3 in a slot, or the built-in.
+    ///
+    /// The question every caller actually wants. `any_plugin_loaded` asks about
+    /// VST3 slots alone, and the built-in is not one: it is a sentinel path
+    /// that never writes `loaded`. Asking the narrow question is what made a
+    /// take of the built-in record the microphone instead.
+    pub fn any_instrument_loaded(&self) -> bool {
+        self.any_plugin_loaded() || self.shared.builtin_slot.load(Ordering::Relaxed) >= 0
+    }
+
+    /// Whether a backing track is loaded, playing or not.
+    ///
+    /// Loaded is the question, not playing: a take is armed before the
+    /// transport rolls, and a track that starts with it would otherwise decide
+    /// the take's sources one buffer too late.
+    pub fn track_loaded(&self) -> bool {
+        self.shared.track_loaded.load(Ordering::Relaxed)
     }
 
     /// What one slot's warm-up concluded. `heard: false` means the instrument

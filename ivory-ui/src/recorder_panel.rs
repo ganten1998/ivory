@@ -2527,12 +2527,30 @@ fn draw_open_button(painter: &Painter, r: Rect, open: bool, p: &Palette) {
 /// pressed rather than toggled. Sharing the chrome is what stops the band
 /// growing a second thing that is nearly, but not quite, a button.
 fn draw_word_button(painter: &Painter, r: Rect, choices: &[&str], p: &Palette) {
+    draw_word_button_sized(painter, r, choices, 0.46, p);
+}
+
+/// As [`draw_word_button`], with the text a chosen fraction of the box.
+///
+/// The fraction is a parameter because one panel wanted to be quieter than the
+/// rest rather than because two sizes are a design: the backing track's panel
+/// is the widest thing this file draws, so its rows are the tallest, and text
+/// sized as a fraction of them came out half again as big as the same control
+/// anywhere else. Sizing text off its own box is right until one box is
+/// unusually large.
+fn draw_word_button_sized(
+    painter: &Painter,
+    r: Rect,
+    choices: &[&str],
+    factor: f32,
+    p: &Palette,
+) {
     if !r.is_positive() {
         return;
     }
     painter.rect_filled(r, 2.0, p.field);
     painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
-    let (text, size) = fit_label(r, choices, r.height() * 0.46);
+    let (text, size) = fit_label(r, choices, r.height() * factor);
     if size >= MIN_TEXT {
         painter.text(r.center(), Align2::CENTER_CENTER, text, font(size), p.ink);
     }
@@ -4499,6 +4517,45 @@ mod tests {
                     assert!(l.panel.contains_rect(*z), "{what} is outside the panel at {w}");
                 }
             }
+        }
+    }
+
+    /// **The backing track's panel does not shout.**
+    ///
+    /// It is the widest panel this file draws — 720 points against an effect
+    /// panel's 300 — and every piece of text in it was sized as a fraction of
+    /// rows derived from that width. The result was a title at 24 points and
+    /// trim readouts at 33, against a band whose own readouts are 11 to 14: the
+    /// owner's words were "all of it smaller, it's way too big".
+    ///
+    /// Asserted as POINTS at a real window size rather than as the fractions,
+    /// because the fractions are what went wrong — each one looked reasonable
+    /// against its own box.
+    #[test]
+    fn the_backing_track_panel_is_sized_like_the_rest_of_the_app() {
+        for w in [1280.0_f32, 1440.0, 1920.0] {
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w * 0.62));
+            let anchor = Rect::from_min_size(Pos2::new(w * 0.3, w * 0.2), Vec2::new(16.0, 16.0));
+            let l = TrackLayout::new(screen, anchor);
+            assert!(l.panel.is_positive(), "no panel at {w}");
+            // The nominal sizes `draw_track_panel` asks for, in the same order
+            // the reader meets them.
+            let title = l.title.height() * 0.42;
+            let field = l.field_in.height() * 0.34;
+            let reset = l.reset.height() * 0.30;
+            for (what, pt) in [("title", title), ("trim field", field), ("reset", reset)] {
+                assert!(
+                    pt <= 20.0,
+                    "the {what} asks for {pt:.0} points at a {w:.0}-point window"
+                );
+                assert!(
+                    pt >= MIN_TEXT,
+                    "the {what} shrank to {pt:.0} points and will not draw"
+                );
+            }
+            // The numbers being typed into are the largest thing in the panel,
+            // which is the one piece of hierarchy it has.
+            assert!(field > title, "the trim readouts are not the subject");
         }
     }
 
@@ -7421,7 +7478,7 @@ pub fn draw_fx(
                 p.faint,
             );
         }
-        draw_word_button(painter, l.close, &["X"], &p);
+        draw_word_button_sized(painter, l.close, &["X"], 0.34, &p);
     }
 
     for (i, FxRow { key, label, step }) in fx.rows().into_iter().enumerate() {
@@ -7747,9 +7804,15 @@ impl TrackLayout {
             return Self::NONE;
         }
         let body = panel.shrink(panel.width() * 0.035);
-        let title = slice_v(body, 0.00, 0.16);
-        let wave = slice_v(body, 0.22, 0.68);
-        let row = slice_v(body, 0.76, 1.00);
+        // **Shorter rows than the panel's width would suggest.** This is the
+        // widest panel in the file — 720 points against an effect panel's 300 —
+        // and every row was a fraction of a height derived from that width, so
+        // its text came out at twice the size of the same control in the band.
+        // The rows carry two numbers and two buttons; they do not need a fifth
+        // of the panel each.
+        let title = slice_v(body, 0.00, 0.13);
+        let wave = slice_v(body, 0.20, 0.72);
+        let row = slice_v(body, 0.80, 1.00);
         Self {
             panel,
             title: slice_h(title, 0.0, 0.86),
@@ -7895,7 +7958,10 @@ pub fn draw_track_panel(painter: &Painter, at: TrackPanel<'_>, s: &Settings) {
         } else {
             format!("{}   {}", track.name, trim_text(track.seconds))
         };
-        let size = fit_text(l.title, &name, l.title.height() * 0.62);
+        // 0.42, the same fraction the effect panels' titles use, so the two
+        // read as the same size of thing on screen rather than the same
+        // fraction of two different boxes.
+        let size = fit_text(l.title, &name, l.title.height() * 0.42);
         if size >= MIN_TEXT {
             painter.text(
                 Pos2::new(l.title.left(), l.title.center().y),
@@ -7917,7 +7983,7 @@ pub fn draw_track_panel(painter: &Painter, at: TrackPanel<'_>, s: &Settings) {
         let half = l.wave.height() * 0.46;
         if track.wave.is_empty() {
             let msg = "click the waveform icon in the band to import a file";
-            let size = fit_text(l.wave, msg, l.wave.height() * 0.16);
+            let size = fit_text(l.wave, msg, l.wave.height() * 0.11);
             if size >= MIN_TEXT {
                 painter.text(l.wave.center(), Align2::CENTER_CENTER, msg, font(size), p.faint);
             }
@@ -7969,10 +8035,12 @@ pub fn draw_track_panel(painter: &Painter, at: TrackPanel<'_>, s: &Settings) {
         painter.rect_filled(r, 2.0, p.field);
         let text = typed.map_or_else(|| trim_text(value), |t| format!("{t}_"));
         let shown = format!("{label} {text}");
-        let size = fit_text(r.shrink(r.width() * 0.06), &shown, r.height() * 0.56);
+        // A little larger than the title: these are the numbers being read and
+        // typed into, which is what the panel is for.
+        let size = fit_text(r.shrink(r.width() * 0.06), &shown, r.height() * 0.34);
         if size >= MIN_TEXT {
             painter.text(r.center(), Align2::CENTER_CENTER, &shown, font(size), p.ink);
         }
     }
-    draw_word_button(painter, l.reset, &["WHOLE FILE"], &p);
+    draw_word_button_sized(painter, l.reset, &["WHOLE FILE", "WHOLE"], 0.30, &p);
 }

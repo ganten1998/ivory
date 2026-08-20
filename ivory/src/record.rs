@@ -229,9 +229,31 @@ impl TakeSource {
     /// is one the user went and chose; leaving it out of the take is never what
     /// they meant.
     ///
+    /// **A backing track is the same argument and it took a second bug to
+    /// notice.** `TakeSource::Plugin` is not really "the plugin": it is the
+    /// instrument BUS, and the bus carries the instruments, the click and the
+    /// backing track. This function knew about plugins and inputs only, so
+    /// somebody with a microphone selected, no instrument loaded and a backing
+    /// track playing got `Input` — a take of themselves playing along to
+    /// something that is not in the file. The track was audible in the room, so
+    /// the recording was not silent; it just had the bleed instead of the
+    /// track, which is the version of this failure that survives a listen.
+    ///
+    /// Loaded, not playing: a take is armed before the transport rolls, and a
+    /// track that starts with it would decide the sources one buffer too late.
+    ///
     /// An EXPLICIT setting is still obeyed, which is what makes
     /// instrument-only and microphone-only reachable.
-    pub fn resolve(setting: &str, plugin_loaded: bool, input_open: bool) -> Self {
+    pub fn resolve(
+        setting: &str,
+        plugin_loaded: bool,
+        track_loaded: bool,
+        input_open: bool,
+    ) -> Self {
+        // Everything downstream asks "is there anything on the instrument bus",
+        // never "is there a plugin". Those were the same question until the
+        // backing track arrived, and every arm below was written when they were.
+        let bus = plugin_loaded || track_loaded;
         let want = match setting {
             "plugin" => TakeSource::Plugin,
             "both" => TakeSource::Both,
@@ -239,18 +261,18 @@ impl TakeSource {
             // Anything else, including the absent default, is "everything
             // there is".
             _ => {
-                if plugin_loaded {
+                if bus {
                     TakeSource::Both
                 } else {
                     TakeSource::Input
                 }
             }
         };
-        match (want, plugin_loaded, input_open) {
+        match (want, bus, input_open) {
             (TakeSource::Plugin, false, _) => TakeSource::Input,
             (TakeSource::Both, false, _) => TakeSource::Input,
             (TakeSource::Both, true, false) => TakeSource::Plugin,
-            (TakeSource::Input, _, false) if plugin_loaded => TakeSource::Plugin,
+            (TakeSource::Input, _, false) if bus => TakeSource::Plugin,
             (other, ..) => other,
         }
     }
@@ -3236,16 +3258,78 @@ mod tests {
 mod source_tests {
     use super::TakeSource;
 
+    /// **Everything on the instrument bus counts, not just a VST3.**
+    ///
+    /// The bug this exists for cost the owner twelve takes across three
+    /// releases and was invisible from inside the app: the monitor played the
+    /// built-in DX7, the meters moved, the `.mid` captured every note, and the
+    /// `.wav` had the microphone and nothing else. `resolve` was asking "is a
+    /// PLUGIN loaded", the built-in is not one, so `auto` answered `Input` and
+    /// the whole bus was left out of the file.
+    ///
+    /// The backing track is the same mistake found a second way: loaded, in the
+    /// mix, audible, and not in the take — which reads as "the backing track
+    /// does not record", because the bleed into the microphone is still there.
+    ///
+    /// So the parameter is `track_loaded` beside `plugin_loaded` and the caller
+    /// passes `any_instrument_loaded()`, which counts the built-in. Every arm
+    /// below is a case that produced a wrong file.
+    #[test]
+    fn anything_on_the_instrument_bus_is_worth_recording() {
+        // A backing track and a microphone: the take must have both.
+        assert_eq!(
+            TakeSource::resolve("auto", false, true, true),
+            TakeSource::Both,
+            "a take made while a backing track plays left the track out"
+        );
+        // A backing track and no microphone: the bus is the whole take.
+        assert_eq!(
+            TakeSource::resolve("auto", false, true, false),
+            TakeSource::Plugin
+        );
+        // The same for an instrument, which is what the caller now passes for
+        // the built-in as well as for a VST3.
+        assert_eq!(
+            TakeSource::resolve("auto", true, false, true),
+            TakeSource::Both
+        );
+        // And with neither, the input is still the only thing there is.
+        assert_eq!(
+            TakeSource::resolve("auto", false, false, true),
+            TakeSource::Input
+        );
+
+        // **An explicit choice is still obeyed**, including the one that says
+        // the bus only. "Record the instruments" with a backing track loaded
+        // and no plugin is a real request, and it used to fall through to the
+        // microphone.
+        assert_eq!(
+            TakeSource::resolve("plugin", false, true, true),
+            TakeSource::Plugin,
+            "instruments-only with a track loaded recorded the microphone"
+        );
+        assert_eq!(
+            TakeSource::resolve("both", false, true, true),
+            TakeSource::Both
+        );
+        // Microphone-only stays reachable, which is what makes the setting
+        // worth having at all.
+        assert_eq!(
+            TakeSource::resolve("input", true, true, true),
+            TakeSource::Input
+        );
+    }
+
     /// "Record the plugin" with no plugin loaded must not record silence. A
     /// take of nothing is never what anybody meant, and it is a setting that
     /// survives from a session where a plugin WAS loaded.
     #[test]
     fn asking_for_a_plugin_that_is_not_loaded_records_the_input_instead() {
         assert_eq!(
-            TakeSource::resolve("plugin", false, true),
+            TakeSource::resolve("plugin", false, false, true),
             TakeSource::Input
         );
-        assert_eq!(TakeSource::resolve("both", false, true), TakeSource::Input);
+        assert_eq!(TakeSource::resolve("both", false, false, true), TakeSource::Input);
     }
 
     /// And the mirror: with a plugin loaded and no input device open, the
@@ -3253,10 +3337,10 @@ mod source_tests {
     #[test]
     fn with_no_input_open_a_loaded_plugin_is_the_take() {
         assert_eq!(
-            TakeSource::resolve("input", true, false),
+            TakeSource::resolve("input", true, false, false),
             TakeSource::Plugin
         );
-        assert_eq!(TakeSource::resolve("both", true, false), TakeSource::Plugin);
+        assert_eq!(TakeSource::resolve("both", true, false, false), TakeSource::Plugin);
     }
 
     /// **The bug a user hit within minutes.** Load a piano, press record, and
@@ -3266,31 +3350,31 @@ mod source_tests {
     #[test]
     fn a_loaded_instrument_is_in_the_take_unless_somebody_says_otherwise() {
         assert_eq!(
-            TakeSource::resolve("auto", true, true),
+            TakeSource::resolve("auto", true, false, true),
             TakeSource::Both,
             "an instrument you went and loaded belongs in the recording"
         );
         assert_eq!(
-            TakeSource::resolve("auto", false, true),
+            TakeSource::resolve("auto", false, false, true),
             TakeSource::Input,
             "and with none loaded there is nothing extra to add"
         );
         // An EXPLICIT choice still wins, which is what makes the other three
         // menu rows mean anything.
-        assert_eq!(TakeSource::resolve("input", true, true), TakeSource::Input);
+        assert_eq!(TakeSource::resolve("input", true, false, true), TakeSource::Input);
         assert_eq!(
-            TakeSource::resolve("plugin", true, true),
+            TakeSource::resolve("plugin", true, false, true),
             TakeSource::Plugin
         );
     }
 
     #[test]
     fn an_ordinary_setup_gets_what_it_asked_for() {
-        assert_eq!(TakeSource::resolve("input", true, true), TakeSource::Input);
-        assert_eq!(TakeSource::resolve("plugin", true, true), TakeSource::Plugin);
-        assert_eq!(TakeSource::resolve("both", true, true), TakeSource::Both);
+        assert_eq!(TakeSource::resolve("input", true, false, true), TakeSource::Input);
+        assert_eq!(TakeSource::resolve("plugin", true, false, true), TakeSource::Plugin);
+        assert_eq!(TakeSource::resolve("both", true, false, true), TakeSource::Both);
         assert_eq!(
-            TakeSource::resolve("nonsense from a later build", false, true),
+            TakeSource::resolve("nonsense from a later build", false, false, true),
             TakeSource::Input
         );
     }
@@ -3298,7 +3382,7 @@ mod source_tests {
     #[test]
     fn the_setting_round_trips() {
         for s in ["input", "plugin", "both"] {
-            assert_eq!(TakeSource::resolve(s, true, true).to_setting(), s);
+            assert_eq!(TakeSource::resolve(s, true, false, true).to_setting(), s);
         }
     }
 }

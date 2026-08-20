@@ -1881,6 +1881,29 @@ impl DesktopApp {
                 self.recorder.engine_error = None;
                 self.recorder.engine_retry = None;
                 self.recorder.plugin_loaded = [const { None }; ivory_ui::recorder::SLOTS];
+                // **The tap belongs to the ENGINE, so it is taken when the
+                // engine starts.**
+                //
+                // It used to be taken in one place only: the success branch of
+                // loading a VST3. Everything else that reaches the instrument
+                // bus — the built-in DX7, the backing track, the click going
+                // into the take — therefore had no path into the file at all,
+                // and the failure was silent because the monitor still played
+                // it. Somebody could load the built-in, play, hear it, watch
+                // the meters move, and get a take with only the microphone in
+                // it; the `.mid` even had every note. Twelve of twelve
+                // manifests on the owner's Linux box said `sources: input`,
+                // across three releases, for exactly this reason.
+                //
+                // `take_recorder_tap` is once-only (`Option::take`), so the
+                // VST3 branch's own call is now a no-op that costs nothing and
+                // is left where it is: it is the line that says the take has to
+                // be able to record what it can hear.
+                if let Some(tap) =
+                    self.recorder.engine.as_mut().and_then(|e| e.take_recorder_tap())
+                {
+                    self.recorder.session.set_plugin_tap(Some(tap));
+                }
                 self.push_monitor_settings();
                 // **The chosen patch, now that there is something to play it.**
                 // The cartridge is read at construction, long before the band
@@ -1993,15 +2016,28 @@ impl DesktopApp {
 
     /// Decide what the next take is made of, from what is actually available.
     fn push_take_source(&mut self) {
+        // **Any instrument, not any PLUGIN.** `any_plugin_loaded` asks about
+        // VST3 slots, and the built-in DX7 is not one — it is a sentinel path
+        // that takes a different branch in `reconcile_plugin` and never writes
+        // `Engine::loaded`. So a take made with the built-in playing resolved
+        // to `input` and recorded the microphone instead of the instrument.
         let plugin = self
             .recorder
             .engine
             .as_ref()
-            .is_some_and(crate::instrument::Engine::any_plugin_loaded);
+            .is_some_and(crate::instrument::Engine::any_instrument_loaded);
+        // The other half of the instrument bus. Without it, a take made while a
+        // backing track plays records the microphone and leaves the track out.
+        let track = self
+            .recorder
+            .engine
+            .as_ref()
+            .is_some_and(crate::instrument::Engine::track_loaded);
         let input = self.recorder.session.audio_device_name().is_some();
         let want = crate::record::TakeSource::resolve(
             self.app.audio_source_setting(),
             plugin,
+            track,
             input,
         );
         if want != self.recorder.session.source() {

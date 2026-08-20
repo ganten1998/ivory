@@ -1509,6 +1509,76 @@ should no longer latch a phantom.
 
 ---
 
+## 2r. 2026-08-20 — the takes that never had the instrument in them
+
+Found by the owner on the Linux box, from twelve take manifests: **every take
+ever made on that machine said `sources: input` and `plugin: null`**, across
+4.4.1, 4.17 and 4.20. The built-in DX7 was audibly playing, the monitor played
+it, the meters moved, the `.mid` captured every note — and the `.wav` and the
+video's audio track had the microphone and nothing else.
+
+It is not a Linux bug. There is no `cfg` anywhere on this path.
+
+### Two independent reasons, both silent
+
+**The recorder tap was taken in exactly one place: the success branch of
+loading a VST3.** `desktop.rs`'s built-in branch calls `set_builtin_slot` and
+returns before reaching it. So with only the built-in loaded there was no tap
+at all — nothing on the instrument bus had a path into the file. The backing
+track and the click-into-take rode the same missing tap.
+
+The tap is now taken when the ENGINE starts, which is what its own comment
+already claimed ("the tap belongs to the engine rather than to any one
+instrument"). `take_recorder_tap` is `Option::take`, so the VST3 branch's call
+is now a harmless no-op and is left where it is.
+
+**And `TakeSource::resolve` asked the wrong question.** It took
+`plugin_loaded`, which came from `Engine::any_plugin_loaded` — VST3 slots only.
+The built-in is a sentinel path that never writes `Engine::loaded`, so `auto`
+saw no instrument, resolved to `Input`, and left the bus out even once a tap
+existed. `Engine::any_instrument_loaded` now counts the built-in, and the
+caller passes that.
+
+### The backing track was the same bug found a second way
+
+Reported the same evening: a take made while a backing track played contained
+the player and not the track. Same cause — the track is on the instrument bus,
+`resolve` did not know the bus had anything on it, and the bleed into the
+microphone made the file sound *almost* right, which is the version of this
+failure that survives a listen.
+
+`resolve` now takes `track_loaded` as well, and everything downstream asks one
+question: **is there anything on the instrument bus** — a VST3, the built-in,
+or a backing track. Those were the same question until the built-in and the
+track arrived, and every arm of that match was written when they were.
+
+`Engine::track_loaded` is set in `Shared::set_track`, on the UI thread, not
+when the renderer picks the clip up: a take is armed before the transport
+rolls, and a flag set on the audio thread's next buffer is false for anybody
+who loads a track and presses record in the same frame.
+
+### The lesson
+
+Three features reached the instrument bus over three releases and each one
+assumed the plumbing that carried the first. **A predicate named for one
+implementation of a thing (`any_plugin_loaded`) becomes wrong the moment a
+second implementation exists, and nothing fails — the monitor still plays it.**
+`anything_on_the_instrument_bus_is_worth_recording` asserts every case that
+produced a wrong file, and fails if `bus` narrows back to `plugin_loaded`.
+
+### The backing track's panel was shouting
+
+Same round, unrelated: it is the widest panel in `recorder_panel.rs` — 720
+points against an effect panel's 300 — and every piece of text in it was a
+fraction of rows derived from that width. Title at 24 points, trim readouts at
+33, against a band whose own readouts are 11 to 14. Sizing text off its own box
+is right until one box is unusually large.
+`the_backing_track_panel_is_sized_like_the_rest_of_the_app` asserts POINTS at
+real window sizes, not the fractions, because the fractions are what went
+wrong: each one looked reasonable against its own row.
+
+---
+
 ## 3. Repo layout
 
 ```
