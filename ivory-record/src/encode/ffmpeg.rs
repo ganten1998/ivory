@@ -158,7 +158,7 @@ impl Encoder {
         // replaced, and the second take would carry the first's opening.
         let _ = std::fs::remove_file(&tmp);
 
-        let child = Command::new(program())
+        let child = crate::proc::command(program())
             .args(["-hide_banner", "-loglevel", "error", "-y"])
             .args(["-f", "rawvideo", "-pixel_format", "bgra"])
             .args(["-video_size", &format!("{}x{}", spec.width, spec.height)])
@@ -363,7 +363,7 @@ impl Encoder {
     /// expensive work happens once, while the take runs, and this pass is a
     /// container rewrite plus an AAC encode of the audio.
     fn mux(video: &Path, sink: &AudioSink, out: &Path) -> Result<(), String> {
-        let status = Command::new(program())
+        let status = crate::proc::command(program())
             .args(["-hide_banner", "-loglevel", "error", "-y"])
             .args(["-i"])
             .arg(video)

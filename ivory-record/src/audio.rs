@@ -418,7 +418,7 @@ pub struct PipewireSource {
 /// a future version — and the caller falls back to cpal's own enumeration.
 #[cfg(target_os = "linux")]
 pub fn pipewire_sources() -> Vec<PipewireSource> {
-    let out = match std::process::Command::new("pw-dump")
+    let out = match crate::proc::command("pw-dump")
         .stderr(std::process::Stdio::null())
         .output()
     {

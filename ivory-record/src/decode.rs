@@ -128,7 +128,7 @@ fn read_raw(path: &Path, rate: u32) -> Result<Vec<u8>, String> {
     use std::io::Read;
 
     let program = crate::encode::ffmpeg::program();
-    let mut child = Command::new(&program)
+    let mut child = crate::proc::command(&program)
         // `-nostdin`, or a child that decides it wants a terminal takes the
         // parent's and the app is left with no keyboard until it exits.
         .args(["-nostdin", "-v", "error", "-i"])
@@ -211,7 +211,7 @@ fn read_raw(path: &Path, rate: u32) -> Result<Vec<u8>, String> {
     }
     let _sweep = Sweep(tmp.clone());
 
-    let out = Command::new("/usr/bin/afconvert")
+    let out = crate::proc::command("/usr/bin/afconvert")
         .arg(path)
         .args(["-f", "WAVE", "-d"])
         .arg(format!("LEF32@{rate}"))
