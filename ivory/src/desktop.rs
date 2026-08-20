@@ -613,6 +613,14 @@ fn cartridge_info(cart: &crate::dx7::Cartridge, error: &str) -> ivory_ui::ports:
 }
 
 #[cfg(feature = "recorder")]
+/// How often a preview needs a fresh camera frame, in nanoseconds.
+///
+/// Ten a second. The preview box is a few hundred points wide and its whole job
+/// is framing a shot; the eye cannot tell ten from thirty at that size, and the
+/// difference is two thirds of a JPEG decode per frame on the machine where
+/// this matters. A take still gets every frame — see the call site.
+const PREVIEW_EVERY_NS: u64 = 100_000_000;
+
 const DISK_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long to wait before trying the monitor output again, and how many times.
@@ -648,6 +656,29 @@ impl DesktopApp {
             self.recorder.disk_checked_at = Some(now);
             self.recorder.disk_bytes = crate::record::available_bytes(&root);
         }
+
+        // **How often the camera's frames are worth paying for.**
+        //
+        // The conversion is the cost — a 720p JPEG decode per frame — and the
+        // capture thread was doing thirty a second for as long as the band was
+        // open, whether or not anything was looking. Measured on a 2013
+        // MacBook Air: 35.6% of a core, idle, with the pane hidden and no take
+        // rolling, on a machine that then could not keep up with a take.
+        //
+        // A take with video needs every frame and gets every frame. A preview
+        // box a few hundred points wide does not: nobody frames a shot at
+        // thirty a second, and ten is indistinguishable for the job it does.
+        // A camera open with nothing on screen showing it — it opens with the
+        // band because opening takes seconds — needs none at all.
+        self.recorder.session.set_camera_rate(
+            if self.recorder.session.is_recording() && self.app.export_spec().video.wants_video() {
+                0
+            } else if self.app.recorder_band_open() || self.app.camera_pane_showing() {
+                PREVIEW_EVERY_NS
+            } else {
+                u64::MAX
+            },
+        );
 
         // The camera. Uploaded here rather than in `after_frame` because the
         // texture has to exist before the band that draws it is painted.

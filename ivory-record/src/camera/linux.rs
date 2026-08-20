@@ -359,6 +359,14 @@ fn capture_loop(
                 stats.note_unreadable();
                 return Ok(());
             }
+            // **Before the decode, after the dequeue.** The queue has to keep
+            // moving whatever the answer is, or the driver backs up and starts
+            // reporting errors; the decode is the part worth skipping, and on
+            // this class of machine it is a third of a core.
+            if !slot.should_convert(host_ns) {
+                stats.note_skipped();
+                return Ok(());
+            }
             let bytes: &[u8] = &view;
             let mut dst = slot.take_spare();
             let ok = match pixel {

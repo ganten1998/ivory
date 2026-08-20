@@ -422,6 +422,16 @@ impl FrameDelegate {
         // that budget permanently.
         let host_ns = ivars.timebase.now();
 
+        // **Before anything is touched, after the stamp.** The stamp is the
+        // sync budget and has to be taken first; everything below it is work
+        // this frame may not be worth. See `FrameSlot::want_every`: a preview
+        // box asks for ten frames a second, and converting thirty is a cost
+        // paid for as long as the band is open.
+        if !ivars.slot.should_convert(host_ns) {
+            ivars.stats.note_skipped();
+            return;
+        }
+
         // SAFETY: reading the sample's presentation stamp, a by-value scalar
         // read on a buffer AVFoundation owns for the duration of this call.
         let pts_ns = cmtime_nanos(unsafe { sample_buffer.presentation_time_stamp() });

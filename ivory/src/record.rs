@@ -1598,6 +1598,17 @@ impl Session {
     /// per-take figure. The camera outlives the take (it opens with the band),
     /// so a per-take number is this read at Stop minus the same read at start;
     /// `TakeVideo` keeps the baseline.
+    /// How often the camera's frames are worth converting, in nanoseconds.
+    ///
+    /// The host decides: a take with video wants every frame, a preview box
+    /// wants a handful a second, and a camera open with nothing on screen
+    /// showing it wants none. See `camera::FrameSlot::want_every`.
+    pub fn set_camera_rate(&self, every_ns: u64) {
+        if let Some(c) = self.camera.as_ref() {
+            c.want_every(every_ns);
+        }
+    }
+
     pub fn camera_frames_delivered(&self) -> u64 {
         self.camera
             .as_ref()

@@ -640,6 +640,26 @@ struct SlotInner {
 pub struct FrameSlot {
     inner: Mutex<SlotInner>,
     stats: Arc<CameraStats>,
+    /// Nanoseconds that must pass between two CONVERTED frames.
+    ///
+    /// **The conversion is the cost, not the capture.** A dequeue is a handoff
+    /// of an mmap'd pointer; turning MJPEG into RGBA is a JPEG decode of a
+    /// 720p image, and the capture thread was doing one thirty times a second
+    /// for as long as the band was open — 35.6% of a core on a 2013 MacBook
+    /// Air, measured, with no take rolling and the camera pane hidden.
+    ///
+    /// It was doing them for a preview box a few hundred points wide, which is
+    /// the waste: nobody frames a shot at 30 fps. So the RATE is demanded by
+    /// whoever is looking, and the thread skips the decode for frames that
+    /// arrive sooner than that. A take asks for every frame and gets every
+    /// frame; a preview asks for ten a second.
+    ///
+    /// `0` is every frame, [`u64::MAX`] is none at all. Both are meaningful:
+    /// the second is a camera that is open because it takes seconds to open,
+    /// with nothing on screen showing it.
+    want_every_ns: AtomicU64,
+    /// Timebase reading of the last frame that WAS converted.
+    converted_at_ns: AtomicU64,
 }
 
 impl FrameSlot {
@@ -647,7 +667,59 @@ impl FrameSlot {
         Self {
             inner: Mutex::new(SlotInner::default()),
             stats,
+            // Every frame until somebody says otherwise, which is what every
+            // build before this one did.
+            want_every_ns: AtomicU64::new(0),
+            converted_at_ns: AtomicU64::new(Self::NEVER),
         }
+    }
+
+    /// No frame has been converted yet. See [`should_convert`](Self::should_convert).
+    const NEVER: u64 = u64::MAX;
+
+    /// Ask for frames no more often than this. See [`want_every_ns`](Self::want_every_ns).
+    pub fn want_every(&self, ns: u64) {
+        self.want_every_ns.store(ns, Ordering::Relaxed);
+    }
+
+    /// **Should the capture thread pay for this frame?**
+    ///
+    /// Called with the frame's own timebase stamp, before the conversion and
+    /// after the dequeue — the queue has to keep moving whatever the answer is,
+    /// or the driver backs up and starts reporting errors.
+    ///
+    /// Records the time on a yes, so the caller cannot forget to. That is the
+    /// whole reason this takes `&self` and is not a pure function: the two
+    /// halves being separable is how a decimator ends up letting every frame
+    /// through on some path nobody tested.
+    pub fn should_convert(&self, host_ns: Nanos) -> bool {
+        let every = self.want_every_ns.load(Ordering::Relaxed);
+        if every == u64::MAX {
+            return false;
+        }
+        let now = host_ns.max(0) as u64;
+        let last = self.converted_at_ns.load(Ordering::Relaxed);
+        // **The first frame of a stream always converts.** `NEVER` rather than
+        // zero, because a zero would mean "converted at time zero" — and a
+        // timebase whose stamps start near zero would then skip its own first
+        // frames, so a preview came up blank for a moment on one platform and
+        // not the other. It cost a test to notice.
+        //
+        // A stamp that went BACKWARDS also converts, once, rather than locking
+        // the camera out until the clock catches up. It should not happen; if
+        // it does, the failure would be a preview that silently stopped.
+        // **A frame that is nearly due counts as due**, and the slack is not a
+        // fudge. Frames arrive on the camera's own grid — 33.3 ms at 30 fps —
+        // so a strict "at least 100 ms since the last one" is never satisfied
+        // by the frame at 99.999 ms and waits for the one at 133, which turns a
+        // request for ten a second into seven and a half. What is being asked
+        // for is a RATE, not a minimum spacing.
+        let due = every.saturating_sub(every / 8);
+        if every > 0 && last != Self::NEVER && now >= last && now - last < due {
+            return false;
+        }
+        self.converted_at_ns.store(now, Ordering::Relaxed);
+        true
     }
 
     /// Borrow the recycled pixel buffer to convert into.
@@ -728,6 +800,9 @@ pub struct CameraStats {
     frames_superseded: AtomicU64,
     frames_dropped_late: AtomicU64,
     frames_unreadable: AtomicU64,
+    /// Frames the capture thread deliberately did not convert. See
+    /// [`FrameSlot::want_every`].
+    frames_skipped: AtomicU64,
     device_state: AtomicU8,
 }
 
@@ -785,6 +860,19 @@ impl CameraStats {
 
     pub fn note_unreadable(&self) {
         self.frames_unreadable.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A frame that arrived and was deliberately not converted.
+    ///
+    /// Counted separately from every other loss, because it is not one: these
+    /// are frames nobody asked for. A skip landing in `frames_dropped_late`
+    /// would make an idle camera look like a failing one in `take.json`.
+    pub fn note_skipped(&self) {
+        self.frames_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn frames_skipped(&self) -> u64 {
+        self.frames_skipped.load(Ordering::Relaxed)
     }
 
     /// Clear the counters for a new take. Never during one.
@@ -963,6 +1051,15 @@ impl CameraStream {
         self.slot.latest()
     }
 
+    /// Ask the capture thread for frames no more often than `ns` apart.
+    ///
+    /// `0` is every frame — what a take with video needs. A preview asks for
+    /// far fewer: see [`FrameSlot::want_every`] for what the conversion costs
+    /// and why nobody frames a shot at thirty a second.
+    pub fn want_every(&self, ns: u64) {
+        self.slot.want_every(ns);
+    }
+
     /// A `Send` handle onto the same slot, for a thread that is not this one.
     pub fn reader(&self) -> FrameReader {
         FrameReader {
@@ -1036,6 +1133,68 @@ impl CameraStream {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The camera pays for a frame only when somebody is looking.**
+    ///
+    /// The conversion is a 720p JPEG decode, and the capture thread was doing
+    /// thirty a second for as long as the band was open — 35.6% of a core on a
+    /// 2013 MacBook Air, measured with the pane hidden and no take rolling, on
+    /// the same machine that then dropped over half the frames of an actual
+    /// take. The dequeue still happens either way; the queue has to keep moving
+    /// or the driver backs up.
+    #[test]
+    fn frames_are_converted_at_the_rate_somebody_asked_for() {
+        let slot = FrameSlot::new(Arc::new(CameraStats::new()));
+
+        // The default, and what every build before this one did: all of them.
+        let ns = 1_000_000_000 / 30;
+        for i in 0..30 {
+            assert!(
+                slot.should_convert(i * ns),
+                "frame {i} was skipped with no rate asked for"
+            );
+        }
+
+        // Ten a second out of thirty. The first always converts — there is
+        // nothing to have been too soon after.
+        let slot = FrameSlot::new(Arc::new(CameraStats::new()));
+        slot.want_every(100_000_000);
+        let taken = (0..30).filter(|i| slot.should_convert(i * ns)).count();
+        assert!(
+            (9..=11).contains(&taken),
+            "asked for 10 a second out of 30 and got {taken} in one second"
+        );
+        // The first is one of them, always: a preview that came up blank for
+        // the first tenth of a second is what the sentinel above is for.
+        let fresh = FrameSlot::new(Arc::new(CameraStats::new()));
+        fresh.want_every(100_000_000);
+        assert!(fresh.should_convert(0), "the first frame was skipped");
+
+        // And none at all, which is a camera that is open because opening takes
+        // seconds, with nothing on screen showing it.
+        let slot = FrameSlot::new(Arc::new(CameraStats::new()));
+        slot.want_every(u64::MAX);
+        assert!(!(0..30).any(|i| slot.should_convert(i * ns)));
+    }
+
+    /// A timebase that goes backwards must not lock the camera out forever.
+    ///
+    /// It should not happen and it is not worth a panic if it does: the failure
+    /// would be a preview that stopped updating and never recovered, with
+    /// nothing anywhere saying why.
+    #[test]
+    fn a_backwards_stamp_does_not_freeze_the_preview() {
+        let slot = FrameSlot::new(Arc::new(CameraStats::new()));
+        slot.want_every(100_000_000);
+        assert!(slot.should_convert(10_000_000_000));
+        // Far in the past, once.
+        assert!(
+            slot.should_convert(5_000_000_000),
+            "a stamp that went backwards was refused"
+        );
+        // And the rate still holds from there.
+        assert!(!slot.should_convert(5_010_000_000));
+    }
     use super::*;
 
     const FPS: f64 = 30.0;

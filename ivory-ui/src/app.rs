@@ -3098,6 +3098,11 @@ impl IvoryApp {
         self.settings.show_recorder
     }
 
+    /// The camera pane beside the theory band is showing.
+    pub fn camera_pane_showing(&self) -> bool {
+        self.settings.show_camera_pane
+    }
+
     /// Where takes go, resolved.
     pub fn record_root(&self) -> std::path::PathBuf {
         self.settings.record_root()
