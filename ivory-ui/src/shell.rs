@@ -138,12 +138,47 @@ pub fn surface(
     let mut body_wants_close = false;
 
     if caps.child_windows {
+        // **Born hidden, revealed on the second pass.**
+        //
+        // A window is created VISIBLE unless told otherwise, and on Windows a
+        // window that exists before anything has been drawn into it shows one
+        // frame of undefined back buffer — white, in practice. eframe's own
+        // main window dodges exactly this by starting hidden and revealing
+        // itself after the first frame (egui#3631, and the comment there says
+        // "to fix white flash on startup"); a CHILD viewport gets no such
+        // treatment, and this app's menu, submenu panel and dialogs are all
+        // child viewports that appear and disappear while somebody is using
+        // it.
+        //
+        // A surface that was drawn on the PREVIOUS pass already has a window,
+        // so it stays visible; one that was not is being created right now.
+        // Consecutive calls differ by exactly one pass — not drawing a surface
+        // is what destroys it — so the gap is a reliable "this is new".
+        let life = egui::Id::new(("surface-life", spec.id));
+        let pass = ctx.cumulative_pass_nr();
+        // `(the pass it was born on, the last pass it was drawn on)`. Drawn on
+        // the previous pass means the window is still there; a gap means this
+        // one is brand new, because not drawing a surface is what destroys it.
+        let alive = ctx
+            .memory(|m| m.data.get_temp::<(u64, u64)>(life))
+            .filter(|(_, last)| pass.saturating_sub(*last) <= 1);
+        let born = alive.map_or(pass, |(b, _)| b);
+        ctx.memory_mut(|m| m.data.insert_temp(life, (born, pass)));
+        let existing = alive.is_some();
+        // The one pass on which it goes from hidden to shown.
+        let revealing = existing && pass == born + 1;
+        if !existing {
+            // The reveal is a second pass, and a menu sitting still would not
+            // otherwise ask for one.
+            ctx.request_repaint();
+        }
         let mut builder = egui::ViewportBuilder::default()
             .with_title(spec.title)
             .with_decorations(spec.decorated)
             .with_resizable(spec.resizable)
             .with_always_on_top()
             .with_active(spec.takes_focus)
+            .with_visible(existing)
             .with_inner_size(spec.size)
             .with_min_inner_size(spec.min_size);
         if !spec.resizable {
@@ -169,6 +204,16 @@ pub fn surface(
                 report.focused = focused;
                 report.pointer_over = Some(pointer_over);
                 report.close |= close_req || esc;
+                // **Asked for on the reveal, because it was born invisible.**
+                // `with_active` is a creation-time attribute and an invisible
+                // window is not a window anybody can focus, so without this a
+                // dialog could come up unable to hear Escape — which is the
+                // only way some of them close. Only for surfaces that asked to
+                // take focus: the submenu passes `takes_focus: false` because
+                // stealing it from the menu is what closes the menu.
+                if revealing && spec.takes_focus {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
                 add(ui, &mut body_wants_close);
             });
         });
