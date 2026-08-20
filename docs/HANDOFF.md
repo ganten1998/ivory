@@ -1421,6 +1421,94 @@ enumeration is not.
 
 ---
 
+## 2q. 2026-08-19 — the clip lamp that could not be reset
+
+Shipped as **4.20.0**. Diagnosed by the owner on the Linux box, in a report
+that reproduced it, filmed it at 60 fps and named the mechanism correctly
+before any source was read. Three fixes, all of them theirs.
+
+### Two latches in series, and Reset only cleared the downstream one
+
+`Session::clear_clip` cleared the `AudioMeters` behind each mutex. Those are a
+published **copy**. The original lives in the `LevelTracker` on the writer
+thread, and `Writer::pump` copies it over the published one every cycle — about
+every 4 ms — so the dismiss was undone before a single repaint could show it.
+Not "usually undone": a 60 fps capture of two clicks caught **zero** dark
+frames.
+
+The symptom looked absurd and was exactly right: the lamp cleared only while NO
+input was selected, because unselecting one destroys the thread that owns the
+surviving latch. Starting a take did not clear it either — `arm()` clears the
+TAKE's tracker, which `take.json` proves is a different object.
+
+The comment above `clear_clip` said "All of them, or the light does not go
+out", listed three latches, and was clearing the wrong three things. A comment
+that names the invariant is not the same as code that holds it.
+
+**Fix:** `Cmd::ClearClip` on the writer command channel, which both writers
+handle. A command rather than a shared flag because the channel already exists
+and the tracker lives on the writer thread, not in the audio callback — there
+is nothing to make lock-free. The copies are still cleared synchronously,
+because that is what makes the lamp go dark on THIS frame rather than at the
+next poll; the command is what makes it stay dark.
+
+Both `match` arms are exhaustive over `Cmd`, so a third writer cannot be added
+without deciding what ClearClip means to it. That is the only structural guard
+here — see the verification note below.
+
+### A converter warming up is not a performance clipping
+
+Second finding, same report: moving the system default source under an open
+stream, in a way that forced a rate-and-channel converter swap (44.1k/2ch ->
+48k/1ch), latched both lamps on a source that was **silent**. A move with no
+format change stayed clean. One garbage buffer during warm-up is enough — and
+with the latch un-clearable, that phantom was permanent. It is very likely
+where "it says I clipped" came from for people who had not.
+
+`LevelTracker::warm_up(ms)` holds the LATCH off for the first
+`CLIP_WARMUP_MS` (50 ms) of a freshly opened stream. Peaks and RMS are
+untouched throughout: a meter that went blind for 50 ms would be a worse lie
+than the one this fixes. Opt-in at the site that knows a stream just opened, so
+a tracker fed from a buffer in a test still latches from the first sample.
+
+### The Linux input path never got the macOS rework
+
+The "1 VU on macOS for a mono mic, 2 on Linux" observation is a real clue and
+not itself a bug. Linux opens `default` through cpal/ALSA, which is
+plug-routed: pipewire-alsa negotiates 2 channels and upmixes a genuinely mono
+source. Verified on the box — a 1-channel 48 kHz virtual source came up as
+`float32le, 2ch, front-left/front-right, 44.1 kHz`. Asking PipeWire for the
+source's true channel count is almost certainly not worth it. What the clue
+established is that the Linux input path did not get the metering rework the
+macOS one did, which is where the reset had accidentally been fixed.
+
+### One line that would have halved the investigation
+
+The Linux build said **nothing** when a capture stream opened, even at
+`IVORY_LOG=debug`, so establishing what the device actually negotiated took
+inspecting the PipeWire graph from outside the app. There is a `debug!` at the
+open now: device, channels, rate, format, buffer. What is ASKED for is nothing
+like what arrives, and every future field report that mentions channels or rate
+starts from this line.
+
+### What is and is not verified
+
+The trap is unit-tested where it lives —
+`clearing_a_published_copy_is_undone_by_the_next_publish` asserts the
+republish-over-the-clear explicitly, and it fails if the source is not cleared.
+The warm-up has its own test, including that the meter still MOVES during it.
+
+**The plumbing is not covered end to end.** Click -> `Cmd::ClearClip` ->
+writer -> tracker needs a real capture device, which no unit test may open.
+The owner's report carries a re-verification recipe (a PipeWire null sink fed a
+full-scale square, so the input is guaranteed to clip with nothing audible and
+no hardware involved); the pass criterion is row 3 of their matrix: **input
+selected, stream open, source silent, click clears the lamp and it stays
+clear.** Bonus check is row 8 — a live default-source switch across formats
+should no longer latch a phantom.
+
+---
+
 ## 3. Repo layout
 
 ```
@@ -1712,6 +1800,13 @@ rely on Ubuntu Light. Do not disable `default_fonts`.
   as the icon-less Windows exe. Anything touching a `cfg`-gated path gets a
   `cargo check --target` for a target that actually has it, before the release
   script finds out.
+- **Clearing a published copy is not clearing the source.** Anything that
+  snapshots state onto a shared struct every cycle will republish over whatever
+  you just cleared, and the failure looks like the button is dead rather than
+  like a race. The clip lamp could not be reset for a whole release because
+  `clear_clip` cleared the `AudioMeters` copy and `pump()` copied the writer's
+  own still-latched `clipped[]` back over it 250 times a second. If a value has
+  a publisher, clear it at the publisher.
 - **A control with no rectangle is invisible to everything except a user.**
   `Hit::ShowAudioStatus` kept its enum variant, its tooltip and its handler arm
   when its row left the take-settings panel in 4.19.0 — only the entry in

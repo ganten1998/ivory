@@ -104,6 +104,19 @@ enum Cmd {
     Plugin(Option<Box<crate::instrument::RecorderTap>>),
     /// Which sources the next take is made of.
     Source(TakeSource),
+    /// Put out the clip latch on the writer's OWN tracker.
+    ///
+    /// **The half of "clear the clip" that was missing.** `Session::clear_clip`
+    /// cleared the published `AudioMeters` — the copy the UI reads — and the
+    /// writer's `pump()` copied its own still-latched `clipped[]` straight back
+    /// over it on the very next cycle, roughly every 4 ms. So the lamp could
+    /// not be cleared while an input was open, and not for one frame: a 60 fps
+    /// capture of two clicks caught zero dark frames.
+    ///
+    /// A command and not a shared flag because the channel is already here and
+    /// the tracker lives on THIS thread, not in the audio callback — there is
+    /// nothing to make lock-free.
+    ClearClip,
     Quit,
 }
 
@@ -674,14 +687,40 @@ impl Audio {
                 config.device
             ));
         }
+        // **What the device actually gave us, in one line.**
+        //
+        // What was ASKED for is nothing like what arrives: on Linux `default`
+        // is plug-routed, so PipeWire will happily hand back a 2-channel
+        // 44.1 kHz stream for a genuinely mono 48 kHz source and neither the
+        // band nor the log said so. A field investigation into a clip lamp
+        // spent half its length establishing this line by inspecting the graph
+        // from outside the app. It costs one `debug!` and it pays for itself in
+        // the first bug report that mentions channels or rate.
+        log::debug!(
+            "input open: {} - {} ch, {} Hz, {:?}, buffer {}",
+            config.device,
+            config.channels,
+            config.sample_rate,
+            config.sample_format,
+            match config.buffer_size {
+                cpal::BufferSize::Fixed(f) => f.to_string(),
+                cpal::BufferSize::Default => "device default".to_owned(),
+            }
+        );
         let meters = Arc::new(Mutex::new(AudioMeters::new(channels)));
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (report_tx, report_rx) = mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
 
+        // The clip latch is held off for the first few milliseconds, because a
+        // stream that has just opened has a converter chain warming up under
+        // it and one garbage buffer is enough to latch a clip on a source that
+        // was silent. See `audio::CLIP_WARMUP_MS`.
+        let mut tracker = LevelTracker::new(channels, f64::from(config.sample_rate));
+        tracker.warm_up(audio::CLIP_WARMUP_MS);
         let mut writer = Writer {
             sink,
-            tracker: LevelTracker::new(channels, f64::from(config.sample_rate)),
+            tracker,
             clock: ClockTap::new(2_000_000_000),
             cursor: FrameCursor::new(),
             meters: Arc::clone(&meters),
@@ -756,6 +795,11 @@ impl Audio {
                         }
                         Ok(Cmd::Plugin(tap)) => writer.plugin = tap.map(|t| *t),
                         Ok(Cmd::Source(mode)) => writer.source = mode,
+                        // `clear_clip`, never `arm`: arming also forgets the
+                        // take peak and the frame count, which are the take's
+                        // history. Acknowledging a red light must not erase the
+                        // evidence that the take was silent.
+                        Ok(Cmd::ClearClip) => writer.tracker.clear_clip(),
                         Ok(Cmd::Quit) | Err(mpsc::TryRecvError::Disconnected) => break,
                         Err(mpsc::TryRecvError::Empty) => {}
                     }
@@ -1054,15 +1098,28 @@ impl Session {
     /// they have seen it.
     ///
     /// **All of them, or the light does not go out.** The indicator is an OR
-    /// across three latches that arrive by three different paths — the live
-    /// input tracker, the instrument bus's own, and the take summary — and
-    /// clearing two of three is a dismiss button that appears not to work.
+    /// across latches that arrive by different paths — the live input tracker,
+    /// the instrument bus's own, and the take summary — and clearing all but
+    /// one is a dismiss button that appears not to work.
     /// The engine's is cleared by the caller, which is the only one holding it.
+    ///
+    /// **Each of them is TWO latches, and that is the bug this comment used to
+    /// describe wrongly.** The `AudioMeters` behind these mutexes are a
+    /// published COPY. The original lives in the `LevelTracker` on the writer
+    /// thread, and `Writer::pump` copies it over the published one every cycle
+    /// — so clearing the copies alone was undone within about 4 ms, forever,
+    /// for as long as the stream stayed open. The symptom was precise and
+    /// bizarre: the lamp could be cleared only while NO input was selected,
+    /// because unselecting one destroys the thread that owns the latch.
+    ///
+    /// So the copies are cleared here — that is what makes the lamp go dark on
+    /// this frame rather than the next poll — and the command clears the
+    /// sources, so it stays dark.
     pub fn clear_clip(&mut self) {
         self.clipped = false;
-        for m in [
-            self.audio.as_ref().map(|a| &a.meters),
-            self.plugin_audio.as_ref().map(|p| &p.meters),
+        for (m, cmds) in [
+            self.audio.as_ref().map(|a| (&a.meters, &a.cmds)),
+            self.plugin_audio.as_ref().map(|p| (&p.meters, &p.cmds)),
         ]
         .into_iter()
         .flatten()
@@ -1070,6 +1127,10 @@ impl Session {
             if let Ok(mut m) = m.lock() {
                 m.clear_clip();
             }
+            // A dead writer thread is not an error here: the send fails, the
+            // meters are already cleared, and there is nothing left to
+            // republish over them.
+            let _ = cmds.send(Cmd::ClearClip);
         }
     }
 
@@ -3326,6 +3387,11 @@ impl PluginAudio {
                         // Meaningless here: with no input there is only one
                         // thing this can be recording.
                         Ok(Cmd::Source(_)) => {}
+                        // Meaningful here for exactly the same reason it is
+                        // meaningful on the input writer: this thread's `pump`
+                        // republishes its own latch every cycle, so clearing
+                        // the shared meters alone would be undone in 4 ms.
+                        Ok(Cmd::ClearClip) => w.tracker.clear_clip(),
                         Ok(Cmd::Quit) | Err(mpsc::TryRecvError::Disconnected) => break,
                         Err(mpsc::TryRecvError::Empty) => {}
                     }

@@ -121,6 +121,26 @@ pub const DEFAULT_RING_SECONDS: f32 = 4.0;
 /// at 48 kHz, comfortably above any buffer size a human would choose.
 const CHUNK_FRAMES: usize = 1024;
 
+/// How long after a stream opens the clip latch stays disarmed.
+///
+/// **A converter warming up is not a performance clipping.** On Linux the app
+/// opens `default`, which is plug-routed: PipeWire builds a rate and channel
+/// converter chain under the stream, and rebuilds it when the system default
+/// source moves. A topology change was observed latching BOTH clip lamps on a
+/// source that was silent — one garbage buffer during warm-up is enough — and
+/// with the latch un-clearable (see `Cmd::ClearClip`) that phantom was
+/// permanent. It is very likely where "clipping" came from for people who
+/// never clipped.
+///
+/// 50 ms: long enough to swallow a converter's first buffers at any buffer
+/// size this app offers, short enough that it cannot hide real clipping. The
+/// stream opens when the Recorder band does, and nobody is a twentieth of a
+/// second from their first note at that moment.
+///
+/// Peaks are NOT suppressed during the window — only the latch. A meter that
+/// went blind for 50 ms would be a worse lie than the one this fixes.
+pub const CLIP_WARMUP_MS: f64 = 50.0;
+
 /// A sample at or above this magnitude counts as clipped.
 ///
 /// **Deliberately not 1.0.** `dasp` maps `i16` to float as `s / 32768.0`
@@ -1379,6 +1399,8 @@ pub struct LevelTracker {
     clipped: Vec<bool>,
     clipped_samples: u64,
     frames: u64,
+    /// Frames still to go before the clip latch arms. See [`CLIP_WARMUP_MS`].
+    warmup: u64,
 }
 
 impl LevelTracker {
@@ -1394,7 +1416,22 @@ impl LevelTracker {
             clipped: vec![false; channels],
             clipped_samples: 0,
             frames: 0,
+            // Armed. The warm-up is asked for at the site that knows a STREAM
+            // just opened — see `warm_up` — because that is the only thing it
+            // is about, and a tracker fed from a buffer in a test has not just
+            // opened anything.
+            warmup: 0,
         }
+    }
+
+    /// Hold the clip latch off for the first `ms` of audio.
+    ///
+    /// Called when a capture stream OPENS, which is the only moment it makes
+    /// sense: see [`CLIP_WARMUP_MS`] for the converter glitch it exists to
+    /// swallow. Peaks, RMS and the take peak are unaffected throughout — the
+    /// meter still moves, it just will not latch.
+    pub fn warm_up(&mut self, ms: f64) {
+        self.warmup = (self.sample_rate * ms / 1000.0).max(0.0) as u64;
     }
 
     /// Clear the latch and the take peak for a new take. The *only* thing that
@@ -1411,6 +1448,10 @@ impl LevelTracker {
     /// **Not `arm`.** Arming also forgets `take_peak` and the frame count,
     /// which are the take's history — a user acknowledging a red light must
     /// not also erase the evidence that the take was silent.
+    ///
+    /// The warm-up is NOT re-armed either. It exists to cover a converter
+    /// starting up, which has already happened by the time anybody clicks; a
+    /// dismiss that also went blind for 50 ms would hide a clip still going on.
     pub fn clear_clip(&mut self) {
         self.clipped.iter_mut().for_each(|c| *c = false);
         self.clipped_samples = 0;
@@ -1435,7 +1476,7 @@ impl LevelTracker {
                 if mag > self.take_peak[c] {
                     self.take_peak[c] = mag;
                 }
-                if mag >= CLIP_LEVEL {
+                if mag >= CLIP_LEVEL && self.warmup == 0 {
                     self.clipped[c] = true;
                     self.clipped_samples += 1;
                 }
@@ -1444,6 +1485,7 @@ impl LevelTracker {
         }
         self.window_frames += frames as u64;
         self.frames += frames as u64;
+        self.warmup = self.warmup.saturating_sub(frames as u64);
     }
 
     /// Copy the current levels into `dst` and start a new window.
@@ -2071,6 +2113,93 @@ mod tests {
             assert_eq!(pair[0], frame as f32);
             assert_eq!(pair[1], frame as f32 + 0.1);
         }
+    }
+
+    /// **Clearing the published copy is not clearing the latch.**
+    ///
+    /// The trap behind Tangent 4.19.0's un-resettable clip lamp, written down
+    /// at the level it lives at. `Session::clear_clip` cleared the `Meters`
+    /// behind the mutex — the copy the UI reads — and the writer thread's
+    /// `pump()` published its own still-latched `clipped[]` over the top within
+    /// about 4 ms, forever, for as long as the stream stayed open.
+    ///
+    /// The symptom was precise and looked absurd: the lamp cleared only while
+    /// NO input was selected, because unselecting one destroys the thread that
+    /// owns the surviving latch. It was filmed at 60 fps and did not go dark
+    /// for a single frame across two clicks.
+    #[test]
+    fn clearing_a_published_copy_is_undone_by_the_next_publish() {
+        let mut tracker = LevelTracker::new(1, RATE);
+        tracker.absorb(&[1.0]);
+        let mut meters = Meters::new(1);
+        tracker.publish(&mut meters);
+        assert!(meters.any_clipped(), "a full-scale sample did not latch");
+
+        // Everything the dismiss used to do.
+        meters.clear_clip();
+        assert!(!meters.any_clipped(), "the copy did not clear");
+        tracker.publish(&mut meters);
+        assert!(
+            meters.any_clipped(),
+            "**this is the bug**: the source republished over the cleared copy"
+        );
+
+        // And what it does now — the source as well. The copy is still cleared
+        // first, because that is what makes the lamp go dark on THIS frame
+        // rather than at the next poll.
+        meters.clear_clip();
+        tracker.clear_clip();
+        tracker.publish(&mut meters);
+        assert!(!meters.any_clipped(), "the dismiss still does not hold");
+        // Twice, because "cleared once then re-latched" is the failure and one
+        // publish cannot tell it from "cleared for good".
+        tracker.publish(&mut meters);
+        assert!(!meters.any_clipped(), "it came back one cycle later");
+
+        // The take's history survives the dismiss: acknowledging a red light
+        // must not erase the evidence that the take was silent.
+        assert!(meters.take_peak[0] >= 1.0, "the dismiss erased the take peak");
+    }
+
+    /// **A converter warming up is not a performance clipping.**
+    ///
+    /// Observed on Linux: moving the system default source under an open
+    /// stream, in a way that forced a rate-and-channel converter swap, latched
+    /// both clip lamps on a source that was silent. One garbage buffer is
+    /// enough — and with the latch un-clearable (the test above) the phantom
+    /// was permanent. It is very likely where "it says I clipped" came from for
+    /// people who had not.
+    #[test]
+    fn a_stream_that_has_just_opened_does_not_latch_a_converter_glitch() {
+        let mut t = LevelTracker::new(2, RATE);
+        t.warm_up(CLIP_WARMUP_MS);
+        // A full-scale garbage buffer in the first millisecond.
+        let garbage = vec![1.0_f32; 2 * (RATE / 1000.0) as usize];
+        t.absorb(&garbage);
+        let mut m = Meters::new(2);
+        t.publish(&mut m);
+        assert!(!m.any_clipped(), "a converter warming up latched a clip");
+        // **The meter still MOVED.** Only the latch is held off; a meter that
+        // went blind for 50 ms would be a worse lie than the one this fixes.
+        assert!(m.peak[0] >= 1.0, "the warm-up blinded the meter as well");
+
+        // Past the window, a real clip latches exactly as before.
+        let quiet = vec![0.0_f32; 2 * (RATE * CLIP_WARMUP_MS / 1000.0) as usize];
+        t.absorb(&quiet);
+        t.absorb(&garbage);
+        t.publish(&mut m);
+        assert!(m.any_clipped(), "the latch never armed after the warm-up");
+    }
+
+    /// A tracker built for a buffer, not a stream, latches from the first
+    /// sample — the warm-up is asked for, never assumed.
+    #[test]
+    fn the_warm_up_is_opt_in() {
+        let mut t = LevelTracker::new(1, RATE);
+        t.absorb(&[1.0]);
+        let mut m = Meters::new(1);
+        t.publish(&mut m);
+        assert!(m.any_clipped());
     }
 
     #[test]
