@@ -36,10 +36,15 @@ Linux
     cd tangent-<version>-linux-<arch>
     ./install.sh
 
-  That installs the app, the menu entry and the VST3 plugin into your home
-  directory — no root needed — and prints how to undo it (./install.sh
-  --uninstall). Or skip installing entirely: `chmod +x tangent && ./tangent`
-  runs it from the folder.
+  That installs the app and the VST3 plugin into your home directory — no root
+  needed — and prints how to undo it (./install.sh --uninstall). Or skip
+  installing entirely: `chmod +x tangent && ./tangent` runs it from the folder.
+
+  It asks once whether you want desktop integration: the menu entry and the
+  icon, which are what put Tangent in your application menu and in launchers
+  like rofi, wofi and dmenu. Say yes and you can start it by name from a
+  launcher as well as by typing `tangent`. --desktop and --no-desktop answer
+  the question in advance, for a scripted install.
 
   Everything the recorder needs ships in the tarball: the video encoder is
   bundled as tangent-ffmpeg, found automatically as long as it sits beside the

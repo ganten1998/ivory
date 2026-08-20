@@ -6,6 +6,8 @@
 #   ./install.sh --vst3          the plugin only
 #   ./install.sh --system        into /usr/local and /usr/lib/vst3 (needs root)
 #   ./install.sh --prefix DIR    somewhere else entirely
+#   ./install.sh --desktop       menu entry + icon, without being asked
+#   ./install.sh --no-desktop    the binary only, no menu entry
 #   ./install.sh --uninstall     take it all back out
 #   ./install.sh --dry-run       print what would happen and do nothing
 #
@@ -35,12 +37,19 @@ Install Tangent — the application, the VST3 plugin, or both.
   ./install.sh --vst3          the plugin only
   ./install.sh --system        into /usr/local and /usr/lib/vst3 (needs root)
   ./install.sh --prefix DIR    somewhere else entirely
+  ./install.sh --desktop       menu entry + icon, without being asked
+  ./install.sh --no-desktop    the binary only, no menu entry
   ./install.sh --uninstall     take it all back out
   ./install.sh --dry-run       print what would happen and do nothing
 
 The default needs no root. It puts the application in ~/.local/bin and the
 plugin in ~/.vst3, which is one of the directories the VST3 specification
 tells hosts to scan.
+
+Desktop integration is the menu entry and the icon: it is what makes Tangent
+appear in your application menu and in launchers like rofi, wofi and dmenu.
+You are asked about it unless --desktop or --no-desktop says so; with no
+terminal to ask in, it is installed.
 USAGE
 }
 
@@ -53,6 +62,11 @@ WANT_VST3=1
 # made the default invocation exit 1 on the app-only tarball — which is the
 # tarball most people have.
 VST3_EXPLICIT=0
+# Desktop integration: the .desktop entry and the icon, which is what puts
+# Tangent in an application menu and in rofi/wofi/dmenu. Empty means "ask" —
+# see the prompt below. Not a plain 1, because "install it" and "the user has
+# not said" are different states and the flags have to be able to say both.
+WANT_DESKTOP=""
 DRY=0
 UNINSTALL=0
 MODE=user
@@ -63,6 +77,8 @@ while [ $# -gt 0 ]; do
         --app)       WANT_APP=1; WANT_VST3=0 ;;
         --vst3)      WANT_APP=0; WANT_VST3=1; VST3_EXPLICIT=1 ;;
         --both)      WANT_APP=1; WANT_VST3=1; VST3_EXPLICIT=1 ;;
+        --desktop)    WANT_DESKTOP=1 ;;
+        --no-desktop) WANT_DESKTOP=0 ;;
         --system)    MODE=system ;;
         --user)      MODE=user ;;
         --prefix)    shift; [ $# -gt 0 ] || { echo "--prefix needs a directory" >&2; exit 2; }
@@ -146,6 +162,16 @@ if [ "$UNINSTALL" = "1" ]; then
     run rm -rf "$VST3_DIR/$NAME.vst3"
     run rm -f  "$DESKTOP_DIR/tangent.desktop"
     run rm -f  "$ICON_DIR/tangent.png"
+    # And tell the desktop, or the menu keeps an entry for a binary that is
+    # gone — which reads as a broken install rather than as a finished
+    # uninstall. Best-effort, exactly as on the way in.
+    if [ "$DRY" = "0" ]; then
+        command -v update-desktop-database >/dev/null 2>&1 &&
+            update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+        command -v gtk-update-icon-cache >/dev/null 2>&1 &&
+            gtk-update-icon-cache -qtf "$(dirname "$(dirname "$(dirname "$ICON_DIR")")")" \
+                >/dev/null 2>&1 || true
+    fi
     echo
     echo "Removed. Your settings are still in ~/.config/ivory — taught chord"
     echo "names and a supporter key live there, so uninstalling does not throw"
@@ -176,15 +202,85 @@ if [ "$WANT_APP" = "1" ]; then
         run chmod 755 "$BIN_DIR/tangent-ffmpeg"
     fi
 
-    # The menu entry, when the tarball carries one.
+    # ── desktop integration ────────────────────────────────────────────────
+    #
+    # The .desktop entry and the icon. Between them they are what makes Tangent
+    # appear in an application menu and, more to the point, in the launchers
+    # people actually use on a tiling desktop — rofi, wofi, dmenu — all of
+    # which read $XDG_DATA_HOME/applications and nothing else.
+    #
+    # ASKED FOR rather than assumed. It writes three files outside the one
+    # directory the rest of this script touches, and somebody installing a
+    # binary into ~/.local/bin on a machine they keep tidy is entitled to be
+    # asked before their menu gains an entry. --desktop / --no-desktop skip the
+    # question; with no terminal to ask in, it happens, because that is what
+    # every release before this one did and a silent behaviour change is worse
+    # than a default somebody disagrees with.
     if [ -f "$SELF_DIR/tangent.desktop" ]; then
+        if [ -z "$WANT_DESKTOP" ]; then
+            if [ -t 0 ]; then
+                echo
+                echo "  Desktop integration puts Tangent in your application menu"
+                echo "  and in launchers like rofi, wofi and dmenu. It writes:"
+                echo "      $DESKTOP_DIR/tangent.desktop"
+                echo "      $ICON_DIR/tangent.png"
+                printf '  Install it? [Y/n] '
+                read -r reply || reply=""
+                case "$reply" in
+                    [Nn]*) WANT_DESKTOP=0 ;;
+                    *)     WANT_DESKTOP=1 ;;
+                esac
+                echo
+            else
+                WANT_DESKTOP=1
+            fi
+        fi
+    else
+        WANT_DESKTOP=0
+    fi
+
+    if [ "$WANT_DESKTOP" = "1" ]; then
         echo "  menu entry  -> $DESKTOP_DIR/tangent.desktop"
         run mkdir -p "$DESKTOP_DIR"
-        run cp "$SELF_DIR/tangent.desktop" "$DESKTOP_DIR/tangent.desktop"
-    fi
-    if [ -f "$SELF_DIR/tangent.png" ]; then
-        run mkdir -p "$ICON_DIR"
-        run cp "$SELF_DIR/tangent.png" "$ICON_DIR/tangent.png"
+        # **The absolute path, not the bare name.** The shipped entry says
+        # `Exec=tangent`, which needs $BIN_DIR to be on PATH — and a launcher
+        # does not run your shell's PATH anyway: rofi and wofi exec through a
+        # session environment that may never have sourced your profile. An
+        # entry that cannot start the program is worse than no entry, because
+        # it fails silently from a menu with nowhere to print an error.
+        if [ "$DRY" = "1" ]; then
+            printf '  would: write tangent.desktop with Exec=%s\n' "$BIN_DIR/tangent"
+        else
+            sed "s|^Exec=.*|Exec=$BIN_DIR/tangent|" \
+                "$SELF_DIR/tangent.desktop" > "$DESKTOP_DIR/tangent.desktop"
+            chmod 644 "$DESKTOP_DIR/tangent.desktop"
+        fi
+
+        if [ -f "$SELF_DIR/tangent.png" ]; then
+            echo "  icon        -> $ICON_DIR/tangent.png"
+            run mkdir -p "$ICON_DIR"
+            run cp "$SELF_DIR/tangent.png" "$ICON_DIR/tangent.png"
+            # 0644 explicitly: the build tarball has carried 0600 on this file
+            # before, which is unreadable by anyone else after a --system
+            # install and shows up as a menu entry with a missing icon.
+            run chmod 644 "$ICON_DIR/tangent.png"
+        fi
+
+        # Tell the desktop it changed. Both are best-effort and both are
+        # genuinely absent on minimal systems — a tiling-WM install often has
+        # neither — so a missing one is not a failure. rofi reads the .desktop
+        # files directly and will find Tangent either way; these are what make
+        # a full desktop environment and the icon cache notice inside a second
+        # rather than at the next login.
+        if [ "$DRY" = "0" ]; then
+            command -v update-desktop-database >/dev/null 2>&1 &&
+                update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+            command -v gtk-update-icon-cache >/dev/null 2>&1 &&
+                gtk-update-icon-cache -qtf "$(dirname "$(dirname "$(dirname "$ICON_DIR")")")" \
+                    >/dev/null 2>&1 || true
+        fi
+    elif [ -f "$SELF_DIR/tangent.desktop" ]; then
+        echo "  menu entry  -> skipped (--no-desktop)"
     fi
 
     # Say so rather than leaving them to find out by typing `tangent`.
@@ -234,6 +330,13 @@ if [ "$WANT_APP" = "1" ]; then
         echo "Run it with:  tangent"
     else
         echo "Run it with:  $BIN_DIR/tangent"
+    fi
+    # Said out loud, because the whole point of answering yes to that question
+    # is being able to start it without a terminal — and a launcher that has
+    # not rescanned yet looks exactly like an entry that was never written.
+    if [ "${WANT_DESKTOP:-0}" = "1" ]; then
+        echo "Or from your application menu, rofi, wofi or dmenu, as \"Tangent\"."
+        echo "  (a launcher that caches its list may need one restart to see it)"
     fi
 
     # Filming a take composites on the GPU through Vulkan. Everything else in
