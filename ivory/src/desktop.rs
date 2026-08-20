@@ -2642,6 +2642,13 @@ struct TakeVideo {
     /// not composite in real time. The video stays on the wall clock; this is
     /// the honest count of how much of it is a freeze-frame.
     padded: u64,
+    /// Compose only every Nth tick, and pad the rest. 1 is every frame.
+    ///
+    /// Raised when a pump overruns its budget, so a machine that cannot keep
+    /// up gives back the UI's time instead of spending it — see the pump. The
+    /// video's clock is unaffected; its motion is coarser and `padded` says by
+    /// how much.
+    stride: u32,
     /// Whether the file carries an audio track, for the manifest's report.
     has_audio: bool,
     /// `Session::camera_frames_delivered` at take start. The camera opens with
@@ -2731,6 +2738,7 @@ impl DesktopApp {
             path,
             failed: 0,
             padded: 0,
+            stride: 1,
             has_audio,
             cam_frames_at_start: self.recorder.session.camera_frames_delivered(),
         });
@@ -2778,20 +2786,57 @@ impl DesktopApp {
         // pump from doubling down on a machine that is already saturated.
         const MAX_PER_FRAME: u32 = 3;
         const BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
+        // **Input has priority: composite fewer frames rather than steal the
+        // UI's time.** A machine that cannot composite at the asked-for rate
+        // used to keep trying and pad the difference, which spends the whole
+        // budget every pump and leaves the window at four frames a second with
+        // notes queued behind it. Above `stride`, only every Nth tick is
+        // composed and the rest are padded — the video's clock is unchanged,
+        // its motion is coarser, and the window comes back.
+        //
+        // Doubling and halving rather than a fine control, because it is
+        // reacting to a measurement made three times a pump: a fine one would
+        // hunt. It stops at 4, which is 15 fps of real frames out of 60 and
+        // already far past where a video is worth degrading further.
+        //
+        // A 15 fps video of a good take beats a 30 fps video of an unplayable
+        // one — the owner's own words, and the reason this is not a setting.
         let pump_started = std::time::Instant::now();
         let mut made = 0;
         while v.next < due && made < MAX_PER_FRAME {
+            // Behind, and composing only every `stride`th tick: pad this one
+            // and move on without paying for a frame nobody asked for.
+            if v.stride > 1 && !v.next.is_multiple_of(u64::from(v.stride)) {
+                if let Some(last) = v.compositor.last_frame() {
+                    let pts = (v.next as i64 * 1_000_000_000) / i64::from(v.fps);
+                    if v.encoder.push(last, pts).is_err() {
+                        v.failed += 1;
+                    }
+                    v.padded += 1;
+                }
+                v.next += 1;
+                continue;
+            }
             let pts = (v.next as i64 * 1_000_000_000) / i64::from(v.fps);
             let frame = self.recorder.camera_rgba.as_ref().map(|(px, w, h)| (px.as_slice(), *w, *h));
             match v
                 .compositor
-                .frame(&self.app, v.layout, v.shows, v.camera, v.display, frame)
+                .frame(&self.app, v.layout, v.shows, v.camera, v.display, frame, pts)
             {
-                Ok(bgra) => {
-                    if v.encoder.push(bgra, pts).is_err() {
+                // A frame from one tick ago is now readable, carrying its own
+                // pts. The readback is pipelined so the UI thread never waits
+                // on the rasteriser — see `composite`'s module docs.
+                Ok(Some(ready)) => {
+                    let pushed = v
+                        .compositor
+                        .last_frame()
+                        .is_some_and(|bgra| v.encoder.push(bgra, ready).is_ok());
+                    if !pushed {
                         v.failed += 1;
                     }
                 }
+                // The first tick of a take: submitted, nothing to encode yet.
+                Ok(None) => {}
                 Err(_) => v.failed += 1,
             }
             v.next += 1;
@@ -2799,6 +2844,16 @@ impl DesktopApp {
             if pump_started.elapsed() > BUDGET {
                 break;
             }
+        }
+        // What that pump cost, and what to do about it next time.
+        let spent = pump_started.elapsed();
+        if spent > BUDGET {
+            v.stride = (v.stride * 2).min(4);
+        } else if spent * 3 < BUDGET && v.stride > 1 {
+            // Well under, for a while: try more frames again. A third of the
+            // budget rather than half, so a machine sitting exactly on the
+            // boundary settles instead of oscillating.
+            v.stride /= 2;
         }
 
         // Still behind: the machine cannot composite this fast, so hold the
@@ -2829,6 +2884,19 @@ impl DesktopApp {
         let Some(mut v) = self.recorder.video.take() else {
             return;
         };
+        // **The frame still in the pipeline.** The readback is one deep, so
+        // there is always exactly one composited frame that has been submitted
+        // and not yet read; without this the last frame of every take is lost.
+        // See `composite`'s module docs.
+        if let Ok(Some(pts)) = v.compositor.flush() {
+            let pushed = v
+                .compositor
+                .last_frame()
+                .is_some_and(|bgra| v.encoder.push(bgra, pts).is_ok());
+            if !pushed {
+                v.failed += 1;
+            }
+        }
         // One last drain, for the samples the writer flushed at Stop. Without
         // it the video's audio is a poll interval shorter than the `.wav`.
         if let Some(rx) = self.recorder.session.video_audio() {

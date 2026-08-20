@@ -18,15 +18,31 @@
 //! handed over by `eframe::Frame::wgpu_render_state()`. No second device, no
 //! second adapter, and no second GPU context of any kind.
 //!
-//! # Why the readback is synchronous
+//! # Why the readback is pipelined
 //!
-//! `copy_texture_to_buffer` then `map_async` then poll-until-done, on the UI
-//! thread, every composited frame. A double-buffered readback would hide the
-//! latency and is what a game would do — but a take is 30 frames a second, not
-//! 240, and the honest measurement is that this costs a few milliseconds at
-//! 1080p. Spending complexity to save that, in a frame budget of 33 ms, would
-//! buy a class of bug (a frame encoded one tick late, silently) for no gain
-//! anyone could perceive.
+//! It used to be synchronous — `copy_texture_to_buffer`, then `map_async`,
+//! then poll-until-done, on the UI thread, every composited frame — on the
+//! reasoning that it "costs a few milliseconds at 1080p" and that hiding it
+//! would buy a class of bug for no gain anyone could perceive.
+//!
+//! **That measurement was taken on a machine with a GPU.** `poll(Wait)` does
+//! not wait for a copy; it waits for the whole submission, and where the
+//! adapter is a CPU rasteriser — mesa's lavapipe, which is the only ICD on a
+//! 2012-era integrated GPU — that is the entire rasterisation of the frame,
+//! on the UI thread, thirty times a second. On the owner's Linux box that took
+//! a take from 30 fps to 13, and note input lagged so badly the take was
+//! unusable: the notes enter through egui's event handling, which was queued
+//! behind a software rasteriser.
+//!
+//! So the readback is one frame behind: submit N, hand back N-1, which by then
+//! has had a whole frame interval to finish. The UI thread stops waiting on
+//! the GPU at all. Two readback buffers, ping-ponged, and a `flush` at the end
+//! of the take so the last frame is not lost — which is the "class of bug" the
+//! old comment was worried about, made explicit and given a name instead of
+//! being avoided.
+//!
+//! The video is not delayed by this: the frame carries its own `pts`, which is
+//! computed from the take's clock and travels with it through the pipeline.
 
 use ivory_ui::app::IvoryApp;
 use ivory_ui::recorder::{DisplayShows, Layout};
@@ -45,7 +61,14 @@ pub struct Compositor {
     ctx: egui::Context,
     target: wgpu::Texture,
     view: wgpu::TextureView,
-    readback: wgpu::Buffer,
+    /// Two, ping-ponged: one being written by the GPU while the other is read.
+    readback: [wgpu::Buffer; 2],
+    /// Which buffer the NEXT submission writes into.
+    slot: usize,
+    /// The buffer with a submission in flight, and the pts that frame carries.
+    ///
+    /// `None` only before the first frame and after a [`flush`](Self::flush).
+    in_flight: Option<(usize, i64)>,
     width: u32,
     height: u32,
     /// Bytes per row in `readback`, rounded up to wgpu's 256-byte copy
@@ -262,12 +285,15 @@ impl Compositor {
         });
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let padded_bpr = padded_bytes_per_row(width);
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tangent composite readback"),
-            size: u64::from(padded_bpr) * u64::from(height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let mut buffer = || {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("tangent composite readback"),
+                size: u64::from(padded_bpr) * u64::from(height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let readback = [buffer(), buffer()];
         let ctx = egui::Context::default();
         Ok(Self {
             device,
@@ -277,6 +303,8 @@ impl Compositor {
             target,
             view,
             readback,
+            slot: 0,
+            in_flight: None,
             width,
             height,
             padded_bpr,
@@ -298,7 +326,17 @@ impl Compositor {
         (self.width, self.height)
     }
 
-    /// Composite one frame and return it as tightly-packed BGRA.
+    /// Composite one frame; a frame from ONE TICK AGO becomes readable.
+    ///
+    /// **Returns the `pts` of the frame now in [`last_frame`](Self::last_frame),
+    /// not of the one just submitted.** The readback is pipelined one deep —
+    /// see the module docs for the machine that made that necessary — so the
+    /// first call of a take returns `Ok(None)` with nothing to encode yet, and
+    /// [`flush`](Self::flush) collects the last one when the take ends.
+    ///
+    /// The `pts` travels with its frame rather than being recomputed on the way
+    /// out, so a pipeline that is one deep today and two deep tomorrow cannot
+    /// silently stamp a frame with somebody else's time.
     ///
     /// `camera` is the latest frame from the device, as **RGBA** with its own
     /// size — which is what `ivory_record::camera::Frame` carries, the backend
@@ -319,7 +357,8 @@ impl Compositor {
         want_camera: bool,
         want_display: bool,
         camera: Option<(&[u8], u32, u32)>,
-    ) -> Result<&[u8], String> {
+        pts_ns: i64,
+    ) -> Result<Option<i64>, String> {
         if let Some((pixels, w, h)) = camera {
             self.upload_camera(pixels, w, h)?;
         }
@@ -419,7 +458,7 @@ impl Compositor {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &self.readback,
+                buffer: &self.readback[self.slot],
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(self.padded_bpr),
@@ -437,9 +476,38 @@ impl Compositor {
             self.renderer.free_texture(id);
         }
 
-        self.read_back()?;
+        // **Submit, then hand back the PREVIOUS frame.** The one just queued
+        // is left to the rasteriser; the one from last time has had a whole
+        // frame interval to finish and is read now. This is the line that
+        // stopped the UI thread waiting on a software rasteriser — see the
+        // module docs.
+        let ready = self.in_flight.replace((self.slot, pts_ns));
+        self.slot ^= 1;
+        match ready {
+            Some((which, pts)) => {
+                self.read_back(which)?;
+                self.has_frame = true;
+                Ok(Some(pts))
+            }
+            // The pipeline is one frame deep and this was the first: nothing
+            // to hand back yet. The caller composes again next tick, and
+            // `flush` collects the last one at the end of the take.
+            None => Ok(None),
+        }
+    }
+
+    /// Read back the frame still in flight, if there is one.
+    ///
+    /// **Called at the end of a take, and forgetting it loses the last frame.**
+    /// That is the cost of pipelining, made explicit and given a name rather
+    /// than avoided by making every frame wait.
+    pub fn flush(&mut self) -> Result<Option<i64>, String> {
+        let Some((which, pts)) = self.in_flight.take() else {
+            return Ok(None);
+        };
+        self.read_back(which)?;
         self.has_frame = true;
-        Ok(&self.frame)
+        Ok(Some(pts))
     }
 
     /// The most recent successfully composited frame, tightly-packed BGRA.
@@ -452,15 +520,22 @@ impl Compositor {
         self.has_frame.then_some(self.frame.as_slice())
     }
 
-    fn read_back(&mut self) -> Result<(), String> {
-        let slice = self.readback.slice(..);
+    /// Copy one finished submission out of `readback[which]` into `frame`.
+    ///
+    /// Called for the PREVIOUS frame, which has had a whole frame interval to
+    /// finish — so on a machine with a GPU this returns immediately, and on a
+    /// CPU rasteriser it waits for work that has already been running rather
+    /// than starting the clock now.
+    fn read_back(&mut self, which: usize) -> Result<(), String> {
+        let slice = self.readback[which].slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
         // Poll until the copy has landed. `PollType::Wait` blocks on the
-        // device rather than spinning, which is the whole reason this is
-        // allowed to be synchronous.
+        // device rather than spinning — and on a software adapter it is
+        // waiting for the whole rasterisation, which is exactly why the
+        // submission being waited on here is the one from LAST time.
         let _ = self.device.poll(wgpu::PollType::Wait {
             submission_index: None,
             timeout: None,
@@ -480,7 +555,7 @@ impl Compositor {
                     .copy_from_slice(&data[from..from + dst_stride]);
             }
         }
-        self.readback.unmap();
+        self.readback[which].unmap();
         Ok(())
     }
 
@@ -601,6 +676,31 @@ mod tests {
     /// The readback stride must be a legal copy alignment AND still hold the
     /// row. Getting it wrong shears the picture diagonally, which is the
     /// classic symptom and is easier to assert than to recognise.
+    /// Compose one frame and get it back, pipeline and all.
+    ///
+    /// The readback is one deep, so a single `frame` call submits and returns
+    /// nothing. Every test that wants a picture wants "compose this, then give
+    /// it to me", and writing the two-step by hand five times is five chances
+    /// to write it differently.
+    fn compose_one<'a>(
+        c: &'a mut Compositor,
+        app: &IvoryApp,
+        camera: Option<(&[u8], u32, u32)>,
+    ) -> Result<&'a [u8], String> {
+        c.frame(
+            app,
+            Layout::default(),
+            DisplayShows::default(),
+            true,
+            true,
+            camera,
+            0,
+        )?;
+        c.flush()?;
+        c.last_frame()
+            .ok_or_else(|| "the pipeline produced no frame".to_owned())
+    }
+
     #[test]
     fn a_readback_row_is_aligned_and_still_fits_the_picture() {
         for w in [1_u32, 2, 63, 64, 65, 320, 1080, 1280, 1920, 3840] {
@@ -677,16 +777,7 @@ mod tests {
             ivory_ui::settings::Settings::first_launch(),
             ivory_ui::host::Caps::DESKTOP,
         );
-        let out = c
-            .frame(
-                &app,
-                Layout::default(),
-                DisplayShows::default(),
-                true,
-                true,
-                Some((&cam, W, H)),
-            )
-            .expect("composite");
+        let out = compose_one(&mut c, &app, Some((&cam, W, H))).expect("composite");
         assert_eq!(out.len(), (W * H * 4) as usize, "the frame is the wrong size");
         // **Searched for, not sampled at a known point.** The camera has no
         // pane of its own any more — it is drawn inside the recorder band's
@@ -788,16 +879,7 @@ mod tests {
                 px[2] = 0xFF - shade;
                 px[3] = 0xFF;
             }
-            let bgra = c
-                .frame(
-                    &app,
-                    Layout::default(),
-                    DisplayShows::default(),
-                    true,
-                    true,
-                    Some((&cam, CW, CHH)),
-                )
-                .expect("composite");
+            let bgra = compose_one(&mut c, &app, Some((&cam, CW, CHH))).expect("composite");
             enc.push(bgra, (i as i64 * 1_000_000_000) / i64::from(FPS))
                 .expect("push video");
             for (n, sm) in audio.chunks_exact_mut(CH).enumerate() {
@@ -845,6 +927,61 @@ mod tests {
     /// the camera had a pane of its own and an empty pane was black. A take is
     /// the window now, so a camera that has not woken up yet costs the video
     /// one small box inside the recorder band and nothing else — the rest of
+    /// **Every frame comes out, once, carrying its own time.**
+    ///
+    /// This is the test for the thing pipelining risks and the old synchronous
+    /// readback could not get wrong: a frame encoded one tick late, silently.
+    /// The module docs used to give that as the reason NOT to pipeline; the
+    /// answer is not to avoid it but to assert it.
+    ///
+    /// Five submissions, five frames back, in order, none lost and none
+    /// duplicated — four through the pipeline and the last from `flush`, which
+    /// is the call whose absence would silently truncate every take by one
+    /// frame.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn the_pipeline_gives_back_every_frame_once_and_in_order() {
+        let Some((device, queue)) = headless() else {
+            eprintln!("no GPU adapter - the compositor was not exercised");
+            return;
+        };
+        let mut c = Compositor::on(device, queue, 160, 120).expect("compositor");
+        let app = IvoryApp::new(
+            c.context(),
+            ivory_ui::settings::Settings::default(),
+            ivory_ui::host::Caps::MINIMAL,
+        );
+        let mut out = Vec::new();
+        for i in 0..5_i64 {
+            let got = c
+                .frame(
+                    &app,
+                    Layout::default(),
+                    DisplayShows::default(),
+                    true,
+                    true,
+                    None,
+                    i * 1_000,
+                )
+                .expect("composite");
+            // The first submission has nothing behind it yet. Asserted rather
+            // than tolerated: a pipeline that handed something back on the
+            // first call would be handing back an unwritten buffer.
+            if i == 0 {
+                assert_eq!(got, None, "the first frame came back before it existed");
+            }
+            out.extend(got);
+        }
+        out.extend(c.flush().expect("flush"));
+        assert_eq!(
+            out,
+            vec![0, 1_000, 2_000, 3_000, 4_000],
+            "frames came back out of order, or one was lost"
+        );
+        // And flushing twice is not a second copy of the last frame.
+        assert_eq!(c.flush().expect("flush"), None, "flush duplicated a frame");
+    }
+
     /// the app is there from the first frame.
     #[test]
     #[ignore = "needs a GPU"]
@@ -861,10 +998,7 @@ mod tests {
             ivory_ui::settings::Settings::default(),
             ivory_ui::host::Caps::MINIMAL,
         );
-        let once = c
-            .frame(&app, Layout::default(), DisplayShows::default(), true, true, None)
-            .expect("composite")
-            .to_vec();
+        let once = compose_one(&mut c, &app, None).expect("composite").to_vec();
         assert_eq!(once.len(), (W * H * 4) as usize);
         // Opaque everywhere: an uninitialised readback shows up here first.
         assert!(
@@ -879,8 +1013,7 @@ mod tests {
         );
         // And it is DETERMINISTIC. Garbage is what differs between two frames
         // of the same unchanged app.
-        let twice = c
-            .frame(&app, Layout::default(), DisplayShows::default(), true, true, None)
+        let twice = compose_one(&mut c, &app, None)
             .expect("composite");
         assert_eq!(once, twice, "two frames of an unchanged app differ");
     }
@@ -980,7 +1113,9 @@ mod shot {
             app.set_track_trim(9.5, 196.0);
         }
         let mut shoot = |app: &IvoryApp| {
-            c.frame(app, Layout::default(), DisplayShows::default(), false, true, None)
+            c.frame(app, Layout::default(), DisplayShows::default(), false, true, None, 0)
+                .and_then(|_| c.flush())
+                .map(|_| ())
                 .map(|_| ())
         };
         // The first frame lays out and the second draws what it decided.

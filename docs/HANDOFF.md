@@ -1579,6 +1579,115 @@ wrong: each one looked reasonable against its own row.
 
 ---
 
+## 2s. 2026-08-20 — the potato pass
+
+Five findings from the owner's Linux box (2013 MacBook Air, 2 cores at
+1.8 GHz, HD 4000 with no Vulkan driver), all root-caused there and fixed here.
+The goal in their words: **"potato running like new".**
+
+### The mic fader was connected to nothing
+
+`gains.input` was packaged by the settings, drawn on the fader, written by the
+drag, and read by NOBODY in `ivory/src`. `push_monitor_settings` pushed slots,
+metronome, master, track gain and trim, and stopped.
+
+It goes to the SESSION, not the engine: the engine has no input in it. Applied
+on the writer thread to the input block before the tracker absorbs it, so the
+fader moves the meter and the file together. Slewed per FRAME — stepping a pole
+across an interleaved buffer applies a different gain to the left and right of
+one frame, which swings the image while the fader moves.
+
+### The camera never slept
+
+35.6% of a core, measured, with no take rolling and the pane hidden — on the
+machine that then dropped half the frames of a take. The conversion is the cost
+(a 720p JPEG decode) and it was being paid thirty times a second for a preview
+box a few hundred points wide.
+
+The RATE is now demanded by whoever is looking: a take gets every frame, a
+preview ten a second, a camera with nothing on screen none at all. The dequeue
+still happens either way or the driver backs up.
+
+Two bugs the tests caught rather than review: "converted at time zero" and
+"never converted" were the same value, so a platform whose stamps start near
+zero skipped its own first frames; and a strict minimum spacing is never
+satisfied on the camera's own 33.3 ms grid, so a request for ten a second
+delivered seven and a half. A frame that is nearly due counts as due.
+
+### No GPU driver, so lower the defaults
+
+`wgpu::AdapterInfo.device_type == Cpu`, probed once and logged. 15 fps joins
+`FPS_CHOICES`. The lowering is a DEFAULT and behaves like one: once ever, only
+from the shipped values, never against somebody who has been to the Export
+dialog.
+
+### The readback was the note lag
+
+**Read this before touching `composite.rs`.** The module said the synchronous
+readback "costs a few milliseconds at 1080p" and that hiding it would buy a
+class of bug for no gain. That measurement was taken on a machine with a GPU.
+
+`device.poll(Wait)` does not wait for a copy. It waits for the whole
+submission — and where the adapter is a CPU rasteriser, that is the entire
+rasterisation of the frame, on the UI thread, thirty times a second. Note input
+enters through egui's event handling, which was queued behind it. That is the
+whole of "the take was unusable".
+
+The readback is now one frame behind: submit N, hand back N-1, which has had a
+frame interval to finish. Two buffers, ping-ponged, and **`flush()` at the end
+of the take** — forgetting it truncates every take by one frame, which is
+exactly the class of bug the old comment was avoiding, now named and asserted.
+The `pts` travels WITH its frame rather than being recomputed on the way out.
+`the_pipeline_gives_back_every_frame_once_and_in_order` fails if it does not:
+reintroducing that bug shifts the whole video by one frame with a duplicate at
+the end, which is what it printed when it was checked.
+
+Also: `stride`. A pump that overruns its budget composes every 2nd or 4th tick
+and pads the rest, instead of spending the whole UI budget every pump and
+leaving the window at four frames a second. Input has priority.
+
+**Not done: moving the compositor to a worker thread.** The paint pass needs
+`&IvoryApp`, which is not `Send`; the split would be UI-paints-shapes /
+worker-renders, and the shapes are `Send` so it is possible. It was not needed
+once the wait was gone, and it should be re-measured before it is attempted.
+
+### ALSA cannot see an interface on a PipeWire machine
+
+The picker offered one input called `pipewire`, which follows the desktop's
+default source — so a Scarlett was plugged in and the laptop's own microphone
+was recorded. cpal is not at fault: it walks the real cards and opens
+`plughw:N`, and PipeWire holds every one of them exclusively. Measured:
+`arecord -D plughw:1` says **"Device or resource busy"** for the Scarlett while
+the built-in opens fine, and which of the two is busy depends on what PipeWire
+is routing at that moment.
+
+So the list comes from `pw-dump` and the binding from `PIPEWIRE_NODE`, both
+verified on the box before any code was written. **Not `pipewire-rs`**: it
+links libpipewire and needs its headers at BUILD time, and the Linux artifacts
+are cross-compiled from a Mac — that would have traded a working release
+process for a tidier lookup.
+
+`PIPEWIRE_NODE` must wrap the ENUMERATION, not just the stream build: cpal's
+ALSA host opens each device's PCM handles while listing them and the stream
+reuses the handle that is already open.
+
+### Input monitoring, and the one thing it may never do
+
+Right-click the microphone icon; a record-red dot while it is on. **It is never
+persisted anywhere.** Not a setting cleared on load — that is one migration
+bug, one refactor or one hand-edited file away from coming back on — but
+session state with no path to disk. The owner's requirement: *"if I forget and
+turn my speakers on and relaunch, I get a head full of feedback."*
+`input_monitoring_never_survives_a_relaunch` asserts the absence, including
+that a file made to claim otherwise cannot turn it on.
+
+The capture pushes into a shallow ring of its own (120 ms, not the take's four
+seconds) which the renderer drains EVERY block whether or not anybody is
+listening — so switching on plays now rather than a second of backlog.
+Listen-only by construction: the take comes off a different ring.
+
+---
+
 ## 3. Repo layout
 
 ```
