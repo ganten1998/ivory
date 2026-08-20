@@ -432,6 +432,15 @@ pub struct Settings {
     /// which is otherwise unreachable, since asking cpal for fewer channels
     /// takes them from the front (see `ConfigWish::channels`).
     pub audio_channels_in_picker: bool,
+    /// Whether the video defaults have already been lowered for a machine that
+    /// renders on the CPU.
+    ///
+    /// **A one-shot, not a policy.** The lowering happens once, on the first
+    /// launch that discovers there is no GPU driver, and never again — so a
+    /// user who then asks for 1080p30 anyway keeps it. A default that reapplied
+    /// itself every launch would not be a default, it would be a cap wearing a
+    /// default's clothes.
+    pub video_defaults_lowered: bool,
     /// The VST3 bundle in each instrument slot. `None` is an empty slot.
     ///
     /// Paths and not names: a plugin's display name is not unique, changes
@@ -673,6 +682,7 @@ impl Default for Settings {
             record_sample_rate: 0,
             audio_system: String::new(),
             audio_channels_in_picker: false,
+            video_defaults_lowered: false,
             plugin_slots: [const { None }; crate::recorder::SLOTS],
             plugin_gains: [1.0; crate::recorder::SLOTS],
             reverb_mix: 0.0,
@@ -1213,6 +1223,11 @@ impl Settings {
             "audio_channels_in_picker",
             &mut s.audio_channels_in_picker,
         );
+        take_bool(
+            &mut map,
+            "video_defaults_lowered",
+            &mut s.video_defaults_lowered,
+        );
         if let Some(v) = map.shift_remove("record_count_in_beats") {
             if let Some(n) = v.as_i64() {
                 s.record_count_in_beats = n;
@@ -1723,6 +1738,10 @@ impl Settings {
         map.insert(
             "audio_channels_in_picker".into(),
             Value::Bool(self.audio_channels_in_picker),
+        );
+        map.insert(
+            "video_defaults_lowered".into(),
+            Value::Bool(self.video_defaults_lowered),
         );
         // Written as full-length arrays including the empty slots, so slot 2
         // stays slot 2 when slot 1 is empty. A compacted list would silently

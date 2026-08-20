@@ -106,6 +106,45 @@ fn software_adapter(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
     .ok()
 }
 
+/// Whether this machine renders video on the CPU.
+///
+/// **Probed once, and cached.** Building a `wgpu::Instance` and asking for an
+/// adapter costs milliseconds and enumerates drivers; the answer cannot change
+/// while the process runs.
+///
+/// It matters because the difference is enormous and invisible: on a machine
+/// with no Vulkan driver — a 2012-era integrated GPU, which is exactly the
+/// owner's Linux test box — mesa's lavapipe rasterises every composited frame
+/// on the same two cores that are running the audio callback, the camera decode
+/// and the encoder. A 1080p30 take there delivered 44% of its frames and made
+/// the app unplayable while it did.
+pub fn renders_on_the_cpu() -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .ok()
+        .or_else(|| software_adapter(&instance));
+        // **No adapter at all is not "software".** It means no video, which is
+        // a different problem with its own message; answering `true` here would
+        // quietly halve the defaults on a machine that cannot film either way.
+        adapter.is_some_and(|a| {
+            let info = a.get_info();
+            log::debug!(
+                "video adapter: {} ({:?}, {:?})",
+                info.name,
+                info.device_type,
+                info.backend
+            );
+            info.device_type == wgpu::DeviceType::Cpu
+        })
+    })
+}
+
 impl Compositor {
     /// Build a compositor for a frame of `width` x `height`.
     ///

@@ -1936,6 +1936,19 @@ impl DesktopApp {
                     self.recorder.session.set_plugin_tap(Some(tap));
                 }
                 self.push_monitor_settings();
+                // **Video defaults for a machine with no GPU driver.**
+                //
+                // Asked here rather than at construction because the probe
+                // enumerates drivers, and a launch that never opens the band
+                // never films anything. Once ever, and only from the shipped
+                // defaults — see `lower_video_defaults_for_cpu`.
+                if crate::composite::renders_on_the_cpu()
+                    && self.app.lower_video_defaults_for_cpu()
+                {
+                    log::info!(
+                        "no GPU driver for video: composite defaults lowered to 720p/15"
+                    );
+                }
                 // **The chosen patch, now that there is something to play it.**
                 // The cartridge is read at construction, long before the band
                 // opens a device, so a voice pushed then goes nowhere — and a

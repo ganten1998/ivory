@@ -1460,7 +1460,14 @@ pub const MAX_BPM: f64 = 300.0;
 /// Frame rates offered. Deliberately short: 30 is what a webcam gives, 24 is
 /// what people who want a film look ask for, 60 is what people recording fast
 /// passages ask for, and everything else is a support question.
-pub const FPS_CHOICES: [u32; 3] = [24, 30, 60];
+/// **15 is on this list for machines that render video on the CPU.**
+///
+/// A 2012-era integrated GPU has no Vulkan driver, so mesa's lavapipe
+/// rasterises every composited frame on the same cores running the audio
+/// callback and the encoder. At 1080p30 the owner's Linux box delivered 44% of
+/// its frames and the app was unplayable while it filmed. A 15 fps video of a
+/// good take beats a 30 fps video of an unplayable one.
+pub const FPS_CHOICES: [u32; 4] = [15, 24, 30, 60];
 
 /// Count-in choices, in BARS.
 ///

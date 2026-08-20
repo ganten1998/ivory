@@ -3103,6 +3103,35 @@ impl IvoryApp {
         self.settings.show_camera_pane
     }
 
+    /// Lower the video defaults for a machine with no GPU driver, once ever.
+    ///
+    /// Called by the host, which is the only side that can ask wgpu what it is
+    /// running on. Returns whether anything changed, so the caller can say so.
+    ///
+    /// **Once, and only from the shipped defaults.** A user who has been to the
+    /// Export dialog has already answered this question; overriding them
+    /// because their GPU is slow would be the app arguing. Somebody who wants
+    /// 1080p30 on a potato and is willing to wait is allowed to have it.
+    pub fn lower_video_defaults_for_cpu(&mut self) -> bool {
+        if self.settings.video_defaults_lowered {
+            return false;
+        }
+        self.settings.video_defaults_lowered = true;
+        let spec = &mut self.settings.record_export;
+        let shipped = recorder::ExportSpec::default();
+        let untouched =
+            spec.resolution == shipped.resolution && spec.fps == shipped.fps;
+        if untouched {
+            // 720p, not "match camera": it is the same cut in composited
+            // pixels and it does not depend on a camera being connected, which
+            // a display-only take has no reason to require.
+            spec.resolution = recorder::Resolution::Hd720;
+            spec.fps = 15;
+        }
+        self.save_settings();
+        untouched
+    }
+
     /// Where takes go, resolved.
     pub fn record_root(&self) -> std::path::PathBuf {
         self.settings.record_root()
@@ -6258,6 +6287,43 @@ mod tests {
 
     fn headless(caps: Caps) -> (egui::Context, IvoryApp) {
         headless_with(caps, Settings::default())
+    }
+
+    /// **The video defaults drop once on a machine with no GPU driver, and
+    /// never argue with somebody who has chosen.**
+    ///
+    /// On the owner's Linux box mesa's lavapipe rasterises every composited
+    /// frame on the two cores already running the audio callback, the camera
+    /// decode and the encoder: a 1080p30 take delivered 44% of its frames and
+    /// the app was unplayable while it filmed.
+    #[test]
+    fn the_video_defaults_drop_once_for_a_machine_with_no_gpu() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        assert_eq!(app.settings.record_export.fps, 30, "the shipped default");
+
+        assert!(app.lower_video_defaults_for_cpu(), "nothing was lowered");
+        assert_eq!(app.settings.record_export.fps, 15);
+        assert_eq!(
+            app.settings.record_export.resolution,
+            recorder::Resolution::Hd720
+        );
+
+        // Once ever. A default that reapplied itself every launch is a cap.
+        app.settings.record_export.fps = 60;
+        assert!(!app.lower_video_defaults_for_cpu());
+        assert_eq!(app.settings.record_export.fps, 60, "it argued back");
+
+        // And a user who had already chosen is left alone the FIRST time too:
+        // they answered this question before the app got to ask it.
+        let (_, mut chosen) = headless(Caps::DESKTOP);
+        chosen.settings.record_export.fps = 60;
+        assert!(
+            !chosen.lower_video_defaults_for_cpu(),
+            "it overrode a choice the user had already made"
+        );
+        assert_eq!(chosen.settings.record_export.fps, 60);
+        // The one-shot is still spent, so it cannot come back later.
+        assert!(chosen.settings.video_defaults_lowered);
     }
 
     /// **Setup opens, draws, and its controls send what they say they send.**
