@@ -600,15 +600,33 @@ const ARM_SLOP: f32 = 6.0;
 const MENU_ID: &str = "ivory-menu";
 const SUBMENU_ID: &str = "ivory-menu-sub";
 
-/// The menu, as categories.
+/// The menu, in four compartments.
 ///
-/// It was twenty-six rows deep and almost entirely flat, which is a list to
-/// read rather than a menu to aim at. Everything that belongs together is now
-/// one hover: the top level names the SUBJECT, the hover carries the verbs.
+/// **Everything here is either global or about a surface you can see.** It was
+/// twenty-six rows deep and almost entirely flat, then it was twenty-five
+/// hovers — a list of every subject the app has, whether or not the thing it
+/// configures was on screen. It is now five blocks with a rule each: what is
+/// true everywhere, then the piano's own, the theory band's own, the guitar's
+/// own and the recorder's own, each appearing only while its surface does.
 ///
-/// Two rules shape what follows, and both are the type's, not a preference:
-/// a submenu holds items and not more submenus (`Entry::Submenu`), and a
-/// category with nothing in it must not draw as an empty hover
+/// **What left, and why none of it is a loss.** Note names, the Recorder
+/// block, the take's sources, the time signature, the count-in, the Keyboard
+/// block, Dark Mode, the typeface and the theory toggles are gone from here,
+/// and every one of them is a KEY — U, V, D, F, 1-4, T, K, P, C — listed on
+/// the help card that `keys.rs` draws. The camera pane has been keyboard-only
+/// for releases and nobody has missed it. A row that duplicates a key charges
+/// a hover forever and teaches nothing; the take's own settings, which a row
+/// cannot show the VALUE of, are behind the cog in the band where they can be
+/// read. What survives a key is what opens a dialog you then have to fill in,
+/// because that row is the front door somebody finds the feature through.
+///
+/// **Detach is gone too, and that one is a pivot rather than a tidy-up.** Four
+/// surfaces could be popped into their own window; all four are now in the box
+/// or filling the screen (`Z`). See `MenuAction::DetachChordWindow`.
+///
+/// Two rules still shape what follows, and both are the type's, not a
+/// preference: a submenu holds items and not more submenus (`Entry::Submenu`),
+/// and a category with nothing in it must not draw as an empty hover
 /// (`push_category`). Where those two collide with the tidy grouping, the
 /// comment at the collision says which one won.
 fn build_entries(view: MenuView) -> Vec<Entry> {
@@ -622,9 +640,23 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         action,
         enabled: true,
     };
-    let mut e = Vec::new();
 
-    // ── Window ─────────────────────────────────────────────────────────────
+    // ── Everywhere ─────────────────────────────────────────────────────────
+    // True wherever you right-click, because none of it is about a surface:
+    // which keyboard is playing, how big the window is, what colour it is, and
+    // what the detector does with what you play.
+    let mut everywhere: Vec<Entry> = Vec::new();
+
+    // TOP, and no longer buried in a "Keyboard" hover. It is the first thing a
+    // new user needs and the one row in this menu that the app cannot do
+    // anything useful without; a hover to reach it was a hover charged to
+    // everybody once, on the day they could least afford it.
+    //
+    // A plugin is handed its notes by the host and has no device to choose.
+    if view.caps.midi_ports {
+        everywhere.push(item("Select MIDI Input...", MenuAction::SelectMidiInput));
+    }
+
     // Size was a submenu of its own, and it CANNOT become a child of Window:
     // `Entry::Submenu` holds items, not submenus, and `show` draws exactly one
     // sibling popup — there is no third level, and inventing one would rewrite
@@ -657,39 +689,13 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
             MenuAction::ToggleBorderless,
         ));
     }
-    push_category(&mut e, "Window", window);
+    push_category(&mut everywhere, "Window", window);
 
-    // Dark Mode is deliberately NOT filed under a category, and it is the one
-    // row that isn't.
-    //
-    // It is the most-flipped item in the menu, so a hover to reach it is a toll
-    // paid all day; and it is the row `app.rs`'s plugin test clicks BY LABEL
-    // through `rows_for_test` to prove menu rows are alive at all in an editor,
-    // which only works while it is a top-level item. Moving it into a hover
-    // means updating that test in the same change, or the only end-to-end proof
-    // that the plugin menu works at all goes red.
-    e.push(item(
-        if view.dark_mode {
-            "Light Mode"
-        } else {
-            "Dark Mode"
-        },
-        MenuAction::ToggleDarkMode,
-    ));
-    // Only offered when a second typeface is actually installed, matching how
-    // Detach appears conditionally rather than showing a dead row. One row, so
-    // no category: a "Text" hover holding a single typeface name would cost a
-    // hover and save nothing.
-    if let Some(next) = view.next_font {
-        e.push(item(next, MenuAction::CycleFont));
-    }
-
-    // ── Colors ─────────────────────────────────────────────────────────────
-    // Five flat rows and a separator, now one hover. Spelled the American way
-    // because every label inside it already is ("Set White Key Color...") and a
-    // "Colours" hover full of "Color..." items reads like a bug.
+    // Spelled the American way because every label inside it already is ("Set
+    // White Key Color...") and a "Colours" hover full of "Color..." items reads
+    // like a bug.
     push_category(
-        &mut e,
+        &mut everywhere,
         "Colors",
         vec![
             row(
@@ -718,65 +724,26 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
             ),
         ],
     );
-    e.push(Entry::Separator);
 
-    // ── Keyboard ───────────────────────────────────────────────────────────
-    let mut keyboard = Vec::new();
-    // A plugin is handed its notes by the host and has no device to choose.
-    if view.caps.midi_ports {
-        keyboard.push(row("Select MIDI Input...", MenuAction::SelectMidiInput));
-    }
-    keyboard.push(row(
-        if view.keytoggle {
-            "Disable Keytoggle"
+    // **The detector, and everything that teaches it.** Global rather than the
+    // piano's, because it reads whatever is played and every surface shows the
+    // answer: the strip, the staff, the triangles and the neck all print the
+    // same reading.
+    //
+    // Every row here is also a key — C, N, E, M, L — and they stay anyway. They
+    // are the ones that open a DIALOG you then have to fill in, so the menu row
+    // is where somebody who has not learned the letters finds out the feature
+    // exists at all. That is the line the deletions above were drawn on: a row
+    // that only flips a switch you can flip with one finger is a toll; a row
+    // that is the front door to a feature is not.
+    let mut chords = vec![row(
+        if view.detection_enabled {
+            "Disable Chord Detection"
         } else {
-            "Enable Keytoggle"
+            "Enable Chord Detection"
         },
-        MenuAction::ToggleKeytoggle,
-    ));
-    // Note spelling sits with the keys rather than with the chords. It respells
-    // every name in the app, not just chord names, and the keyboard is where
-    // the user meets it first.
-    keyboard.push(row(
-        if view.prefer_flats {
-            "Use Sharps (A#)"
-        } else {
-            "Use Flats (Bb)"
-        },
-        MenuAction::ToggleNotePreference,
-    ));
-    // The stickers. With the keys because that is what they are printed on,
-    // and worded as what you will get rather than as a state, like every other
-    // row in this menu.
-    keyboard.push(row(
-        if view.key_note_names {
-            "Hide Note Names on the Keys"
-        } else {
-            "Show Note Names on the Keys"
-        },
-        MenuAction::ToggleKeyNoteNames,
-    ));
-    push_category(&mut e, "Keyboard", keyboard);
-
-    // ── Chords ─────────────────────────────────────────────────────────────
-    // The detector, its window, and everything that teaches it — six rows and
-    // three separators' worth of top level, all of it about one subject.
-    let mut chords = Vec::new();
-    if view.detached && view.caps.detachable {
-        chords.push(row("Attach Chord Window", MenuAction::AttachChordWindow));
-    } else {
-        chords.push(row(
-            if view.detection_enabled {
-                "Disable Chord Detection"
-            } else {
-                "Enable Chord Detection"
-            },
-            MenuAction::ToggleChordDetection,
-        ));
-        if view.detection_enabled && view.caps.detachable {
-            chords.push(row("Detach Chord Window", MenuAction::DetachChordWindow));
-        }
-    }
+        MenuAction::ToggleChordDetection,
+    )];
     // D-UI-5: "Teach Chord Name..." is greyed only when no notes are held;
     // "Manage Taught Chords..." is always available.
     chords.push(SubItem {
@@ -808,77 +775,42 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         },
         MenuAction::ToggleChordLearning,
     ));
-    push_category(&mut e, "Chords", chords);
+    push_category(&mut everywhere, "Chords", chords);
 
-    // ── Theory ─────────────────────────────────────────────────────────────
-    // D-UI-17: the theory band. Each row renames itself the way every other
-    // toggle here does, so the hover says what is showing without a checkmark
-    // column.
-    // Each row carries its NUMBER KEY and, when it is showing, where in the
-    // band it sits. The position is the part that would otherwise be invisible:
-    // the same four elements in a different order is a different window, and a
-    // menu that only says on-or-off cannot describe it.
-    let mut theory: Vec<SubItem> = crate::theory_panel::View::ALL
-        .iter()
-        .map(|v| SubItem {
-            label: match view.theory.position(*v) {
-                Some(i) => format!("{}. Hide {}  [{}]", v.number(), v.label(), i + 1),
-                None => format!("{}. Show {}", v.number(), v.label()),
-            },
-            action: MenuAction::ToggleTheoryView(*v),
-            enabled: true,
-        })
-        .collect();
-    if view.theory.count() < crate::theory_panel::View::ALL.len() {
-        theory.push(row("Show Everything (T)", MenuAction::ShowAllTheory));
-    }
-    // Whether the band tracks your playing sits with the diagrams rather than
-    // in the keyboard block, because it is a property of this display and of
-    // nothing else.
-    theory.push(row(
-        if view.theory_follows_midi {
-            "Stop Following MIDI"
-        } else {
-            "Follow MIDI"
-        },
-        MenuAction::ToggleTheoryFollowsMidi,
-    ));
-    // D-UI-17: the third detachable surface. Last in the hover, not second like
-    // the fretboard's, because the diagram toggles above it are what the band
-    // IS — where it lives is the afterthought.
-    if view.caps.detachable {
-        theory.push(row(
-            if view.theory_detached {
-                "Attach Theory"
+    // ── The piano's own ────────────────────────────────────────────────────
+    // One row, and it is here rather than under Chords because it is a BAND:
+    // it takes height from the window, it sits under the keys, and it is the
+    // piano-and-strip window this app was for years.
+    //
+    // "(legacy)" is in the label and is not a warning — the sheet music prints
+    // the chord name itself now, so the strip is off by default and this row is
+    // how somebody who wants the old window gets it back. Nothing to say about
+    // a strip with no detector behind it, so with detection off the row is not
+    // there at all.
+    let mut piano: Vec<Entry> = Vec::new();
+    if view.detection_enabled {
+        piano.push(item(
+            if view.chord_strip {
+                "Disable Chord Strip (legacy)"
             } else {
-                "Detach Theory"
+                "Enable Chord Strip (legacy)"
             },
-            if view.theory_detached {
-                MenuAction::AttachTheory
-            } else {
-                MenuAction::DetachTheory
-            },
+            MenuAction::ToggleChordStrip,
         ));
     }
-    push_category(&mut e, "Theory", theory);
 
-    // ── Sheet music ────────────────────────────────────────────────────────
-    // Its own subject, between Theory and Fretboard, in the order the bands
-    // themselves are stacked — a menu that lists panels in a different order
-    // from the window is a menu you have to translate.
+    // ── The theory band's own ──────────────────────────────────────────────
+    // Clef, Key and Staves used to be filed under "Sheet music" as if they were
+    // the notation's business alone. They are not: `Key` now sets what the
+    // harmonic triangles are drawn AROUND as well as what the staff is spelled
+    // in, which makes it the band's key rather than the staff's, and the three
+    // read as one subject once they are in one block.
+    // Any diagram at all counts, not just the notation: the key sets what the
+    // triangles are drawn around, so a band showing only them still has a key
+    // to choose.
+    let theory_showing = view.staff_on || view.theory.any();
+    let mut theory: Vec<Entry> = Vec::new();
     if view.staff_on {
-        push_category(
-            &mut e,
-            "Sheet music",
-            vec![row(
-                if view.staff_note_names {
-                    "Hide Note Names (U)"
-                } else {
-                    "Show Note Names (U)"
-                },
-                MenuAction::ToggleNoteNames,
-            )],
-        );
         // Every preset, marked, plus whatever custom stack the user built —
         // which is listed and marked like the rest rather than hidden behind
         // the word "custom", because a set you cannot see is one you cannot
@@ -906,14 +838,20 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 enabled: true,
             });
         }
-        push_category(&mut e, "Clef", clefs);
-        // **Every key, on the thing it is printed on.** Fifteen rows is a long
-        // hover and it is the right shape for this: they are one exclusive
-        // choice, they have an order everybody already knows -- flats down,
-        // sharps up, C in the middle -- and the marked one says where you are
-        // in it.
+        push_category(&mut theory, "Clef", clefs);
+    }
+    // **Every key, on the thing it is printed on.** Fifteen rows is a long
+    // hover and it is the right shape for this: they are one exclusive choice,
+    // they have an order everybody already knows -- flats down, sharps up, C in
+    // the middle -- and the marked one says where you are in it.
+    //
+    // Offered whenever ANY theory diagram is up, not just the staff. It sets
+    // the tonic the key-centred diagrams orient around, so a band showing only
+    // the triangles still has a key to choose — and the staff, when it is
+    // there, is spelled in it.
+    if theory_showing {
         push_category(
-            &mut e,
+            &mut theory,
             "Key",
             (-crate::staff::MAX_KEY..=crate::staff::MAX_KEY)
                 .map(|k| SubItem {
@@ -927,12 +865,14 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 })
                 .collect(),
         );
+    }
+    if view.staff_on {
         // **A staff each, for a room with more than one instrument in it.**
         // Ticking a second clef here stacks it under the first and every staff
         // shows every note — so a violist reads alto while the pianist reads
         // the grand staff, off the same chord.
         push_category(
-            &mut e,
+            &mut theory,
             "Staves",
             Clef::ALL
                 .into_iter()
@@ -948,87 +888,51 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 .collect(),
         );
     }
-
-    // ── Chord strip ────────────────────────────────────────────────────────
-    // **A BAND, so it sits with the bands.** It lived inside the Chords
-    // category for one release and nobody could find it: every other band this
-    // app can hide says so at the top level — "Show Fretboard", "Show
-    // Recorder" — and a band whose only way back is the seventh row of a
-    // submenu is a band that is gone. Off by default in 5.0, because the sheet
-    // music prints the chord name itself; turning it on is how somebody gets
-    // the piano-and-strip window this app had for years.
-    //
-    // Nothing to say about a strip with no detector behind it, so with
-    // detection off the row is not there at all — the row above it is the one
-    // that brings both back.
-    if view.detection_enabled && !(view.detached && view.caps.detachable) {
-        push_category(
-            &mut e,
-            "Chord Strip",
-            vec![row(
-                if view.chord_strip {
-                    "Hide Chord Strip"
-                } else {
-                    "Show Chord Strip"
-                },
-                MenuAction::ToggleChordStrip,
-            )],
-        );
-    }
-
-    // ── Fretboard ──────────────────────────────────────────────────────────
-    // D-UI-15: the guitar view. Its own subject, because it is a second
-    // instrument rather than another chord-display option. While it is off the
-    // category collapses to the one row there is to show — a Custom Tuning
-    // item on a hidden fretboard is a control for something you cannot see.
-    let mut fretboard = vec![row(
-        if view.fretboard_on {
-            "Hide Fretboard"
-        } else {
-            "Show Fretboard"
-        },
-        MenuAction::ToggleFretboard,
-    )];
-    if view.fretboard_on {
-        // Mirrors the chord window's Detach/Attach exactly, so there is one
-        // set of habits rather than two.
-        if view.caps.detachable {
-            fretboard.push(row(
-                if view.fretboard_detached {
-                    "Attach Fretboard"
-                } else {
-                    "Detach Fretboard"
-                },
-                if view.fretboard_detached {
-                    MenuAction::AttachFretboard
-                } else {
-                    MenuAction::DetachFretboard
-                },
-            ));
-        }
-        fretboard.push(row(
-            if view.fret_note_names {
-                "Hide Note Names on the Neck"
+    // The one theory row that is not a list of choices and has no key of its
+    // own. It stays because without it there is no way at all to stop the band
+    // chasing the piano — and a diagram that will not hold still is the whole
+    // reason somebody goes looking for this.
+    if theory_showing {
+        theory.push(item(
+            if view.theory_follows_midi {
+                "Stop Following MIDI"
             } else {
-                "Show Note Names on the Neck"
+                "Follow MIDI"
             },
-            MenuAction::ToggleFretNoteNames,
+            MenuAction::ToggleTheoryFollowsMidi,
         ));
-        fretboard.push(row("Custom Tuning...", MenuAction::EditCustomTuning));
     }
-    push_category(&mut e, "Fretboard", fretboard);
+
+    // ── The guitar's own ───────────────────────────────────────────────────
+    // All four appear only while the neck does. `G` is what brings it back —
+    // the same arrangement the camera pane has had for releases, where the
+    // toggle is a key and the settings are on the surface it opens.
+    let mut guitar: Vec<Entry> = Vec::new();
     if view.fretboard_on {
-        // Wood, Tuning and Capo stay TOP-LEVEL hovers, immediately under the
-        // Fretboard row and inside the same separator block so they still read
-        // as its business.
-        //
-        // They are lists of choices — three woods, every shipped tuning, ten
-        // frets — so each is already a submenu, and a submenu cannot hold
-        // another one (see `Entry::Submenu`). The alternatives were both worse
-        // than a sibling: flattening ~20 choices into the Fretboard hover, or
-        // inventing a third menu level for three rows. Siblings it is.
         push_category(
-            &mut e,
+            &mut guitar,
+            "Fretboard",
+            vec![
+                row("Hide Fretboard", MenuAction::ToggleFretboard),
+                row(
+                    if view.fret_note_names {
+                        "Hide Note Names on the Neck"
+                    } else {
+                        "Show Note Names on the Neck"
+                    },
+                    MenuAction::ToggleFretNoteNames,
+                ),
+                row("Custom Tuning...", MenuAction::EditCustomTuning),
+            ],
+        );
+        // Wood, Tuning and Capo are SIBLINGS of the Fretboard row rather than
+        // rows inside it. They are lists of choices — three woods, every
+        // shipped tuning, ten frets — so each is already a submenu, and a
+        // submenu cannot hold another one (see `Entry::Submenu`). The
+        // alternatives were both worse: flattening ~20 choices into the
+        // Fretboard hover, or inventing a third menu level for three rows.
+        push_category(
+            &mut guitar,
             "Wood",
             fretboard_panel::Wood::ALL
                 .iter()
@@ -1044,7 +948,7 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 .collect(),
         );
         push_category(
-            &mut e,
+            &mut guitar,
             "Tuning",
             fretboard::TUNINGS
                 .iter()
@@ -1063,7 +967,7 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 .collect(),
         );
         push_category(
-            &mut e,
+            &mut guitar,
             "Capo",
             (0..=CAPO_MAX)
                 .map(|f| {
@@ -1086,215 +990,42 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         );
     }
 
-    // ── Recorder ───────────────────────────────────────────────────────────
-    // §5. LAST of the subjects, after the whole display block, and the position
-    // is the argument rather than an accident.
+    // ── The band's own ─────────────────────────────────────────────────────
+    // **The only thing left of the Recorder block, and the only one that could
+    // not go.** Show/hide is `V`; the take's name, folder, count-in, time
+    // signature, sources, export and now the audio system are behind the cog,
+    // where a setting can show its VALUE instead of being a row that only
+    // hints at one.
     //
-    // Window, Keyboard, Chords, Theory and Fretboard are all answers to "what
-    // is on screen" — asked and re-asked all day, which is why they are near
-    // the top. The recorder is a MODE the user enters: it opens a camera,
-    // claims 200 points of the window and ends in files on disk. You go to it
-    // deliberately, once, and then you are in it; putting it among the display
-    // toggles would make it one more thing to scan past every time somebody
-    // wants dark mode. The plan's own control-order thinking is the same shape:
-    // the things you touch constantly come first, and the things you set up
-    // once come after.
-    //
-    // It also physically cannot go between Fretboard and Wood/Tuning/Capo,
-    // which are siblings that have to stay adjacent to the row they belong to.
-    //
-    // The whole category is gated on `caps.capture_devices` rather than row by
-    // row: a plugin has no business opening a camera behind the DAW's back, and
-    // a Minimal build has not linked the code to. Absent, not
-    // offered-and-greyed — an inert row is worse than a missing one, because
-    // the user cannot tell it from a bug.
-    if view.caps.capture_devices {
-        // Renames itself rather than carrying a checkmark, per the chrome rule
-        // at the top of this file. (Wood/Tuning/Capo use a `•` marker instead,
-        // and that is not an exception to it: those are lists of CHOICES, where
-        // the question is which one, not whether.)
-        let mut recorder = vec![row(
-            if view.recorder_on {
-                // "Hide" closes the detached window rather than orphaning it,
-                // exactly as "Hide Fretboard" does. The app does the closing;
-                // what matters here is that both states are one action, so
-                // there is never a hidden band with a live window beside it.
-                "Hide Recorder"
-            } else {
-                "Show Recorder"
-            },
-            MenuAction::ToggleRecorder,
-        )];
-        if view.recorder_on {
-            // Detach needs `caps.detachable` ON TOP of `capture_devices`: a
-            // host may be able to open a camera and still have no second window
-            // to put the framing view in. Same gate the fretboard and theory
-            // detach rows use, so there is one set of habits rather than four.
-            if view.caps.detachable {
-                recorder.push(row(
-                    if view.recorder_detached {
-                        "Attach Recorder"
-                    } else {
-                        "Detach Recorder"
-                    },
-                    if view.recorder_detached {
-                        MenuAction::AttachRecorder
-                    } else {
-                        MenuAction::DetachRecorder
-                    },
-                ));
-            }
-            // No instrument rows here. They live in the band — three visible
-            // slots, each with its own volume and its own button to open that
-            // plugin's window — because that is where they are usable and
-            // because a right-click submenu is where the owner could not find
-            // them. The band is also the only place they COULD live: the
-            // monitor engine's life is tied to the band being open, so there is
-            // no state in which a menu row could load an instrument and the
-            // band could not show it.
-            recorder.push(row(
-                if view.metronome_on {
-                    "Stop the Click"
-                } else {
-                    "Start the Click"
-                },
-                MenuAction::ToggleMetronome,
+    // "My plugin is not in the list" is the single most common thing that goes
+    // wrong with a plugin host, it has no key and it cannot have one — the
+    // answer is a rescan, another folder, or starting over — so it stays a
+    // menu, and it stays with the band whose slots it fills.
+    let mut band: Vec<Entry> = Vec::new();
+    if view.caps.capture_devices && view.recorder_on {
+        let mut plugins = vec![
+            row("Rescan for Plugins", MenuAction::RescanPlugins),
+            row("Add a Folder...", MenuAction::AddPluginFolder),
+        ];
+        if view.extra_plugin_folders > 0 {
+            plugins.push(row(
+                &format!(
+                    "Forget {} Added Folder{}",
+                    view.extra_plugin_folders,
+                    if view.extra_plugin_folders == 1 { "" } else { "s" }
+                ),
+                MenuAction::ClearPluginFolders,
             ));
-            // **And that is the whole category.** Everything else that used to
-            // be here — where takes go, the camera, the audio input, the
-            // count-in, the export, the four ticks — is in the take-settings
-            // popup behind the cog in the band. They are boxes with captions
-            // and VALUES: a folder path you want to read, a device that may
-            // say "(not connected)", a tick whose current state is the whole
-            // question. A menu row can show none of that, and having them in
-            // two places meant two wordings for one setting.
-            //
-            // What stays is what is about the BAND rather than about a take:
-            // whether it is on screen, whether it is in this window, and the
-            // click — which is a thing you start and stop while playing, so it
-            // wants to be reachable without opening a panel.
         }
-        push_category(&mut e, "Recorder", recorder);
-        if view.recorder_on {
-            // What a take is made of. A sibling hover for the same reason the
-            // count-in is one: it is a list of choices.
-            //
-            // It exists at all because its absence was a bug people hit: with
-            // no control, the stored default decided, and the default recorded
-            // the microphone and left the instrument you could plainly hear out
-            // of the file.
-            //
-            // "Sources" and not "Record": this sits directly under "Recorder",
-            // and two rows reading "Recorder" and "Record" are one glance apart
-            // from being the same word.
-            push_category(
-                &mut e,
-                "Sources",
-                [
-                    ("auto", "Everything there is"),
-                    ("plugin", "Instruments only"),
-                    ("input", "Audio input only"),
-                    ("both", "Instruments + input"),
-                ]
-                .into_iter()
-                .map(|(key, label)| SubItem {
-                    label: if key == view.record_sources {
-                        format!("{label}  \u{2022}")
-                    } else {
-                        label.to_owned()
-                    },
-                    action: MenuAction::SetRecordSources(key),
-                    enabled: true,
-                })
-                .collect(),
-            );
-            // **Where the instruments come from.** Its own category because
-            // "my plugin is not in the list" is the single most common thing
-            // that goes wrong with a plugin host, and the answer to it has to
-            // be somewhere you can find without being told: look again, look
-            // somewhere else as well, or start over.
-            let mut plugins = vec![
-                row("Rescan for Plugins", MenuAction::RescanPlugins),
-                row("Add a Folder...", MenuAction::AddPluginFolder),
-            ];
-            if view.extra_plugin_folders > 0 {
-                plugins.push(row(
-                    &format!(
-                        "Forget {} Added Folder{}",
-                        view.extra_plugin_folders,
-                        if view.extra_plugin_folders == 1 { "" } else { "s" }
-                    ),
-                    MenuAction::ClearPluginFolders,
-                ));
-            }
-            push_category(&mut e, "Plugin folders", plugins);
-            // The signature the click, the count-in and the `.mid` all share.
-            // A sibling hover for the same reason the count-in is one.
-            push_category(
-                &mut e,
-                "Time signature",
-                crate::recorder::TIME_SIGNATURES
-                    .into_iter()
-                    .map(|sig| SubItem {
-                        label: if sig == view.time_signature {
-                            format!("{}  \u{2022}", sig.label())
-                        } else {
-                            sig.label()
-                        },
-                        action: MenuAction::SetTimeSignature(sig),
-                        enabled: true,
-                    })
-                    .collect(),
-            );
-            // A SIBLING hover, for exactly the reason Wood/Tuning/Capo are:
-            // the count-in is a list of choices, so it is already a submenu, and a
-            // submenu cannot hold another one (see `Entry::Submenu`). Offered
-            // only while the band is showing — a countdown length for a
-            // recorder you cannot see is a control with no visible effect.
-            push_category(
-                &mut e,
-                "Count-in",
-                crate::recorder::COUNT_IN_CHOICES
-                    .into_iter()
-                    .map(|bars| {
-                        // Bars, with the beat count in brackets — the signature
-                        // decides it now, so "2 bars" alone leaves you doing
-                        // the multiplication and "12 beats" alone leaves you
-                        // doing the division.
-                        let label = if bars == 0 {
-                            "No count-in".to_owned()
-                        } else {
-                            let beats = view.time_signature.beats_in(bars);
-                            let word = if bars == 1 { "bar" } else { "bars" };
-                            format!(
-                                "{bars} {word}  ({beats} beats of {})",
-                                view.time_signature.label()
-                            )
-                        };
-                        SubItem {
-                            // Marked rather than hidden, like Tuning and Capo: a
-                            // submenu that never says what is selected makes you
-                            // close it again to find out.
-                            label: if bars == view.count_in_bars {
-                                format!("{label}  \u{2022}")
-                            } else {
-                                label
-                            },
-                            action: MenuAction::SetCountIn(bars),
-                            enabled: true,
-                        }
-                    })
-                    .collect(),
-            );
-        }
+        push_category(&mut band, "Plugin folders", plugins);
     }
 
     // ── The rows that are not a category ───────────────────────────────────
     // Three one-shot actions and the supporter pair. None of them groups with
     // anything: burying "About" under a "Help" hover would be a hover invented
     // to hold one row.
-    e.push(Entry::Separator);
-    e.push(item(
+    let mut tail: Vec<Entry> = Vec::new();
+    tail.push(item(
         if view.supporter {
             "Supporter Key..."
         } else {
@@ -1306,7 +1037,7 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         // Stays beside the supporter row rather than under Colors: it is a
         // visibility toggle for a decoration, not a colour, and it only exists
         // for the person the row above it is addressed to.
-        e.push(item(
+        tail.push(item(
             if view.heart_on {
                 "Hide Heart"
             } else {
@@ -1315,9 +1046,28 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
             MenuAction::ToggleHeart,
         ));
     }
-    e.push(Entry::Separator);
-    e.push(item("About", MenuAction::ShowAbout));
-    e.push(item("Reset Settings to Default", MenuAction::ResetSettings));
+    tail.push(Entry::Separator);
+    tail.push(item("About", MenuAction::ShowAbout));
+    tail.push(item("Reset Settings to Default", MenuAction::ResetSettings));
+
+    // **The compartments, joined.** A separator between blocks and never two in
+    // a row, never one at the top and never one at the bottom — which is the
+    // whole reason this is a join over a list of blocks rather than a `push`
+    // wherever a separator looked right. Three of the four blocks can be empty
+    // (no neck, no diagrams, no band), and every empty one used to leave its
+    // separator behind: a menu whose gaps move around as bands open and close
+    // reads as a rendering bug.
+    let mut e: Vec<Entry> = Vec::new();
+    for block in [everywhere, piano, theory, guitar, band, tail] {
+        if block.is_empty() {
+            continue;
+        }
+        if !e.is_empty() {
+            e.push(Entry::Separator);
+        }
+        e.extend(block);
+    }
+
     if view.recorder_first {
         move_recorder_to_the_front(&mut e);
     }
@@ -1378,13 +1128,11 @@ fn move_staff_to_the_front(e: &mut Vec<Entry>) {
 }
 
 fn move_recorder_to_the_front(e: &mut Vec<Entry>) {
-    const OURS: [&str; 5] = [
-        "Recorder",
-        "Sources",
-        "Plugin folders",
-        "Time signature",
-        "Count-in",
-    ];
+    // **One name, where there were five.** Recorder, Sources, Time signature
+    // and Count-in all left the menu — show/hide is `V` and the rest are behind
+    // the cog — so the band's business up here is the one category that could
+    // not become either: where its instruments are found.
+    const OURS: [&str; 1] = ["Plugin folders"];
     let mut moved: Vec<Entry> = Vec::new();
     // Kept in the order OURS lists, which is the order they already appear in —
     // so this is a move, not a re-sort, and adding a fifth category to the
@@ -2043,36 +1791,40 @@ mod tests {
             .collect()
     }
 
-    /// The chord strip says how to get it back, where the other bands do.
+
+    /// The chord strip says how to get it back, at the top level.
     ///
     /// **The regression this exists for**: it shipped inside the Chords
-    /// submenu, seventh of seven rows, and the owner could not find it. Every
-    /// other band this app can hide offers its way back at the TOP level.
+    /// submenu, seventh of seven rows, and the owner could not find it. It now
+    /// has a compartment to itself — the piano's — and the label carries
+    /// "(legacy)": the sheet music prints the chord name itself, so the strip
+    /// is off by default and this row exists for somebody who wants back the
+    /// piano-and-strip window this app was for years.
     #[test]
-    fn the_chord_strip_is_a_top_level_row_beside_the_other_bands() {
+    fn the_chord_strip_is_the_pianos_own_row_and_says_it_is_legacy() {
         let mut v = view();
         v.chord_strip = false;
-        let labels: Vec<String> = rows(v.clone()).into_iter().map(|(l, ..)| l).collect();
-        let at = |want: &str| {
-            labels
-                .iter()
-                .position(|l| l == want)
-                .unwrap_or_else(|| panic!("no top-level {want:?} in {labels:?}"))
-        };
-        // Beside the other two, and above them: the strip is the band a first
-        // launch does NOT have, so it is the one somebody comes looking for.
-        assert!(at("Show Chord Strip") < at("Show Fretboard"));
-        assert!(at("Show Fretboard") < at("Show Recorder"));
+        assert_eq!(
+            find(v.clone(), MenuAction::ToggleChordStrip),
+            Some(("Enable Chord Strip (legacy)".to_owned(), true))
+        );
+        // TOP level, not inside a hover: `rows` is the top level only.
+        assert!(rows(v.clone())
+            .iter()
+            .any(|(_, a, _)| *a == MenuAction::ToggleChordStrip));
 
         // It says the other thing when it is up.
         v.chord_strip = true;
-        assert!(rows(v.clone()).iter().any(|(l, ..)| l == "Hide Chord Strip"));
+        assert_eq!(
+            find(v.clone(), MenuAction::ToggleChordStrip),
+            Some(("Disable Chord Strip (legacy)".to_owned(), true))
+        );
 
-        // And it is gone with no detector behind it, since the row above it
-        // brings back the strip and the detector together.
+        // And it is gone with no detector behind it, since the row that brings
+        // the detector back brings the strip with it.
         v.detection_enabled = false;
         assert!(
-            !rows(v).iter().any(|(l, ..)| l.contains("Chord Strip")),
+            !all_rows(v).iter().any(|(l, ..)| l.contains("Chord Strip")),
             "a strip offered with detection off"
         );
     }
@@ -2207,58 +1959,121 @@ mod tests {
         assert_eq!(subs[0].1[7], "Borderless");
     }
 
-    /// Dark Mode is the one row that is deliberately NOT in a category.
+
+    /// **No row does what a key already does.**
     ///
-    /// `app.rs`'s plugin test finds it by label through `rows_for_test` and
-    /// clicks it to prove menu rows are alive at all in an editor — and
-    /// `rows_for_test` returns top-level items only. Filing it under a hover
-    /// breaks that test in another file, which is the sort of failure nobody
-    /// reads the second time. It is also the most-flipped row in the menu, so
-    /// the hover would be a toll paid all day.
+    /// This is the whole rule the tidy-up was made of, and it is the one that
+    /// rots: every one of these was a perfectly reasonable row to add, and
+    /// twenty-six reasonable additions is the menu nobody could read. If a
+    /// binding is deleted from `keys.rs`, the feature it carried has to come
+    /// back here — which is why this asserts the BINDING exists too, rather
+    /// than just that the row is gone.
     #[test]
-    fn dark_mode_stays_a_top_level_row_because_another_file_clicks_it_by_label() {
-        for caps in [Caps::DESKTOP, Caps::PLUGIN] {
-            let v = MenuView {
-                caps,
-                next_font: Some("Terminess"),
-                ..view()
-            };
+    fn no_menu_row_does_what_a_key_already_does() {
+        use crate::keys::KeyAction;
+        let gone = [
+            (MenuAction::ToggleDarkMode, KeyAction::ToggleDarkMode),
+            (MenuAction::CycleFont, KeyAction::CycleFont),
+            (MenuAction::ToggleKeytoggle, KeyAction::ToggleKeytoggle),
+            (MenuAction::ToggleNotePreference, KeyAction::ToggleNotePreference),
+            (MenuAction::ToggleNoteNames, KeyAction::ToggleNoteNames),
+            (MenuAction::ToggleRecorder, KeyAction::ToggleRecorder),
+            (MenuAction::ShowAllTheory, KeyAction::CycleTheory),
+            (
+                MenuAction::ToggleTheoryView(crate::theory_panel::View::Circle),
+                KeyAction::ToggleTheoryElement(1),
+            ),
+        ];
+        for (row, key) in gone {
+            assert_eq!(
+                find(fullest(), row.clone()),
+                None,
+                "{row:?} is back in the menu, and a key already does it"
+            );
             assert!(
-                rows(v)
-                    .iter()
-                    .any(|(l, a, _)| l == "Dark Mode" && *a == MenuAction::ToggleDarkMode),
-                "no top-level Dark Mode row under {caps:?}"
+                crate::keys::binding_for_test(key),
+                "{row:?} left the menu and its key went with it"
+            );
+        }
+        // The rows a key CANNOT replace stay: each opens a dialog you then
+        // have to fill in, so the row is the front door people find it through.
+        for kept in [
+            MenuAction::SelectMidiInput,
+            MenuAction::TeachChordName,
+            MenuAction::ManageTaughtChords,
+            MenuAction::PickColor(ColorTarget::WhiteIdle),
+            MenuAction::RescanPlugins,
+        ] {
+            assert!(
+                find(fullest(), kept.clone()).is_some(),
+                "{kept:?} has no key and left the menu anyway"
             );
         }
     }
 
-    /// D-UI-15: the guitar view renames itself like every other toggle here,
-    /// and its choice lists exist only while it is on. A Tuning row on a
-    /// hidden fretboard is a control for something you cannot see.
+    /// The four blocks that can be empty must take their separators with them.
+    ///
+    /// A menu whose gaps move around as bands open and close reads as a
+    /// rendering bug, and the shapes that produce it — a leading separator, a
+    /// trailing one, two in a row — are exactly what a `push` at each block
+    /// boundary would have left behind.
+    #[test]
+    fn no_menu_ever_shows_a_stray_separator() {
+        let both = |v: MenuView| {
+            let e = build_entries(v);
+            assert!(
+                !matches!(e.first(), Some(Entry::Separator)),
+                "a separator leads the menu"
+            );
+            assert!(
+                !matches!(e.last(), Some(Entry::Separator)),
+                "a separator ends the menu"
+            );
+            for w in e.windows(2) {
+                assert!(
+                    !(matches!(w[0], Entry::Separator) && matches!(w[1], Entry::Separator)),
+                    "two separators in a row"
+                );
+            }
+        };
+        both(fullest());
+        both(view());
+        // Every block empty that can be: no neck, no diagrams, no band, and
+        // no detector to hang the strip on.
+        both(MenuView {
+            fretboard_on: false,
+            recorder_on: false,
+            staff_on: false,
+            theory: crate::theory_panel::Views::of(Vec::new()),
+            detection_enabled: false,
+            ..view()
+        });
+        for caps in [Caps::DESKTOP, Caps::PLUGIN, Caps::MINIMAL] {
+            both(MenuView { caps, ..fullest() });
+        }
+    }
+
+
+    /// D-UI-15: the guitar's four categories appear with the neck and not
+    /// before, and that now includes the row that hides it. `G` is what brings
+    /// the view back — the arrangement the camera pane has had for releases.
+    ///
+    /// A Tuning row on a hidden fretboard is a control for something you cannot
+    /// see; so, it turns out, is "Show Fretboard" in a menu that is otherwise
+    /// only about what is on screen.
     #[test]
     fn the_fretboard_toggle_brings_its_submenus_with_it() {
         let mut v = view();
         assert_eq!(
             find(v.clone(), MenuAction::ToggleFretboard),
-            Some(("Show Fretboard".to_owned(), true))
+            None,
+            "the guitar block showed up without a guitar"
         );
-        // With the view off there is exactly one thing to say about it, so the
-        // Fretboard category is that row rather than a hover onto one item.
         assert_eq!(
             category_names(v.clone()),
-            vec![
-                "Window",
-                "Colors",
-                "Keyboard",
-                "Chords",
-                "Theory",
-                "Clef",
-                "Key",
-                "Staves"
-            ],
+            vec!["Window", "Colors", "Chords", "Clef", "Key", "Staves"],
             "no fretboard hovers while the fretboard is off"
         );
-        assert!(rows(v.clone()).iter().any(|(l, ..)| l == "Show Fretboard"));
 
         v.fretboard_on = true;
         assert_eq!(
@@ -2272,18 +2087,8 @@ mod tests {
         assert_eq!(
             category_names(v.clone()),
             vec![
-                "Window",
-                "Colors",
-                "Keyboard",
-                "Chords",
-                "Theory",
-                "Clef",
-                "Key",
-                "Staves",
-                "Fretboard",
-                "Wood",
-                "Tuning",
-                "Capo"
+                "Window", "Colors", "Chords", "Clef", "Key", "Staves", "Fretboard", "Wood",
+                "Tuning", "Capo"
             ]
         );
         let wood = sub(v.clone(), "Wood");
@@ -2294,19 +2099,6 @@ mod tests {
         );
         assert!(wood.1[0].ends_with('\u{2022}'));
         assert_eq!(wood.2[0], MenuAction::SetWood("rosewood"));
-        // Detach mirrors the chord window's toggle, renaming itself.
-        assert_eq!(
-            find(v.clone(), MenuAction::DetachFretboard).map(|(l, _)| l),
-            Some("Detach Fretboard".to_owned())
-        );
-        let d = MenuView {
-            fretboard_detached: true,
-            ..v.clone()
-        };
-        assert_eq!(
-            find(d, MenuAction::AttachFretboard).map(|(l, _)| l),
-            Some("Attach Fretboard".to_owned())
-        );
         // Every shipped tuning is offered, and the live one is marked rather
         // than hidden: a submenu that never says what is selected makes you
         // close it again to find out.
@@ -2442,64 +2234,72 @@ mod tests {
                 .filter(|e| !matches!(e, Entry::Separator))
                 .count()
         };
-        // Was 16, then 18. The recorder costs FOUR, and each is structural
-        // rather than sprawl: one subject (Recorder) plus three choice-list
-        // siblings — Sources, Time signature and Count-in — which is the exact
-        // shape the fretboard already has and the only shape `Entry::Submenu`
-        // allows, since a submenu cannot hold another one. The sheet music
-        // costs the same two the fretboard does: the subject and the list of
-        // clefs. Plugin folders is the one place a plugin host has to be able
-        // to say "look again", and it is a sibling of Sources for that reason.
+        // Was 16, then 18, then 27 once the recorder had brought its four
+        // categories with it. It is 18 with EVERYTHING on — every band, a
+        // supporter's heart and the guitar's three choice lists — because the
+        // compartments are gated on the surface being there.
+        //
         // Raise this only for a reason that can be written down in the same
-        // breath.
+        // breath. Nine rows left in one release and none of them was missed;
+        // the next nine will be added one reasonable row at a time.
         assert!(
-            count(fullest()) <= 27,
+            count(fullest()) <= 18,
             "the fullest menu is back to {} top-level rows",
             count(fullest())
         );
-        // The everyday menu gains the two the sheet music costs, and it is
-        // the band the app now opens with.
+        // The everyday menu: a piano, the notation and no guitar.
         assert!(
-            count(view()) <= 16,
+            count(view()) <= 12,
             "the everyday menu is {} top-level rows",
             count(view())
         );
     }
 
-    /// D-UI-17: the theory band is the third detachable surface and its row
-    /// renames itself like the other two. It is absent where there is no window
-    /// to put it in, which is the same rule the other two follow.
+
+    /// **Nothing detaches any more, anywhere.**
+    ///
+    /// Four surfaces could be popped into a window of their own, and between
+    /// them they were the source of most of what felt janky: a band that could
+    /// be on screen and in another window at once, a window that outlived the
+    /// band it showed, and a fullscreen main window with children stacked
+    /// behind it. The app is now either filling the screen (`Z`) or in the box.
+    ///
+    /// Asserted over `fullest()` and every `Caps`, because each pair used to be
+    /// gated differently and a row that comes back under one host only is a row
+    /// nobody would find until a user did.
     #[test]
-    fn the_theory_detach_row_renames_itself_and_is_absent_without_a_window() {
-        assert_eq!(
-            find(view(), MenuAction::DetachTheory).map(|(l, _)| l),
-            Some("Detach Theory".to_owned())
-        );
-        let d = MenuView {
-            theory_detached: true,
-            ..view()
-        };
-        assert_eq!(
-            find(d.clone(), MenuAction::AttachTheory).map(|(l, _)| l),
-            Some("Attach Theory".to_owned())
-        );
-        assert_eq!(
-            find(d, MenuAction::DetachTheory),
-            None,
-            "one row with two names, never both at once"
-        );
-        let p = MenuView {
-            caps: Caps::PLUGIN,
-            ..view()
-        };
-        assert_eq!(find(p.clone(), MenuAction::DetachTheory), None);
-        assert_eq!(
-            sub(p, "Theory").1.len(),
-            // Every element, "Show Everything" while any are off, and Follow
-            // MIDI. Nothing that needs a window.
-            crate::theory_panel::View::ALL.len() + 2,
-            "the elements, Show Everything and Follow MIDI, and nothing else"
-        );
+    fn nothing_can_be_detached_any_more() {
+        let detach = [
+            MenuAction::DetachChordWindow,
+            MenuAction::AttachChordWindow,
+            MenuAction::DetachFretboard,
+            MenuAction::AttachFretboard,
+            MenuAction::DetachTheory,
+            MenuAction::AttachTheory,
+            MenuAction::DetachRecorder,
+            MenuAction::AttachRecorder,
+        ];
+        // Detached in the settings as well as attached: the rows renamed
+        // themselves, so half of them only ever appeared in one of the states.
+        for detached in [false, true] {
+            for caps in [Caps::DESKTOP, Caps::PLUGIN, Caps::MINIMAL] {
+                let v = MenuView {
+                    caps,
+                    detached,
+                    fretboard_detached: detached,
+                    theory_detached: detached,
+                    recorder_detached: detached,
+                    ..fullest()
+                };
+                for a in &detach {
+                    assert_eq!(
+                        find(v.clone(), a.clone()),
+                        None,
+                        "{a:?} survived at caps={caps:?} detached={detached}"
+                    );
+                }
+            }
+        }
     }
 
     /// The custom-tuning editor is a fretboard control, so it appears with the
@@ -2546,13 +2346,21 @@ mod tests {
         let mut v = view();
         v.fretboard_on = true;
         v.detection_enabled = true;
+        // The band too: its one surviving category is gated on it, and a
+        // "nothing went away" test that leaves a surface off cannot see what
+        // went away with it.
+        v.recorder_on = true;
         let with = all_rows(v.clone());
+        // The detach pairs used to head this list. They are gone on purpose
+        // now — see `nothing_can_be_detached_any_more`, which is the assertion
+        // that replaced them and asserts the opposite deliberately, so that
+        // this test cannot quietly become the reason they come back.
         for want in [
             MenuAction::ToggleBorderless,
             MenuAction::SelectMidiInput,
-            MenuAction::DetachChordWindow,
-            MenuAction::DetachFretboard,
-            MenuAction::DetachTheory,
+            MenuAction::ToggleChordStrip,
+            MenuAction::SetStaffKey(0),
+            MenuAction::RescanPlugins,
         ] {
             assert!(
                 with.iter().any(|(_, a, _)| *a == want),
@@ -2661,8 +2469,6 @@ mod tests {
         // can still teach a chord, change tuning and pick a colour.
         let kept = all_rows(v.clone());
         for want in [
-            MenuAction::ToggleDarkMode,
-            MenuAction::ToggleKeytoggle,
             MenuAction::TeachChordName,
             MenuAction::ManageTaughtChords,
             MenuAction::ToggleFretboard,
@@ -2679,97 +2485,76 @@ mod tests {
         assert_eq!(
             category_names(v.clone()),
             vec![
-                "Window",
-                "Colors",
-                "Keyboard",
-                "Chords",
-                "Theory",
-                "Clef",
-                "Key",
-                "Staves",
-                "Fretboard",
-                "Wood",
-                "Tuning",
-                "Capo"
+                "Window", "Colors", "Chords", "Clef", "Key", "Staves", "Fretboard", "Wood",
+                "Tuning", "Capo"
             ]
         );
     }
 
-    /// Each theory row renames itself the way every other toggle in this menu
-    /// does, and all three are independent — the request was explicitly to be
-    /// able to show more than one at once, so turning one on must not turn
-    /// another off.
-    #[test]
-    fn the_theory_rows_rename_themselves_and_stay_independent() {
-        use crate::theory_panel::{View, Views};
-        let mut v = view();
-        assert_eq!(
-            sub(v.clone(), "Theory").1,
-            vec![
-                "1. Show Circle of Fifths",
-                "2. Show Tonnetz",
-                "3. Show Harmonic Triangles",
-                "4. Show Sheet Music",
-                "Show Everything (T)",
-                "Follow MIDI",
-                // Where the band LIVES comes last: the toggles above it are
-                // what the band is.
-                "Detach Theory",
-            ]
-        );
-        let mut want: Vec<MenuAction> = View::ALL
-            .iter()
-            .map(|x| MenuAction::ToggleTheoryView(*x))
-            .collect();
-        want.push(MenuAction::ShowAllTheory);
-        want.push(MenuAction::ToggleTheoryFollowsMidi);
-        want.push(MenuAction::DetachTheory);
-        assert_eq!(sub(v.clone(), "Theory").2, want);
 
-        // The follow row renames itself like every other toggle here, and it
-        // is OFF by default: the band is something to look at while playing,
-        // and one that redrew on every note could not be read while playing.
-        assert!(!view().theory_follows_midi);
-        let following = MenuView {
-            theory_follows_midi: true,
-            // Everything showing, so "Show Everything" is absent and the
-            // follow row sits directly after the elements. Indexing past a row
-            // that comes and goes is how this assertion would start checking
-            // the wrong string without failing.
-            theory: Views::all(),
+    /// **The theory compartment is Clef, Key, Staves and one row.**
+    ///
+    /// Which diagrams are up is `1`-`4` and `T`; what they are drawn in is
+    /// here. The split is the point: the toggles are things you flip while
+    /// looking at the band, and the key is something you set once for a piece.
+    #[test]
+    fn the_theory_compartment_is_the_key_and_the_notation() {
+        use crate::theory_panel::{View, Views};
+        let v = view();
+        let names = category_names(v.clone());
+        let at = |want: &str| names.iter().position(|n| n == want);
+        assert!(at("Clef") < at("Key") && at("Key") < at("Staves"));
+        // The follow row is the one theory toggle with no key of its own, so it
+        // is the one that had to stay.
+        assert_eq!(
+            find(v.clone(), MenuAction::ToggleTheoryFollowsMidi).map(|(l, _)| l),
+            Some("Follow MIDI".to_owned())
+        );
+        assert_eq!(
+            find(
+                MenuView {
+                    theory_follows_midi: true,
+                    ..v.clone()
+                },
+                MenuAction::ToggleTheoryFollowsMidi
+            )
+            .map(|(l, _)| l),
+            Some("Stop Following MIDI".to_owned())
+        );
+
+        // **The key belongs to the BAND, not to the staff.** It sets what the
+        // harmonic triangles are drawn around as well as how the notation is
+        // spelled, so a band showing only the triangles still offers it — and
+        // a window with no theory at all offers none of the three.
+        let triangles_only = MenuView {
+            staff_on: false,
+            theory: Views::of(vec![View::Triangles]),
             ..view()
         };
-        assert_eq!(
-            sub(following, "Theory").1[View::ALL.len()],
-            "Stop Following MIDI"
-        );
+        assert!(category_names(triangles_only.clone())
+            .iter()
+            .any(|n| n == "Key"));
+        assert!(!category_names(triangles_only.clone())
+            .iter()
+            .any(|n| n == "Clef" || n == "Staves"));
+        assert!(find(triangles_only, MenuAction::ToggleTheoryFollowsMidi).is_some());
 
-        // **The rows say the number, the state AND the position.** An order
-        // is the thing flags could never express, and it is the thing the
-        // number keys edit: circle is showing first, triangles second, and the
-        // Tonnetz is not in the band at all.
-        v.theory = Views::of(vec![View::Circle, View::Triangles]);
-        assert_eq!(
-            sub(v.clone(), "Theory").1[..4],
-            [
-                "1. Hide Circle of Fifths  [1]",
-                "2. Show Tonnetz",
-                "3. Hide Harmonic Triangles  [2]",
-                "4. Show Sheet Music"
-            ],
-            "the rows do not each follow their own element"
-        );
-        // And the same two elements the other way round say so.
-        v.theory = Views::of(vec![View::Triangles, View::Circle]);
-        assert_eq!(
-            sub(v.clone(), "Theory").1[..3],
-            [
-                "1. Hide Circle of Fifths  [2]",
-                "2. Show Tonnetz",
-                "3. Hide Harmonic Triangles  [1]"
-            ],
-            "reordering the band did not reach the menu"
-        );
+        let nothing = MenuView {
+            staff_on: false,
+            theory: Views::of(Vec::new()),
+            ..view()
+        };
+        for gone in [
+            MenuAction::SetStaffKey(2),
+            MenuAction::ToggleTheoryFollowsMidi,
+            MenuAction::SetStaffSet("grand"),
+        ] {
+            assert_eq!(
+                find(nothing.clone(), gone.clone()),
+                None,
+                "{gone:?} offered with no theory on screen"
+            );
+        }
     }
 
     /// The learning block sits with the teach block, after it, and the menu
@@ -2848,11 +2633,14 @@ mod tests {
         assert_eq!(open, Some(0), "a deliberate hover must still work");
     }
 
-    /// **Right-clicking the band puts the Recorder first.**
+
+    /// **Right-clicking the band leads with the band's own category.**
     ///
-    /// The band is a surface with fifteen controls on it, and reaching the
-    /// sixteenth meant a right-click anywhere at all followed by a hunt down a
-    /// list of subjects that are mostly about the piano.
+    /// One category, where there were five: show/hide is `V`, and the take's
+    /// name, folder, sources, count-in, signature and audio system are behind
+    /// the cog, where a setting can show its value. What is left up here is
+    /// where the instruments are found — the one recorder question with no
+    /// answer on the surface itself.
     #[test]
     fn a_right_click_on_the_band_leads_with_the_recorder() {
         let v = MenuView {
@@ -2860,22 +2648,16 @@ mod tests {
             recorder_first: true,
             ..view()
         };
-        let names = category_names(v.clone());
         assert_eq!(
-            &names[..5],
-            &[
-                "Recorder",
-                "Sources",
-                "Plugin folders",
-                "Time signature",
-                "Count-in"
-            ],
-            "the recorder block does not lead: {names:?}"
+            category_names(v.clone()).first().map(String::as_str),
+            Some("Plugin folders"),
+            "the band's category does not lead: {:?}",
+            category_names(v.clone())
         );
 
         // **And nothing is lost.** It reorders; it does not filter. A context
         // menu showing only what is under the pointer would be a second menu to
-        // learn, and dark mode would start depending on where you clicked.
+        // learn, and the colours would start depending on where you clicked.
         let elsewhere = MenuView {
             recorder_on: true,
             recorder_first: false,
@@ -2983,104 +2765,6 @@ mod tests {
         assert_eq!(open, None, "a plain row should have closed it");
     }
 
-    #[test]
-    fn the_recorder_row_renames_itself_and_brings_its_controls_with_it() {
-        let mut v = view();
-        assert_eq!(
-            find(v.clone(), MenuAction::ToggleRecorder),
-            Some(("Show Recorder".to_owned(), true))
-        );
-        // Off, the category IS that one row — the same collapse the fretboard
-        // gets, and for the same reason: there is one thing to say.
-        assert!(!category_names(v.clone()).iter().any(|n| n == "Recorder"));
-        assert!(rows(v.clone()).iter().any(|(l, ..)| l == "Show Recorder"));
-        for absent in [
-            MenuAction::ShowExportDialog,
-            MenuAction::ToggleHideElapsed,
-            MenuAction::DetachRecorder,
-        ] {
-            assert_eq!(
-                find(v.clone(), absent.clone()),
-                None,
-                "{absent:?} is a control for a band the user cannot see"
-            );
-        }
-        assert!(!category_names(v.clone()).iter().any(|n| n == "Count-in"));
-
-        v.recorder_on = true;
-        assert_eq!(
-            find(v.clone(), MenuAction::ToggleRecorder),
-            Some(("Hide Recorder".to_owned(), true)),
-            "the label is the state readout; there are no checkmarks here"
-        );
-        // Detach mirrors the other three detachable surfaces, renaming itself.
-        assert_eq!(
-            find(v.clone(), MenuAction::DetachRecorder).map(|(l, _)| l),
-            Some("Detach Recorder".to_owned())
-        );
-        let d = MenuView {
-            recorder_detached: true,
-            ..v.clone()
-        };
-        assert_eq!(
-            find(d.clone(), MenuAction::AttachRecorder).map(|(l, _)| l),
-            Some("Attach Recorder".to_owned())
-        );
-        assert_eq!(
-            find(d, MenuAction::DetachRecorder),
-            None,
-            "one row with two names, never both at once"
-        );
-        assert_eq!(
-            sub(v.clone(), "Recorder").1,
-            vec![
-                "Hide Recorder",
-                "Detach Recorder",
-                "Start the Click",
-                            ]
-        );
-        // **And nothing else.** The take's settings are in the popup behind
-        // the cog now, so none of them may be here as well: one setting with
-        // two homes is one setting with two wordings.
-        for gone in [
-            MenuAction::ToggleHideElapsed,
-            MenuAction::ChooseFolder,
-            MenuAction::PickCamera,
-            MenuAction::PickAudio,
-            MenuAction::ShowExportDialog,
-            MenuAction::ToggleOpenWhenDone,
-            MenuAction::ToggleCountInInTake,
-        ] {
-            let name = format!("{gone:?}");
-            assert_eq!(find(v.clone(), gone), None, "{name} is still in the menu");
-        }
-        // Recorder is LAST of the subjects, after the whole display block, and
-        // Pre-roll is its sibling for the reason Wood/Tuning/Capo are the
-        // fretboard's. Asserted as the whole list, in order: an inserted
-        // category that shifts these is exactly what this catches.
-        assert_eq!(
-            category_names(fullest()),
-            vec![
-                "Window",
-                "Colors",
-                "Keyboard",
-                "Chords",
-                "Theory",
-                "Clef",
-                "Key",
-                "Staves",
-                "Fretboard",
-                "Wood",
-                "Tuning",
-                "Capo",
-                "Recorder",
-                "Sources",
-                "Plugin folders",
-                "Time signature",
-                "Count-in",
-            ]
-        );
-    }
 
     /// The subject is absent, not greyed, where no device may be opened. A
     /// plugin must not reach for a camera behind the DAW's back, and a Minimal
@@ -3120,105 +2804,5 @@ mod tests {
         }
     }
 
-    /// Capturing and opening a second window are separate permissions, and a
-    /// host can hold one without the other. The recorder must still be fully
-    /// usable there — only the row that needs a window goes.
-    ///
-    /// A configuration nobody ships today, which is why it is worth a test: the
-    /// gate is `capture_devices && detachable`, and writing it as one `if` is
-    /// the mistake that would take the whole band away from such a host.
-    #[test]
-    fn only_the_detach_row_goes_when_a_capturing_host_has_no_second_window() {
-        let v = MenuView {
-            caps: Caps {
-                detachable: false,
-                child_windows: false,
-                ..Caps::DESKTOP
-            },
-            recorder_on: true,
-            ..view()
-        };
-        assert_eq!(find(v.clone(), MenuAction::DetachRecorder), None);
-        assert_eq!(find(v.clone(), MenuAction::AttachRecorder), None);
-        assert_eq!(
-            sub(v.clone(), "Recorder").1,
-            vec![
-                "Hide Recorder",
-                "Start the Click",
-            ],
-            "everything that does not need a window stays"
-        );
-        assert!(category_names(v).iter().any(|n| n == "Count-in"));
-    }
 
-    /// The count-in hover says what it is set to rather than making you close
-    /// it again to find out — and says it exactly once. Two marks is a menu
-    /// that has lost track of its own state; none is a menu that never had it.
-    #[test]
-    fn the_count_in_hover_marks_exactly_one_choice() {
-        for &want in &crate::recorder::COUNT_IN_CHOICES {
-            let v = MenuView {
-                recorder_on: true,
-                count_in_bars: want,
-                ..view()
-            };
-            let (labels, actions) = {
-                let s = sub(v.clone(), "Count-in");
-                (s.1, s.2)
-            };
-            assert_eq!(labels.len(), crate::recorder::COUNT_IN_CHOICES.len());
-            let marked: Vec<&String> =
-                labels.iter().filter(|l| l.ends_with('\u{2022}')).collect();
-            assert_eq!(marked.len(), 1, "{want} bars marked {marked:?}");
-            // Bars, with the beat count in brackets — the signature decides
-            // it, so "2 bars" alone leaves the reader multiplying and
-            // "12 beats" alone leaves them dividing.
-            let expect = match want {
-                0 => "No count-in".to_owned(),
-                1 => "1 bar".to_owned(),
-                n => format!("{n} bars"),
-            };
-            assert!(marked[0].starts_with(&expect), "{marked:?} is not {expect}");
-            assert_eq!(
-                actions,
-                crate::recorder::COUNT_IN_CHOICES
-                    .map(MenuAction::SetCountIn)
-                    .to_vec()
-            );
-        }
-        // The wording the plan asks for, in order.
-        let v = MenuView {
-            recorder_on: true,
-            ..view()
-        };
-        assert_eq!(
-            sub(v.clone(), "Count-in").1,
-            vec![
-                "No count-in",
-                "1 bar  (4 beats of 4/4)  \u{2022}",
-                "2 bars  (8 beats of 4/4)",
-                "4 bars  (16 beats of 4/4)",
-            ]
-        );
-
-        // **And the same list in 6/8 counts twelve, not eight.** This is the
-        // whole reason the count-in is bars: no number of beats is the right
-        // answer at every signature, and the old label said "of 4" because
-        // there was nothing else it could say.
-        let six_eight = MenuView {
-            recorder_on: true,
-            time_signature: crate::recorder::TimeSignature { beats: 6, unit: 8 },
-            count_in_bars: 2,
-            ..view()
-        };
-        assert_eq!(
-            sub(six_eight, "Count-in").1,
-            vec![
-                "No count-in",
-                "1 bar  (6 beats of 6/8)",
-                "2 bars  (12 beats of 6/8)  \u{2022}",
-                "4 bars  (24 beats of 6/8)",
-            ]
-        );
-    }
 }

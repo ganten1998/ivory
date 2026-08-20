@@ -359,6 +359,85 @@ pub struct InputDeviceInfo {
     pub is_default: bool,
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// The audio system
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Which audio system every stream in this process opens through.
+///
+/// **Process-global, and it has to be.** A host is not a handle you can keep:
+/// `cpal::Host` is not `Sync`, so it cannot live in a struct shared with the
+/// audio thread, and building one is a lookup rather than a resource — which
+/// is why this stores the *name* and rebuilds on demand instead. The
+/// alternative was threading a `&Host` through `input_devices`, `resolve`,
+/// `open_input`, the output stream and every caller of those, to express one
+/// thing that is genuinely one per process: which driver stack the machine is
+/// talking to.
+///
+/// Empty means the platform default, which is what every build before this one
+/// did unconditionally.
+static SYSTEM: Mutex<Option<String>> = Mutex::new(None);
+
+/// Every audio system this build can open, in cpal's own order.
+///
+/// **Usually one, and that is not a bug in this function.** cpal compiles in
+/// exactly one host per platform unless a feature asks for more: CoreAudio on
+/// macOS, ALSA on Linux (which is what PipeWire and PulseAudio both present
+/// themselves as), WASAPI on Windows. JACK and ASIO are cargo features that
+/// each need a development library present at BUILD time — libjack, and the
+/// ASIO SDK plus clang — so turning either on is a change to what the release
+/// scripts can produce on a machine without them, not a change here.
+///
+/// Listed anyway, from the real enumeration, so the control says what the
+/// build actually has rather than what it was hoped to have.
+pub fn systems() -> Vec<String> {
+    cpal::available_hosts()
+        .into_iter()
+        .map(|id| id.name().to_owned())
+        .collect()
+}
+
+/// Choose the audio system by name. An unknown or empty name means the default.
+///
+/// Takes effect on the next stream OPEN, not immediately: the caller closes and
+/// reopens, which is the same contract the buffer-size control already has.
+pub fn set_system(name: Option<&str>) {
+    let mut slot = match SYSTEM.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned);
+}
+
+/// The chosen system's name, or `None` for the platform default.
+pub fn system() -> Option<String> {
+    match SYSTEM.lock() {
+        Ok(g) => g.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// The host every device lookup in this module goes through.
+///
+/// Falls back to the default host when the saved name names a system this
+/// build does not have — which is what a settings file written on a machine
+/// with JACK, opened on one without it, looks like. Silently, because the
+/// alternative is refusing to open any audio at all over a preference.
+pub fn host() -> cpal::Host {
+    let want = system();
+    let Some(want) = want else {
+        return cpal::default_host();
+    };
+    cpal::available_hosts()
+        .into_iter()
+        .find(|id| id.name() == want)
+        .and_then(|id| cpal::host_from_id(id).ok())
+        .unwrap_or_else(cpal::default_host)
+}
+
 /// Which device to open.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum InputSelection {
@@ -444,8 +523,27 @@ pub struct ConfigWish {
     /// from the device's first input, so asking an 18-in interface for 2
     /// channels records inputs 1 and 2 and silently ignores a piano plugged into
     /// 3 and 4.
+    ///
+    /// Which is what [`pick_channel`](Self::pick_channel) is for, and why the
+    /// two must not be used together.
     pub channels: Option<u16>,
     pub buffer_frames: Option<u32>,
+    /// Keep ONE of the device's inputs, counted from 0, and present it as mono.
+    ///
+    /// **The answer to the paragraph above.** The piano plugged into input 3 of
+    /// an 18-in interface cannot be reached by asking for fewer channels — that
+    /// takes them from the front. So the device is opened with everything it
+    /// has, exactly as it would be otherwise, and the one channel is taken at
+    /// the point where the callback's interleaved buffer enters the app
+    /// ([`CaptureSource::accept`]). Everything downstream — the ring, the
+    /// marks, the meter, the WAV's channel count — then sees a mono stream and
+    /// needs to know nothing about it.
+    ///
+    /// Out of range for the device that actually opens is ignored rather than
+    /// refused: an interface can come back from a hub with fewer inputs than it
+    /// had, and a saved "channel 12" should cost you the channel, not the
+    /// session.
+    pub pick_channel: Option<u16>,
 }
 
 /// Fidelity ranking of the sample formats this module can convert to `f32`.
@@ -720,7 +818,32 @@ pub fn capture_channel(
     mark_slots: usize,
     stats: Arc<CaptureStats>,
 ) -> (CaptureSource, CaptureSink) {
-    assert!(channels > 0, "a capture channel needs at least one channel");
+    capture_channel_from(channels, None, ring_frames, mark_slots, stats)
+}
+
+/// As [`capture_channel`], but keeping only one of the device's inputs.
+///
+/// `device_channels` is what the callback will deliver per frame;
+/// `pick` is the one to keep, counted from 0. With `pick` set the ring, the
+/// sink and everything downstream are MONO — that is the whole point, and it is
+/// why the ring is sized from the output count and not the device's.
+///
+/// An out-of-range `pick` is dropped rather than refused, so a saved channel
+/// that no longer exists costs the channel and not the session. See
+/// [`ConfigWish::pick_channel`].
+pub fn capture_channel_from(
+    device_channels: usize,
+    pick: Option<u16>,
+    ring_frames: usize,
+    mark_slots: usize,
+    stats: Arc<CaptureStats>,
+) -> (CaptureSource, CaptureSink) {
+    assert!(
+        device_channels > 0,
+        "a capture channel needs at least one channel"
+    );
+    let pick = pick.map(usize::from).filter(|k| *k < device_channels);
+    let channels = if pick.is_some() { 1 } else { device_channels };
     let (sample_tx, sample_rx) = RingBuffer::<f32>::new(ring_frames.max(1) * channels);
     let (mark_tx, mark_rx) = RingBuffer::<TimingMark>::new(mark_slots.max(1));
     let source = CaptureSource {
@@ -728,6 +851,8 @@ pub fn capture_channel(
         marks: mark_tx,
         stats: Arc::clone(&stats),
         channels,
+        device_channels,
+        pick,
         frames: 0,
         stamp_epoch: None,
         scratch: vec![0.0; CHUNK_FRAMES * channels],
@@ -752,7 +877,14 @@ pub struct CaptureSource {
     samples: Producer<f32>,
     marks: Producer<TimingMark>,
     stats: Arc<CaptureStats>,
+    /// Channels going OUT, into the ring. One when a channel is picked.
     channels: usize,
+    /// Channels coming IN, from the callback. The two differ only when a
+    /// channel is picked, and confusing them swaps the interleaving for the
+    /// rest of the take — which is rule 1 of `accept`, one level down.
+    device_channels: usize,
+    /// Which input to keep, already range-checked against `device_channels`.
+    pick: Option<usize>,
     frames: u64,
     stamp_epoch: Option<Nanos>,
     scratch: Vec<f32>,
@@ -786,10 +918,12 @@ impl CaptureSource {
     {
         self.stats.callbacks.fetch_add(1, Ordering::Relaxed);
 
+        // IN and OUT, which are the same number unless a channel is picked.
+        let ch_in = self.device_channels;
         let ch = self.channels;
         // A trailing partial frame is a malformed buffer, not audio. Truncating
         // is the only option that keeps the interleaving honest.
-        let frames_in = data.len() / ch;
+        let frames_in = data.len() / ch_in;
         let first_frame = self.frames;
         self.frames += frames_in as u64;
         self.stats
@@ -812,10 +946,25 @@ impl CaptureSource {
         while pushed < frames_in {
             let want = chunk_frames.min(frames_in - pushed);
             let n = want * ch;
-            let src = &data[pushed * ch..pushed * ch + n];
             let dst = &mut self.scratch[..n];
-            for (d, s) in dst.iter_mut().zip(src) {
-                *d = f32::from_sample(*s);
+            match self.pick {
+                // Everything, in order: the straight-through case, and the only
+                // one where `ch_in == ch` so a flat zip over the slice is right.
+                None => {
+                    let src = &data[pushed * ch_in..pushed * ch_in + want * ch_in];
+                    for (d, s) in dst.iter_mut().zip(src) {
+                        *d = f32::from_sample(*s);
+                    }
+                }
+                // One input of many, strided. `dst` is one sample per frame
+                // here, so the index into `data` is a frame number times the
+                // DEVICE's channel count — the one place where using `ch` would
+                // compile, run, and quietly read the wrong input.
+                Some(k) => {
+                    for (i, d) in dst.iter_mut().enumerate() {
+                        *d = f32::from_sample(data[(pushed + i) * ch_in + k]);
+                    }
+                }
             }
             // Rule 1: round the room down to whole frames before asking.
             let room = self.samples.slots() / ch;
@@ -1338,7 +1487,7 @@ impl LevelTracker {
 /// appear without a restart, and cpal has no change notification to hang a cache
 /// invalidation on.
 pub fn input_devices() -> Result<Vec<InputDeviceInfo>, AudioError> {
-    let host = cpal::default_host();
+    let host = host();
     let devices = host
         .input_devices()
         .map_err(|e| AudioError::Enumeration(e.to_string()))?;
@@ -1371,8 +1520,38 @@ pub fn input_devices() -> Result<Vec<InputDeviceInfo>, AudioError> {
         .collect())
 }
 
+/// The rates a device will open at, from the menu of rates worth offering.
+///
+/// **Filtered against the device rather than listed from a constant**, because
+/// a control offering 192 kHz to an interface that stops at 48 is a control
+/// that produces a "could not open" every time somebody tries the biggest
+/// number. cpal reports ranges, so a rate counts as offered when any range
+/// contains it — which is also how [`pick_input_config`] decides, and the two
+/// disagreeing is how a rate gets offered and then silently not used.
+///
+/// Empty when the device cannot be reached at all; the caller shows the
+/// device's own default in that case and changes nothing.
+pub fn input_rates(selection: &InputSelection) -> Vec<u32> {
+    const OFFERED: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+    let Ok(device) = resolve(selection) else {
+        return Vec::new();
+    };
+    let Ok(ranges) = device.supported_input_configs() else {
+        return Vec::new();
+    };
+    let ranges: Vec<_> = ranges.collect();
+    OFFERED
+        .into_iter()
+        .filter(|r| {
+            ranges
+                .iter()
+                .any(|c| c.min_sample_rate().0 <= *r && *r <= c.max_sample_rate().0)
+        })
+        .collect()
+}
+
 fn resolve(selection: &InputSelection) -> Result<cpal::Device, AudioError> {
-    let host = cpal::default_host();
+    let host = host();
     match selection {
         InputSelection::Default => host.default_input_device().ok_or(AudioError::NoDefaultInput),
         InputSelection::Key(key) => {
@@ -1500,7 +1679,13 @@ pub fn open_input(
     let mark_slots = (ring_frames / 64).clamp(64, 8192);
 
     let stats = Arc::new(CaptureStats::new());
-    let (source, sink) = capture_channel(channels, ring_frames, mark_slots, Arc::clone(&stats));
+    let (source, sink) = capture_channel_from(
+        channels,
+        wish.pick_channel,
+        ring_frames,
+        mark_slots,
+        Arc::clone(&stats),
+    );
     let fault = Arc::new(Mutex::new(None));
 
     let stream = build_typed_stream(
@@ -1517,7 +1702,12 @@ pub fn open_input(
         stream,
         config: OpenConfig {
             device: device_name,
-            channels: chosen.channels(),
+            // **What comes out, not what the device offers.** One channel
+            // picked out of eighteen is a mono stream, and this number is what
+            // the WAV declares and what the meter divides by — so reporting the
+            // device's count here would write an 18-channel header over mono
+            // samples and read every take as one-eighteenth of a second long.
+            channels: sink.channels() as u16,
             sample_rate: rate,
             sample_format: chosen.sample_format(),
             buffer_size,
@@ -1806,6 +1996,81 @@ mod tests {
         }
         assert_eq!(got, out.len() / 2);
         assert_eq!(got, 10, "the ring's whole depth, and not one sample more");
+    }
+
+    /// **One input of eight, and the right one.**
+    ///
+    /// The test that has to exist for `pick_channel`, because every way of
+    /// getting it wrong is SILENT: a stride computed from the output count
+    /// instead of the device's reads a walking mixture of the lanes, an
+    /// off-by-one reads the neighbouring input, and both produce a take full of
+    /// plausible audio that is not what was plugged in. `frames` encodes the
+    /// lane in the tenths, so a wrong lane is visible rather than suspected.
+    #[test]
+    fn a_picked_channel_is_the_one_that_reaches_the_ring() {
+        for ch in 0..8u16 {
+            let (mut src, mut sink) = capture_channel_from(8, Some(ch), 64, 64, stats());
+            assert_eq!(sink.channels(), 1, "a picked channel is a mono stream");
+            src.accept(&frames(8, 16, 0), Some(0), 0);
+
+            let mut out = Vec::new();
+            let got = sink.drain_samples(&mut out);
+            // Frames, not samples. Sixteen either way here, which is the point:
+            // reading the device's 128 samples as 8-channel frames would give
+            // 16 and as 1-channel frames would give 128.
+            assert_eq!(got, 16, "channel {ch} delivered {got} frames");
+            assert_eq!(out.len(), 16, "one sample per frame, not one per lane");
+            for (frame, sample) in out.iter().enumerate() {
+                assert_eq!(
+                    *sample,
+                    frame as f32 + f32::from(ch) / 10.0,
+                    "frame {frame} of channel {ch} came from another lane"
+                );
+            }
+        }
+    }
+
+    /// The frame accounting is the DEVICE's, whatever is kept from it.
+    ///
+    /// Counting the mono samples as frames would report eight times the audio
+    /// the device produced, and every ratio built on it — the drop rate, the
+    /// rate fit, the take's length — would be wrong by the channel count.
+    #[test]
+    fn picking_a_channel_does_not_change_what_the_device_is_said_to_have_sent() {
+        let stats = stats();
+        let (mut src, _sink) = capture_channel_from(8, Some(3), 64, 64, Arc::clone(&stats));
+        src.accept(&frames(8, 16, 0), Some(0), 0);
+        assert_eq!(stats.frames_captured(), 16, "the device produced 16 frames");
+    }
+
+    /// A channel that is not there costs the channel, not the session.
+    ///
+    /// An interface can come back from a hub with fewer inputs than it had, and
+    /// the saved choice then names one that does not exist. Refusing to open
+    /// would leave somebody with no microphone and a message about a number.
+    #[test]
+    fn a_channel_the_device_does_not_have_falls_back_to_all_of_them() {
+        let (mut src, mut sink) = capture_channel_from(2, Some(9), 64, 64, stats());
+        assert_eq!(sink.channels(), 2, "the whole device, not one lane of it");
+        src.accept(&frames(2, 4, 0), Some(0), 0);
+        let mut out = Vec::new();
+        assert_eq!(sink.drain_samples(&mut out), 4);
+        assert_eq!(out.len(), 8);
+    }
+
+    /// Asking for no channel is the path every build before this one took, and
+    /// it must be byte-for-byte what it was.
+    #[test]
+    fn no_pick_is_the_straight_through_path() {
+        let (mut src, mut sink) = capture_channel_from(2, None, 64, 64, stats());
+        assert_eq!(sink.channels(), 2);
+        src.accept(&frames(2, 8, 0), Some(0), 0);
+        let mut out = Vec::new();
+        sink.drain_samples(&mut out);
+        for (frame, pair) in out.chunks_exact(2).enumerate() {
+            assert_eq!(pair[0], frame as f32);
+            assert_eq!(pair[1], frame as f32 + 0.1);
+        }
     }
 
     #[test]

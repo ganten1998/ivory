@@ -411,6 +411,27 @@ pub struct Settings {
     /// round-trip figure made of a 64-frame input and a 1024-frame output is a
     /// number nobody can act on.
     pub record_buffer_frames: i64,
+    /// Sample rate for both streams, or 0 for the device's own.
+    ///
+    /// Both, for the reason above and one more: the writer drains the
+    /// instrument's ring at the INPUT's rate while the engine fills it at the
+    /// OUTPUT's, so two devices that disagree make a take that drifts — which
+    /// the Setup panel warns about and, before this existed, gave no way to fix.
+    pub record_sample_rate: i64,
+    /// Which audio system every stream opens through. Empty is the platform's.
+    ///
+    /// Stored by NAME rather than by index: cpal's host list is per-build, and
+    /// an index would silently mean a different driver stack on a build with
+    /// one more of them compiled in.
+    pub audio_system: String,
+    /// List a multichannel interface's inputs individually in the mic selector.
+    ///
+    /// Off by default, because for the two-channel devices most people have it
+    /// would double the list and say nothing. On, an 18-in interface offers its
+    /// eighteen inputs and the piano plugged into 3 can be recorded from 3 —
+    /// which is otherwise unreachable, since asking cpal for fewer channels
+    /// takes them from the front (see `ConfigWish::channels`).
+    pub audio_channels_in_picker: bool,
     /// The VST3 bundle in each instrument slot. `None` is an empty slot.
     ///
     /// Paths and not names: a plugin's display name is not unique, changes
@@ -649,6 +670,9 @@ impl Default for Settings {
             record_time_signature: "4/4".to_owned(),
             record_count_in_in_take: false,
             record_buffer_frames: 0,
+            record_sample_rate: 0,
+            audio_system: String::new(),
+            audio_channels_in_picker: false,
             plugin_slots: [const { None }; crate::recorder::SLOTS],
             plugin_gains: [1.0; crate::recorder::SLOTS],
             reverb_mix: 0.0,
@@ -1176,6 +1200,19 @@ impl Settings {
                 s.record_buffer_frames = n;
             }
         }
+        if let Some(v) = map.shift_remove("record_sample_rate") {
+            if let Some(n) = v.as_i64() {
+                s.record_sample_rate = n;
+            }
+        }
+        if let Some(Value::String(t)) = map.shift_remove("audio_system") {
+            s.audio_system = t;
+        }
+        take_bool(
+            &mut map,
+            "audio_channels_in_picker",
+            &mut s.audio_channels_in_picker,
+        );
         if let Some(v) = map.shift_remove("record_count_in_beats") {
             if let Some(n) = v.as_i64() {
                 s.record_count_in_beats = n;
@@ -1675,6 +1712,18 @@ impl Settings {
             "record_buffer_frames".into(),
             Value::Number(self.record_buffer_frames.into()),
         );
+        map.insert(
+            "record_sample_rate".into(),
+            Value::Number(self.record_sample_rate.into()),
+        );
+        map.insert(
+            "audio_system".into(),
+            Value::String(self.audio_system.clone()),
+        );
+        map.insert(
+            "audio_channels_in_picker".into(),
+            Value::Bool(self.audio_channels_in_picker),
+        );
         // Written as full-length arrays including the empty slots, so slot 2
         // stays slot 2 when slot 1 is empty. A compacted list would silently
         // promote an instrument into a slot the user did not put it in.
@@ -1960,6 +2009,29 @@ impl Settings {
         crate::recorder::BUFFER_CHOICES
             .into_iter()
             .min_by_key(|c| c.abs_diff(want))
+    }
+
+    /// Sample rate for both streams, or `None` for the device's own.
+    ///
+    /// Sanitised at the point of use like the buffer size, and by the same
+    /// rule: a file naming a rate this build does not offer keeps it in the
+    /// file and runs at the device's own, rather than being silently rewritten
+    /// to something the user did not choose.
+    pub fn sample_rate(&self) -> Option<u32> {
+        let want = self.record_sample_rate;
+        if want <= 0 {
+            return None;
+        }
+        let want = want.clamp(0, i64::from(u32::MAX)) as u32;
+        crate::recorder::SAMPLE_RATE_CHOICES
+            .into_iter()
+            .find(|c| *c == want)
+    }
+
+    /// The audio system, or `None` for the platform's own.
+    pub fn audio_system(&self) -> Option<&str> {
+        let name = self.audio_system.trim();
+        (!name.is_empty()).then_some(name)
     }
 
     /// The take's time signature, sanitised at the point of use.
@@ -2411,6 +2483,41 @@ mod tests {
                 "{bad:?} should fall back rather than reach the solver"
             );
         }
+    }
+
+    /// **The audio path survives the file, and is sanitised on the way out.**
+    ///
+    /// The three Setup keys, together, because they are read in the same breath
+    /// by the host: a rate this build does not offer, a system that is not
+    /// compiled in, or a channel toggle that failed to persist each produce the
+    /// same symptom — Setup opens showing something other than what is running.
+    #[test]
+    fn the_audio_path_settings_round_trip() {
+        let mut s = Settings::default();
+        s.record_sample_rate = 96_000;
+        s.audio_system = "JACK".to_owned();
+        s.audio_channels_in_picker = true;
+        let back = Settings::from_json(&s.to_json());
+        assert_eq!(back.sample_rate(), Some(96_000));
+        assert_eq!(back.audio_system(), Some("JACK"));
+        assert!(back.audio_channels_in_picker);
+
+        // **Sanitised at the point of use, not on the way in.** A file naming a
+        // rate this build does not offer keeps it — a later build may — and
+        // runs at the device's own in the meantime, which is the same bargain
+        // the buffer size, the tuning and the capo already make.
+        let mut odd = Settings::default();
+        odd.record_sample_rate = 37_000;
+        let back = Settings::from_json(&odd.to_json());
+        assert_eq!(back.record_sample_rate, 37_000, "the file was rewritten");
+        assert_eq!(back.sample_rate(), None, "37 kHz was offered to a device");
+
+        // Zero and empty are "the device's own" and "the platform's own", which
+        // is what every build before Setup did unconditionally.
+        let d = Settings::default();
+        assert_eq!(d.sample_rate(), None);
+        assert_eq!(d.audio_system(), None);
+        assert!(!d.audio_channels_in_picker);
     }
 
     /// Selecting a preset does not discard the custom tuning, so switching away

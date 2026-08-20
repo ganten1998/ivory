@@ -68,6 +68,30 @@ pub trait CaptureDevices: Send {
     fn current_name(&self) -> Option<String>;
 }
 
+/// What the audio system itself can be asked, for the Setup panel.
+///
+/// A third port beside [`MidiPorts`] and [`CaptureDevices`], and not a method
+/// on either: a system is not a device, and the two questions here are asked
+/// once when a panel opens rather than every frame — which is the whole reason
+/// they are not on [`crate::recorder::AudioStatus`], the struct the host
+/// pushes sixty times a second. `rates` in particular re-enumerates hardware.
+pub trait AudioSetup: Send {
+    /// Every audio system this build can open, in the backend's own order.
+    ///
+    /// Usually one. cpal compiles in exactly one host per platform unless a
+    /// cargo feature asks for more, and both of the extras — JACK and ASIO —
+    /// need a development library present when the release is BUILT. Listed
+    /// from the real enumeration anyway, so the panel says what this build has.
+    fn systems(&self) -> Vec<String>;
+
+    /// The rates the input device now selected will actually open at.
+    ///
+    /// Empty when nothing is selected or the device cannot be reached, and the
+    /// panel then offers only "the device's own" — which is what every build
+    /// before this one did unconditionally.
+    fn rates(&self) -> Vec<u32>;
+}
+
 /// A folder the app has asked the host to choose.
 ///
 /// The **request pattern**, not a blocking call. `rfd`'s native panel runs a

@@ -24,6 +24,7 @@
 //! is `Send` because it is data.
 
 use ivory_ui::ports::{CaptureDevices, DeviceInfo};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// What the picker chose and what the reconciler managed to do about it.
@@ -95,6 +96,55 @@ impl AudioInputs {
     }
 }
 
+/// The separator between a device's key and one of its inputs, inside a uid.
+///
+/// **ASCII 31, UNIT SEPARATOR, and the choice is the point.** The uid is
+/// documented as opaque and is never shown, so its grammar is this module's to
+/// define — but it is also stored in `settings.json` and round-tripped, so it
+/// has to survive a device whose own name contains anything a device name can
+/// contain. `#` was already taken and escaped by `DeviceKey`; `|`, `:` and `@`
+/// all appear in real interface names. A C0 control character appears in none,
+/// serialises as `\u001f`, and is invisible in the file.
+const CHANNEL_SEP: char = '\u{1f}';
+
+/// Split a uid into the device's key and the input picked out of it, if any.
+///
+/// A malformed channel — anything that is not a number — is treated as no
+/// channel rather than as an error, and the DEVICE still opens. A settings file
+/// somebody edited by hand should cost the channel, not the microphone.
+fn split_channel(uid: &str) -> (&str, Option<u16>) {
+    match uid.split_once(CHANNEL_SEP) {
+        Some((key, ch)) => (key, ch.parse().ok()),
+        None => (uid, None),
+    }
+}
+
+/// The uid for one input of a device.
+fn channel_uid(key: &str, channel: u16) -> String {
+    format!("{key}{CHANNEL_SEP}{channel}")
+}
+
+/// Whether the picker lists a multichannel interface's inputs one by one.
+///
+/// Process-global for the same reason the audio system is: `CaptureDevices` is
+/// a trait the UI holds by the settings' word, `list()` takes no arguments, and
+/// threading a preference through it would put a settings type in `ports.rs` —
+/// which is the one thing the firewall exists to prevent.
+static REVEAL_CHANNELS: AtomicBool = AtomicBool::new(false);
+
+/// Set from the settings at startup and whenever Setup changes it.
+pub fn set_reveal_channels(on: bool) {
+    REVEAL_CHANNELS.store(on, Ordering::Relaxed);
+}
+
+/// Below this, a device's inputs are not worth listing separately.
+///
+/// Two, because "left" and "right" of an ordinary stereo input are not two
+/// microphones and offering them as such would double every list to say
+/// nothing. Three and up is an interface, and on an interface the channel
+/// number is where the instrument is plugged in.
+const MULTICHANNEL: u16 = 3;
+
 impl CaptureDevices for AudioInputs {
     fn list(&self) -> Vec<DeviceInfo> {
         // Not cached, deliberately: an interface plugged in while the Recorder
@@ -107,17 +157,45 @@ impl CaptureDevices for AudioInputs {
             // any, and guessing at the reason here would be guessing.
             return Vec::new();
         };
-        found
-            .into_iter()
-            .map(|d| DeviceInfo {
-                // The uid is the name-plus-occurrence key, not the bare name:
-                // `DeviceKey` exists because two identical interfaces report
-                // the same string and cpal offers no way to compare devices.
-                uid: d.key.to_setting(),
+        let reveal = REVEAL_CHANNELS.load(Ordering::Relaxed);
+        let mut out = Vec::new();
+        for d in found {
+            // The uid is the name-plus-occurrence key, not the bare name:
+            // `DeviceKey` exists because two identical interfaces report the
+            // same string and cpal offers no way to compare devices.
+            let key = d.key.to_setting();
+            out.push(DeviceInfo {
+                uid: key.clone(),
                 name: d.key.to_string(),
                 default: d.is_default,
-            })
-            .collect()
+            });
+            // **Then its inputs, one row each.** This is the whole answer to
+            // "the piano is plugged into input 3": asking cpal for fewer
+            // channels takes them from the FRONT (see `ConfigWish::channels`),
+            // so input 3 is unreachable by any device-level choice. Each row
+            // here opens the device exactly as the row above it does and keeps
+            // one channel out of the interleaved buffer.
+            //
+            // Numbered from 1, because that is what is printed on the front of
+            // the interface. The uid carries the zero-based index.
+            let Some(channels) = d.channels.filter(|c| *c >= MULTICHANNEL) else {
+                continue;
+            };
+            if !reveal {
+                continue;
+            }
+            for ch in 0..channels {
+                out.push(DeviceInfo {
+                    uid: channel_uid(&key, ch),
+                    name: format!("{}  -  input {}", d.key, ch + 1),
+                    // The device's own row carries the default mark. A channel
+                    // is never "the system default input", and marking one
+                    // would put the badge on an arbitrary member of a set.
+                    default: false,
+                });
+            }
+        }
+        out
     }
 
     fn open(&mut self, uid: &str) -> Result<(), String> {
@@ -134,8 +212,31 @@ impl CaptureDevices for AudioInputs {
     }
 
     fn current_name(&self) -> Option<String> {
-        lock(&self.0).open_name.clone()
+        let sel = lock(&self.0);
+        let name = sel.open_name.clone()?;
+        // The CHANNEL too, when one was chosen, or the band would say
+        // "Scarlett 18i20" whether it is recording the whole interface or the
+        // one input the piano is in — which are different takes.
+        //
+        // Read off the selection rather than off the open stream: the stream
+        // knows only that it is mono. The two can disagree in one case, a
+        // device that came back from a hub with fewer inputs than the saved
+        // channel number, where the stream falls back to everything and this
+        // still names the input that was asked for. Re-picking settles it.
+        match sel.wanted.as_deref().and_then(|u| split_channel(u).1) {
+            Some(ch) => Some(format!("{name}  -  input {}", ch + 1)),
+            None => Some(name),
+        }
     }
+}
+
+/// A device and, when the user picked one, the input of it to keep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioChoice {
+    pub selection: ivory_record::audio::InputSelection,
+    /// Zero-based, and already known to be a number — never yet known to exist
+    /// on the device that opens, which is checked where the stream is built.
+    pub channel: Option<u16>,
 }
 
 /// The selection as `ivory-record` wants it, or `None` for "open nothing".
@@ -144,11 +245,17 @@ impl CaptureDevices for AudioInputs {
 /// opened the picker still gets a live meter — that is the entire point of the
 /// meter being live before arming. Explicitly-chosen-None becomes `None`, and
 /// the caller closes the device.
-pub fn audio_selection(shared: &Shared) -> Option<ivory_record::audio::InputSelection> {
+pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
     use ivory_record::audio::{DeviceKey, InputSelection};
     let sel = lock(shared);
     match sel.wanted.as_deref() {
-        Some(uid) => Some(InputSelection::Key(DeviceKey::from_setting(uid))),
+        Some(uid) => {
+            let (key, channel) = split_channel(uid);
+            Some(AudioChoice {
+                selection: InputSelection::Key(DeviceKey::from_setting(key)),
+                channel,
+            })
+        }
         // **Nothing chosen means nothing opened.** There used to be a fallback
         // to `InputSelection::Default` here, for the case where the user had
         // never opened the picker — the idea being that a live meter is a
@@ -179,6 +286,44 @@ pub fn settle(shared: &Shared, opened: Option<String>, name: Option<String>, err
     sel.settled = true;
     sel.open_name = name;
     sel.error = error;
+}
+
+/// What the audio system itself can be asked, for the Setup panel.
+///
+/// A unit struct: both questions are answered by `ivory_record::audio` from
+/// process-global state, so there is nothing to hold. It is a trait object all
+/// the same because `ivory-ui` may not name cpal — that is what the firewall
+/// is — and because a build with no audio hands over `None` instead.
+pub struct Setup(Shared);
+
+impl Setup {
+    pub fn new(shared: &Shared) -> Self {
+        Self(Arc::clone(shared))
+    }
+}
+
+impl ivory_ui::ports::AudioSetup for Setup {
+    fn systems(&self) -> Vec<String> {
+        ivory_record::audio::systems()
+    }
+
+    fn rates(&self) -> Vec<u32> {
+        // The rates of the device the user has SELECTED, and the host's
+        // default only when they have selected nothing. Not the device that is
+        // OPEN: a panel opened while an interface is unplugged should offer
+        // that interface's rates rather than silently offering the built-in
+        // microphone's under its name.
+        //
+        // The channel is dropped on the way past. Every input of a device runs
+        // at the device's rate — that is what a device rate is — so a panel
+        // that offered a different list for input 3 would be inventing one.
+        match audio_selection(&self.0) {
+            Some(choice) => ivory_record::audio::input_rates(&choice.selection),
+            None => ivory_record::audio::input_rates(
+                &ivory_record::audio::InputSelection::Default,
+            ),
+        }
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -405,8 +550,81 @@ mod tests {
         restore(&picked, Some("Scarlett 2i2#0"), false);
         assert!(matches!(
             audio_selection(&picked),
-            Some(InputSelection::Key(_))
+            Some(AudioChoice {
+                selection: InputSelection::Key(_),
+                channel: None
+            })
         ));
+    }
+
+    /// **The uid grammar survives a device name that would break it.**
+    ///
+    /// The separator has to be a character no interface puts in its own name,
+    /// and the obvious candidates all fail: `#` is already taken and escaped by
+    /// `DeviceKey`, and `|`, `:` and `@` are all in real product names. A C0
+    /// control is in none, which is the argument — and this is the test that
+    /// makes it an argument rather than a hope.
+    ///
+    /// The failure it prevents is quiet: a uid that splits wrong resolves to a
+    /// device that does not exist, so the saved microphone silently reverts to
+    /// nothing on the next launch and the user re-picks it every session.
+    #[test]
+    fn a_channel_uid_round_trips_through_a_hostile_device_name() {
+        use ivory_record::audio::DeviceKey;
+        for name in [
+            "Scarlett 18i20 USB",
+            "Mic #2",
+            "Focusrite | 8",
+            "A:B@C",
+            "1-2",
+            "Built-in Microphone",
+        ] {
+            let key = DeviceKey::named(name).to_setting();
+            // The device's own row carries no channel and must not grow one.
+            assert_eq!(split_channel(&key), (key.as_str(), None), "{name}");
+            for ch in [0_u16, 3, 17] {
+                let uid = channel_uid(&key, ch);
+                let (back, got) = split_channel(&uid);
+                assert_eq!(back, key, "{name} at channel {ch}");
+                assert_eq!(got, Some(ch), "{name} at channel {ch}");
+                assert_eq!(
+                    DeviceKey::from_setting(back),
+                    DeviceKey::named(name),
+                    "{name} did not survive the round trip via {uid:?}"
+                );
+            }
+        }
+    }
+
+    /// A chosen channel reaches the stream open, with its device intact.
+    #[test]
+    fn a_chosen_channel_reaches_the_stream_open() {
+        use ivory_record::audio::{DeviceKey, InputSelection};
+        let (_a, shared) = AudioInputs::new();
+        let uid = channel_uid(&DeviceKey::named("Scarlett 18i20 USB").to_setting(), 2);
+        restore(&shared, Some(&uid), false);
+        let choice = audio_selection(&shared).expect("a device was chosen");
+        assert_eq!(
+            choice.selection,
+            InputSelection::Key(DeviceKey::named("Scarlett 18i20 USB"))
+        );
+        // Zero-based here; the picker's label said "input 3".
+        assert_eq!(choice.channel, Some(2));
+    }
+
+    /// A hand-edited channel that is not a number costs the channel, not the
+    /// microphone.
+    #[test]
+    fn a_malformed_channel_still_opens_the_device() {
+        use ivory_record::audio::{DeviceKey, InputSelection};
+        let (_a, shared) = AudioInputs::new();
+        restore(&shared, Some(&format!("Scarlett{CHANNEL_SEP}left")), false);
+        let choice = audio_selection(&shared).expect("the device still opens");
+        assert_eq!(
+            choice.selection,
+            InputSelection::Key(DeviceKey::named("Scarlett"))
+        );
+        assert_eq!(choice.channel, None);
     }
 
     /// A remembered device has to be re-opened at launch, or the app looks like
@@ -419,7 +637,10 @@ mod tests {
         assert!(selection(&shared).is_stale());
         assert!(matches!(
             audio_selection(&shared),
-            Some(InputSelection::Key(_))
+            Some(AudioChoice {
+                selection: InputSelection::Key(_),
+                channel: None
+            })
         ));
     }
 

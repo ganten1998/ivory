@@ -46,6 +46,31 @@ const FLAT_NAMES: [&str; 12] = [
     "C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B",
 ];
 
+/// The tonic of a key signature, as a pitch class.
+///
+/// Sharps go up a fifth each, flats down one, so the signature IS the tonic in
+/// disguise: `key` fifths from C. The major tonic, because that is what the
+/// menu's labels lead with ("Eb / Cm  (3b)") and the relative minor sits on the
+/// same six notes either way.
+pub fn key_tonic(key: i32) -> u8 {
+    (7 * key).rem_euclid(12) as u8
+}
+
+/// Which way to spell the five black keys, given a signature.
+///
+/// The same rule `staff::spell_in_key` uses, and deliberately the same words:
+/// flats when the signature has flats, sharps when it has sharps, and the
+/// user's own preference only when the signature is silent. A diagram spelling
+/// A flat while the staff beside it prints G sharp is one instrument's key
+/// signature drawn twice, two different ways.
+fn key_flats(key: i32, prefer_flats: bool) -> bool {
+    if key == 0 {
+        prefer_flats
+    } else {
+        key < 0
+    }
+}
+
 fn pc_name(pc: u8, prefer_flats: bool) -> &'static str {
     let i = (pc % 12) as usize;
     if prefer_flats {
@@ -482,7 +507,7 @@ pub enum Hit {
 /// The exact inverse of `draw`, and deliberately in the same file a few lines
 /// from it: a hit test that lives somewhere else is a hit test that stops
 /// matching the picture the first time the picture moves.
-pub fn hit_test(rect: Rect, views: &Views, input: Input, pos: Pos2) -> Option<Hit> {
+pub fn hit_test(rect: Rect, views: &Views, key: i32, pos: Pos2) -> Option<Hit> {
     let (view, cell) = cells(rect, &views)
         .into_iter()
         .find(|(_, c)| c.contains(pos))?;
@@ -496,9 +521,12 @@ pub fn hit_test(rect: Rect, views: &Views, input: Input, pos: Pos2) -> Option<Hi
         // band's behaviour depend on which panel happened to be under the
         // pointer.
         View::Staff => None,
-        // The only one that needs to know what is playing: I, IV and V are
-        // relative to a tonic, and the tonic comes from the notes.
-        View::Triangles => triangles_hit(body, input.tonic(), pos),
+        // The only one that needs a tonic: I, IV and V are relative to one.
+        // It comes from the KEY now rather than from the notes — which is why
+        // this function grew a parameter it can no longer get from `input`, and
+        // why passing the wrong one would place the triad a click meant to
+        // place somewhere else entirely.
+        View::Triangles => triangles_hit(body, key_tonic(key), pos),
     }
 }
 
@@ -1179,7 +1207,21 @@ fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &
         return;
     }
 
-    let tonic = input.tonic();
+    // **The KEY's tonic, not the chord's.**
+    //
+    // It used to be whatever you had just played, which made the one diagram
+    // with roman numerals on it the one that could not tell you where you
+    // were: every chord was I, because the picture slid under it. Anchored to
+    // the key, the numerals mean what they say — you play the IV and the IV
+    // lights up — and sliding the whole shape is a modulation you perform by
+    // choosing another key, which is what the shape was always for.
+    //
+    // The Circle and the Tonnetz are unchanged and still ring what you are
+    // playing. Two diagrams that answer "what am I on" and one that answers
+    // "where is it in the key" is the split that makes the band worth reading;
+    // three of the first is why the third was ignored.
+    let tonic = key_tonic(s.staff_key);
+    let flats = key_flats(s.staff_key, s.prefer_flats);
     // I, IV, V — the tonic, the fifth below it and the fifth above it. Written
     // as -5 and +7 rather than +5 and +7 so the arithmetic says what the
     // relationship is.
@@ -1238,7 +1280,7 @@ fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &
             painter,
             Pos2::new(pos.x, pos.y - node_r * 0.22),
             root,
-            s.prefer_flats,
+            flats,
             node_r * 0.62,
             if lit { p.lit_text } else { p.ink },
             false,
@@ -1269,7 +1311,7 @@ fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &
         painter,
         c,
         tonic,
-        s.prefer_flats,
+        flats,
         r * 0.24,
         p.ink.gamma_multiply(0.55),
         false,
@@ -1550,7 +1592,7 @@ pub fn show_detached_window(
             // happens and do nothing at all — a dead patch of window.
             if pressed && !menu && s.keytoggle_enabled {
                 if let Some(p) = pointer {
-                    outcome.hit = hit_test(rect, &views, input, p);
+                    outcome.hit = hit_test(rect, &views, s.staff_key, p);
                 }
             }
 
@@ -2380,7 +2422,7 @@ mod tests {
                     }
                     let c = l.at(u, v);
                     assert_eq!(
-                        hit_test(band, &views, Input::default(), c),
+                        hit_test(band, &views, 0, c),
                         Some(Hit::Pc(tonnetz_pc(u, v, 0))),
                         "clicking the centre of node ({u},{v}) missed it"
                     );
@@ -2407,24 +2449,34 @@ mod tests {
             let major_at = c + dir * ((r * 0.80 + r * 0.56) * 0.5);
             let minor_at = c + dir * ((r * 0.56 + r * 0.34) * 0.5);
             assert_eq!(
-                hit_test(band, &views, Input::default(), major_at),
+                hit_test(band, &views, 0, major_at),
                 Some(Hit::Pc(pc)),
                 "the major name at position {i} is not clickable"
             );
             // The relative-minor ring is a label. Every pitch class is
             // already reachable on the major ring, so nothing is lost.
             assert_eq!(
-                hit_test(band, &views, Input::default(), minor_at),
+                hit_test(band, &views, 0, minor_at),
                 None,
                 "the relative-minor label at position {i} acts as a control"
             );
         }
         // The hub and the signature ring are labels, not controls.
-        assert_eq!(hit_test(band, &views, Input::default(), c), None);
+        assert_eq!(hit_test(band, &views, 0, c), None);
     }
 
     /// Each vertex of the hexagram gives back the chord printed on it, in
     /// every key — and the two triangles must not answer for each other.
+    ///
+    /// **Driven by the KEY now, in every one of the fifteen.** The shape is
+    /// anchored to the signature rather than to what is being played, which is
+    /// why `hit_test` no longer takes an `Input` at all: a test could have
+    /// caught it answering for the wrong tonic, but a parameter it cannot see
+    /// is a guarantee, and the compiler checks that one.
+    ///
+    /// What is left to check is the arithmetic, which is where the mistake
+    /// moved to: `key_tonic` for flats is one `rem_euclid` away from being
+    /// right for sharps and wrong for flats.
     #[test]
     fn a_click_on_a_chord_vertex_gives_that_chord() {
         let views = Views::of(vec![View::Triangles]);
@@ -2432,35 +2484,57 @@ mod tests {
         let body = body_rect(cell_inner(cells(band, &views)[0].1));
         let c = body.center();
         let r = hexagram_radius(body);
-        for tonic in 0..12u8 {
-            let input = Input {
-                pcs: 1 << tonic,
-                bass: Some(tonic),
-                root: Some(tonic),
-                minor: false,
-            };
+        for key in -crate::staff::MAX_KEY..=crate::staff::MAX_KEY {
+            let tonic = key_tonic(key);
             let roots = [tonic, (tonic + 5) % 12, (tonic + 7) % 12];
             for (k, &oi) in HEX_UP_ORDER.iter().enumerate() {
                 assert_eq!(
-                    hit_test(band, &views, input, hex_vertex(c, r, k, false)),
+                    hit_test(band, &views, key, hex_vertex(c, r, k, false)),
                     Some(Hit::Triad {
                         root: roots[oi],
                         minor: false
                     }),
-                    "upward vertex {k} in key {tonic}"
+                    "upward vertex {k} in key {key}"
                 );
             }
             for (k, &oi) in HEX_DOWN_ORDER.iter().enumerate() {
                 assert_eq!(
-                    hit_test(band, &views, input, hex_vertex(c, r, k, true)),
+                    hit_test(band, &views, key, hex_vertex(c, r, k, true)),
                     Some(Hit::Triad {
                         root: roots[oi],
                         minor: true
                     }),
-                    "downward vertex {k} in key {tonic}"
+                    "downward vertex {k} in key {key}"
                 );
             }
         }
+    }
+
+    /// The signature IS the tonic, `key` fifths from C.
+    ///
+    /// Spelled out rather than left to the arithmetic, because the arithmetic
+    /// is one `rem_euclid` away from being right for sharps and wrong for
+    /// flats, and both halves look correct in isolation.
+    #[test]
+    fn the_key_signature_names_the_tonic_it_is_the_signature_of() {
+        for (key, want) in [
+            (0, 0),   // C
+            (1, 7),   // G
+            (2, 2),   // D
+            (7, 1),   // C sharp
+            (-1, 5),  // F
+            (-2, 10), // B flat
+            (-3, 3),  // E flat
+            (-7, 11), // C flat, which sounds B
+        ] {
+            assert_eq!(key_tonic(key), want, "key {key}");
+        }
+        // And the black keys are spelled the way the signature does, not the
+        // way the user's own preference would: that preference decides only
+        // when there is no signature to decide it.
+        assert!(key_flats(-3, false), "a flat key spelled with sharps");
+        assert!(!key_flats(4, true), "a sharp key spelled with flats");
+        assert!(key_flats(0, true) && !key_flats(0, false));
     }
 
     /// A click belongs to the pane it landed in, and to no other.
@@ -2488,7 +2562,7 @@ mod tests {
         for x in (0..1300).step_by(7) {
             for y in (0..300).step_by(7) {
                 let p = Pos2::new(x as f32, y as f32);
-                match hit_test(band, &all, Input::default(), p) {
+                match hit_test(band, &all, 0, p) {
                     Some(Hit::Triad { .. }) => {
                         assert!(
                             triangles_cell.contains(p),
@@ -2518,10 +2592,7 @@ mod tests {
         for x in (0..1300).step_by(53) {
             for y in (0..300).step_by(29) {
                 assert_eq!(
-                    hit_test(
-                        band,
-                        &Views::default(),
-                        Input::default(),
+                    hit_test(band, &Views::default(), 0,
                         Pos2::new(x as f32, y as f32)
                     ),
                     None
@@ -2721,7 +2792,7 @@ mod tests {
                     let controls = controls(rect, &views, input);
                     for (view, at, want) in &controls {
                         assert_eq!(
-                            hit_test(rect, &views, input, *at),
+                            hit_test(rect, &views, 0, *at),
                             Some(*want),
                             "{view:?} in a {size:?} window at {origin:?}: the \
                              control drawn at {at:?} is not clickable"
@@ -2762,7 +2833,7 @@ mod tests {
         let controls = controls(window, &views, input);
         let wrong = controls
             .iter()
-            .filter(|(_, at, want)| hit_test(band, &views, input, *at) != Some(*want))
+            .filter(|(_, at, want)| hit_test(band, &views, 0, *at) != Some(*want))
             .count();
         assert!(
             wrong * 2 > controls.len(),
@@ -2949,7 +3020,7 @@ mod tests {
             // is the assertion that would fail if the window ever hit-tested
             // against band geometry.
             assert_ne!(
-                hit_test(band, &views, input, at),
+                hit_test(band, &views, 0, at),
                 Some(want),
                 "the band happens to answer the same at {at:?}, so this case \
                  cannot tell the two rects apart"
@@ -3142,7 +3213,7 @@ mod tests {
                         rect.min.y + size.y * y as f32 / 23.0,
                     );
                     assert_eq!(
-                        hit_test(rect, &Views::default(), c_major(), p),
+                        hit_test(rect, &Views::default(), 0, p),
                         None,
                         "something in the empty window at {p:?} is clickable"
                     );

@@ -211,6 +211,15 @@ struct Recorder {
     /// rolling: a take whose buffer changed halfway through is a take with a
     /// hole in it.
     buffer_open: Option<u32>,
+    /// The sample rate both streams were opened with, and the system they were
+    /// opened through. Same edge, same reopen, same refusal mid-take.
+    ///
+    /// The system is the heaviest of the three: it does not merely reopen the
+    /// streams, it changes which driver stack they are opened against — so the
+    /// device selected under the old one may not exist under the new one, and
+    /// `reconcile_audio` will settle to "missing" and say so.
+    rate_open: Option<u32>,
+    system_open: Option<String>,
     /// The last finished take this host has already accounted for.
     ///
     /// Updated whether or not "Show when done" is ticked, which is the point:
@@ -718,9 +727,27 @@ impl DesktopApp {
             }
         }
 
+        // Whether a multichannel interface lists its inputs one by one. Pushed
+        // every frame rather than on an edge: it is one atomic store, and the
+        // list it changes is built fresh every time the picker opens, so there
+        // is no state to reconcile and nothing to reopen.
+        crate::devices::set_reveal_channels(self.app.audio_channels_in_picker());
+
         let want_buffer = self.app.buffer_frames();
-        if self.recorder.buffer_open != want_buffer && !self.recorder.session.is_recording() {
+        let want_rate = self.app.sample_rate();
+        let want_system = self.app.audio_system();
+        let path_changed = self.recorder.buffer_open != want_buffer
+            || self.recorder.rate_open != want_rate
+            || self.recorder.system_open != want_system;
+        if path_changed && !self.recorder.session.is_recording() {
             self.recorder.buffer_open = want_buffer;
+            self.recorder.rate_open = want_rate;
+            self.recorder.system_open = want_system.clone();
+            // The system FIRST, and before anything is opened: every device
+            // lookup in `ivory_record::audio` goes through it, so setting it
+            // after the streams were built would open them on the old stack and
+            // then list devices from the new one.
+            ivory_record::audio::set_system(want_system.as_deref());
             // Dropping the engine stops the output stream, and STARTING ONE
             // AGAIN is not optional. `start_engine` otherwise runs only on the
             // edge of the band opening, so dropping it here left the app with
@@ -1847,6 +1874,7 @@ impl DesktopApp {
             None,
             self.recorder.session.timebase(),
             self.app.buffer_frames(),
+            self.app.sample_rate(),
         ) {
             Ok(e) => {
                 self.recorder.engine = Some(e);
@@ -2146,10 +2174,12 @@ impl DesktopApp {
             return;
         }
         match crate::devices::audio_selection(&self.recorder.audio) {
-            Some(selection) => self
-                .recorder
-                .session
-                .open_input(&selection, self.app.buffer_frames()),
+            Some(choice) => self.recorder.session.open_input(
+                &choice.selection,
+                choice.channel,
+                self.app.buffer_frames(),
+                self.app.sample_rate(),
+            ),
             // The user picked "None - record MIDI only". Mapping that to the
             // system default (which is what happened before `explicit` existed)
             // opened the built-in microphone and put its name in the band.
@@ -2288,6 +2318,16 @@ impl DesktopApp {
             crate::devices::restore(&camera, app.chosen_camera_uid(), false);
             app.set_capture_devices(Some(Box::new(inputs)));
             app.set_cameras(Some(Box::new(cams)));
+            app.set_audio_setup(Some(Box::new(crate::devices::Setup::new(&audio))));
+            // **The saved system, before anything opens.** Every device lookup
+            // in `ivory_record::audio` goes through it, including the one two
+            // lines above this that restored the microphone. Left to the
+            // per-frame edge in `frame()` it would still be applied, one frame
+            // late — and one frame late means the engine starts on the platform
+            // default and is then torn down and restarted, which is a five-
+            // second instrument reload at every launch.
+            ivory_record::audio::set_system(app.audio_system().as_deref());
+            crate::devices::set_reveal_channels(app.audio_channels_in_picker());
             // Every installed VST3, by path and file name. This is a DIRECTORY
             // LISTING, not a scan: nothing is opened, so it costs milliseconds
             // even with 112 of them, and no plugin gets the chance to crash the
@@ -2317,7 +2357,13 @@ impl DesktopApp {
                 camera_rgba: None,
                 engine_retry: None,
                 armed_downbeat: None,
-                buffer_open: None,
+                // Seeded from the settings, not left at None: these are the
+                // values the streams are about to be opened with, and a
+                // tracker that starts out disagreeing with reality reports a
+                // change on frame one that nobody made.
+                buffer_open: app.buffer_frames(),
+                rate_open: app.sample_rate(),
+                system_open: app.audio_system(),
                 seen_take: None,
                 dev_editor_done: false,
             }

@@ -148,6 +148,9 @@ pub struct IvoryApp {
     /// Who can enumerate and select an audio input, and a camera. `None` in a
     /// plugin and in a Minimal build, where the code to do it is not linked.
     audio_devices: Option<Box<dyn CaptureDevices>>,
+    /// What the audio system itself can be asked. Consulted when Setup opens
+    /// and never per frame — `rates()` re-enumerates hardware.
+    audio_setup: Option<Box<dyn crate::ports::AudioSetup>>,
     cameras: Option<Box<dyn CaptureDevices>>,
     /// What the host permits. Read at every branch point rather than compared
     /// against a host name, and captured once at construction so a frame
@@ -497,25 +500,32 @@ impl IvoryApp {
     /// MIDI source at all; a host that picks its own attaches one with
     /// `set_ports`, and one that is handed its notes never does.
     pub fn new(ctx: &egui::Context, mut settings: Settings, caps: Caps) -> Self {
-        // A host with no child windows cannot have anything detached, so it
-        // must not believe it has.
+        // **Nothing is detached, ever, on any host.**
         //
-        // These two flags persist, and a plugin instance is seeded from the
-        // same `settings.json` the standalone writes. Someone who left the
-        // chord strip popped out on the desktop got a plugin with NO chord
-        // readout: the band is zeroed by the flag, the window it was moved to
-        // is gated off by `caps.detachable`, and the Attach row that would
-        // undo it is gated off too. There was no way back except Reset
-        // Settings, which throws away every colour, font and tuning as well.
+        // Four surfaces — the chord readout, the neck, the theory band and the
+        // recorder — could be popped into a window of their own. They are the
+        // pivot this release makes: the app is either filling the screen (`Z`)
+        // or it is in the box, because the third arrangement was where most of
+        // what felt janky lived. A band could be on screen and in a window at
+        // once; a window could outlive the band it showed; a fullscreen main
+        // window buried its own children (see the 4.19.0 file-browser freeze).
+        //
+        // The menu rows are gone, so nothing can set these now — but the flags
+        // PERSIST, and clearing them here is what stops an upgrade stranding
+        // somebody: a settings file saying `theory_detached: true` would
+        // otherwise zero the band, put it in a window nothing opens, and offer
+        // no Attach row to undo it. That failure is not hypothetical. It is
+        // exactly what a plugin instance seeded from the desktop's file used to
+        // do, which is what this clamp was written for when it was still gated
+        // on `caps.detachable`; the gate is gone and the reason is unchanged.
         //
         // Cleared on the LOCAL copy only. A plugin does not write the shared
-        // file, so the desktop's own arrangement is untouched.
-        if !caps.detachable {
-            settings.chord_window_detached = false;
-            settings.fretboard_detached = false;
-            settings.theory_detached = false;
-            settings.recorder_detached = false;
-        }
+        // file, so a desktop file edited by hand keeps whatever it says — and
+        // still opens attached, because this runs on the way in.
+        settings.chord_window_detached = false;
+        settings.fretboard_detached = false;
+        settings.theory_detached = false;
+        settings.recorder_detached = false;
         // And the band itself, for a host that cannot open a device.
         //
         // Not the same question as detaching, and it has a worse failure. The
@@ -600,6 +610,7 @@ impl IvoryApp {
             midi_rx,
             ports: None,
             audio_devices: None,
+            audio_setup: None,
             cameras: None,
             caps,
             pending_resize: None,
@@ -727,6 +738,12 @@ impl IvoryApp {
     /// reachable from this crate, so what arrives is a trait object. A plugin
     /// never calls this, which is what makes the device rows inert rather than
     /// merely hidden — and `Caps::capture_devices` is what makes them absent.
+    /// Hand over the audio system's own questions. `None` in a build that has
+    /// no audio at all, exactly like the two above.
+    pub fn set_audio_setup(&mut self, setup: Option<Box<dyn crate::ports::AudioSetup>>) {
+        self.audio_setup = setup;
+    }
+
     pub fn set_capture_devices(&mut self, devices: Option<Box<dyn CaptureDevices>>) {
         self.audio_devices = devices;
     }
@@ -1768,11 +1785,10 @@ impl IvoryApp {
                         self.place_or_play(note);
                         return;
                     }
-                    let display = self.display_notes();
                     if let Some(hit) = theory_panel::hit_test(
                         r,
                         &self.settings.theory_views(),
-                        self.theory_input(&display),
+                        self.settings.staff_key,
                         pos,
                     ) {
                         // Sounded either way — a triad as a triad, not as its
@@ -2863,16 +2879,63 @@ impl IvoryApp {
     pub fn set_audio_status(&mut self, status: recorder::AudioStatus) {
         // Also refreshed into an OPEN panel, or it would show whatever was true
         // at the moment it was opened and never change.
-        if let Some(dialogs::Dialog::AudioStatus { status: live, .. }) = self.dialog.as_mut() {
+        if let Some(dialogs::Dialog::AudioSetup { status: live, .. }) = self.dialog.as_mut() {
             live.clone_from(&status);
         }
         self.audio_status = status;
+    }
+
+    /// Open Setup, snapshotting everything that is not pushed per frame.
+    ///
+    /// `systems()` and `rates()` are asked HERE and not in `set_audio_status`,
+    /// which runs every frame: rates re-enumerate the hardware, and doing that
+    /// sixty times a second is the mistake `CaptureDevices::current_name`
+    /// already exists to avoid.
+    fn open_audio_setup(&mut self) {
+        let (systems, rates) = match self.audio_setup.as_ref() {
+            Some(s) => (s.systems(), s.rates()),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.dialog = Some(dialogs::Dialog::AudioSetup {
+            // A SNAPSHOT, taken when the panel opens. It is refreshed each
+            // frame by the host — see `set_audio_status` — because a status
+            // panel that froze the moment it opened would be the least useful
+            // version of itself.
+            status: self.audio_status.clone(),
+            buffer: self.settings.buffer_frames(),
+            rate: self.settings.sample_rate(),
+            systems,
+            system: self.settings.audio_system().map(str::to_owned),
+            rates,
+            channels_in_picker: self.settings.audio_channels_in_picker,
+            input_channels: self
+                .audio_status
+                .input
+                .as_ref()
+                .map(|(_, s)| s.channels)
+                .unwrap_or(0),
+        });
     }
 
     /// Frames per audio callback the user has chosen, or `None` for the
     /// device's own default. The host reopens its streams to match.
     pub fn buffer_frames(&self) -> Option<u32> {
         self.settings.buffer_frames()
+    }
+
+    /// The rate both streams should open at, or `None` for the device's own.
+    pub fn sample_rate(&self) -> Option<u32> {
+        self.settings.sample_rate()
+    }
+
+    /// The audio system both streams should open through.
+    pub fn audio_system(&self) -> Option<String> {
+        self.settings.audio_system().map(str::to_owned)
+    }
+
+    /// Whether a multichannel interface lists its inputs in the mic selector.
+    pub fn audio_channels_in_picker(&self) -> bool {
+        self.settings.audio_channels_in_picker
     }
 
     /// Take a pending "show me this folder" request. Same contract.
@@ -2914,12 +2977,7 @@ impl IvoryApp {
             // question — and a menu row can show none of that.
             Hit::OpenSetup => self.setup_open = true,
             Hit::CloseSetup => self.setup_open = false,
-            Hit::ShowAudioStatus => {
-                self.dialog = Some(dialogs::Dialog::AudioStatus {
-                    status: self.audio_status.clone(),
-                    buffer: self.settings.buffer_frames(),
-                });
-            }
+            Hit::ShowAudioStatus => self.open_audio_setup(),
             Hit::ToggleCountInInTake => {
                 self.settings.record_count_in_in_take = !self.settings.record_count_in_in_take;
                 self.save_settings();
@@ -4052,16 +4110,7 @@ impl IvoryApp {
             MenuAction::DetachRecorder => self.detach_recorder(),
             MenuAction::AttachRecorder => self.reattach_recorder(),
             MenuAction::ShowExportDialog => self.open_export_dialog(),
-            MenuAction::ShowAudioStatus => {
-                self.dialog = Some(dialogs::Dialog::AudioStatus {
-                    // A SNAPSHOT, taken when the panel opens. It is refreshed
-                    // each frame by the host — see `set_audio_status` — because
-                    // a status panel that froze the moment it opened would be
-                    // the least useful version of itself.
-                    status: self.audio_status.clone(),
-                    buffer: self.settings.buffer_frames(),
-                });
-            }
+            MenuAction::ShowAudioStatus => self.open_audio_setup(),
             MenuAction::SetRecordSources(kind) => {
                 self.settings.record_sources = kind.to_owned();
                 self.save_settings();
@@ -4400,6 +4449,26 @@ impl IvoryApp {
                 self.save_settings();
                 // The host reopens both streams when it notices; it cannot be
                 // done from here, and it must not be done mid-take.
+            }
+            DialogAction::SetSampleRate(rate) => {
+                // The same bargain as the buffer, one line down: written here,
+                // acted on by the host, never mid-take.
+                self.settings.record_sample_rate = i64::from(rate.unwrap_or(0));
+                self.save_settings();
+            }
+            DialogAction::SetAudioSystem(name) => {
+                self.settings.audio_system = name.unwrap_or_default();
+                self.save_settings();
+            }
+            DialogAction::SetChannelsInPicker(on) => {
+                self.settings.audio_channels_in_picker = on;
+                self.save_settings();
+            }
+            // Setup closes and the picker opens in its place, which is the same
+            // hand-off the band's own mic icon makes — one device chooser, not
+            // two lists of the same hardware.
+            DialogAction::ChooseAudioDevice => {
+                self.open_device_picker(dialogs::DeviceKind::AudioInput);
             }
             DialogAction::SetShowWelcome(show) => {
                 self.settings.show_welcome = show;
@@ -6186,6 +6255,76 @@ mod tests {
         headless_with(caps, Settings::default())
     }
 
+    /// **Setup opens, draws, and its controls send what they say they send.**
+    ///
+    /// Drawn for real rather than inspected: this panel grew from one control
+    /// to five in one change, and every way an egui panel goes wrong — an id
+    /// clash between two `selectable_label` rows, a `horizontal_wrapped` inside
+    /// a scroll area with no width, a checkbox borrowing a field that is also
+    /// read below it — is a PANIC at draw time and invisible to a test that
+    /// only reads the struct.
+    ///
+    /// It also asserts the thing that made this feature necessary: the panel is
+    /// reachable, from the take settings, without a menu row.
+    #[test]
+    fn the_setup_panel_opens_and_draws_and_its_controls_act() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let run = |ctx: &egui::Context, app: &mut IvoryApp| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(1280.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        run(&ctx, &mut app);
+        app.apply_recorder_hit(recorder_panel::Hit::ShowAudioStatus);
+        assert!(
+            matches!(app.dialog, Some(dialogs::Dialog::AudioSetup { .. })),
+            "the take settings did not open Setup"
+        );
+        // Three frames, because a viewport dialog is not fully built on its
+        // first one and an id clash shows up when a surface is drawn twice.
+        for _ in 0..3 {
+            run(&ctx, &mut app);
+        }
+        assert!(
+            matches!(app.dialog, Some(dialogs::Dialog::AudioSetup { .. })),
+            "Setup closed itself while drawing"
+        );
+
+        // The four settings it writes, through the same path the panel's
+        // clicks take. Each one is read back through the accessor the HOST
+        // uses, not the raw field: a rate that persists but does not survive
+        // `sample_rate()` is a rate the streams will never open at.
+        app.apply_dialog_action(DialogAction::SetSampleRate(Some(48_000)));
+        assert_eq!(app.sample_rate(), Some(48_000));
+        app.apply_dialog_action(DialogAction::SetBufferFrames(Some(512)));
+        assert_eq!(app.buffer_frames(), Some(512));
+        app.apply_dialog_action(DialogAction::SetAudioSystem(Some("CoreAudio".to_owned())));
+        assert_eq!(app.audio_system().as_deref(), Some("CoreAudio"));
+        app.apply_dialog_action(DialogAction::SetChannelsInPicker(true));
+        assert!(app.audio_channels_in_picker());
+
+        // And "the device" half: Setup hands off to the one picker there is,
+        // rather than carrying a second copy of the device list.
+        app.apply_dialog_action(DialogAction::ChooseAudioDevice);
+        assert!(
+            matches!(
+                app.dialog,
+                Some(dialogs::Dialog::DevicePicker {
+                    kind: dialogs::DeviceKind::AudioInput,
+                    ..
+                })
+            ),
+            "Change... did not open the microphone picker"
+        );
+    }
+
     fn headless_with(caps: Caps, settings: Settings) -> (egui::Context, IvoryApp) {
         let ctx = egui::Context::default();
         let app = IvoryApp::new(&ctx, settings, caps);
@@ -7797,19 +7936,21 @@ mod tests {
         assert_eq!(app.barre_to_draw(), app.voicing.current().shape.barre);
     }
 
-    /// A host that cannot open windows must not believe something is detached.
+    /// **No host inherits a detached band, and that now includes the desktop.**
     ///
-    /// Both flags persist, and a plugin instance is seeded from the same file
-    /// the standalone writes. Someone who left the chord strip popped out on
-    /// the desktop got a plugin with no chord readout at all: the band is
-    /// zeroed by the flag, the window is gated off by `caps.detachable`, and
-    /// the Attach row that would undo it is gated off too. The only way back
-    /// was Reset Settings.
+    /// The flags persist and the menu rows that cleared them are gone, so a
+    /// settings file written by any earlier build would otherwise zero a band,
+    /// put it in a window nothing opens, and offer nothing to undo it — the
+    /// exact failure this test was written for when only a plugin could hit it.
+    /// The way back used to be Reset Settings, which throws away every colour,
+    /// font and tuning too.
     #[test]
-    fn a_plugin_never_inherits_a_detached_band() {
+    fn nobody_inherits_a_detached_band() {
         let detached = Settings {
             chord_window_detached: true,
             fretboard_detached: true,
+            theory_detached: true,
+            recorder_detached: true,
             show_fretboard: true,
             chord_detection_enabled: true,
             // Explicitly, since 5.0: the strip is off by default and this test
@@ -7830,10 +7971,15 @@ mod tests {
         );
         assert!(b.fret_h > 0.0, "the fretboard vanished with nowhere to go");
 
-        // The desktop keeps what it was given: there, detached means detached.
+        // And the desktop, which is the half that changed: it used to keep
+        // what it was given, because there was a window to keep it in.
         let (_, desktop) = headless_with(Caps::DESKTOP, detached);
-        assert!(desktop.settings.chord_window_detached);
-        assert!(desktop.settings.fretboard_detached);
+        assert!(!desktop.settings.chord_window_detached);
+        assert!(!desktop.settings.fretboard_detached);
+        assert!(!desktop.settings.theory_detached);
+        assert!(!desktop.settings.recorder_detached);
+        let b = band_sizes(&desktop.settings);
+        assert!(b.chord_h > 0.0 && b.fret_h > 0.0, "a band came back to nowhere");
     }
 
     /// Turning a band on must make the editor TALLER, not the picture smaller.
@@ -7973,25 +8119,32 @@ mod tests {
             "a right-click did not open the menu in a plugin"
         );
 
-        // The first row is Size, a submenu; the first ITEM row is what we can
-        // click without hovering a submenu open. Find it from the same view
-        // the menu was built from.
+        // Window is a submenu; the first ITEM row is what we can click without
+        // hovering a submenu open. Find it from the same view the menu was
+        // built from.
+        //
+        // The chord strip, because it is a top-level item in every build, it
+        // flips one bool with no dialog and no device behind it, and it is
+        // reached WITHOUT a hover. This used to be Dark Mode, which left the
+        // menu when a row that only does what `D` does stopped earning its
+        // place; the test is about whether a plugin's menu rows are alive at
+        // all, so any such row will do — but it has to be one that exists.
         let view = app.menu_view();
         let rows = menu::rows_for_test(view);
         let (idx, _, want) = rows
             .iter()
             .enumerate()
             .find_map(|(i, (label, a))| {
-                (label.as_str() == "Dark Mode").then_some((i, label.clone(), a.clone()))
+                (*a == MenuAction::ToggleChordStrip).then_some((i, label.clone(), a.clone()))
             })
-            .expect("Dark Mode is in the menu");
-        assert_eq!(want, MenuAction::ToggleDarkMode);
+            .expect("the chord strip row is in the menu");
+        assert_eq!(want, MenuAction::ToggleChordStrip);
 
-        let before = app.settings.dark_mode;
+        let before = app.settings.show_chord_strip;
         let row = menu::row_center_for_test(app.menu_state.as_ref().unwrap(), idx);
         click(&ctx, &mut app, row, egui::PointerButton::Primary);
         assert_ne!(
-            app.settings.dark_mode, before,
+            app.settings.show_chord_strip, before,
             "clicking a menu row in a plugin did nothing - the row is dead"
         );
         assert!(

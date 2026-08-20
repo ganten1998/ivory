@@ -1605,7 +1605,7 @@ impl Hit {
             Hit::Record => "Record",
             Hit::OpenSetup => "Take settings",
             Hit::CloseSetup => "Done",
-            Hit::ShowAudioStatus => "Audio status",
+            Hit::ShowAudioStatus => "Setup: the audio system, devices, rate and buffer",
             Hit::ToggleCountInInTake => "Record the count-in into the take",
             Hit::ToggleHideElapsed => "Hide the elapsed time",
             Hit::Stop => "Stop",
@@ -4408,6 +4408,100 @@ mod tests {
         Rect::from_min_size(Pos2::new(0.0, 350.0), Vec2::new(w, band_height(w)))
     }
 
+    /// **Every control in the take-settings panel can actually be clicked.**
+    ///
+    /// The regression this exists for, in full: 4.19.0 moved the camera and the
+    /// audio input out of this panel and onto the controls they feed, and took
+    /// the AUDIO STATUS row out with them. That one was not moved anywhere.
+    /// `Hit::ShowAudioStatus` kept its variant, kept its tooltip, kept its arm
+    /// in `app.rs` — and had no rectangle in any layout, so the panel that says
+    /// what rate the two streams are running at could not be opened from
+    /// anywhere in the app. Nothing failed. Nothing warned. It was simply gone,
+    /// and it stayed gone for a release.
+    ///
+    /// A rect-by-rect walk rather than a list of Hits, so this cannot be
+    /// satisfied by a target that exists in `targets()` and is covered by
+    /// something drawn over it.
+    #[test]
+    fn every_take_settings_control_can_actually_be_clicked() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let anchor = Rect::from_min_size(Pos2::new(40.0, 480.0), Vec2::new(20.0, 20.0));
+        let l = SetupLayout::new(screen, anchor);
+        let v = idle();
+        for (rect, want) in l.targets() {
+            assert!(rect.is_positive(), "{want:?} has no rectangle at all");
+            let got = setup_hit_test(screen, anchor, &v, rect.center());
+            assert_eq!(got, Some(want), "clicking {want:?} landed on {got:?}");
+        }
+        // The two that are only reachable here, and the way in to Setup.
+        for want in [
+            Hit::ToggleCountInInTake,
+            Hit::ToggleHideElapsed,
+            Hit::ShowAudioStatus,
+        ] {
+            let rect = match want {
+                Hit::ToggleCountInInTake => l.count_in_in_take,
+                Hit::ToggleHideElapsed => l.hide_elapsed,
+                _ => l.audio,
+            };
+            assert_eq!(
+                setup_hit_test(screen, anchor, &v, rect.center()),
+                Some(want),
+                "{want:?} is not reachable from the take settings"
+            );
+        }
+    }
+
+    /// No two controls in the panel share a pixel.
+    ///
+    /// Seven rows where there were six: the row that was added is the row most
+    /// likely to have been laid over the one above it.
+    #[test]
+    fn the_take_settings_rows_do_not_overlap() {
+        for w in [900.0_f32, 1280.0, 1920.0] {
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w * 0.56));
+            let anchor = Rect::from_min_size(Pos2::new(40.0, w * 0.3), Vec2::new(20.0, 20.0));
+            let l = SetupLayout::new(screen, anchor);
+            let zones: Vec<(&str, Rect)> = vec![
+                ("name", l.name),
+                ("dest", l.dest),
+                ("reveal", l.reveal),
+                ("default", l.default_tick),
+                ("folder", l.folder),
+                ("disk", l.disk),
+                ("count-in", l.count_in),
+                ("time sig", l.time_sig),
+                ("export", l.export),
+                ("open when done", l.open_when_done),
+                ("click in take", l.click_in_take),
+                ("count-in in take", l.count_in_in_take),
+                ("hide elapsed", l.hide_elapsed),
+                ("audio setup", l.audio),
+                ("close", l.close),
+            ];
+            for i in 0..zones.len() {
+                for j in (i + 1)..zones.len() {
+                    if !zones[i].1.is_positive() || !zones[j].1.is_positive() {
+                        continue;
+                    }
+                    assert!(
+                        !zones[i].1.intersects(zones[j].1),
+                        "{} and {} overlap at {w}",
+                        zones[i].0,
+                        zones[j].0
+                    );
+                }
+            }
+            // And every one of them is inside the panel, which a seventh row
+            // pushing past the bottom edge is exactly how it would not be.
+            for (what, z) in &zones {
+                if z.is_positive() {
+                    assert!(l.panel.contains_rect(*z), "{what} is outside the panel at {w}");
+                }
+            }
+        }
+    }
+
     /// An empty rack, which is what the app opens with.
     fn idle() -> RecorderView<'static> {
         RecorderView::empty()
@@ -6688,14 +6782,21 @@ mod tests {
 /// it was summoned from.
 const SETUP_W: (f32, f32, f32) = (0.24, 290.0, 430.0);
 /// Its height over its width.
-const SETUP_ASPECT: f32 = 0.72;
+const SETUP_ASPECT: f32 = 0.80;
 /// Rows of controls under the title.
-/// **Six, down from eight.** The camera and the audio input left this panel:
-/// a device belongs to the control it feeds, so the microphone's own icon
-/// opens the audio picker and the camera preview opens the camera's — see
-/// `input_icon` and `preview_rect`. What was left was a settings panel two
-/// rows of which were about hardware and six about the take.
-const SETUP_ROWS: usize = 6;
+///
+/// **Seven: six about the take, and Setup.** The camera and the audio input
+/// left this panel because a device belongs to the control it feeds — the
+/// microphone's own icon opens the audio picker and the camera preview opens
+/// the camera's (see `input_icon` and `preview_rect`).
+///
+/// The audio PATH did not, and should not have. It went out with them in
+/// 4.19.0 and landed nowhere: `Hit::ShowAudioStatus` was left with no target in
+/// any layout, so the panel that says what rate the two streams are running at
+/// — the one that exists because a silent 44.1-against-48 mismatch makes takes
+/// drift — became unreachable from anywhere in the app. It is back, as the last
+/// row, and it is the one row here that is not about a take.
+const SETUP_ROWS: usize = 7;
 
 /// Every rectangle in the popup.
 struct SetupLayout {
@@ -6718,6 +6819,8 @@ struct SetupLayout {
     click_in_take: Rect,
     count_in_in_take: Rect,
     hide_elapsed: Rect,
+    /// The way to Setup: the audio system, the devices, the rate, the buffer.
+    audio: Rect,
 }
 
 impl SetupLayout {
@@ -6738,6 +6841,7 @@ impl SetupLayout {
         hide_elapsed: Rect::NOTHING,
         click_in_take: Rect::NOTHING,
         count_in_in_take: Rect::NOTHING,
+        audio: Rect::NOTHING,
     };
 
     /// Hung off `anchor` — the cog — and pulled back onto `screen`.
@@ -6802,6 +6906,7 @@ impl SetupLayout {
         let r3 = row(3);
         let r4 = row(4);
         let r5 = row(5);
+        let r6 = row(6);
         Self {
             panel,
             title,
@@ -6831,11 +6936,16 @@ impl SetupLayout {
             click_in_take: slice_h(r4, 0.51, 1.00),
             count_in_in_take: slice_h(r5, 0.00, 0.49),
             hide_elapsed: slice_h(r5, 0.51, 1.00),
+            // **The whole width, and alone on its row.** Everything above is
+            // about the take that is about to be made; this is about the path
+            // it will be made through, and a row to itself is the cheapest way
+            // to say so in a panel with no headings.
+            audio: r6,
         }
     }
 
     /// Every clickable region and what it means. The popup's [`Layout::targets`].
-    fn targets(&self) -> [(Rect, Hit); 10] {
+    fn targets(&self) -> [(Rect, Hit); 11] {
         [
             (self.name, Hit::NameField),
             (self.close, Hit::CloseSetup),
@@ -6847,6 +6957,7 @@ impl SetupLayout {
             (self.export, Hit::Export),
             (self.open_when_done, Hit::ToggleOpenWhenDone),
             (self.click_in_take, Hit::ToggleMetronomeInTake),
+            (self.audio, Hit::ShowAudioStatus),
         ]
     }
 }
@@ -7553,6 +7664,12 @@ pub fn draw_setup(
     ] {
         draw_tick(painter, r, cap, on, &p);
     }
+
+    // **Setup**, showing the input it is about. The caption is a question the
+    // device name answers, so the row is a readout as well as a way in: an
+    // interface that has gone missing says so here, in the panel you would open
+    // to find out why nothing is being recorded.
+    labelled(painter, l.audio, "AUDIO SETUP", view.audio.text(), p.ink, &p);
 }
 
 

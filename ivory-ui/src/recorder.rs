@@ -1852,6 +1852,19 @@ impl AudioStatus {
 /// alongside these and is what the app has always used.
 pub const BUFFER_CHOICES: [u32; 6] = [64, 128, 256, 512, 1024, 2048];
 
+/// Sample rates Setup offers, in Hz.
+///
+/// The six every interface names, and no more: this is a list to pick a
+/// familiar number off, not a survey of what a driver will accept. What the
+/// panel actually shows is this list intersected with what the INPUT device
+/// reports — see `audio::input_rates` — because a rate offered and then
+/// refused is a "could not open" every time somebody tries the biggest number.
+///
+/// `None`, the device's own, is offered alongside these and is what the app has
+/// always used.
+pub const SAMPLE_RATE_CHOICES: [u32; 6] =
+    [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+
 /// Tempo the metronome and the SMF tempo mark share.
 ///
 /// One number, deliberately: a click at 90 against a file that says 120 is a

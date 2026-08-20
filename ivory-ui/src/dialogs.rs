@@ -176,16 +176,39 @@ pub enum Dialog {
         message: String,
     },
     About,
-    /// What the audio path is actually doing, and the one knob that changes it.
+    /// **Setup.** What the audio path is doing, and everything that changes it.
     ///
-    /// It exists because every number in it was invisible: somebody whose
-    /// interface quietly came up at 44.1 while the monitor ran at 48 had no way
-    /// to find out, and the symptom — an instrument ring overflowing and
-    /// reporting the losses against the take — points nowhere near the cause.
-    AudioStatus {
+    /// It began as a read-only status card, because every number in it was
+    /// invisible: somebody whose interface quietly came up at 44.1 while the
+    /// monitor ran at 48 had no way to find out, and the symptom — an
+    /// instrument ring overflowing and reporting the losses against the take —
+    /// points nowhere near the cause. It is now where the path is CHOSEN as
+    /// well as read, which is the same argument one step further: a panel that
+    /// shows you a rate mismatch and offers no way to fix it is a panel that
+    /// tells you your take will drift and then stands there.
+    ///
+    /// Everything except `status` is snapshotted when the panel opens.
+    /// `systems` and `rates` come from [`crate::ports::AudioSetup`] and
+    /// `rates` re-enumerates hardware, so neither may be pushed per frame;
+    /// `status` is pushed per frame and must be, because a rate that changed
+    /// under you is exactly what this is here to show.
+    AudioSetup {
         status: crate::recorder::AudioStatus,
         /// Frames per callback, or `None` for the device's own default.
         buffer: Option<u32>,
+        /// Rate for both streams, or `None` for the devices' own.
+        rate: Option<u32>,
+        /// Every audio system this build can open.
+        systems: Vec<String>,
+        /// The one in use, or `None` for the platform's default.
+        system: Option<String>,
+        /// The rates the selected input device offers.
+        rates: Vec<u32>,
+        /// A multichannel interface lists its inputs in the mic selector.
+        channels_in_picker: bool,
+        /// How many inputs the open device has, so the channel row can say
+        /// whether there is anything to reveal.
+        input_channels: u16,
     },
     /// Shown at startup until dismissed with its checkbox. Tangent is free; this
     /// asks for support without gating anything, so it must never feel like a
@@ -328,6 +351,20 @@ pub enum DialogAction {
     /// Frames per audio callback, or `None` for the device's own default.
     /// Applies to both streams and reopens them.
     SetBufferFrames(Option<u32>),
+    /// Sample rate for both streams, or `None` for the devices' own.
+    /// Applies to both and reopens them, exactly as the buffer does.
+    SetSampleRate(Option<u32>),
+    /// The audio system every stream opens through. `None` is the platform's.
+    ///
+    /// The heaviest of the three: it does not merely reopen the streams, it
+    /// changes which driver stack they are opened against, so the device
+    /// selected under the old system may not exist under the new one.
+    SetAudioSystem(Option<String>),
+    /// List a multichannel interface's inputs individually in the mic selector.
+    SetChannelsInPicker(bool),
+    /// Open the microphone picker from Setup. The device half of "the audio
+    /// system and device", without a second copy of the list to keep in step.
+    ChooseAudioDevice,
     /// Try to install a pasted supporter key. The app reports the outcome by
     /// updating or closing the dialog.
     InstallLicense {
@@ -842,7 +879,11 @@ const WELCOME_LINES: [&str; 13] = [
 /// The Audio Status window. Two device blocks, a round-trip line, and a row of
 /// buffer sizes — measured by `the_audio_status_card_fits_its_own_text`.
 const AUDIO_W: f32 = 430.0;
-const AUDIO_H: f32 = 400.0;
+/// Taller since the panel became Setup: four choice blocks and their captions
+/// where there was one. The body scrolls, so this is the size at which nothing
+/// HAS to — a machine whose interface offers all six rates is the tallest case,
+/// and it fits.
+const AUDIO_H: f32 = 520.0;
 
 /// The Welcome card's window, and the size it opens at.
 ///
@@ -3219,12 +3260,21 @@ pub fn show(
             )
         }
 
-        Dialog::AudioStatus { status, buffer } => {
+        Dialog::AudioSetup {
+            status,
+            buffer,
+            rate,
+            systems,
+            system,
+            rates,
+            channels_in_picker,
+            input_channels,
+        } => {
             let t = theme(dark_mode);
             show_dialog_viewport(
                 ctx,
                 placement,
-                "Audio Status",
+                "Setup",
                 Vec2::new(AUDIO_W, AUDIO_H),
                 Vec2::new(AUDIO_W - 60.0, AUDIO_H - 40.0),
                 |ui, result| {
@@ -3242,10 +3292,48 @@ pub fn show(
                     egui::Frame::NONE
                         .inner_margin(egui::Margin::same(14))
                         .show(ui, |ui| {
+                            // The buttons stay put and the body scrolls, which
+                            // is the Export dialog's arrangement and for the
+                            // same reason: the number of rate rows depends on
+                            // the interface, so the panel's content has no
+                            // fixed height and its Close button must anyway.
+                            let button_row = 34.0;
+                            egui::ScrollArea::vertical()
+                                .max_height((ui.available_height() - button_row).max(0.0))
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
                             for (title, side) in
                                 [("INPUT", &status.input), ("OUTPUT", &status.output)]
                             {
-                                ui.label(RichText::new(title).font(bold(11.0)).color(t.text));
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(title).font(bold(11.0)).color(t.text));
+                                    // **The device half of "the audio system
+                                    // and device".** A button rather than a
+                                    // second list: the microphone picker is
+                                    // already the device chooser, it is already
+                                    // where the revealed channels appear, and a
+                                    // copy of that list here would be a copy to
+                                    // keep in step with it.
+                                    if title == "INPUT" {
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .add(Button::new(
+                                                        RichText::new("Change...")
+                                                            .font(plain(10.0))
+                                                            .color(t.text),
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    action =
+                                                        Some(DialogAction::ChooseAudioDevice);
+                                                    result.close = true;
+                                                }
+                                            },
+                                        );
+                                    }
+                                });
                                 match side {
                                     Some((name, s)) => {
                                         ui.label(
@@ -3320,6 +3408,74 @@ pub fn show(
                             );
                             ui.add_space(10.0);
 
+                            // ── the audio system ─────────────────────────────
+                            // Drawn even when there is one, and saying so.
+                            // cpal compiles in a single host per platform
+                            // unless a cargo feature asks for more, so on most
+                            // builds this row is a READOUT — and a readout that
+                            // names the driver stack is worth having, because
+                            // "ALSA" on a PipeWire machine is the sentence that
+                            // explains why the buffer behaves the way it does.
+                            ui.label(RichText::new("SYSTEM").font(bold(11.0)).color(t.text));
+                            if systems.len() <= 1 {
+                                ui.label(
+                                    RichText::new(match systems.first() {
+                                        Some(only) => format!("{only}  (the only one this build has)"),
+                                        None => "none reported".to_owned(),
+                                    })
+                                    .font(plain(11.0))
+                                    .color(dim),
+                                );
+                            } else {
+                                ui.horizontal_wrapped(|ui| {
+                                    for name in systems.iter() {
+                                        let on = system.as_deref() == Some(name.as_str());
+                                        if ui.selectable_label(on, name).clicked() && !on {
+                                            *system = Some(name.clone());
+                                            action = Some(DialogAction::SetAudioSystem(Some(
+                                                name.clone(),
+                                            )));
+                                        }
+                                    }
+                                });
+                                ui.label(
+                                    RichText::new("the device list changes with it")
+                                        .font(plain(10.0))
+                                        .color(dim),
+                                );
+                            }
+                            ui.add_space(10.0);
+
+                            // ── the rate ─────────────────────────────────────
+                            ui.label(
+                                RichText::new("SAMPLE RATE").font(bold(11.0)).color(t.text),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                let mut pick =
+                                    |ui: &mut egui::Ui, label: String, val: Option<u32>| {
+                                        if ui.selectable_label(*rate == val, label).clicked() {
+                                            *rate = val;
+                                            action = Some(DialogAction::SetSampleRate(val));
+                                        }
+                                    };
+                                pick(ui, "Device".to_owned(), None);
+                                // What the INPUT device actually offers, not a
+                                // constant: a rate offered and then refused is
+                                // a "could not open" every time somebody tries
+                                // the biggest number.
+                                for r in rates.iter() {
+                                    pick(ui, r.to_string(), Some(*r));
+                                }
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "what the input offers; the output follows where it can",
+                                )
+                                .font(plain(10.0))
+                                .color(dim),
+                            );
+                            ui.add_space(10.0);
+
                             ui.label(
                                 RichText::new("BUFFER SIZE").font(bold(11.0)).color(t.text),
                             );
@@ -3340,8 +3496,42 @@ pub fn show(
                                     .font(plain(10.0))
                                     .color(dim),
                             );
+                            ui.add_space(10.0);
 
-                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            // ── the channels ─────────────────────────────────
+                            ui.label(
+                                RichText::new("INPUT CHANNELS").font(bold(11.0)).color(t.text),
+                            );
+                            if ui
+                                .checkbox(
+                                    channels_in_picker,
+                                    RichText::new("List each input separately")
+                                        .font(plain(11.0))
+                                        .color(t.text),
+                                )
+                                .changed()
+                            {
+                                action =
+                                    Some(DialogAction::SetChannelsInPicker(*channels_in_picker));
+                            }
+                            // The reason, in the one sentence that makes the
+                            // switch worth finding: an interface numbers its
+                            // inputs on the front panel, and until now only the
+                            // first two could be recorded.
+                            ui.label(
+                                RichText::new(if *input_channels >= 3 {
+                                    format!(
+                                        "{input_channels} inputs; record the one the piano is in"
+                                    )
+                                } else {
+                                    "for an interface with more than two inputs".to_owned()
+                                })
+                                .font(plain(10.0))
+                                .color(dim),
+                            );
+                                });
+
+                            ui.add_space(6.0);
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui.add(Button::new(RichText::new("Close").color(t.text))).clicked()
                                 {
@@ -5545,6 +5735,13 @@ mod tests {
             "Round trip, at least  21.3 ms".to_owned(),
             "buffers only; converters and the driver add more".to_owned(),
             "both streams reopen; not while a take is rolling".to_owned(),
+            // Setup's own lines. The first is the longest string this panel
+            // draws, which is why it is here: it was written to fit and that is
+            // a claim, not a fact, until something measures it.
+            "what the input offers; the output follows where it can".to_owned(),
+            "18 inputs; record the one the piano is in".to_owned(),
+            "for an interface with more than two inputs".to_owned(),
+            "the device list changes with it".to_owned(),
         ];
         let mut widest = 0.0_f32;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -5554,7 +5751,8 @@ mod tests {
                     // not. Measured at the size each is actually drawn.
                     let (size, family) = match i {
                         2 | 3 | 4 => (11.0, fonts::courier_bold()),
-                        5 | 6 => (10.0, fonts::courier()),
+                        // The captions and the small print, at 10.
+                        5..=10 => (10.0, fonts::courier()),
                         _ => (11.0, fonts::courier()),
                     };
                     let g = ui.painter().layout_no_wrap(

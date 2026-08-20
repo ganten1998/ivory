@@ -1284,6 +1284,143 @@ the general form of the bug.
 
 ---
 
+## 2p. 2026-08-19 — the menu in compartments, no detach, and Setup
+
+Shipped as **4.20.0**. A tidy-up, a pivot, and one thing put back that should
+never have left.
+
+### The menu is four compartments and nine rows shorter
+
+It was twenty-five hovers: every subject the app has, whether or not the thing
+it configures was on screen. It is now blocks joined by separators — what is
+true everywhere, then the piano's, the theory band's, the guitar's and the
+recorder's, each present only while its surface is.
+
+What was deleted: **Show/Hide Note Names, the Recorder block, Sources, Time
+signature, Count-in, the Keyboard block, Dark Mode, the typeface, and the
+Theory toggles.** None of it is a feature loss — every one is a bound key (`U`,
+`V`, `D`, `F`, `1`-`4`, `T`, `K`, `P`, `C`), and `no_menu_row_does_what_a_key_
+already_does` asserts BOTH halves: the row is gone *and* the binding still
+exists. Delete a binding from `keys.rs` and that test tells you the feature now
+has no way in at all.
+
+The line the deletions were drawn on: a row that only flips a switch is a toll
+paid every time you open the menu; a row that opens a dialog you then have to
+fill in is the front door somebody finds the feature through. So Select MIDI
+Input, the teach block, Colors and Plugin folders stayed, and moved up.
+
+Two categories are NOT in the owner's list and were kept anyway — **Chords**
+and **Plugin folders**. Neither was named obsolete; Plugin folders has no key
+and cannot have one ("my plugin is not in the list" is answered by a rescan, a
+folder, or starting over). Say so when reporting: keeping something unnamed is
+a decision, and it is the owner's to reverse.
+
+`Key` is now offered whenever ANY theory diagram is up, not just the notation —
+see below. `Follow MIDI` is the one theory row with no key of its own, so it
+stayed; deleting it would have left no way to stop the band chasing the piano.
+
+### The key signature drives the harmonic triangles
+
+`draw_triangles` anchored I, IV and V on `input.tonic()` — whatever you had
+just played. That made the one diagram with roman numerals on it the one that
+could not tell you where you were: every chord was I, because the picture slid
+under it. It is anchored on the KEY now (`key_tonic(s.staff_key)`, which is
+`key` fifths from C), the black keys are spelled the way the signature spells
+them, and the ring still marks the chord you are actually playing — so you see
+that what you played *is* the IV.
+
+`hit_test` lost its `Input` parameter in the same change, which is a stronger
+guarantee than the test it replaces: a hit test that cannot see what is playing
+cannot answer for it. The Circle and the Tonnetz are unchanged.
+
+### Nothing detaches any more
+
+Four surfaces could be popped into their own window. All four are retired: the
+menu rows are gone, and `IvoryApp::new` clears all four `*_detached` flags
+UNCONDITIONALLY on the way in. That clamp is the important half — the flags
+persist, so an upgrade would otherwise zero a band, put it in a window nothing
+opens, and offer no Attach row to undo it. That failure is not hypothetical; it
+is what a plugin instance seeded from the desktop's settings file used to do,
+which is what the clamp was originally written for when it was gated on
+`caps.detachable`.
+
+The viewport plumbing is left in place and inert — the owner's own words were
+"remove (or make inactive)", and deleting ~1000 lines of window code is a much
+larger, riskier change than the pivot asked for. `nothing_can_be_detached_any_
+more` asserts absence over every `Caps` and both detached states.
+
+### Setup came back, and had been unreachable for a release
+
+**Read this one before touching the take-settings panel.** 4.19.0 moved the
+camera and the audio input out of that panel onto the controls they feed, and
+took the AUDIO STATUS row out with them — but did not move it anywhere.
+`Hit::ShowAudioStatus` kept its variant, its tooltip and its arm in `app.rs`,
+and had no rectangle in any layout. The panel that says what rate the two
+streams are running at could not be opened from anywhere in the app. Nothing
+failed, nothing warned, and it stayed that way for a release until the owner
+noticed it was missing.
+
+`every_take_settings_control_can_actually_be_clicked` is the guard: it walks
+`SetupLayout::targets()` rect by rect through `setup_hit_test`, so a Hit with
+no rectangle fails rather than disappearing.
+
+It is now the seventh row of the take settings and it is **Setup**, holding
+everything about the audio path rather than only reporting it:
+
+- **SYSTEM** — `cpal::available_hosts()`, persisted by NAME in `audio_system`.
+  Usually ONE entry, and the panel says so rather than pretending: cpal
+  compiles in a single host per platform unless a cargo feature asks for more,
+  and both extras (JACK, ASIO) need a development library present when the
+  RELEASE is built. Turning either on is a change to what the release scripts
+  can produce, not a change to this code. The chooser is real either way, and
+  `ivory_record::audio::SYSTEM` is process-global because a `cpal::Host` is not
+  `Sync` and cannot be held.
+- **SAMPLE RATE** — `record_sample_rate`, applied to BOTH streams. The list is
+  the six familiar rates intersected with what the input device actually
+  reports (`audio::input_rates`), because a rate offered and then refused is a
+  "could not open" every time somebody tries the biggest number. The output
+  narrows through one of its own ranges and silently keeps its default if it
+  cannot match — losing the app's sound over a preference would be worse than
+  the mismatch the panel already warns about.
+- **BUFFER SIZE** — unchanged, and the model the other two follow: written to
+  settings, acted on by the host on an edge, never mid-take.
+- **INPUT CHANNELS** — the multichannel answer. `ConfigWish::channels` already
+  documented why this was needed: cpal numbers channels from the device's
+  FIRST input, so asking an 18-in interface for two channels records inputs 1
+  and 2 and silently ignores a piano plugged into 3. So the device is opened
+  with everything it has and one channel is taken at
+  `CaptureSource::accept` — the single point where the interleaved callback
+  buffer enters the app. Everything downstream sees a mono stream and knows
+  nothing about it, including `OpenConfig.channels`, which must be the SINK's
+  count or the WAV declares 18 channels over mono samples.
+
+The device half is a "Change..." button that opens the existing microphone
+picker. One device chooser, not two lists of the same hardware to keep in step.
+
+**The channel uid grammar** is `<device key>\u{1f}<channel>`, and the separator
+is the argument: `#` is taken and escaped by `DeviceKey`, and `|`, `:` and `@`
+all appear in real interface names. A C0 control appears in none, serialises as
+`\u001f`, and is invisible in `settings.json`.
+`a_channel_uid_round_trips_through_a_hostile_device_name` is what makes that an
+argument rather than a hope — a uid that splits wrong resolves to a device that
+does not exist, and the saved microphone then silently reverts every launch.
+
+### What was verified, and how
+
+The channel pick and the panel are both covered by tests that were *proved to
+fail without the fix* — the stride bug (`* ch` instead of `* ch_in`) and the
+missing target were each reintroduced and the tests went red.
+`the_setup_panel_opens_and_draws_and_its_controls_act` drives real egui frames,
+and a `panic!` planted in the panel body confirmed the body actually runs, so
+it is not a vacuous "no panic" test.
+
+**Not verified on hardware:** no multichannel interface was available, so the
+channel rows have never been seen listing a real 18-in device, and no build has
+more than one audio system to switch between. The DSP is unit-tested; the
+enumeration is not.
+
+---
+
 ## 3. Repo layout
 
 ```
@@ -1575,6 +1712,21 @@ rely on Ubuntu Light. Do not disable `default_fonts`.
   as the icon-less Windows exe. Anything touching a `cfg`-gated path gets a
   `cargo check --target` for a target that actually has it, before the release
   script finds out.
+- **A control with no rectangle is invisible to everything except a user.**
+  `Hit::ShowAudioStatus` kept its enum variant, its tooltip and its handler arm
+  when its row left the take-settings panel in 4.19.0 — only the entry in
+  `SetupLayout::targets()` went. Nothing failed: no dead code, no warning, no
+  test, because every test asked whether a Hit *does the right thing* and none
+  asked whether it can be *reached*. The whole Audio Status panel was gone for
+  a release. Any layout that owns press regions needs a test that walks its
+  targets rect by rect through its own hit test — see
+  `every_take_settings_control_can_actually_be_clicked`.
+- **Deleting a menu row is only safe if something else still reaches the
+  feature, and "something else" has to be asserted.** Nine rows left the menu
+  in 4.20.0 on the grounds that each duplicated a key binding. That is true
+  today and is one line in `keys.rs` away from being false, so
+  `no_menu_row_does_what_a_key_already_does` asserts the row is absent AND that
+  `keys::binding_for_test` still finds the key.
 - **Verify claims about assets before repeating them.** "543-byte placeholder
   icon" was in this document for a week; the file was the original artwork all
   along. One `shasum` against the Python app settled it.

@@ -637,16 +637,24 @@ struct Audio {
 impl Audio {
     fn open(
         selection: &InputSelection,
+        channel: Option<u16>,
         timebase: Timebase,
         tap_home: mpsc::Sender<Box<crate::instrument::RecorderTap>>,
         buffer_frames: Option<u32>,
+        sample_rate: Option<u32>,
     ) -> Result<Self, String> {
         // The user's buffer choice, or the device's own. Both streams get the
         // same one: they are two halves of one path, and a round-trip figure
         // made of a 64-frame input and a 1024-frame output is a number nobody
-        // can act on.
+        // can act on. The rate is the same bargain for the same reason — two
+        // devices at two rates make a take that drifts.
         let wish = audio::ConfigWish {
             buffer_frames,
+            sample_rate,
+            // NOT `channels`. Asking for one channel would take the FIRST one;
+            // this opens everything the device has and keeps the one that was
+            // asked for. See `ConfigWish::pick_channel`.
+            pick_channel: channel,
             ..audio::ConfigWish::default()
         };
         // Three seconds of ring. The writer thread wakes every 4 ms, so this is
@@ -1143,7 +1151,13 @@ impl Session {
     /// changes — never at Record. RECORDER-PLAN §3: a device opened at Record
     /// costs warm-up time inside the take, and a meter that only comes alive
     /// once recording has begun cannot prevent the mistake it exists to prevent.
-    pub fn open_input(&mut self, selection: &InputSelection, buffer_frames: Option<u32>) {
+    pub fn open_input(
+        &mut self,
+        selection: &InputSelection,
+        channel: Option<u16>,
+        buffer_frames: Option<u32>,
+        sample_rate: Option<u32>,
+    ) {
         if self.state.is_active() {
             return; // never swap the device out from under a running take
         }
@@ -1154,7 +1168,14 @@ impl Session {
         // the channel rather than lost with the thread.
         self.plugin_audio = None;
         let tap = self.recover_tap();
-        match Audio::open(selection, self.timebase, self.tap_tx.clone(), buffer_frames) {
+        match Audio::open(
+            selection,
+            channel,
+            self.timebase,
+            self.tap_tx.clone(),
+            buffer_frames,
+            sample_rate,
+        ) {
             Ok(a) => {
                 if let Some(t) = tap {
                     let _ = a.cmds.send(Cmd::Plugin(Some(Box::new(t))));
@@ -2073,7 +2094,7 @@ pub fn record_test(seconds: Option<String>) {
     let timebase = Timebase::new();
     let tap = Arc::new(RawMidiTap::new(60_000));
     let mut session = Session::new(Arc::clone(&tap), timebase);
-    session.open_input(&InputSelection::Default, None);
+    session.open_input(&InputSelection::Default, None, None, None);
     match (session.audio_device_name(), session.audio_error()) {
         (Some(name), _) => println!("\nopen: {name}"),
         (None, Some(e)) => {

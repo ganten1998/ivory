@@ -278,6 +278,19 @@ fn card_rows(gates: Gates) -> Vec<(&'static str, &'static str)> {
 ///
 /// `gates` says which bindings are live; it is a parameter rather than a filter
 /// in `app.rs` so the card cannot disagree with the keyboard. See [`Gates`].
+/// Is this action bound to a key at all?
+///
+/// For `menu.rs`, which deleted a dozen rows on the grounds that a key already
+/// does the job. That justification is only true while the binding exists, and
+/// a binding is one line in a table that nothing else would miss — so the menu
+/// asserts the key is here, and this is how it asks.
+///
+/// Matched by `family`, so `ToggleTheoryElement(1)` answers for all four
+/// number keys.
+pub fn binding_for_test(action: KeyAction) -> bool {
+    BINDINGS.iter().any(|(_, _, a, _)| a.family() == action.family())
+}
+
 pub fn pressed(ctx: &egui::Context, gates: Gates) -> Option<KeyAction> {
     ctx.input(|i| {
         if i.modifiers.any() {
