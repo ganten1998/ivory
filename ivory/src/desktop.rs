@@ -769,7 +769,6 @@ impl DesktopApp {
         // every frame rather than on an edge: it is one atomic store, and the
         // list it changes is built fresh every time the picker opens, so there
         // is no state to reconcile and nothing to reopen.
-        crate::devices::set_reveal_channels(self.app.audio_channels_in_picker());
 
         let want_buffer = self.app.buffer_frames();
         let want_rate = self.app.sample_rate();
@@ -2458,7 +2457,6 @@ impl DesktopApp {
             // default and is then torn down and restarted, which is a five-
             // second instrument reload at every launch.
             ivory_record::audio::set_system(app.audio_system().as_deref());
-            crate::devices::set_reveal_channels(app.audio_channels_in_picker());
             // Every installed VST3, by path and file name. This is a DIRECTORY
             // LISTING, not a scan: nothing is opened, so it costs milliseconds
             // even with 112 of them, and no plugin gets the chance to crash the

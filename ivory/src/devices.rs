@@ -23,6 +23,7 @@
 //! So what crosses the boundary is a `String` of intent, under a mutex, which
 //! is `Send` because it is data.
 
+use ivory_record::audio::ChannelPick;
 use ivory_ui::ports::{CaptureDevices, DeviceInfo};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -119,38 +120,33 @@ const PIPEWIRE_UID: &str = "pw:";
 /// A malformed channel — anything that is not a number — is treated as no
 /// channel rather than as an error, and the DEVICE still opens. A settings file
 /// somebody edited by hand should cost the channel, not the microphone.
-fn split_channel(uid: &str) -> (&str, Option<u16>) {
-    match uid.split_once(CHANNEL_SEP) {
-        Some((key, ch)) => (key, ch.parse().ok()),
-        None => (uid, None),
+fn split_channel(uid: &str) -> (&str, Option<ChannelPick>) {
+    let Some((key, spec)) = uid.split_once(CHANNEL_SEP) else {
+        return (uid, None);
+    };
+    (key, parse_pick(spec))
+}
+
+/// `3` is mono input 3; `1+2` is a stereo pair of inputs 1 and 2.
+///
+/// Zero-based, like everything below the label. `+` because it cannot appear
+/// in a number and reads as "and" — and because a `-` would be ambiguous with
+/// a range, which this is deliberately not: 3+0 is a legitimate pair with the
+/// channels crossed, and a range cannot say that.
+fn parse_pick(spec: &str) -> Option<ChannelPick> {
+    match spec.split_once('+') {
+        Some((a, b)) => Some(ChannelPick::Stereo(a.parse().ok()?, b.parse().ok()?)),
+        None => Some(ChannelPick::Mono(spec.parse().ok()?)),
     }
 }
 
-/// The uid for one input of a device.
-fn channel_uid(key: &str, channel: u16) -> String {
-    format!("{key}{CHANNEL_SEP}{channel}")
+/// The uid for one input of a device, or a pair of them.
+fn channel_uid(key: &str, pick: ChannelPick) -> String {
+    match pick {
+        ChannelPick::Mono(a) => format!("{key}{CHANNEL_SEP}{a}"),
+        ChannelPick::Stereo(a, b) => format!("{key}{CHANNEL_SEP}{a}+{b}"),
+    }
 }
-
-/// Whether the picker lists a multichannel interface's inputs one by one.
-///
-/// Process-global for the same reason the audio system is: `CaptureDevices` is
-/// a trait the UI holds by the settings' word, `list()` takes no arguments, and
-/// threading a preference through it would put a settings type in `ports.rs` —
-/// which is the one thing the firewall exists to prevent.
-static REVEAL_CHANNELS: AtomicBool = AtomicBool::new(false);
-
-/// Set from the settings at startup and whenever Setup changes it.
-pub fn set_reveal_channels(on: bool) {
-    REVEAL_CHANNELS.store(on, Ordering::Relaxed);
-}
-
-/// Below this, a device's inputs are not worth listing separately.
-///
-/// Two, because "left" and "right" of an ordinary stereo input are not two
-/// microphones and offering them as such would double every list to say
-/// nothing. Three and up is an interface, and on an interface the channel
-/// number is where the instrument is plugged in.
-const MULTICHANNEL: u16 = 3;
 
 impl CaptureDevices for AudioInputs {
     fn list(&self) -> Vec<DeviceInfo> {
@@ -164,7 +160,6 @@ impl CaptureDevices for AudioInputs {
             // any, and guessing at the reason here would be guessing.
             return Vec::new();
         };
-        let reveal = REVEAL_CHANNELS.load(Ordering::Relaxed);
         let mut out = Vec::new();
         // **PipeWire first, and on its own when it answers.**
         //
@@ -191,19 +186,6 @@ impl CaptureDevices for AudioInputs {
                 // guessed: a badge on the wrong row is worse than no badge.
                 default: false,
             });
-            let Some(channels) = src.channels.filter(|c| *c >= MULTICHANNEL) else {
-                continue;
-            };
-            if !reveal {
-                continue;
-            }
-            for ch in 0..channels {
-                out.push(DeviceInfo {
-                    uid: channel_uid(&uid, ch),
-                    name: format!("{}  -  input {}", src.description, ch + 1),
-                    default: false,
-                });
-            }
         }
         if !out.is_empty() {
             return out;
@@ -218,31 +200,6 @@ impl CaptureDevices for AudioInputs {
                 name: d.key.to_string(),
                 default: d.is_default,
             });
-            // **Then its inputs, one row each.** This is the whole answer to
-            // "the piano is plugged into input 3": asking cpal for fewer
-            // channels takes them from the FRONT (see `ConfigWish::channels`),
-            // so input 3 is unreachable by any device-level choice. Each row
-            // here opens the device exactly as the row above it does and keeps
-            // one channel out of the interleaved buffer.
-            //
-            // Numbered from 1, because that is what is printed on the front of
-            // the interface. The uid carries the zero-based index.
-            let Some(channels) = d.channels.filter(|c| *c >= MULTICHANNEL) else {
-                continue;
-            };
-            if !reveal {
-                continue;
-            }
-            for ch in 0..channels {
-                out.push(DeviceInfo {
-                    uid: channel_uid(&key, ch),
-                    name: format!("{}  -  input {}", d.key, ch + 1),
-                    // The device's own row carries the default mark. A channel
-                    // is never "the system default input", and marking one
-                    // would put the badge on an arbitrary member of a set.
-                    default: false,
-                });
-            }
         }
         out
     }
@@ -273,7 +230,10 @@ impl CaptureDevices for AudioInputs {
         // channel number, where the stream falls back to everything and this
         // still names the input that was asked for. Re-picking settles it.
         match sel.wanted.as_deref().and_then(|u| split_channel(u).1) {
-            Some(ch) => Some(format!("{name}  -  input {}", ch + 1)),
+            Some(ChannelPick::Mono(a)) => Some(format!("{name}  -  input {}", a + 1)),
+            Some(ChannelPick::Stereo(a, b)) => {
+                Some(format!("{name}  -  inputs {}/{}", a + 1, b + 1))
+            }
             None => Some(name),
         }
     }
@@ -283,9 +243,9 @@ impl CaptureDevices for AudioInputs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioChoice {
     pub selection: ivory_record::audio::InputSelection,
-    /// Zero-based, and already known to be a number — never yet known to exist
-    /// on the device that opens, which is checked where the stream is built.
-    pub channel: Option<u16>,
+    /// Which input, or which pair. Zero-based, and never yet known to exist on
+    /// the device that opens — that is checked where the stream is built.
+    pub channel: Option<ChannelPick>,
 }
 
 /// The selection as `ivory-record` wants it, or `None` for "open nothing".
@@ -355,6 +315,60 @@ impl Setup {
 impl ivory_ui::ports::AudioSetup for Setup {
     fn systems(&self) -> Vec<String> {
         ivory_record::audio::systems()
+    }
+
+    fn input_channels(&self) -> u16 {
+        let want = lock(&self.0).wanted.clone();
+        let Some(uid) = want else {
+            return 0;
+        };
+        let (key, _) = split_channel(&uid);
+        // PipeWire knows its own node's width; ALSA's answer comes from the
+        // device's default config. Either way this is what the chooser lays
+        // its buttons out from, so a wrong number is a chooser that offers
+        // inputs the device does not have.
+        if let Some(node) = key.strip_prefix(PIPEWIRE_UID) {
+            return ivory_record::audio::pipewire_sources()
+                .into_iter()
+                .find(|s| s.node == node)
+                .and_then(|s| s.channels)
+                .unwrap_or(0);
+        }
+        let key = ivory_record::audio::DeviceKey::from_setting(key);
+        ivory_record::audio::input_devices()
+            .ok()
+            .into_iter()
+            .flatten()
+            .find(|d| d.key == key)
+            .and_then(|d| d.channels)
+            .unwrap_or(0)
+    }
+
+    fn channels(&self) -> Option<(u16, Option<u16>)> {
+        let uid = lock(&self.0).wanted.clone()?;
+        match split_channel(&uid).1? {
+            ChannelPick::Mono(a) => Some((a, None)),
+            ChannelPick::Stereo(a, b) => Some((a, Some(b))),
+        }
+    }
+
+    fn set_channels(&mut self, pick: Option<(u16, Option<u16>)>) {
+        let mut sel = lock(&self.0);
+        let Some(uid) = sel.wanted.clone() else {
+            return;
+        };
+        // Rebuilt from the KEY, so choosing twice does not stack suffixes.
+        let (key, _) = split_channel(&uid);
+        sel.wanted = Some(match pick {
+            None => key.to_owned(),
+            Some((a, None)) => channel_uid(key, ChannelPick::Mono(a)),
+            Some((a, Some(b))) => channel_uid(key, ChannelPick::Stereo(a, b)),
+        });
+        // A channel change reopens the stream, exactly as a device change
+        // does: the pick is applied where the callback's buffer enters the
+        // app, and that is decided when the stream is built.
+        sel.explicit = true;
+        sel.error = None;
     }
 
     fn rates(&self) -> Vec<u32> {
@@ -633,10 +647,10 @@ mod tests {
             // The device's own row carries no channel and must not grow one.
             assert_eq!(split_channel(&key), (key.as_str(), None), "{name}");
             for ch in [0_u16, 3, 17] {
-                let uid = channel_uid(&key, ch);
+                let uid = channel_uid(&key, ChannelPick::Mono(ch));
                 let (back, got) = split_channel(&uid);
                 assert_eq!(back, key, "{name} at channel {ch}");
-                assert_eq!(got, Some(ch), "{name} at channel {ch}");
+                assert_eq!(got, Some(ChannelPick::Mono(ch)), "{name} at channel {ch}");
                 assert_eq!(
                     DeviceKey::from_setting(back),
                     DeviceKey::named(name),
@@ -670,7 +684,7 @@ mod tests {
         let (_b, with_ch) = AudioInputs::new();
         restore(
             &with_ch,
-            Some(&channel_uid(&format!("{PIPEWIRE_UID}{node}"), 1)),
+            Some(&channel_uid(&format!("{PIPEWIRE_UID}{node}"), ChannelPick::Stereo(1, 2))),
             false,
         );
         let choice = audio_selection(&with_ch).expect("a device was chosen");
@@ -679,7 +693,7 @@ mod tests {
             InputSelection::PipewireNode(node.to_owned()),
             "the channel suffix ate the node name"
         );
-        assert_eq!(choice.channel, Some(1));
+        assert_eq!(choice.channel, Some(ChannelPick::Stereo(1, 2)));
     }
 
     /// A chosen channel reaches the stream open, with its device intact.
@@ -687,15 +701,18 @@ mod tests {
     fn a_chosen_channel_reaches_the_stream_open() {
         use ivory_record::audio::{DeviceKey, InputSelection};
         let (_a, shared) = AudioInputs::new();
-        let uid = channel_uid(&DeviceKey::named("Scarlett 18i20 USB").to_setting(), 2);
+        let uid = channel_uid(
+            &DeviceKey::named("Scarlett 18i20 USB").to_setting(),
+            ChannelPick::Mono(2),
+        );
         restore(&shared, Some(&uid), false);
         let choice = audio_selection(&shared).expect("a device was chosen");
         assert_eq!(
             choice.selection,
             InputSelection::Key(DeviceKey::named("Scarlett 18i20 USB"))
         );
-        // Zero-based here; the picker's label said "input 3".
-        assert_eq!(choice.channel, Some(2));
+        // Zero-based here; the chooser's label said "input 3".
+        assert_eq!(choice.channel, Some(ChannelPick::Mono(2)));
     }
 
     /// A hand-edited channel that is not a number costs the channel, not the

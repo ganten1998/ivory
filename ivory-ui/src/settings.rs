@@ -424,14 +424,6 @@ pub struct Settings {
     /// an index would silently mean a different driver stack on a build with
     /// one more of them compiled in.
     pub audio_system: String,
-    /// List a multichannel interface's inputs individually in the mic selector.
-    ///
-    /// Off by default, because for the two-channel devices most people have it
-    /// would double the list and say nothing. On, an 18-in interface offers its
-    /// eighteen inputs and the piano plugged into 3 can be recorded from 3 —
-    /// which is otherwise unreachable, since asking cpal for fewer channels
-    /// takes them from the front (see `ConfigWish::channels`).
-    pub audio_channels_in_picker: bool,
     /// Whether the video defaults have already been lowered for a machine that
     /// renders on the CPU.
     ///
@@ -681,7 +673,6 @@ impl Default for Settings {
             record_buffer_frames: 0,
             record_sample_rate: 0,
             audio_system: String::new(),
-            audio_channels_in_picker: false,
             video_defaults_lowered: false,
             plugin_slots: [const { None }; crate::recorder::SLOTS],
             plugin_gains: [1.0; crate::recorder::SLOTS],
@@ -1220,11 +1211,6 @@ impl Settings {
         }
         take_bool(
             &mut map,
-            "audio_channels_in_picker",
-            &mut s.audio_channels_in_picker,
-        );
-        take_bool(
-            &mut map,
             "video_defaults_lowered",
             &mut s.video_defaults_lowered,
         );
@@ -1734,10 +1720,6 @@ impl Settings {
         map.insert(
             "audio_system".into(),
             Value::String(self.audio_system.clone()),
-        );
-        map.insert(
-            "audio_channels_in_picker".into(),
-            Value::Bool(self.audio_channels_in_picker),
         );
         map.insert(
             "video_defaults_lowered".into(),
@@ -2515,11 +2497,9 @@ mod tests {
         let mut s = Settings::default();
         s.record_sample_rate = 96_000;
         s.audio_system = "JACK".to_owned();
-        s.audio_channels_in_picker = true;
         let back = Settings::from_json(&s.to_json());
         assert_eq!(back.sample_rate(), Some(96_000));
         assert_eq!(back.audio_system(), Some("JACK"));
-        assert!(back.audio_channels_in_picker);
 
         // **Sanitised at the point of use, not on the way in.** A file naming a
         // rate this build does not offer keeps it — a later build may — and
@@ -2536,7 +2516,6 @@ mod tests {
         let d = Settings::default();
         assert_eq!(d.sample_rate(), None);
         assert_eq!(d.audio_system(), None);
-        assert!(!d.audio_channels_in_picker);
     }
 
     /// Selecting a preset does not discard the custom tuning, so switching away

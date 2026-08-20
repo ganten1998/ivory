@@ -90,6 +90,26 @@ pub trait AudioSetup: Send {
     /// panel then offers only "the device's own" — which is what every build
     /// before this one did unconditionally.
     fn rates(&self) -> Vec<u32>;
+
+    /// How many inputs the selected device has. 0 when nothing is selected.
+    fn input_channels(&self) -> u16;
+
+    /// Which input, or pair of inputs, is being recorded.
+    ///
+    /// `None` is the whole device. `Some((a, None))` is input `a` as mono;
+    /// `Some((a, Some(b)))` is the pair — which need not be adjacent and need
+    /// not be in order, because 2/3 and 3/2 are both things people patch.
+    ///
+    /// Zero-based, like every index. What the UI prints is one-based, because
+    /// that is what is on the front of the interface.
+    fn channels(&self) -> Option<(u16, Option<u16>)>;
+
+    /// Record this input, this pair, or the whole device.
+    ///
+    /// **The uid grammar stays on the host's side of the firewall.** A choice
+    /// is a pair of numbers here and a string there; `ivory-ui` cannot spell
+    /// the string and must not learn to.
+    fn set_channels(&mut self, pick: Option<(u16, Option<u16>)>);
 }
 
 /// A folder the app has asked the host to choose.

@@ -762,7 +762,7 @@ struct Audio {
 impl Audio {
     fn open(
         selection: &InputSelection,
-        channel: Option<u16>,
+        channel: Option<audio::ChannelPick>,
         timebase: Timebase,
         tap_home: mpsc::Sender<Box<crate::instrument::RecorderTap>>,
         buffer_frames: Option<u32>,
@@ -1372,7 +1372,7 @@ impl Session {
     pub fn open_input(
         &mut self,
         selection: &InputSelection,
-        channel: Option<u16>,
+        channel: Option<audio::ChannelPick>,
         buffer_frames: Option<u32>,
         sample_rate: Option<u32>,
     ) {

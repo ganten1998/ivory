@@ -2932,13 +2932,28 @@ impl IvoryApp {
             systems,
             system: self.settings.audio_system().map(str::to_owned),
             rates,
-            channels_in_picker: self.settings.audio_channels_in_picker,
-            input_channels: self
+            pick: self.audio_setup.as_ref().and_then(|s| s.channels()),
+            // The DEVICE's width, not the open stream's: a stream with one
+            // input picked out of eight is one channel wide, and laying the
+            // chooser out from that would offer exactly the channel already
+            // chosen.
+            input_channels: self.audio_setup.as_ref().map_or(0, |s| s.input_channels()),
+        });
+    }
+
+    /// Open the channel chooser for the device now selected.
+    fn open_input_channels(&mut self) {
+        let Some(setup) = self.audio_setup.as_ref() else {
+            return;
+        };
+        self.dialog = Some(dialogs::Dialog::InputChannels {
+            device: self
                 .audio_status
                 .input
                 .as_ref()
-                .map(|(_, s)| s.channels)
-                .unwrap_or(0),
+                .map_or_else(|| "the input".to_owned(), |(n, _)| n.clone()),
+            channels: setup.input_channels(),
+            pick: setup.channels(),
         });
     }
 
@@ -2956,11 +2971,6 @@ impl IvoryApp {
     /// The audio system both streams should open through.
     pub fn audio_system(&self) -> Option<String> {
         self.settings.audio_system().map(str::to_owned)
-    }
-
-    /// Whether a multichannel interface lists its inputs in the mic selector.
-    pub fn audio_channels_in_picker(&self) -> bool {
-        self.settings.audio_channels_in_picker
     }
 
     /// Whether the live input is being monitored. Never persisted; see the
@@ -4525,10 +4535,19 @@ impl IvoryApp {
                 self.settings.audio_system = name.unwrap_or_default();
                 self.save_settings();
             }
-            DialogAction::SetChannelsInPicker(on) => {
-                self.settings.audio_channels_in_picker = on;
-                self.save_settings();
+            DialogAction::SetInputChannels(pick) => {
+                if let Some(s) = self.audio_setup.as_mut() {
+                    s.set_channels(pick);
+                }
+                // Live in the open dialog too, or the buttons do not light up
+                // until it is closed and opened again.
+                if let Some(dialogs::Dialog::InputChannels { pick: live, .. })
+                | Some(dialogs::Dialog::AudioSetup { pick: live, .. }) = self.dialog.as_mut()
+                {
+                    *live = pick;
+                }
             }
+            DialogAction::ChooseInputChannels => self.open_input_channels(),
             // Setup closes and the picker opens in its place, which is the same
             // hand-off the band's own mic icon makes — one device chooser, not
             // two lists of the same hardware.
@@ -6320,6 +6339,67 @@ mod tests {
         headless_with(caps, Settings::default())
     }
 
+    /// **The channel chooser opens, draws, and every pair is reachable.**
+    ///
+    /// Drawn for real: it is two wrapped rows of buttons per section, which is
+    /// where egui id clashes live, and a chooser that panics on an eighteen-in
+    /// interface would only be discovered by somebody who owns one.
+    ///
+    /// The claim it asserts is the one the feature exists for — that 2/3 is as
+    /// reachable as 1/2, in either order — expressed as: every ordered pair of
+    /// distinct inputs can be set and read back.
+    #[test]
+    fn the_channel_chooser_opens_and_reaches_every_pair() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.dialog = Some(dialogs::Dialog::InputChannels {
+            device: "Scarlett 18i20 USB".to_owned(),
+            channels: 8,
+            pick: None,
+        });
+        let run = |ctx: &egui::Context, app: &mut IvoryApp| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(1280.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        for _ in 0..3 {
+            run(&ctx, &mut app);
+        }
+        assert!(
+            matches!(app.dialog, Some(dialogs::Dialog::InputChannels { .. })),
+            "the chooser closed itself while drawing"
+        );
+
+        // Every ordered pair, plus every mono, plus the whole device. The
+        // dialog holds the live choice so the buttons light up before the
+        // device has reopened.
+        for a in 0..8_u16 {
+            for b in 0..8_u16 {
+                app.apply_dialog_action(DialogAction::SetInputChannels(Some((a, Some(b)))));
+                let Some(dialogs::Dialog::InputChannels { pick, .. }) = &app.dialog else {
+                    panic!("the chooser vanished");
+                };
+                assert_eq!(*pick, Some((a, Some(b))), "the pair {a}/{b} did not stick");
+            }
+            app.apply_dialog_action(DialogAction::SetInputChannels(Some((a, None))));
+            let Some(dialogs::Dialog::InputChannels { pick, .. }) = &app.dialog else {
+                panic!("the chooser vanished");
+            };
+            assert_eq!(*pick, Some((a, None)));
+        }
+        app.apply_dialog_action(DialogAction::SetInputChannels(None));
+        let Some(dialogs::Dialog::InputChannels { pick, .. }) = &app.dialog else {
+            panic!("the chooser vanished");
+        };
+        assert_eq!(*pick, None, "the whole device is not reachable again");
+    }
+
     /// **Input monitoring is off at every launch, and cannot be otherwise.**
     ///
     /// The owner's requirement, in their words: "if I forget and turn my
@@ -6449,8 +6529,10 @@ mod tests {
         assert_eq!(app.buffer_frames(), Some(512));
         app.apply_dialog_action(DialogAction::SetAudioSystem(Some("CoreAudio".to_owned())));
         assert_eq!(app.audio_system().as_deref(), Some("CoreAudio"));
-        app.apply_dialog_action(DialogAction::SetChannelsInPicker(true));
-        assert!(app.audio_channels_in_picker());
+        // The channel choice goes to the HOST's device selection, not to the
+        // settings — the uid grammar stays on that side of the firewall — so
+        // there is nothing to read back here without a device attached.
+        app.apply_dialog_action(DialogAction::SetInputChannels(Some((2, Some(3)))));
 
         // And "the device" half: Setup hands off to the one picker there is,
         // rather than carrying a second copy of the device list.
