@@ -1557,9 +1557,7 @@ impl IvoryApp {
                     //
                     // `save_settings` is deliberately NOT called and there is
                     // nothing to save: see `input_monitor`.
-                    if recorder_panel::hit_test(r, &view, pos)
-                        == Some(recorder_panel::Hit::PickAudio)
-                    {
+                    if recorder_panel::input_icon(r, &view).is_some_and(|i| i.contains(pos)) {
                         self.input_monitor = !self.input_monitor;
                         return;
                     }

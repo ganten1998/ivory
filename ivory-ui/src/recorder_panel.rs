@@ -2000,7 +2000,18 @@ pub fn knob_rect(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<Rect> 
     r.is_positive().then_some(r)
 }
 
-/// The microphone icon, for the right-click that opens the audio picker.
+/// The microphone icon's rectangle.
+///
+/// **Read directly rather than through `hit_test`, and that is the point.**
+/// The icon's entry in `targets` is `Rect::NOTHING` while a take is rolling,
+/// so that nobody swaps the input device out from under a running encoder. A
+/// right-click on the same pixels toggles live MONITORING, which is not a
+/// device change — it is listen-only, and checking your feed mid-take is
+/// exactly when somebody wants it. So that gesture reads the rectangle here
+/// and is not gated by a rule belonging to the other one.
+///
+/// (The doc used to say "for the right-click that opens the audio picker".
+/// That became a LEFT click in 4.19.0 and the comment did not follow.)
 pub fn input_icon(rect: Rect, view: &RecorderView<'_>) -> Option<Rect> {
     let r = Layout::new(rect, view).input_icon;
     r.is_positive().then_some(r)
@@ -4566,6 +4577,37 @@ mod tests {
             // which is the one piece of hierarchy it has.
             assert!(field > title, "the trim readouts are not the subject");
         }
+    }
+
+    /// **The microphone icon keeps a rectangle mid-take; the PICKER does not.**
+    ///
+    /// The difference is the whole reason a right-click on those pixels reads
+    /// `input_icon` rather than going through `hit_test`. The picker is gated
+    /// off while a take rolls so that nobody swaps the input device out from
+    /// under a running encoder — a good rule that does not apply to live
+    /// monitoring, which is listen-only and is exactly what somebody wants to
+    /// check mid-take. Sharing one gate would have disabled both.
+    #[test]
+    fn monitoring_stays_reachable_mid_take_and_the_picker_does_not() {
+        let r = band(1280.0);
+        let icon = input_icon(r, &idle()).expect("a microphone icon");
+        assert_eq!(
+            hit_test(r, &idle(), icon.center()),
+            Some(Hit::PickAudio),
+            "a left-click on the icon does not open the picker"
+        );
+
+        let rolling = rolling();
+        assert_eq!(
+            hit_test(r, &rolling, icon.center()),
+            None,
+            "the device picker is reachable mid-take"
+        );
+        assert_eq!(
+            input_icon(r, &rolling),
+            Some(icon),
+            "the icon lost its rectangle mid-take, so monitoring cannot be toggled"
+        );
     }
 
     /// An empty rack, which is what the app opens with.

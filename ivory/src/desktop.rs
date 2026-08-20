@@ -176,6 +176,13 @@ struct Recorder {
     /// same error sixty times a second over whatever else the band was saying.
     ///
     video_tried: bool,
+    /// A live-input tap waiting for an engine to play it.
+    ///
+    /// The tap is made when the INPUT opens and can only be handed to an
+    /// ENGINE, and the two are opened by different edges — so it is held here
+    /// rather than dropped when the second one is not there yet. See
+    /// `push_monitor_settings`, which is where it gets handed over.
+    pending_monitor: Option<(rtrb::Consumer<f32>, u16)>,
     /// The newest camera frame, kept as RGBA for the compositor.
     ///
     /// A copy, and a deliberate one: the preview uploads its own texture and
@@ -1985,6 +1992,19 @@ impl DesktopApp {
     /// nothing — and a change-detection cache here would be a second copy of
     /// the settings to get out of step with the first.
     fn push_monitor_settings(&mut self) {
+        // **The live tap, if one has been waiting for an engine to appear.**
+        //
+        // First, and before the `&Engine` borrow below, because handing the
+        // ring over needs `&mut`. Here rather than on an edge because this runs
+        // every frame the band is open: whenever both halves exist, they are
+        // joined, and neither one has to know which was built first.
+        if let Some(tap) = self.recorder.pending_monitor.take() {
+            match self.recorder.engine.as_mut() {
+                Some(e) => e.set_monitor(Some(tap)),
+                // No engine yet — put it back and try next frame.
+                None => self.recorder.pending_monitor = Some(tap),
+            }
+        }
         // The SESSION's copy first, and outside the engine gate. It is what the
         // count-in's on-screen beat and the `.mid`'s tempo map are derived
         // from, and neither has anything to do with an output device — so a
@@ -2277,14 +2297,18 @@ impl DesktopApp {
                     self.app.buffer_frames(),
                     self.app.sample_rate(),
                 );
-                // The live tap, to whoever can play it. Taken once per device:
-                // a new input builds a new ring, and the renderer fades the
-                // new one in from silence rather than continuing at whatever
-                // the last one was at.
+                // **The live tap, HELD until there is an engine to play it.**
+                //
+                // Taking it and dropping it on the floor is what the first
+                // draft did, and the tap is made once per device open — so
+                // whenever the engine did not exist at this exact moment,
+                // monitoring was silently dead for the rest of the session
+                // with no way to get it back short of re-picking the device.
+                // That is not a rare window: `start_engine` fails and retries
+                // on a busy output, and every retry lands here after the input
+                // is already open.
                 if let Some(tap) = self.recorder.session.take_monitor() {
-                    if let Some(e) = self.recorder.engine.as_mut() {
-                        e.set_monitor(Some(tap));
-                    }
+                    self.recorder.pending_monitor = Some(tap);
                 }
             }
             // The user picked "None - record MIDI only". Mapping that to the
@@ -2443,6 +2467,7 @@ impl DesktopApp {
             let extra = app.plugin_folders();
             app.set_plugin_list(ivory_host::discover_in(&extra));
             Recorder {
+                pending_monitor: None,
                 session: crate::record::Session::new(tap, timebase),
                 audio,
                 camera,
