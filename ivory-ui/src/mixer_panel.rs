@@ -31,14 +31,6 @@ pub struct StripView<'a> {
     pub insert: &'a str,
     /// Index into [`STRIP_COLORS`]. Zero is the desk's own wood.
     pub color: usize,
-    /// Not drawn at all, and no column of its own.
-    ///
-    /// **Only the input strips use it.** Four empty microphone columns is not
-    /// a rack with room in it, it is a desk that is mostly plus signs — so the
-    /// inputs show the ones that are open and ONE spare to add to, which is
-    /// the same offer in a tenth of the width. An instrument slot is drawn
-    /// either way: five is what the rack has, and that number does not move.
-    pub hidden: bool,
     /// An instrument slot with nothing in it.
     ///
     /// **Drawn, not hidden.** Five slots that appear one at a time as they are
@@ -95,6 +87,8 @@ pub struct MixerView<'a> {
     /// eighty decibels; the drag was slowed until it was usable, and this is
     /// the other half of that — click the number and say it.
     pub typing: Option<(usize, &'a str)>,
+    /// The channel whose NAME is being typed, and what is in the field.
+    pub naming: Option<(usize, &'a str)>,
 }
 
 impl MixerView<'_> {
@@ -132,6 +126,14 @@ pub enum Hit {
     Palette(usize),
     /// The decibel readout: type a number into it.
     Db(usize),
+    /// The channel's name: type a new one.
+    ///
+    /// **On an INPUT this renames the interface, not the channel.** Every
+    /// input of one box shares the half of the label worth shortening, so
+    /// typing "x" over "Scarlett 18i20 USB - 3" makes all of them "x - N" at
+    /// once — which is the only rename that fits and the only one anybody
+    /// wants to type more than once.
+    Name(usize),
 }
 
 impl Hit {
@@ -146,6 +148,7 @@ impl Hit {
             | Hit::Insert(i)
             | Hit::Palette(i)
             | Hit::Db(i)
+            | Hit::Name(i)
             | Hit::Paint(i, _) => i,
         }
     }
@@ -160,7 +163,7 @@ impl Hit {
             Hit::Fader(_) => Some(DragAxis::Vertical),
             Hit::Send(_) => Some(DragAxis::Vertical),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(_) | Hit::Paint(..)
-            | Hit::Palette(_) | Hit::Db(_) => None,
+            | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) => None,
         }
     }
 
@@ -170,7 +173,7 @@ impl Hit {
             Hit::Fader(_) => Some(FADER_TRAVEL),
             Hit::Send(_) => Some(SEND_TRAVEL),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(_) | Hit::Paint(..)
-            | Hit::Palette(_) | Hit::Db(_) => None,
+            | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) => None,
         }
     }
 }
@@ -319,24 +322,20 @@ impl Layout {
                 strips: [StripStrip::NONE; COLUMNS],
             };
         }
-        // Every channel one unit wide, and the master a little more so it
-        // reads as the end of the row rather than another channel. A hidden
-        // strip takes no width and leaves no gap — see `StripView::hidden`.
-        let shown = view
-            .strips
-            .iter()
-            .filter(|s| !s.hidden)
-            .count()
-            .max(1);
-        let gaps = (shown - 1) as f32;
+        // **Every channel one unit wide, and the count never changes.** Five
+        // instrument slots, the interface's inputs, the backing track and the
+        // master — a fixed desk, drawn the same whether or not anything is in
+        // it. A rack that grows a column when something is plugged in is a
+        // rack whose controls move under a hand.
+        //
+        // The master is a little wider, so it reads as the end of the row
+        // rather than as another channel.
+        let gaps = (COLUMNS - 1) as f32;
         let units = gaps + 1.0 + MASTER_EXTRA;
         let unit = (inner.width() - GAP * gaps) / units;
         let mut x = inner.left();
         let strips = std::array::from_fn(|i| {
-            let Some(v) = view.strips.get(i).filter(|v| !v.hidden) else {
-                // **A rect with no area**, which is what every hit test here
-                // already skips: a hidden strip cannot be pressed because
-                // there is nothing of it to press.
+            let Some(v) = view.strips.get(i) else {
                 return StripStrip::NONE;
             };
             let w = if i == COLUMNS - 1 {
@@ -473,6 +472,7 @@ impl Layout {
                 (s.add, Hit::Add(i)),
                 (s.insert, Hit::Insert(i)),
                 (s.db, Hit::Db(i)),
+                (s.name, Hit::Name(i)),
             ] {
                 if r.is_positive() {
                     out.push((r, hit));
@@ -579,7 +579,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
         }
         let heard = view.heard(i);
         let typed = view.typing.filter(|(at, _)| *at == i).map(|(_, b)| b);
-        strip(painter, s, v, &p, heard, typed);
+        let naming = view.naming.filter(|(at, _)| *at == i).map(|(_, b)| b);
+        strip(painter, s, v, &p, heard, typed, naming);
     }
     // The palette last, over whatever it belongs to.
     if let Some(at) = view.palette_open {
@@ -611,6 +612,7 @@ fn strip(
     p: &Ink,
     heard: bool,
     typed: Option<&str>,
+    naming: Option<&str>,
 ) {
     if v.empty {
         empty_slot(painter, l, p);
@@ -650,7 +652,12 @@ fn strip(
         Pos2::new(l.panel.left() + 3.0, l.name.top() - 2.0),
         Pos2::new(l.panel.right() - 3.0, l.detail.bottom() + 2.0),
     );
-    if painted && plate.is_positive() {
+    // **Under every name, painted or not.** It was drawn only on a coloured
+    // channel, where it exists to keep the label legible on any background —
+    // but a name is a FIELD now, and a field needs an edge to look like one
+    // before it is clicked. The two reasons want the same rectangle.
+    let _ = painted;
+    if plate.is_positive() {
         painter.rect_filled(plate, 2.0, p.face);
     }
     // **The band's own icons, above the names.** The microphone and the
@@ -658,6 +665,22 @@ fn strip(
     // one band up; drawing them again here is what makes the two channels that
     // are not instruments read as the same two things rather than as two more
     // rows of text.
+    if let Some(buf) = naming {
+        painter.rect_filled(l.name, 2.0, p.face);
+        painter.rect_stroke(
+            l.name,
+            2.0,
+            Stroke::new(1.0, p.lit),
+            egui::StrokeKind::Inside,
+        );
+        centred(
+            painter,
+            l.name,
+            &format!("{buf}_"),
+            cap((h * 0.032).clamp(7.5, 12.0)),
+            p.engrave,
+        );
+    }
     let named = match v.strip {
         Some(Strip::Input(_)) => {
             crate::recorder_panel::draw_microphone(painter, l.icon, p.engrave);
@@ -670,7 +693,9 @@ fn strip(
         _ => false,
     };
     let _ = named;
-    centred(painter, l.name, v.name, cap((h * 0.032).clamp(7.5, 12.0)), p.engrave);
+    if naming.is_none() {
+        centred(painter, l.name, v.name, cap((h * 0.032).clamp(7.5, 12.0)), p.engrave);
+    }
     if !v.detail.is_empty() {
         centred(
             painter,
@@ -990,17 +1015,52 @@ fn switch(painter: &Painter, r: Rect, label: &str, on: bool, lit: Color32, p: &I
     );
 }
 
+/// Centred, and **cut to the cell rather than run out of it**.
+///
+/// A channel's name is whatever the user typed and whatever the interface
+/// calls itself, and a mixer strip is a hundred points wide: "Scarlett 18i20
+/// USB - 3" drawn whole reaches across two neighbours and reads as a fault in
+/// the drawing. An ellipsis says "there is more of this"; overflow says
+/// nothing at all.
 fn centred(painter: &Painter, r: Rect, text: &str, font: FontId, colour: Color32) {
-    if !r.is_positive() {
+    if !r.is_positive() || text.is_empty() {
         return;
     }
     painter.text(
         r.center(),
         egui::Align2::CENTER_CENTER,
-        text,
+        &cut_to_fit(painter, r.width(), text, &font),
         font,
         colour,
     );
+}
+
+/// The longest prefix of `text` that fits `width`, with an ellipsis if it was
+/// cut. Measured through the painter's own fonts, because a character's width
+/// is a property of the face and not of the count.
+fn cut_to_fit(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
+    let measure = |t: &str| {
+        painter
+            .layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE)
+            .rect
+            .width()
+    };
+    if measure(text) <= width {
+        return text.to_owned();
+    }
+    // From the end: the front of a name is the half that identifies it.
+    let mut keep = text.len();
+    while keep > 0 {
+        keep -= 1;
+        while keep > 0 && !text.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        let cut = format!("{}\u{2026}", text[..keep].trim_end());
+        if measure(&cut) <= width {
+            return cut;
+        }
+    }
+    String::new()
 }
 
 #[cfg(test)]
@@ -1017,7 +1077,6 @@ mod tests {
             stereo: true,
             gr_db: 0.0,
             empty,
-            hidden: false,
             gain: 1.0,
             send: 0.0,
             peak: [0.0; 2],
@@ -1036,6 +1095,7 @@ mod tests {
             any_solo: false,
             palette_open: None,
             typing: None,
+            naming: None,
             dark_mode: true,
             wood: (0x4A, 0x3B, 0x2C),
         }
@@ -1199,57 +1259,37 @@ mod tests {
         assert_eq!(seen.len(), n, "two channels share an index");
     }
 
-    /// **A hidden strip has no column and cannot be pressed.**
+    /// **A channel's name is a field, and a long one is cut.**
     ///
-    /// Four empty microphone columns is a desk that is mostly plus signs, so
-    /// the inputs show the ones that are open and one spare — and the ones
-    /// that are not shown must not be pressable either, or a fader nobody can
-    /// see would move when somebody grabbed the channel beside it.
+    /// A desk is a set of names before it is a set of faders — "BELL KEYS" is
+    /// what the app knows and "Rhodes" is what the person at the desk knows —
+    /// so every drawn channel has a name you can press and type into. And the
+    /// name that arrives from an interface is "Scarlett 18i20 USB - 3", which
+    /// has never fitted a strip a hundred points wide.
     #[test]
-    fn a_hidden_strip_takes_no_room_and_no_presses() {
-        use crate::recorder::INPUTS;
-        let mut v = a_view();
-        // Everything past the first input goes away, which is the state a rig
-        // with one microphone is in.
-        for i in 0..v.strips.len() {
-            if let Some(Strip::Input(n)) = v.strips[i].strip {
-                v.strips[i].hidden = n > 1;
-            }
-        }
+    fn every_channel_has_a_name_you_can_press() {
+        let v = a_view();
         let r = rect();
         let l = Layout::new(r, &v);
-        let mut wide = 0.0f32;
         for (i, s) in l.strips.iter().enumerate() {
-            let hidden = v.strips.get(i).is_some_and(|x| x.hidden);
-            if hidden {
-                assert!(
-                    !s.panel.is_positive(),
-                    "hidden strip {i} was given a column anyway"
-                );
+            if !s.panel.is_positive() {
                 continue;
             }
-            assert!(s.panel.is_positive(), "strip {i} lost its column");
-            wide = wide.max(s.panel.width());
-        }
-        // The room the hidden ones gave up went to the ones that are left,
-        // rather than being left as a gap in the middle of the desk.
-        let all_shown = Layout::new(r, &a_view());
-        let widest = all_shown
-            .strips
-            .iter()
-            .fold(0.0f32, |a, s| a.max(s.panel.width()));
-        assert!(
-            wide > widest,
-            "hiding {} columns bought nothing: {wide} vs {widest}",
-            INPUTS - 2
-        );
-        // And nothing on a hidden strip answers a press.
-        for (_, hit) in l.targets() {
-            assert!(
-                !v.strips.get(hit.strip()).is_some_and(|x| x.hidden),
-                "{hit:?} is on a strip nobody can see"
+            assert!(s.name.is_positive(), "channel {i} has nowhere to put a name");
+            assert_eq!(
+                hit_test(r, &v, s.name.center()),
+                Some(Hit::Name(i)),
+                "channel {i}'s name cannot be pressed"
             );
         }
+        // An EMPTY slot has no name to change: it is an outline and a plus,
+        // and a name field on it would be a control for a channel that is not
+        // there yet.
+        let mut empty = a_view();
+        empty.strips[0] = a_strip(Some(Strip::Slot(0)), true);
+        let l = Layout::new(r, &empty);
+        assert!(!l.strips[0].name.is_positive(), "an empty slot got a name field");
+        assert_eq!(hit_test(r, &empty, l.strips[0].panel.center()), Some(Hit::Add(0)));
     }
 
     /// **Every mark has to land on the scale it is drawn against.**

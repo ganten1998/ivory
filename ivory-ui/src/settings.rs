@@ -544,6 +544,23 @@ pub struct Settings {
     /// wood, which is what an unpainted channel is. The master defaults to RED
     /// because it is the one channel you look for.
     pub strip_colors: [i64; crate::recorder::STRIPS + 1],
+    /// What the user called each channel, or empty for its own name.
+    ///
+    /// **A desk is a set of names before it is a set of faders.** "BELL KEYS"
+    /// and "INPUT" are what the app knows; "Rhodes" and "Vox" are what the
+    /// person at the desk knows, and the second one is the one they are
+    /// looking for at 0:47.
+    ///
+    /// Indexed by `Strip::index`, with the master last — the same shape as
+    /// `strip_colors`, and it moves with them when the desk changes.
+    pub strip_names: Vec<String>,
+    /// A short name for the audio interface, used on every one of its inputs.
+    ///
+    /// **One name for the box, not one per channel.** "Scarlett 18i20 USB  -
+    /// input 3" does not fit a mixer strip and never will, and the half worth
+    /// shortening is the half that is the same on every channel of it: call it
+    /// "x" and the strips read "x - 3", "x - 4/5".
+    pub input_alias: String,
     /// A user effect plugin across the effects bus, as a bundle path.
     ///
     /// **On the bus, not on every channel.** A reverb is a send effect: one
@@ -804,6 +821,8 @@ impl Default for Settings {
             strip_sends: std::array::from_fn(|i| {
                 if i < crate::recorder::SLOTS { 1.0 } else { 0.0 }
             }),
+            strip_names: Vec::new(),
+            input_alias: String::new(),
             strip_muted: 0,
             strip_soloed: 0,
             show_take_summary: true,
@@ -1314,6 +1333,16 @@ impl Settings {
                     s.strip_sends[i] = n.clamp(0.0, 1.0);
                 }
             }
+        }
+        if let Some(Value::Array(v)) = map.shift_remove("strip_names") {
+            s.strip_names = v
+                .into_iter()
+                .map(|x| x.as_str().unwrap_or_default().to_owned())
+                .take(crate::recorder::STRIPS + 1)
+                .collect();
+        }
+        if let Some(Value::String(v)) = map.shift_remove("input_alias") {
+            s.input_alias = v;
         }
         if let Some(n) = map.shift_remove("strip_muted").and_then(|v| v.as_u64()) {
             s.strip_muted = n as u32;
@@ -1858,6 +1887,16 @@ impl Settings {
             Value::Array(self.strip_sends.iter().map(|v| Value::from(*v)).collect()),
         );
         map.insert("strip_muted".into(), Value::from(self.strip_muted));
+        map.insert(
+            "strip_names".into(),
+            Value::Array(
+                self.strip_names
+                    .iter()
+                    .map(|n| Value::String(n.clone()))
+                    .collect(),
+            ),
+        );
+        map.insert("input_alias".into(), Value::String(self.input_alias.clone()));
         map.insert(
             "strip_colors_v2".into(),
             Value::Array(self.strip_colors.iter().map(|c| Value::from(*c)).collect()),
@@ -2481,7 +2520,26 @@ mod tests {
     /// default and the only thing that had ever turned it on was choosing a
     /// camera. New installs get it from the default; existing files need the
     /// migration, and only the one time.
-     /// **The desk grew four input columns where there had been one.**
+     /// **A name the user gave a channel outlives the app's own.**
+    #[test]
+    fn a_renamed_channel_and_a_renamed_interface_survive_a_save() {
+        let mut s = Settings::default();
+        s.strip_names = vec![String::new(); crate::recorder::STRIPS + 1];
+        s.strip_names[0] = "Rhodes".to_owned();
+        s.strip_names[crate::recorder::STRIPS] = "OUT".to_owned();
+        s.input_alias = "x".to_owned();
+        let back = Settings::from_json(&s.to_json());
+        assert_eq!(back.strip_names[0], "Rhodes");
+        assert_eq!(back.strip_names[crate::recorder::STRIPS], "OUT");
+        assert_eq!(back.input_alias, "x", "the interface's short name was lost");
+        // A file that has never named anything comes back with nothing to
+        // say, rather than with a row of empty strings pretending to be names.
+        let fresh = Settings::from_json("{}");
+        assert!(fresh.strip_names.iter().all(String::is_empty));
+        assert!(fresh.input_alias.is_empty());
+    }
+
+    /// **The desk grew four input columns where there had been one.**
     ///
     /// Every array indexed by a channel moved with it. Without the shift a
     /// violet backing track comes back on input 2 and a muted click mutes an

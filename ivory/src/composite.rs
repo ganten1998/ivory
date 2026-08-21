@@ -1055,6 +1055,11 @@ mod shot {
         };
         let mut settings = ivory_ui::settings::Settings::default();
         settings.show_recorder = true;
+        // The neck, for looking at what the solver put where.
+        //   IVORY_SHOT_FRET=1 IVORY_DEMO_NOTES=60 ...
+        if std::env::var("IVORY_SHOT_FRET").is_ok() {
+            settings.show_fretboard = true;
+        }
         settings.reverb_mix = 0.42;
         settings.delay_mix = 0.18;
         settings.chorus_mix = 0.66;

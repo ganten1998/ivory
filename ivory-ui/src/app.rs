@@ -273,6 +273,12 @@ pub struct IvoryApp {
     mixer_palette: Option<usize>,
     /// A decibel figure being typed into a strip, and which.
     mixer_typing: Option<(usize, String)>,
+    /// The channel whose NAME is being typed, and what is in the field.
+    ///
+    /// Its own field rather than a mode on `mixer_typing`: the two accept
+    /// different characters, commit to different places and are drawn in
+    /// different rows, and a shared one would need a tag at every use.
+    mixer_naming: Option<(usize, String)>,
     /// Where the mixer was last drawn, so a press can be tested against it.
     mixer_rect: Option<Rect>,
     /// The OS's own file panel is on screen right now.
@@ -730,6 +736,7 @@ impl IvoryApp {
             mixer_grab: None,
             mixer_palette: None,
             mixer_typing: None,
+            mixer_naming: None,
             mixer_rect: None,
             native_panel_up: false,
             factory_cartridge: false,
@@ -1376,6 +1383,77 @@ impl IvoryApp {
         self.mixer_typing = Some((at, buf));
     }
 
+    /// A channel's name, typed in place.
+    ///
+    /// **Same bargain as the decibel field**: Enter commits, Escape abandons,
+    /// and a press anywhere else commits — a half-typed name that vanishes
+    /// when you look away is a field people learn not to trust.
+    ///
+    /// An empty name is not an error, it is "put it back": the channel goes
+    /// back to calling itself what the app calls it.
+    fn name_in_mixer(&mut self, ctx: &egui::Context) {
+        let Some((at, mut buf)) = self.mixer_naming.take() else {
+            return;
+        };
+        let (commit, cancel) = ctx.input(|i| {
+            for e in &i.events {
+                match e {
+                    egui::Event::Text(t) => {
+                        for c in t.chars() {
+                            // Anything printable, capped: a name longer than
+                            // the strip is a name nobody can read anyway, and
+                            // the field would scroll a caret off its own edge.
+                            if !c.is_control() && buf.chars().count() < 24 {
+                                buf.push(c);
+                            }
+                        }
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        pressed: true,
+                        ..
+                    } => {
+                        buf.pop();
+                    }
+                    _ => {}
+                }
+            }
+            (
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if cancel {
+            return;
+        }
+        if commit {
+            self.commit_mixer_name(at, buf);
+            return;
+        }
+        self.mixer_naming = Some((at, buf));
+    }
+
+    /// Where a typed name goes. See `Hit::Name`.
+    fn commit_mixer_name(&mut self, at: usize, name: String) {
+        let name = name.trim().to_owned();
+        let strips = crate::recorder::Strip::shown();
+        if let Some(crate::recorder::Strip::Input(_)) = strips.get(at) {
+            // **One name for the box, not one per channel.** See
+            // `Settings::input_alias`.
+            self.settings.input_alias = name;
+        } else {
+            if self.settings.strip_names.len() <= crate::recorder::STRIPS {
+                self.settings
+                    .strip_names
+                    .resize(crate::recorder::STRIPS + 1, String::new());
+            }
+            if let Some(slot) = self.settings.strip_names.get_mut(at) {
+                *slot = name;
+            }
+        }
+        self.save_settings();
+    }
+
     /// What a mixer control reads now, 0..=1, for a drag to start from.
     fn mixer_value(&self, hit: crate::mixer_panel::Hit) -> f32 {
         use crate::mixer_panel::Hit as H;
@@ -1387,7 +1465,7 @@ impl IvoryApp {
                 .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
             H::Send(i) => view.strips.get(i).map_or(0.0, |s| s.send),
             H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(_) | H::Paint(..)
-            | H::Palette(_) | H::Db(_) => 0.0,
+            | H::Palette(_) | H::Db(_) | H::Name(_) => 0.0,
         }
     }
 
@@ -1464,6 +1542,25 @@ impl IvoryApp {
                 self.mixer_typing = Some((i, String::new()));
                 return;
             }
+            // **Seeded with what is there**, unlike the decibel field. A name
+            // is edited — "Rhodes" is two characters off "Rhode" — where a
+            // figure is replaced.
+            H::Name(i) => {
+                let seed = match strips.get(i) {
+                    // An input renames the INTERFACE, so the field starts from
+                    // the alias and not from the label that has the channel
+                    // number stuck on the end of it.
+                    Some(Strip::Input(_)) => self.settings.input_alias.clone(),
+                    _ => self
+                        .settings
+                        .strip_names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                self.mixer_naming = Some((i, seed));
+                return;
+            }
             // `usize::MAX` is "anywhere but a swatch", which closes it without
             // painting — the same sentinel the patch picker uses for its own
             // "none of these" row.
@@ -1518,13 +1615,6 @@ impl IvoryApp {
         // is mostly plus signs. The first is always drawn — it is the band's
         // own microphone row seen a second time, and it is there whether or
         // not anything is plugged in.
-        let filled = self
-            .recorder
-            .inputs
-            .iter()
-            .filter(|s| !s.name.is_empty())
-            .count()
-            .max(1);
         let strip = |s: Strip| {
             let i = s.index();
             let (name, detail, gain, empty) = match s {
@@ -1549,19 +1639,34 @@ impl IvoryApp {
                 // nothing under it is what a rig with no interface looks like,
                 // and an outline with a plus in its place would be a channel
                 // that had disappeared.
+                // The host assembles the label — see `InputState::label`.
                 Strip::Input(n) => (
-                    "INPUT",
-                    self.recorder.inputs.get(n).map_or("", |s| s.name.as_str()),
+                    self.recorder.inputs.get(n).map_or("INPUT", |st| {
+                        if st.label.is_empty() { "INPUT" } else { st.label.as_str() }
+                    }),
+                    "",
                     g.inputs.get(n).copied().unwrap_or(1.0),
-                    n > 0 && self.recorder.inputs.get(n).is_none_or(|s| s.name.is_empty()),
+                    n > 0 && self.recorder.inputs.get(n).is_none_or(|st| st.label.is_empty()),
                 ),
-                Strip::Track => ("BACKING", self.track.name.as_str(), g.track, false),
+                // **No file name.** A track is called
+                // "Blue Bossa - backing (final 2).mp3" and a mixer strip is a
+                // hundred points wide: it never fitted, and a name cut to
+                // "Blue Bo…" tells nobody anything the waveform panel does not
+                // already say in full.
+                Strip::Track => ("BACKING", "", g.track, false),
                 Strip::Click => ("CLICK", "", g.metronome, false),
                 Strip::Fx => ("FX BUS", "reverb · delay · chorus", g.fx_return, false),
             };
             crate::mixer_panel::StripView {
                 strip: Some(s),
-                name,
+                // **What the user called it wins.** A desk is a set of names
+                // before it is a set of faders: "BELL KEYS" is what the app
+                // knows and "Rhodes" is what the person at the desk knows.
+                name: self
+                    .settings
+                    .strip_names
+                    .get(i)
+                    .map_or(name, |n| if n.is_empty() { name } else { n.as_str() }),
                 detail,
                 color: self.settings.strip_colors.get(i).copied().unwrap_or(0) as usize,
                 // **What the SOURCE is, not what the samples happen to be.**
@@ -1576,7 +1681,7 @@ impl IvoryApp {
                         .recorder
                         .inputs
                         .get(n)
-                        .is_none_or(|st| st.name.is_empty() || st.stereo),
+                        .is_none_or(|st| st.label.is_empty() || st.stereo),
                     _ => true,
                 },
                 gr_db: 0.0,
@@ -1586,8 +1691,6 @@ impl IvoryApp {
                     ""
                 },
                 empty,
-                // Past the ones that are open, plus the one spare.
-                hidden: matches!(s, Strip::Input(n) if n > filled),
                 gain,
                 send: desk.send[i],
                 peak: peaks[i],
@@ -1601,7 +1704,11 @@ impl IvoryApp {
                 Some(s) => strip(*s),
                 None => crate::mixer_panel::StripView {
                     strip: None,
-                    name: "MASTER",
+                    name: self
+                        .settings
+                        .strip_names
+                        .get(crate::recorder::STRIPS)
+                        .map_or("MASTER", |n| if n.is_empty() { "MASTER" } else { n.as_str() }),
                     detail: "",
                     color: self
                         .settings
@@ -1611,7 +1718,6 @@ impl IvoryApp {
                         .unwrap_or(0) as usize,
                     insert: "",
                     empty: false,
-                    hidden: false,
                     gain: g.master,
                     send: 0.0,
                     // The master's own meter, which the band already has: the
@@ -1630,6 +1736,10 @@ impl IvoryApp {
             palette_open: self.mixer_palette,
             typing: self
                 .mixer_typing
+                .as_ref()
+                .map(|(at, buf)| (*at, buf.as_str())),
+            naming: self
+                .mixer_naming
                 .as_ref()
                 .map(|(at, buf)| (*at, buf.as_str())),
             dark_mode: self.settings.dark_mode,
@@ -3707,6 +3817,13 @@ impl IvoryApp {
     /// The user effect the host should put across the effects bus, if any.
     pub fn bus_effect(&self) -> Option<&str> {
         self.settings.bus_effect.as_deref()
+    }
+
+    /// A short name for the audio interface, used on every one of its inputs.
+    ///
+    /// Empty means "use the interface's own name". See `Settings::input_alias`.
+    pub fn input_alias(&self) -> &str {
+        &self.settings.input_alias
     }
 
     /// The inputs open BESIDE the first, as the host's own opaque uids.
@@ -6629,6 +6746,9 @@ impl IvoryApp {
             if self.mixer_typing.is_some() {
                 self.type_into_mixer(&ctx);
             }
+            if self.mixer_naming.is_some() {
+                self.name_in_mixer(&ctx);
+            }
             // **A right-click paints.** Anywhere on a channel opens its palette,
             // which is the only gesture in the mixer that is not a control —
             // so it needs no target of its own and cannot collide with one.
@@ -6655,6 +6775,9 @@ impl IvoryApp {
                         }
                     }
                 }
+                if let Some((at, buf)) = std::mem::take(&mut self.mixer_naming) {
+                    self.commit_mixer_name(at, buf);
+                }
                 if let Some(pos) = pos.filter(|p| rect.contains(*p)) {
                     let view = self.mixer_view();
                     match crate::mixer_panel::hit_test(rect, &view, pos) {
@@ -6664,7 +6787,8 @@ impl IvoryApp {
                         | crate::mixer_panel::Hit::Insert(_)
                         | crate::mixer_panel::Hit::Paint(..)
                         | crate::mixer_panel::Hit::Palette(_)
-                        | crate::mixer_panel::Hit::Db(_))) => {
+                        | crate::mixer_panel::Hit::Db(_)
+                        | crate::mixer_panel::Hit::Name(_))) => {
                             self.apply_mixer_hit(hit, 0.0);
                         }
                         Some(hit) => {

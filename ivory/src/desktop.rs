@@ -1001,6 +1001,10 @@ impl DesktopApp {
                 self.app.report_take(message, problem);
             }
         }
+        // **The alias replaces the interface's name, once, for all of it.**
+        // Read BEFORE the state borrow, like everything else here: the app is
+        // borrowed mutably for the rest of this function.
+        let alias = self.app.input_alias().trim().to_owned();
         let state = self.app.recorder_state_mut();
         state.preview = preview;
         state.camera_name = self
@@ -1078,13 +1082,27 @@ impl DesktopApp {
         // the mixer draws and the channels the capture keeps cannot drift
         // apart — see `devices::open_inputs`.
         let open_inputs = crate::devices::open_inputs(&self.recorder.audio);
+        // **The alias replaces the interface's name, once, for all of it.**
+        // "Scarlett 18i20 USB  -  input 3" does not fit a mixer strip; "x - 3"
+        // does, and the half worth shortening is the one that is the same on
+        // every channel of the box.
         for i in 0..ivory_ui::recorder::INPUTS {
-            let (name, stereo) = open_inputs
+            let (device, channel, stereo) = open_inputs
                 .get(i)
                 .cloned()
-                .unwrap_or_else(|| (String::new(), false));
-            self.recorder.input_names[i].clone_from(&name);
-            state.inputs[i] = ivory_ui::recorder::InputState { name, stereo };
+                .unwrap_or_else(|| (String::new(), String::new(), false));
+            let label = if device.is_empty() {
+                String::new()
+            } else {
+                let head = if alias.is_empty() { device.as_str() } else { alias.as_str() };
+                if channel.is_empty() {
+                    head.to_owned()
+                } else {
+                    format!("{head} - {channel}")
+                }
+            };
+            self.recorder.input_names[i].clone_from(&label);
+            state.inputs[i] = ivory_ui::recorder::InputState { label, stereo };
         }
         state.audio_missing = audio_missing;
         state.disk_minutes = self

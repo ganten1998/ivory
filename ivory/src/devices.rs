@@ -178,9 +178,22 @@ fn channel_uid(key: &str, pick: ChannelPick) -> String {
 /// "Scarlett  -  inputs 1/2" in the picker and reading something else in the
 /// band is how somebody ends up unsure which input a take actually holds.
 fn with_channel(name: &str, pick: ChannelPick) -> String {
+    let word = if pick.channels() == 2 { "inputs" } else { "input" };
+    format!("{name}  -  {word} {}", channel_label(pick))
+}
+
+/// Which input of a device a pick names, as bare numbers: "3", "4/5".
+///
+/// **Separable from the device's name on purpose.** A mixer strip has room for
+/// one of the two, and the half worth keeping is this one — the interface is
+/// the same on every channel of it, so the desk puts a short name in front and
+/// this after: "x - 3", "x - 4/5".
+///
+/// One-based, because that is what is printed on the box.
+pub fn channel_label(pick: ChannelPick) -> String {
     match pick {
-        ChannelPick::Mono(a) => format!("{name}  -  input {}", a + 1),
-        ChannelPick::Stereo(a, b) => format!("{name}  -  inputs {}/{}", a + 1, b + 1),
+        ChannelPick::Mono(a) => format!("{}", a + 1),
+        ChannelPick::Stereo(a, b) => format!("{}/{}", a + 1, b + 1),
     }
 }
 
@@ -623,17 +636,17 @@ impl CaptureDevices for Cameras {
 ///
 /// Empty while nothing is open. An extra whose device key does not match the
 /// primary's is dropped, exactly as `audio_selection` drops it.
-pub fn open_inputs(shared: &Shared) -> Vec<(String, bool)> {
+pub fn open_inputs(shared: &Shared) -> Vec<(String, String, bool)> {
     let sel = lock(shared);
     let (Some(name), Some(uid)) = (sel.open_name.clone(), sel.wanted.clone()) else {
         return Vec::new();
     };
     let (key, pick) = split_channel(&uid);
     let described = |p: Option<ChannelPick>| match p {
-        Some(p) => (with_channel(&name, p), p.channels() == 2),
+        Some(p) => (name.clone(), channel_label(p), p.channels() == 2),
         // The whole device: as wide as it is, and a stereo interface is the
         // ordinary case.
-        None => (name.clone(), true),
+        None => (name.clone(), String::new(), true),
     };
     let mut out = vec![described(pick)];
     // Only when the primary is one channel of the device. With the whole
@@ -1082,10 +1095,14 @@ mod tests {
         lock(&shared).open_name = Some("Scarlett 18i20".to_owned());
         let named = open_inputs(&shared);
         assert_eq!(named.len(), 2);
-        assert!(named[0].0.ends_with("input 6"), "{}", named[0].0);
-        assert!(named[1].0.ends_with("inputs 4/5"), "{}", named[1].0);
-        assert!(!named[0].1, "a mono input is not stereo");
-        assert!(named[1].1, "a pair is stereo");
+        // The interface and the channel come back APART, so the desk can put
+        // a short name in front of a label that would never fit whole.
+        assert_eq!(named[0].0, "Scarlett 18i20");
+        assert_eq!(named[0].1, "6");
+        assert_eq!(named[1].0, "Scarlett 18i20", "both are the same box");
+        assert_eq!(named[1].1, "4/5");
+        assert!(!named[0].2, "a mono input is not stereo");
+        assert!(named[1].2, "a pair is stereo");
     }
 
     /// The same uid twice is one input, not two strips of the same microphone.

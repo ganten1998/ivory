@@ -631,9 +631,15 @@ impl Default for Gains {
 /// of them — see the firewall.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InputState {
-    /// What the picker called it — "Scarlett 18i20  -  input 6". Empty for a
-    /// strip nobody has filled, which is drawn as somewhere to put one.
-    pub name: String,
+    /// What the desk calls it: "x - 3", "Scarlett 18i20 USB - 4/5". Empty for
+    /// a strip nobody has filled, which is drawn as somewhere to put one.
+    ///
+    /// **Assembled by the host**, from the interface's own name or the user's
+    /// alias for it, plus the channel. "Scarlett 18i20 USB  -  input 3" does
+    /// not fit a mixer strip and never will, and the half worth shortening is
+    /// the one that is the same on every channel of the box — so the alias
+    /// replaces it, once, for all of them.
+    pub label: String,
     /// Two channels rather than one, which is what decides two meter bars.
     /// A mono microphone drawn as two identical bars is a meter claiming a
     /// stereo signal.
