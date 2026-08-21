@@ -875,6 +875,19 @@ impl DesktopApp {
                     .ok()
                     .and_then(|d| d.clone())
             })
+            // **And what this take is going to be missing.**
+            //
+            // Mute is the only thing that decides what a take is made of now,
+            // which is one rule where there used to be four — but a silent
+            // rule that costs somebody a take is no better than the setting it
+            // replaced. So a muted source with something in it says so, once,
+            // while there is still a take to save.
+            //
+            // Only while one is RUNNING. Muting the microphone to practise is
+            // a normal thing to do and a band that complained about it all
+            // afternoon would teach everybody to ignore the line that also
+            // says the camera was denied.
+            .or_else(|| self.muted_out_of_the_take())
             // **The take's report is not here any more.** It was the last
             // `or_else` in this chain, which meant it sat in a one-line strip
             // competing with live errors and stayed up until something else
@@ -2199,6 +2212,42 @@ impl DesktopApp {
             let sig = self.app.time_signature();
             e.set_meter(u32::from(sig.beats), u32::from(sig.unit));
         }
+    }
+
+    /// What this take is going to be missing, and where to fix it.
+    ///
+    /// **Only sources that EXIST.** A muted slot with no instrument in it is
+    /// not a loss, it is an empty channel — and naming five of those every
+    /// take is how a status line stops being read.
+    ///
+    /// Named individually rather than counted, because "a source is muted" on
+    /// a desk with eight of them is not an instruction anybody can follow.
+    fn muted_out_of_the_take(&self) -> Option<String> {
+        if !self.recorder.session.is_recording() {
+            return None;
+        }
+        use ivory_ui::recorder::Strip;
+        let desk = self.app.desk();
+        let engine = self.recorder.engine.as_ref();
+        let mut lost: Vec<Strip> = Vec::new();
+        for i in 0..ivory_ui::recorder::SLOTS {
+            // Loaded, not merely chosen: a slot whose plugin failed to open is
+            // already being reported by the row that failed.
+            let loaded = self.app.chosen_plugin(i) == Some(ivory_ui::dialogs::BUILTIN_PATH)
+                || engine.is_some_and(|e| e.plugin(i).is_some());
+            if loaded && !desk.heard(Strip::Slot(i)) {
+                lost.push(Strip::Slot(i));
+            }
+        }
+        if self.recorder.session.audio_device_name().is_some() && !desk.heard(Strip::Input) {
+            lost.push(Strip::Input);
+        }
+        if engine.is_some_and(crate::instrument::Engine::track_loaded)
+            && !desk.heard(Strip::Track)
+        {
+            lost.push(Strip::Track);
+        }
+        ivory_ui::recorder::missing_from_take(&lost)
     }
 
     /// Load or unload the instrument the settings name.

@@ -460,6 +460,51 @@ impl Strip {
     pub const fn sends(self) -> bool {
         !matches!(self, Strip::Fx)
     }
+
+    /// What the strip is called where a sentence has to name it.
+    ///
+    /// Lower case and bare, because every caller so far puts it mid-sentence.
+    /// A slot says which one, since "the instrument is muted" on a rack of
+    /// five is not an instruction anybody can follow.
+    pub fn label(self) -> String {
+        match self {
+            Strip::Slot(i) => format!("instrument {}", i + 1),
+            Strip::Input => "the input".to_owned(),
+            Strip::Track => "the backing track".to_owned(),
+            Strip::Click => "the click".to_owned(),
+            Strip::Fx => "the effects bus".to_owned(),
+        }
+    }
+}
+
+/// What to say about sources a take is going to be missing.
+///
+/// **The sentence lives here, not in the host**, for the reason every string
+/// in this crate does: it is the part that can be tested without a device, a
+/// window or a take. The host decides WHICH strips are lost — that needs an
+/// engine and an open input — and this decides how to say it.
+///
+/// `None` for an empty list, so the caller can chain it straight into a status
+/// line that is otherwise about live errors.
+pub fn missing_from_take(lost: &[Strip]) -> Option<String> {
+    let mut names: Vec<String> = lost.iter().map(|s| s.label()).collect();
+    let many = names.len() > 1;
+    let what = match names.len() {
+        0 => return None,
+        1 => names.remove(0),
+        // "the input, instrument 2 and the backing track" — the list anybody
+        // would say out loud, rather than a count of a number nobody can act
+        // on.
+        _ => {
+            let last = names.pop()?;
+            format!("{} and {last}", names.join(", "))
+        }
+    };
+    let (is_are, it_them) = if many { ("are", "them") } else { ("is", "it") };
+    Some(format!(
+        "{what} {is_are} muted, so this take will not have {it_them} - the \
+         mixer is on Tab"
+    ))
 }
 
 /// The routing half of the desk: what goes to the effects, and what is heard.
@@ -504,10 +549,17 @@ impl Desk {
         self.soloed.iter().any(|s| *s)
     }
 
-    /// Whether a strip is heard. Solo wins, and a soloed strip is heard even
-    /// if it is also muted — pressing solo on a muted channel is a request to
-    /// hear it, and a solo button that sometimes does nothing is worse than
-    /// one that overrules.
+    /// Whether a strip is heard — which is now also whether it is RECORDED.
+    ///
+    /// The take is the desk (see `record::TakeSource`), so this one rule
+    /// answers "is it in the file" as well as "is it in the room". The audio
+    /// thread's `strip_is_heard` is the same rule over the bit masks this same
+    /// `Desk` was pushed as; two answers to that question is the shape of the
+    /// bug that collapsing `TakeSource` removed.
+    ///
+    /// Solo wins, and a soloed strip is heard even if it is also muted —
+    /// pressing solo on a muted channel is a request to hear it, and a solo
+    /// button that sometimes does nothing is worse than one that overrules.
     pub fn heard(&self, strip: Strip) -> bool {
         if self.any_solo() {
             return self.soloed[strip.index()];
@@ -2984,5 +3036,54 @@ mod status_tests {
             output: None,
         }
         .rates_disagree());
+    }
+}
+
+#[cfg(test)]
+mod missing_tests {
+    use super::{missing_from_take, Strip, SLOTS};
+
+    /// **The one that costs a take, so the sentence has to be an
+    /// instruction.**
+    ///
+    /// Mute is now the only thing that decides what a file is made of. That is
+    /// one rule instead of four, and worth it — but a rule nobody is told
+    /// about is exactly the setting it replaced, which cost the owner twelve
+    /// takes across three releases.
+    #[test]
+    fn it_names_what_is_lost_and_where_to_fix_it() {
+        assert_eq!(missing_from_take(&[]), None, "nothing muted, nothing to say");
+
+        let one = missing_from_take(&[Strip::Input]).expect("a muted input is news");
+        assert!(
+            one.contains("the input is muted") && one.contains("will not have it"),
+            "{one}"
+        );
+        assert!(
+            one.contains("Tab"),
+            "it has to say where the mixer is, or it is a complaint rather than \
+             an instruction: {one}"
+        );
+
+        // A list anybody would say out loud, and the verb agreeing with it.
+        // "instrument 2 are muted" is the kind of thing that makes a person
+        // trust the rest of the line less.
+        let many = missing_from_take(&[Strip::Slot(1), Strip::Input, Strip::Track])
+            .expect("three of them is still news");
+        assert!(
+            many.contains("instrument 2, the input and the backing track"),
+            "{many}"
+        );
+        assert!(many.contains("are muted") && many.contains("have them"), "{many}");
+    }
+
+    /// A slot says WHICH slot. "the instrument is muted" on a rack of five is
+    /// not something anybody can act on.
+    #[test]
+    fn a_slot_says_which_one() {
+        for i in 0..SLOTS {
+            let said = Strip::Slot(i).label();
+            assert_eq!(said, format!("instrument {}", i + 1));
+        }
     }
 }
