@@ -31,6 +31,14 @@ pub struct StripView<'a> {
     pub insert: &'a str,
     /// Index into [`STRIP_COLORS`]. Zero is the desk's own wood.
     pub color: usize,
+    /// Not drawn at all, and no column of its own.
+    ///
+    /// **Only the input strips use it.** Four empty microphone columns is not
+    /// a rack with room in it, it is a desk that is mostly plus signs — so the
+    /// inputs show the ones that are open and ONE spare to add to, which is
+    /// the same offer in a tenth of the width. An instrument slot is drawn
+    /// either way: five is what the rack has, and that number does not move.
+    pub hidden: bool,
     /// An instrument slot with nothing in it.
     ///
     /// **Drawn, not hidden.** Five slots that appear one at a time as they are
@@ -127,6 +135,21 @@ pub enum Hit {
 }
 
 impl Hit {
+    /// Which channel it is on. Every one of them is on exactly one.
+    pub fn strip(self) -> usize {
+        match self {
+            Hit::Fader(i)
+            | Hit::Send(i)
+            | Hit::Mute(i)
+            | Hit::Solo(i)
+            | Hit::Add(i)
+            | Hit::Insert(i)
+            | Hit::Palette(i)
+            | Hit::Db(i)
+            | Hit::Paint(i, _) => i,
+        }
+    }
+
     /// Whether it travels under the hand, and along which axis.
     ///
     /// The same contract the band's controls use, and deliberately the same
@@ -229,7 +252,11 @@ const SEND_TRAVEL: f32 = 420.0;
 /// window size the app offers — and so the hit test and the painter cannot
 /// drift, because they read the same struct.
 /// The drawn channels, plus the master.
-pub const COLUMNS: usize = SLOTS + 3;
+///
+/// Every instrument slot, every input of the interface, the backing track and
+/// the master. The click and the effects return keep their place on the desk
+/// and are not drawn — their controls are the band's.
+pub const COLUMNS: usize = SLOTS + crate::recorder::INPUTS + 2;
 
 pub struct Layout {
     pub strips: [StripStrip; COLUMNS],
@@ -293,12 +320,25 @@ impl Layout {
             };
         }
         // Every channel one unit wide, and the master a little more so it
-        // reads as the end of the row rather than another channel.
-        let gaps = (COLUMNS - 1) as f32;
+        // reads as the end of the row rather than another channel. A hidden
+        // strip takes no width and leaves no gap — see `StripView::hidden`.
+        let shown = view
+            .strips
+            .iter()
+            .filter(|s| !s.hidden)
+            .count()
+            .max(1);
+        let gaps = (shown - 1) as f32;
         let units = gaps + 1.0 + MASTER_EXTRA;
         let unit = (inner.width() - GAP * gaps) / units;
         let mut x = inner.left();
         let strips = std::array::from_fn(|i| {
+            let Some(v) = view.strips.get(i).filter(|v| !v.hidden) else {
+                // **A rect with no area**, which is what every hit test here
+                // already skips: a hidden strip cannot be pressed because
+                // there is nothing of it to press.
+                return StripStrip::NONE;
+            };
             let w = if i == COLUMNS - 1 {
                 unit * (1.0 + MASTER_EXTRA)
             } else {
@@ -306,7 +346,7 @@ impl Layout {
             };
             let panel = Rect::from_min_size(Pos2::new(x, inner.top()), Vec2::new(w, inner.height()));
             x += w + GAP;
-            Self::one(panel, view.strips.get(i))
+            Self::one(panel, Some(v))
         });
         Self { strips }
     }
@@ -395,7 +435,7 @@ impl Layout {
         let split = travel.left() + travel.width() * 0.34;
         // The two sources that carry an icon get a band for it and push their
         // name down; an instrument slot has none and keeps the room.
-        let has_icon = matches!(view.strip, Some(Strip::Input | Strip::Track));
+        let has_icon = matches!(view.strip, Some(Strip::Input(_) | Strip::Track));
         StripStrip {
             panel,
             icon: if has_icon {
@@ -619,7 +659,7 @@ fn strip(
     // are not instruments read as the same two things rather than as two more
     // rows of text.
     let named = match v.strip {
-        Some(Strip::Input) => {
+        Some(Strip::Input(_)) => {
             crate::recorder_panel::draw_microphone(painter, l.icon, p.engrave);
             true
         }
@@ -977,6 +1017,7 @@ mod tests {
             stereo: true,
             gr_db: 0.0,
             empty,
+            hidden: false,
             gain: 1.0,
             send: 0.0,
             peak: [0.0; 2],
@@ -1141,8 +1182,12 @@ mod tests {
         // their place on the desk and have controls of their own elsewhere;
         // the mixer shows the slots, the input, the backing track and the
         // master.
-        assert_eq!(COLUMNS, SLOTS + 3, "a drawn channel went missing");
-        assert_eq!(channels.len(), SLOTS + 2);
+        assert_eq!(
+            COLUMNS,
+            SLOTS + crate::recorder::INPUTS + 2,
+            "a drawn channel went missing"
+        );
+        assert_eq!(channels.len(), SLOTS + crate::recorder::INPUTS + 1);
         assert!(!channels.contains(&Strip::Click), "the click is drawn twice");
         assert!(!channels.contains(&Strip::Fx), "the bus is drawn twice");
         // Every strip owns a distinct place in the arrays, or two of them
@@ -1152,6 +1197,59 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), n, "two channels share an index");
+    }
+
+    /// **A hidden strip has no column and cannot be pressed.**
+    ///
+    /// Four empty microphone columns is a desk that is mostly plus signs, so
+    /// the inputs show the ones that are open and one spare — and the ones
+    /// that are not shown must not be pressable either, or a fader nobody can
+    /// see would move when somebody grabbed the channel beside it.
+    #[test]
+    fn a_hidden_strip_takes_no_room_and_no_presses() {
+        use crate::recorder::INPUTS;
+        let mut v = a_view();
+        // Everything past the first input goes away, which is the state a rig
+        // with one microphone is in.
+        for i in 0..v.strips.len() {
+            if let Some(Strip::Input(n)) = v.strips[i].strip {
+                v.strips[i].hidden = n > 1;
+            }
+        }
+        let r = rect();
+        let l = Layout::new(r, &v);
+        let mut wide = 0.0f32;
+        for (i, s) in l.strips.iter().enumerate() {
+            let hidden = v.strips.get(i).is_some_and(|x| x.hidden);
+            if hidden {
+                assert!(
+                    !s.panel.is_positive(),
+                    "hidden strip {i} was given a column anyway"
+                );
+                continue;
+            }
+            assert!(s.panel.is_positive(), "strip {i} lost its column");
+            wide = wide.max(s.panel.width());
+        }
+        // The room the hidden ones gave up went to the ones that are left,
+        // rather than being left as a gap in the middle of the desk.
+        let all_shown = Layout::new(r, &a_view());
+        let widest = all_shown
+            .strips
+            .iter()
+            .fold(0.0f32, |a, s| a.max(s.panel.width()));
+        assert!(
+            wide > widest,
+            "hiding {} columns bought nothing: {wide} vs {widest}",
+            INPUTS - 2
+        );
+        // And nothing on a hidden strip answers a press.
+        for (_, hit) in l.targets() {
+            assert!(
+                !v.strips.get(hit.strip()).is_some_and(|x| x.hidden),
+                "{hit:?} is on a strip nobody can see"
+            );
+        }
     }
 
     /// **Every mark has to land on the scale it is drawn against.**

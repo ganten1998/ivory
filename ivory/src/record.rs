@@ -573,7 +573,7 @@ struct Audio {
     running: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The live tap, until the engine takes it. See `Session::take_monitor`.
-    monitor: Option<(rtrb::Consumer<f32>, u16)>,
+    monitor: Option<(rtrb::Consumer<f32>, u16, [u8; crate::instrument::INPUTS])>,
 }
 
 impl Audio {
@@ -607,6 +607,11 @@ impl Audio {
             audio::open_input(selection, &wish, 3.0, timebase).map_err(|e| e.to_string())?;
         let config = stream.config().clone();
         let channels = config.channels as usize;
+        // Read off the SINK, which knows what the device actually honoured —
+        // an interface narrower than it was drops a pick, and a layout taken
+        // from what was asked for would then point every strip at the wrong
+        // column of the block.
+        let sink_widths = sink.widths::<{ crate::instrument::INPUTS }>();
         // `capture_channel` asserts this, and an assert on the UI thread goes
         // through the panic hook to a dialog and exit(1) — a device claiming
         // zero channels would kill the app the moment the band opened.
@@ -766,7 +771,10 @@ impl Audio {
             meters,
             running,
             thread: Some(thread),
-            monitor: monitor.map(|m| (m, config.channels)),
+            // The ring's own width, and how it is shared out between the
+            // input strips. NOT the take's width — those parted company when
+            // the take became the desk.
+            monitor: monitor.map(|m| (m, config.channels, sink_widths)),
         })
     }
 
@@ -1060,7 +1068,9 @@ impl Session {
     ///
     /// Taken rather than borrowed: the ring's read end belongs to exactly one
     /// consumer, and that is the engine's render thread.
-    pub fn take_monitor(&mut self) -> Option<(rtrb::Consumer<f32>, u16)> {
+    pub fn take_monitor(
+        &mut self,
+    ) -> Option<(rtrb::Consumer<f32>, u16, [u8; crate::instrument::INPUTS])> {
         self.audio.as_mut().and_then(|a| a.monitor.take())
     }
 

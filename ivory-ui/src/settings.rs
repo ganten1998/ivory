@@ -35,7 +35,58 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 9;
+const SETTINGS_VERSION: u64 = 10;
+
+/// Where a desk channel written before the INPUT STRIPS ended up.
+///
+/// **The desk grew four input columns where there had been one**, and every
+/// array indexed by [`crate::recorder::Strip::index`] moved with it: the
+/// colours, the sends, and the bits in the mute and solo masks. Without this a
+/// violet backing track comes back on input 2 and a muted click mutes an input
+/// nobody has filled — on a file the user was happily using a minute earlier.
+///
+/// The one input there was becomes the FIRST of the four, which is what it is:
+/// `wanted` is input 1 and the extras are inputs 2 upward.
+fn desk_channel_moved(old: usize) -> usize {
+    use crate::recorder::{INPUTS, SLOTS};
+    if old <= SLOTS {
+        // The slots, then the one input, which keeps its place.
+        old
+    } else {
+        // The backing track, the click, the bus and the master, all pushed
+        // along by the inputs that were added in front of them.
+        old + INPUTS - 1
+    }
+}
+
+/// Move every desk array from the one-input layout to this one.
+fn migrate_desk_channels(s: &mut Settings) {
+    use crate::recorder::{SLOTS, STRIPS};
+    // Highest first, because every channel moves UP: writing low to high would
+    // overwrite entries that have not been read yet.
+    let was = SLOTS + 4; // the old `STRIPS`, before the input strips
+    for old in (SLOTS + 1..=was).rev() {
+        let new = desk_channel_moved(old);
+        if new == old || new > STRIPS {
+            continue;
+        }
+        s.strip_colors[new] = std::mem::replace(&mut s.strip_colors[old], 0);
+        if old < s.strip_sends.len() && new < s.strip_sends.len() {
+            s.strip_sends[new] = std::mem::replace(&mut s.strip_sends[old], 0.0);
+        }
+    }
+    let move_mask = |mask: u32| {
+        let mut out = 0u32;
+        for old in 0..=was {
+            if mask & (1 << old) != 0 {
+                out |= 1 << desk_channel_moved(old);
+            }
+        }
+        out
+    };
+    s.strip_muted = move_mask(s.strip_muted);
+    s.strip_soloed = move_mask(s.strip_soloed);
+}
 
 /// Recorder backgrounds this app shipped as defaults before [`SETTINGS_VERSION`]
 /// 1, and which are therefore not evidence that anybody chose them.
@@ -357,6 +408,15 @@ pub struct Settings {
     /// — so these are stored verbatim and handed straight back at startup. See
     /// `ports::AudioSetup::set_exposed`.
     pub record_input_channels: Vec<String>,
+    /// The inputs open BESIDE the first, as the host's own opaque uids.
+    ///
+    /// **Opaque here for the same reason `record_audio_device` is**: the
+    /// grammar belongs to the host and `ivory-ui` must not learn to spell one.
+    /// Stored verbatim, handed straight back, and dropped by the host if they
+    /// name a different device from the first — one interface is one clock.
+    ///
+    /// Position matters: this is input 2 upward, in strip order.
+    pub record_extra_inputs: Vec<String>,
     /// The user picked "None - record MIDI only" in the audio-input picker.
     ///
     /// Its own key, because `record_audio_source` used to carry BOTH this and
@@ -467,7 +527,12 @@ pub struct Settings {
     /// without `dx7_cartridge`, and ignored when that does not load.
     pub dx7_patch: usize,
     pub metronome_gain: f64,
-    pub input_gain: f64,
+    /// One per input strip, linear. The band shows the first; the mixer shows
+    /// all of them.
+    ///
+    /// **The old `input_gain` is read into `[0]`**, because that is what it
+    /// was: the one microphone this app could open.
+    pub input_gains: [f64; crate::recorder::INPUTS],
     /// The master, linear. Unity by default: it is a master, and a master that
     /// ships anywhere else is one every user has to put back.
     pub master_gain: f64,
@@ -693,6 +758,7 @@ impl Default for Settings {
             record_camera_uid: None,
             record_audio_device: None,
             record_input_channels: Vec::new(),
+            record_extra_inputs: Vec::new(),
             record_input_off: false,
             record_count_in_beats: 4,
             record_count_in_bars: 1,
@@ -714,7 +780,7 @@ impl Default for Settings {
             dx7_cartridge: String::new(),
             dx7_patch: 0,
             metronome_gain: 0.5,
-            input_gain: 1.0,
+            input_gains: [1.0; crate::recorder::INPUTS],
             master_gain: 1.0,
             track_gain: 1.0,
             strip_colors: {
@@ -724,7 +790,7 @@ impl Default for Settings {
                 // instruments nor each other, and a colour each says so before
                 // the labels are read.
                 let mut c = [0; crate::recorder::STRIPS + 1];
-                c[crate::recorder::Strip::Input.index()] = 16; // teal
+                c[crate::recorder::Strip::Input(0).index()] = 16; // teal
                 c[crate::recorder::Strip::Track.index()] = 23; // violet
                 c[crate::recorder::STRIPS] = crate::mixer_panel::MASTER_COLOR as i64;
                 c
@@ -1255,6 +1321,14 @@ impl Settings {
         if let Some(n) = map.shift_remove("strip_soloed").and_then(|v| v.as_u64()) {
             s.strip_soloed = n as u32;
         }
+        if let Some(Value::Array(v)) = map.shift_remove("record_extra_inputs") {
+            s.record_extra_inputs = v
+                .into_iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .filter(|x| !x.trim().is_empty())
+                .take(crate::recorder::INPUTS.saturating_sub(1))
+                .collect();
+        }
         if let Some(Value::Array(v)) = map.shift_remove("record_input_channels") {
             s.record_input_channels = v
                 .into_iter()
@@ -1382,7 +1456,16 @@ impl Settings {
             }
         };
         take_gain(&mut map, "metronome_gain", &mut s.metronome_gain);
-        take_gain(&mut map, "input_gain", &mut s.input_gain);
+        take_gain(&mut map, "input_gain", &mut s.input_gains[0]);
+        if let Some(Value::Array(v)) = map.shift_remove("input_gains") {
+            for (i, x) in v.iter().take(crate::recorder::INPUTS).enumerate() {
+                if let Some(n) = x.as_f64() {
+                    if n.is_finite() && (0.0..=16.0).contains(&n) {
+                        s.input_gains[i] = n;
+                    }
+                }
+            }
+        }
         take_gain(&mut map, "master_gain", &mut s.master_gain);
         take_gain(&mut map, "track_gain", &mut s.track_gain);
         take_gain(&mut map, "fx_return_gain", &mut s.fx_return_gain);
@@ -1447,6 +1530,12 @@ impl Settings {
         legacy_staff: bool,
         saw_order: bool,
     ) {
+        if was < 10 {
+            // **The desk grew four input columns where there had been one**,
+            // and everything indexed by a channel moved with it. See
+            // `desk_channel_moved`.
+            migrate_desk_channels(self);
+        }
         if was < 9 {
             // **The limiter's dial turned round.** It used to be off at zero
             // like everything else; it is a threshold now and off is fully
@@ -1775,6 +1864,15 @@ impl Settings {
         );
         map.insert("strip_soloed".into(), Value::from(self.strip_soloed));
         map.insert(
+            "record_extra_inputs".into(),
+            Value::Array(
+                self.record_extra_inputs
+                    .iter()
+                    .map(|c| Value::String(c.clone()))
+                    .collect(),
+            ),
+        );
+        map.insert(
             "record_input_channels".into(),
             Value::Array(
                 self.record_input_channels
@@ -1882,10 +1980,18 @@ impl Settings {
             Value::String(self.dx7_cartridge.clone()),
         );
         map.insert("dx7_patch".into(), Value::Number(self.dx7_patch.into()));
+        map.insert(
+            "input_gains".into(),
+            Value::Array(
+                self.input_gains
+                    .iter()
+                    .filter_map(|g| serde_json::Number::from_f64(*g).map(Value::Number))
+                    .collect(),
+            ),
+        );
         map.insert("track_path".into(), Value::String(self.track_path.clone()));
         for (key, gain) in [
             ("metronome_gain", self.metronome_gain),
-            ("input_gain", self.input_gain),
             ("master_gain", self.master_gain),
             ("track_gain", self.track_gain),
             ("track_in", self.track_in),
@@ -2178,7 +2284,7 @@ impl Settings {
             gains: crate::recorder::Gains {
                 slots: std::array::from_fn(|i| self.plugin_gains[i] as f32),
                 metronome: self.metronome_gain as f32,
-                input: self.input_gain as f32,
+                inputs: std::array::from_fn(|i| self.input_gains[i] as f32),
                 master: self.master_gain as f32,
                 track: self.track_gain as f32,
                 fx_return: self.fx_return_gain as f32,
@@ -2375,7 +2481,66 @@ mod tests {
     /// default and the only thing that had ever turned it on was choosing a
     /// camera. New installs get it from the default; existing files need the
     /// migration, and only the one time.
-     /// **A palette is a set of indices somebody has already saved.**
+     /// **The desk grew four input columns where there had been one.**
+    ///
+    /// Every array indexed by a channel moved with it. Without the shift a
+    /// violet backing track comes back on input 2 and a muted click mutes an
+    /// input nobody has filled — on a file the user was happily using a minute
+    /// earlier.
+    #[test]
+    fn a_desk_saved_before_the_input_strips_still_lines_up() {
+        use crate::recorder::{Strip, SLOTS};
+        // The old layout: five slots, ONE input, track, click, bus, master.
+        // Violet on the backing track, the click muted, half a send on the bus.
+        let old_track = SLOTS + 1;
+        let old_click = SLOTS + 2;
+        let mut colors = vec![0i64; SLOTS + 5];
+        colors[SLOTS] = 4; // the one input: teal, in the old numbering
+        colors[old_track] = 6; // violet
+        colors[SLOTS + 4] = 1; // the master: red
+        let mut sends = vec![0.0f64; SLOTS + 4];
+        sends[SLOTS + 3] = 0.5; // the bus
+        let json = format!(
+            r#"{{"strip_colors": {colors:?}, "strip_sends": {sends:?},
+                 "strip_muted": {}, "strip_soloed": 0}}"#,
+            1u32 << old_click
+        );
+        let s = Settings::from_json(&json);
+
+        assert_eq!(
+            s.strip_colors[Strip::Track.index()] as usize,
+            crate::mixer_panel::PALETTE_V1_TO_V2[6],
+            "the backing track's colour landed on another channel"
+        );
+        assert_eq!(
+            s.strip_colors[Strip::Input(0).index()] as usize,
+            crate::mixer_panel::PALETTE_V1_TO_V2[4],
+            "the one input there was is not the first of the four"
+        );
+        assert_eq!(
+            s.strip_colors[crate::recorder::STRIPS] as usize,
+            crate::mixer_panel::PALETTE_V1_TO_V2[1],
+            "the master is not last any more"
+        );
+        assert!(
+            (s.strip_sends[Strip::Fx.index()] - 0.5).abs() < 1.0e-9,
+            "the bus's send moved to {}",
+            Strip::Fx.index()
+        );
+        assert_eq!(
+            s.strip_muted,
+            1 << Strip::Click.index(),
+            "the muted click now mutes something else"
+        );
+        // The new input strips come up unmuted and uncoloured, because nobody
+        // has ever said anything about them.
+        for i in 1..crate::recorder::INPUTS {
+            assert_eq!(s.strip_colors[Strip::Input(i).index()], 0, "input {i}");
+            assert_eq!(s.strip_muted & (1 << Strip::Input(i).index()), 0);
+        }
+    }
+
+    /// **A palette is a set of indices somebody has already saved.**
     ///
     /// Growing the table from eight colours to twenty-seven renumbered every
     /// one of them. Without the map, a desk with a teal microphone and a
@@ -2388,7 +2553,7 @@ mod tests {
         use crate::recorder::Strip;
         // The old defaults: 4 was teal and 6 was violet.
         let old = Settings::from_json(r#"{"strip_colors": [0, 0, 0, 0, 0, 4, 6, 0, 0, 1]}"#);
-        let teal = old.strip_colors[Strip::Input.index()] as usize;
+        let teal = old.strip_colors[Strip::Input(0).index()] as usize;
         let violet = old.strip_colors[Strip::Track.index()] as usize;
         assert_eq!(teal, PALETTE_V1_TO_V2[4], "the microphone changed colour");
         assert_eq!(violet, PALETTE_V1_TO_V2[6], "the backing track changed colour");
@@ -2400,7 +2565,7 @@ mod tests {
 
         // A file already written by this build is taken at face value.
         let new = Settings::from_json(r#"{"strip_colors_v2": [0, 0, 0, 0, 0, 26, 0, 0, 0, 5]}"#);
-        assert_eq!(new.strip_colors[Strip::Input.index()], 26);
+        assert_eq!(new.strip_colors[Strip::Input(0).index()], 26);
 
         // And what is written back is the NEW key, or the next launch would
         // migrate the already-migrated numbers a second time.

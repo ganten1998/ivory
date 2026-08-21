@@ -185,7 +185,14 @@ struct Recorder {
     /// ENGINE, and the two are opened by different edges — so it is held here
     /// rather than dropped when the second one is not there yet. See
     /// `push_monitor_settings`, which is where it gets handed over.
-    pending_monitor: Option<(rtrb::Consumer<f32>, u16)>,
+    pending_monitor: Option<(rtrb::Consumer<f32>, u16, [u8; crate::instrument::INPUTS])>,
+    /// What each input strip is called, as the picker names it. Empty for one
+    /// nobody has filled.
+    ///
+    /// Kept here rather than read back out of the app, because the host is
+    /// what knows: which inputs are open is a fact about the device and the
+    /// selection, and `ivory-ui` can reach neither.
+    input_names: [String; crate::instrument::INPUTS],
     /// The newest camera frame, kept as RGBA for the compositor.
     ///
     /// A copy, and a deliberate one: the preview uploads its own texture and
@@ -1028,6 +1035,19 @@ impl DesktopApp {
             name.as_deref().and_then(take::sanitise_slug).as_deref(),
         );
         state.audio_name = open_name.or(audio_uid);
+        // **One strip per input, filled from the selection.** The names and
+        // the widths come from the same function the picks do, so the column
+        // the mixer draws and the channels the capture keeps cannot drift
+        // apart — see `devices::open_inputs`.
+        let open_inputs = crate::devices::open_inputs(&self.recorder.audio);
+        for i in 0..ivory_ui::recorder::INPUTS {
+            let (name, stereo) = open_inputs
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| (String::new(), false));
+            self.recorder.input_names[i].clone_from(&name);
+            state.inputs[i] = ivory_ui::recorder::InputState { name, stereo };
+        }
         state.audio_missing = audio_missing;
         state.disk_minutes = self
             .recorder
@@ -2210,7 +2230,9 @@ impl DesktopApp {
         // desk, so the desk's own fader is the whole of it, and the second
         // copy would have been the fader applied to everything in the file
         // rather than to the microphone.
-        e.set_monitor_gain(gains.input);
+        for (i, g) in gains.inputs.iter().enumerate() {
+            e.set_monitor_gain(i, *g);
+        }
         // Never read from a settings file — see `IvoryApp::input_monitor`. It
         // is pushed every frame like every other monitor setting, and its value
         // at launch is false because the field it comes from starts false.
@@ -2298,8 +2320,13 @@ impl DesktopApp {
                 lost.push(Strip::Slot(i));
             }
         }
-        if self.recorder.session.audio_device_name().is_some() && !desk.heard(Strip::Input) {
-            lost.push(Strip::Input);
+        // Every input that is OPEN, by name. A strip nobody has filled is not
+        // a loss; a microphone that is plugged in and muted is.
+        for i in 0..ivory_ui::recorder::INPUTS {
+            let open = self.recorder.input_names.get(i).is_some_and(|n| !n.is_empty());
+            if open && !desk.heard(Strip::Input(i)) {
+                lost.push(Strip::Input(i));
+            }
         }
         if engine.is_some_and(crate::instrument::Engine::track_loaded)
             && !desk.heard(Strip::Track)
@@ -2466,6 +2493,11 @@ impl DesktopApp {
 
     /// Open the audio input the user asked for, if it is not already open.
     fn reconcile_audio(&mut self, force: bool) {
+        // **The extras, pushed before the staleness check reads it.** Choosing
+        // a second input changes how many channels the stream carries and
+        // which ones, so it is a reopen — `set_extra_inputs` marks the
+        // selection unsettled and this call is what notices.
+        crate::devices::set_extra_inputs(&self.recorder.audio, self.app.extra_inputs().to_vec());
         let stale = {
             let sel = crate::devices::selection(&self.recorder.audio);
             sel.is_stale()
@@ -2627,11 +2659,12 @@ impl DesktopApp {
                 app.chosen_audio_uid(),
                 app.audio_explicitly_off(),
                 app.exposed_input_channels(),
+                app.extra_inputs(),
             );
             // No `explicitly_off` for the camera: absent already means no
             // camera there, because opening one turns on a light and a camera
             // nobody asked for must never be opened.
-            crate::devices::restore(&camera, app.chosen_camera_uid(), false, &[]);
+            crate::devices::restore(&camera, app.chosen_camera_uid(), false, &[], &[]);
             app.set_capture_devices(Some(Box::new(inputs)));
             app.set_cameras(Some(Box::new(cams)));
             app.set_audio_setup(Some(Box::new(crate::devices::Setup::new(&audio))));
@@ -2652,6 +2685,7 @@ impl DesktopApp {
             app.set_plugin_list(ivory_host::discover_in(&extra));
             Recorder {
                 pending_monitor: None,
+                input_names: std::array::from_fn(|_| String::new()),
                 session: crate::record::Session::new(tap, timebase),
                 audio,
                 camera,

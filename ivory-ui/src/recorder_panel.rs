@@ -1681,7 +1681,7 @@ impl Hit {
                 Hit::SetSlotGain(i, ships_at(d.slots.get(i).copied().unwrap_or(1.0)))
             }
             Hit::SetMetronomeGain(_) => Hit::SetMetronomeGain(ships_at(d.metronome)),
-            Hit::SetInputGain(_) => Hit::SetInputGain(ships_at(d.input)),
+            Hit::SetInputGain(_) => Hit::SetInputGain(ships_at(d.inputs[0])),
             Hit::SetTrackGain(_) => Hit::SetTrackGain(ships_at(d.track)),
             // **The limiter is the exception and it is not an inconsistency.**
             // Its knob is a threshold, so "not applied" is fully clockwise —
@@ -2356,7 +2356,7 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
             l.input_row,
             FaderIcon::Microphone,
             p.faint,
-            view.gains.input,
+            view.gains.inputs[0],
             NumField::Input,
         ),
         (
@@ -4877,7 +4877,7 @@ mod tests {
         // that mutes what you were listening to is one nobody uses twice.
         let d = Gains::default();
         for (hit, want) in [
-            (Hit::SetInputGain(0.3), d.input),
+            (Hit::SetInputGain(0.3), d.inputs[0]),
             (Hit::SetSlotGain(1, 0.3), d.slots[1]),
             (Hit::SetTrackGain(0.3), d.track),
             (Hit::SetMetronomeGain(0.9), d.metronome),
@@ -6758,7 +6758,7 @@ mod tests {
                                 gains: Gains {
                                     slots: [3.98, 0.0, 1.0, 0.5, 0.25],
                                     metronome: 0.0,
-                                    input: 0.5,
+                                    inputs: [0.5; crate::recorder::INPUTS],
                                     master: if dark { 1.0 } else { 0.35 },
                                     track: 0.7,
                                     fx_return: 1.0,

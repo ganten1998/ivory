@@ -470,24 +470,34 @@ fn is_pedal(status: u8, data1: u8) -> bool {
 pub enum Strip {
     /// One instrument slot, loaded or not. See the UI's own `Strip`.
     Slot(usize),
-    Input,
+    /// One input of the interface. See the UI's own `Strip`.
+    Input(usize),
     Track,
     Click,
     Fx,
 }
 
+/// How many inputs of one interface the desk has room for.
+///
+/// **Asserted equal to `ivory_record::audio::MAX_PICKS`** — the capture cannot
+/// keep more than that, and a desk with more strips than the capture has picks
+/// would draw channels nothing can ever fill. `ivory-ui` declares its own copy
+/// because it may not reach either of these; the test below is what keeps all
+/// three the same number.
+pub const INPUTS: usize = ivory_ui::recorder::INPUTS;
+
 /// How many channels the desk has, master aside.
-pub const STRIPS: usize = SLOTS + 4;
+pub const STRIPS: usize = SLOTS + INPUTS + 3;
 
 impl Strip {
     /// Its place in the arrays, and the bit it owns.
     pub const fn index(self) -> usize {
         match self {
             Strip::Slot(i) => i,
-            Strip::Input => SLOTS,
-            Strip::Track => SLOTS + 1,
-            Strip::Click => SLOTS + 2,
-            Strip::Fx => SLOTS + 3,
+            Strip::Input(i) => SLOTS + i,
+            Strip::Track => SLOTS + INPUTS,
+            Strip::Click => SLOTS + INPUTS + 1,
+            Strip::Fx => SLOTS + INPUTS + 2,
         }
     }
 
@@ -505,7 +515,7 @@ impl From<ivory_ui::recorder::Strip> for Strip {
         use ivory_ui::recorder::Strip as Ui;
         match ui {
             Ui::Slot(i) => Strip::Slot(i),
-            Ui::Input => Strip::Input,
+            Ui::Input(i) => Strip::Input(i),
             Ui::Track => Strip::Track,
             Ui::Click => Strip::Click,
             Ui::Fx => Strip::Fx,
@@ -1058,7 +1068,8 @@ struct Shared {
     /// they had forgotten was monitoring.
     monitor_on: AtomicBool,
     /// The monitor's own level, as a linear gain. The microphone fader.
-    monitor_gain: AtomicU32,
+    /// One microphone fader per input strip.
+    monitor_gain: [AtomicU32; INPUTS],
     /// Where the track starts and stops, in frames. `out` of zero means "to
     /// the end", so a clip with no trim needs no knowledge of its own length
     /// down here.
@@ -1075,7 +1086,15 @@ struct Shared {
     /// Behind a mutex and picked up with `try_lock`, exactly like the backing
     /// track: the ring's read end is `!Sync` and belongs to one thread, and the
     /// audio thread may not wait on the UI thread to hand it over.
-    pending_monitor: std::sync::Mutex<Option<Option<(rtrb::Consumer<f32>, u16)>>>,
+    /// The live input's ring, its total channel count, and how those channels
+    /// are shared out between the input strips.
+    ///
+    /// **The widths are the other end of `Picks`.** The capture laid the
+    /// chosen inputs end to end in one stream — a mono input then a stereo
+    /// pair is one channel then two — and without the widths this side would
+    /// have a block of three channels and no idea which strip owns which.
+    pending_monitor:
+        std::sync::Mutex<Option<Option<(rtrb::Consumer<f32>, u16, [u8; INPUTS])>>>,
     /// The master, as a LINEAR gain. The last thing on the instrument bus,
     /// after the limiter, reaching both the device mix and the take — the same
     /// rule the effects follow.
@@ -1214,7 +1233,7 @@ impl Shared {
             track_playing: AtomicBool::new(false),
             track_loaded: AtomicBool::new(false),
             monitor_on: AtomicBool::new(false),
-            monitor_gain: AtomicU32::new(1.0_f32.to_bits()),
+            monitor_gain: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
             track_in: AtomicU64::new(0),
             track_out: AtomicU64::new(0),
             pending_track: std::sync::Mutex::new(None),
@@ -1683,7 +1702,9 @@ struct Renderer {
     /// How many channels that ring carries per frame.
     monitor_channels: usize,
     /// Slewed, so switching monitoring on is a fade rather than a bang.
-    monitor_gain: f32,
+    monitor_gain: [f32; INPUTS],
+    /// Channels per input strip, in stream order. Zero for one not open.
+    monitor_widths: [usize; INPUTS],
     monitor_scratch: Vec<f32>,
 }
 
@@ -2283,18 +2304,20 @@ impl Renderer {
         if let Ok(mut pending) = self.shared.pending_monitor.try_lock() {
             if let Some(next) = pending.take() {
                 match next {
-                    Some((ring, channels)) => {
+                    Some((ring, channels, widths)) => {
                         self.monitor = Some(ring);
                         self.monitor_channels = usize::from(channels).max(1);
+                        self.monitor_widths = widths.map(usize::from);
                     }
                     None => {
                         self.monitor = None;
                         self.monitor_channels = 0;
+                        self.monitor_widths = [0; INPUTS];
                     }
                 }
                 // A new device fades in from silence rather than arriving at
                 // whatever the last one was playing at.
-                self.monitor_gain = 0.0;
+                self.monitor_gain = [0.0; INPUTS];
             }
         }
         let Some(ring) = self.monitor.as_mut() else {
@@ -2321,77 +2344,107 @@ impl Renderer {
 
         // **Mute decides the take. Monitoring decides only the room.**
         //
-        // The strip is on the bus whenever it is not muted, so the file gets
-        // what the desk says it gets — and `monitor_on` narrows to the one
-        // question it can answer without lying: whether the SPEAKERS get it
-        // too. It used to answer both, and the take was the casualty: a
-        // microphone monitored through the interface's own hardware — the
-        // ordinary way anybody records one, because it is the only way with no
-        // latency — is not monitored here, and produced a take with no
-        // microphone in it.
+        // A strip is on the bus whenever it is not muted, so the file gets what
+        // the desk says it gets — and `monitor_on` narrows to the one question
+        // it can answer without lying: whether the SPEAKERS get it too. It used
+        // to answer both, and the take was the casualty: a microphone monitored
+        // through the interface's own hardware — the ordinary way anybody
+        // records one, because it is the only way with no latency — is not
+        // monitored here, and produced a take with no microphone in it.
         //
         // Feedback is why the room half exists at all and why it is still off
         // at every launch. See `IvoryApp::input_monitor`.
-        let heard = strip_is_heard(Strip::Input, muted, soloed);
-        let target = if heard {
-            Shared::f32_of(&self.shared.monitor_gain)
-        } else {
-            0.0
-        };
+        //
+        // **One switch for every input, and one fader each.** Monitoring is a
+        // control-room question and the answer is the same for the whole room;
+        // how loud each source is, and whether it is in the take at all, is a
+        // question per channel and has a strip per channel.
         let room_target = if self.shared.monitor_on.load(Ordering::Relaxed) {
             1.0
         } else {
             0.0
         };
-        let send = Shared::f32_of(&self.shared.send[Strip::Input.index()]).clamp(0.0, 1.0);
-        // Silent and already faded out: the drain above was the whole job.
-        if !heard && self.monitor_gain <= 1.0e-6 {
-            self.monitor_gain = 0.0;
-            self.room_gain = room_target;
-            return;
-        }
+        let frames_got = got / ch_in;
+        let n = frames.min(frames_got);
         if let Some(dry) = self.input_dry.get_mut(..frames * TAP_CHANNELS) {
             dry.fill(0.0);
         }
-        let frames_got = got / ch_in;
-        let mut peak = [0.0f32; 2];
+        // The room's slew is the room's, not any one channel's: it moves once
+        // per frame however many inputs are open, or four inputs would each
+        // drag it a quarter of the way and the fade would depend on how many
+        // microphones happened to be plugged in.
+        let room_from = self.room_gain;
+        let mut room_to = room_from;
         let mut withheld = 0.0f32;
-        for i in 0..frames.min(frames_got) {
-            self.monitor_gain += (target - self.monitor_gain) * self.gain_coeff;
-            self.room_gain += (room_target - self.room_gain) * self.gain_coeff;
-            // How much of this frame the room is NOT being given.
-            let keep_out = 1.0 - self.room_gain;
-            withheld = withheld.max(keep_out);
-            let at = i * TAP_CHANNELS;
-            for c in 0..TAP_CHANNELS {
-                // A mono input goes to both sides; a stereo one keeps its
-                // sides. Anything wider is folded down by taking the first two,
-                // which is what a monitor is for — hearing that something is
-                // arriving, not auditioning a surround mix.
-                let src = scratch[i * ch_in + c.min(ch_in - 1)] * self.monitor_gain;
-                peak[c.min(1)] = peak[c.min(1)].max(src.abs());
-                if let Some(v) = self.mix.get_mut(at + c) {
-                    *v += src;
-                }
-                // The room's subtrahend, written by the pass that made the
-                // sample. Zero while monitoring is fully on, which is when the
-                // two mixes are one mix and the second master insert is idle.
-                if let Some(d) = self.input_dry.get_mut(at + c) {
-                    *d = src * keep_out;
-                }
-                // Post-fader, like every other send here, and closed with the
-                // room: a channel nobody can hear must not arrive back in the
-                // speakers through the reverb.
-                if let Some(a) = self.aux.get_mut(at + c) {
-                    *a += src * send * self.room_gain;
+        // **Every input of the interface, at its own offset in the block.**
+        // `Picks` laid them end to end when the stream was opened — a mono
+        // input then a stereo pair is one channel then two — and this is the
+        // other end of that: which columns of the interleaved frame belong to
+        // which strip.
+        let mut offset = 0usize;
+        for input in 0..INPUTS {
+            let width = self.monitor_widths[input].min(ch_in.saturating_sub(offset));
+            if width == 0 {
+                continue;
+            }
+            let at_ch = offset;
+            offset += width;
+            let strip = Strip::Input(input);
+            let heard = strip_is_heard(strip, muted, soloed);
+            let target = if heard {
+                Shared::f32_of(&self.shared.monitor_gain[input])
+            } else {
+                0.0
+            };
+            // Silent and already faded out: the drain above was the whole job
+            // for this one. The others still get their turn.
+            if !heard && self.monitor_gain[input] <= 1.0e-6 {
+                self.monitor_gain[input] = 0.0;
+                continue;
+            }
+            let send = Shared::f32_of(&self.shared.send[strip.index()]).clamp(0.0, 1.0);
+            let mut peak = [0.0f32; 2];
+            let mut room = room_from;
+            for i in 0..n {
+                self.monitor_gain[input] += (target - self.monitor_gain[input]) * self.gain_coeff;
+                room += (room_target - room) * self.gain_coeff;
+                // How much of this frame the room is NOT being given.
+                let keep_out = 1.0 - room;
+                withheld = withheld.max(keep_out);
+                let at = i * TAP_CHANNELS;
+                for c in 0..TAP_CHANNELS {
+                    // A mono input goes to both sides; a stereo one keeps its
+                    // sides. Anything wider is folded down by taking the first
+                    // two, which is what a monitor is for — hearing that
+                    // something is arriving, not auditioning a surround mix.
+                    let lane = at_ch + c.min(width - 1);
+                    let src = scratch[i * ch_in + lane] * self.monitor_gain[input];
+                    peak[c.min(1)] = peak[c.min(1)].max(src.abs());
+                    if let Some(v) = self.mix.get_mut(at + c) {
+                        *v += src;
+                    }
+                    // The room's subtrahend, ADDED to rather than written:
+                    // four inputs share one buffer and the last one to run
+                    // would otherwise be the only one the speakers were spared.
+                    if let Some(d) = self.input_dry.get_mut(at + c) {
+                        *d += src * keep_out;
+                    }
+                    // Post-fader, like every other send here, and closed with
+                    // the room: a channel nobody can hear must not arrive back
+                    // in the speakers through the reverb.
+                    if let Some(a) = self.aux.get_mut(at + c) {
+                        *a += src * send * room;
+                    }
                 }
             }
+            room_to = room;
+            self.shared.note_strip_peak(strip, peak);
         }
-        // A hundredth of a decibel of the input still withheld is still two
+        self.room_gain = room_to;
+        // A hundredth of a decibel of an input still withheld is still two
         // mixes. The threshold is what stops a fully-monitored rig from
         // running a second limiter forever over a rounding error.
         self.room_live = withheld > 1.0e-4;
-        self.shared.note_strip_peak(Strip::Input, peak);
     }
 
     /// Add the backing track to the bus, if one is loaded and rolling.
@@ -3124,7 +3177,8 @@ impl Engine {
             gain_coeff: gain_coefficient(f64::from(rate)),
             monitor: None,
             monitor_channels: 0,
-            monitor_gain: 0.0,
+            monitor_gain: [0.0; INPUTS],
+            monitor_widths: [0; INPUTS],
             monitor_scratch: vec![0.0; widest * 4096],
         };
 
@@ -3954,14 +4008,14 @@ impl Engine {
 
     /// The monitor's level — the microphone fader, which is also what scales
     /// the input into the take.
-    pub fn set_monitor_gain(&self, linear: f32) {
-        self.shared
-            .monitor_gain
-            .store(sane_gain(linear).to_bits(), Ordering::Relaxed);
+    pub fn set_monitor_gain(&self, input: usize, linear: f32) {
+        if let Some(g) = self.shared.monitor_gain.get(input) {
+            g.store(sane_gain(linear).to_bits(), Ordering::Relaxed);
+        }
     }
 
     /// Hand the renderer the live input's ring. `None` takes it away.
-    pub fn set_monitor(&mut self, tap: Option<(rtrb::Consumer<f32>, u16)>) {
+    pub fn set_monitor(&mut self, tap: Option<(rtrb::Consumer<f32>, u16, [u8; INPUTS])>) {
         if let Ok(mut g) = self.shared.pending_monitor.lock() {
             *g = Some(tap);
         }
@@ -5542,7 +5596,8 @@ mod tests {
         Renderer {
             monitor: None,
             monitor_channels: 0,
-            monitor_gain: 0.0,
+            monitor_gain: [0.0; INPUTS],
+            monitor_widths: [0; INPUTS],
             monitor_scratch: Vec::new(),
             fx_plugin: PluginBox(None),
             fx_incoming,
@@ -5644,13 +5699,13 @@ mod tests {
             assert!(strip_is_heard(*s, none, none), "{s:?} was silent for no reason");
         }
         // One muted: it alone is silent.
-        let m = Input.bit();
-        assert!(!strip_is_heard(Input, m, none));
+        let m = Input(0).bit();
+        assert!(!strip_is_heard(Input(0), m, none));
         assert!(strip_is_heard(Track, m, none));
         // One soloed: it alone is heard, and mute does not enter into it.
         let so = Track.bit();
         assert!(strip_is_heard(Track, none, so));
-        assert!(!strip_is_heard(Input, none, so));
+        assert!(!strip_is_heard(Input(0), none, so));
         assert!(!strip_is_heard(Slot(0), none, so));
         // Soloed AND muted: heard, because pressing solo asked for it.
         assert!(
@@ -6271,6 +6326,25 @@ mod tests {
         );
     }
 
+    /// **Three copies of one number.**
+    ///
+    /// `ivory-ui` declares its own `INPUTS` because it may not reach across
+    /// the firewall, and `ivory-record` declares `MAX_PICKS` because that is
+    /// where the channels are actually kept. A desk with more strips than the
+    /// capture has picks would draw channels nothing can ever fill; fewer, and
+    /// an input the user chose would be captured and never heard.
+    #[test]
+    fn the_desk_has_as_many_inputs_as_the_capture_can_keep() {
+        assert_eq!(INPUTS, ivory_record::audio::MAX_PICKS);
+        assert_eq!(INPUTS, ivory_ui::recorder::INPUTS);
+        assert_eq!(STRIPS, ivory_ui::recorder::STRIPS, "the desks disagree");
+        // And every UI strip maps onto a host strip at the same index, which
+        // is what makes the mute masks and the send array the same arrays.
+        for ui in ivory_ui::recorder::Strip::all() {
+            assert_eq!(Strip::from(ui).index(), ui.index(), "{ui:?} moved");
+        }
+    }
+
     /// **The take is the desk. The room is the desk minus what nobody asked
     /// to hear.**
     ///
@@ -6293,11 +6367,12 @@ mod tests {
             }
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
+            r.monitor_widths = [1, 0, 0, 0];
             r.monitor_scratch = vec![0.0; 8192];
             // At the fader's destination rather than on its way there: the
             // slews are per sample and this test is about routing.
-            shared.monitor_gain.store(1.0f32.to_bits(), Ordering::Relaxed);
-            r.monitor_gain = 1.0;
+            shared.monitor_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+            r.monitor_gain[0] = 1.0;
             shared.monitor_on.store(monitored, Ordering::Relaxed);
             r.room_gain = if monitored { 1.0 } else { 0.0 };
 

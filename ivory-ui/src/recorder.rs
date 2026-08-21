@@ -378,8 +378,12 @@ pub struct Gains {
     /// `metronome_in_take`, which is a separate question with a separate
     /// answer.
     pub metronome: f32,
-    /// The audio input being recorded.
-    pub input: f32,
+    /// The inputs being recorded, one fader each.
+    ///
+    /// **An array for the same reason the slots are one**: the band shows the
+    /// first and the mixer shows all of them, and two fields for one number is
+    /// how a fader and its second view disagree.
+    pub inputs: [f32; INPUTS],
     /// **The master.** Last on the instrument bus, after the limiter, on both
     /// what you hear and what is written. Not the click, which has its own.
     pub master: f32,
@@ -404,7 +408,17 @@ pub enum Strip {
     /// with one fader is not a mixer, it is a master with extra steps. An
     /// empty slot still gets a strip, drawn as an outline you can load into.
     Slot(usize),
-    Input,
+    /// One input of the interface. **One strip each, chosen or not.**
+    ///
+    /// A rig is not one microphone. The owner's case is a vocal on input 6 and
+    /// a synth across 4/5, live at the same time, and one lumped "input"
+    /// channel for both is a master with extra steps — the same argument that
+    /// gave every instrument slot a strip of its own.
+    ///
+    /// One INTERFACE, though. A second device is a second clock and is
+    /// declined on purpose; anyone with that rig makes an aggregate device,
+    /// which presents as one device and arrives here as the ordinary case.
+    Input(usize),
     Track,
     Click,
     /// The return from the effects bus. It has no send of its own: a bus that
@@ -412,8 +426,15 @@ pub enum Strip {
     Fx,
 }
 
+/// How many inputs of one interface the desk has room for.
+///
+/// **Must equal `ivory_record::audio::MAX_PICKS`**, which is the same number
+/// counted where the capture happens. This crate cannot reach that one — see
+/// the firewall — so the host asserts they agree.
+pub const INPUTS: usize = 4;
+
 /// How many channels the desk has, master aside.
-pub const STRIPS: usize = SLOTS + 4;
+pub const STRIPS: usize = SLOTS + INPUTS + 3;
 
 impl Strip {
     /// The channels the MIXER draws, in order.
@@ -424,12 +445,14 @@ impl Strip {
     /// two columns of duplication and a narrower strip for everything that had
     /// nowhere else to be. They keep their place on the desk: the sends and
     /// the mute masks are unchanged, they are simply not drawn.
-    pub fn shown() -> [Strip; SLOTS + 2] {
+    pub fn shown() -> [Strip; SLOTS + INPUTS + 1] {
         std::array::from_fn(|i| {
             if i < SLOTS {
                 Strip::Slot(i)
+            } else if i < SLOTS + INPUTS {
+                Strip::Input(i - SLOTS)
             } else {
-                [Strip::Input, Strip::Track][i - SLOTS]
+                Strip::Track
             }
         })
     }
@@ -439,8 +462,10 @@ impl Strip {
         std::array::from_fn(|i| {
             if i < SLOTS {
                 Strip::Slot(i)
+            } else if i < SLOTS + INPUTS {
+                Strip::Input(i - SLOTS)
             } else {
-                [Strip::Input, Strip::Track, Strip::Click, Strip::Fx][i - SLOTS]
+                [Strip::Track, Strip::Click, Strip::Fx][i - SLOTS - INPUTS]
             }
         })
     }
@@ -449,10 +474,10 @@ impl Strip {
     pub const fn index(self) -> usize {
         match self {
             Strip::Slot(i) => i,
-            Strip::Input => SLOTS,
-            Strip::Track => SLOTS + 1,
-            Strip::Click => SLOTS + 2,
-            Strip::Fx => SLOTS + 3,
+            Strip::Input(i) => SLOTS + i,
+            Strip::Track => SLOTS + INPUTS,
+            Strip::Click => SLOTS + INPUTS + 1,
+            Strip::Fx => SLOTS + INPUTS + 2,
         }
     }
 
@@ -469,7 +494,10 @@ impl Strip {
     pub fn label(self) -> String {
         match self {
             Strip::Slot(i) => format!("instrument {}", i + 1),
-            Strip::Input => "the input".to_owned(),
+            // Numbered only when there could be more than one of them on the
+            // desk, which there can be — "the input is muted" with two open is
+            // not something anybody can act on.
+            Strip::Input(i) => format!("input {}", i + 1),
             Strip::Track => "the backing track".to_owned(),
             Strip::Click => "the click".to_owned(),
             Strip::Fx => "the effects bus".to_owned(),
@@ -578,7 +606,7 @@ impl Default for Gains {
         Self {
             slots: [1.0; SLOTS],
             metronome: 0.5,
-            input: 1.0,
+            inputs: [1.0; INPUTS],
             master: 1.0,
             track: 1.0,
             fx_return: 1.0,
@@ -596,6 +624,22 @@ impl Default for Gains {
 ///
 /// Every field is inert in a plugin: `Caps::capture_devices` is false there, the
 /// band takes zero height, and nothing ever writes to this.
+/// One input of the interface, as the desk needs to draw it.
+///
+/// **Filled by the host every frame, like the slots.** Which inputs are open
+/// is a fact about the device and the picker, and `ivory-ui` cannot ask either
+/// of them — see the firewall.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputState {
+    /// What the picker called it — "Scarlett 18i20  -  input 6". Empty for a
+    /// strip nobody has filled, which is drawn as somewhere to put one.
+    pub name: String,
+    /// Two channels rather than one, which is what decides two meter bars.
+    /// A mono microphone drawn as two identical bars is a meter claiming a
+    /// stereo signal.
+    pub stereo: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RecorderState {
     pub state: RecordState,
@@ -618,6 +662,8 @@ pub struct RecorderState {
     /// The loaded instrument's display name.
     /// One per slot, filled by the host each frame.
     pub slots: [SlotState; SLOTS],
+    /// The inputs of the interface that are open, one strip each.
+    pub inputs: [InputState; INPUTS],
     pub audio_name: Option<String>,
     pub audio_missing: bool,
     pub preview: Option<Preview>,
@@ -3054,9 +3100,9 @@ mod missing_tests {
     fn it_names_what_is_lost_and_where_to_fix_it() {
         assert_eq!(missing_from_take(&[]), None, "nothing muted, nothing to say");
 
-        let one = missing_from_take(&[Strip::Input]).expect("a muted input is news");
+        let one = missing_from_take(&[Strip::Input(0)]).expect("a muted input is news");
         assert!(
-            one.contains("the input is muted") && one.contains("will not have it"),
+            one.contains("input 1 is muted") && one.contains("will not have it"),
             "{one}"
         );
         assert!(
@@ -3068,10 +3114,10 @@ mod missing_tests {
         // A list anybody would say out loud, and the verb agreeing with it.
         // "instrument 2 are muted" is the kind of thing that makes a person
         // trust the rest of the line less.
-        let many = missing_from_take(&[Strip::Slot(1), Strip::Input, Strip::Track])
+        let many = missing_from_take(&[Strip::Slot(1), Strip::Input(0), Strip::Track])
             .expect("three of them is still news");
         assert!(
-            many.contains("instrument 2, the input and the backing track"),
+            many.contains("instrument 2, input 1 and the backing track"),
             "{many}"
         );
         assert!(many.contains("are muted") && many.contains("have them"), "{many}");

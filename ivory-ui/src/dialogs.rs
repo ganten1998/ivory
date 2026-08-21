@@ -1359,13 +1359,20 @@ pub enum BrowseFor {
 pub enum DeviceKind {
     Camera,
     AudioInput,
+    /// One of the inputs open BESIDE the first, numbered from 1.
+    ///
+    /// **The same list, aimed somewhere else.** A second microphone is not a
+    /// different kind of thing from the first — it is the same picker filling
+    /// a different strip, which is why this carries the strip and not a copy
+    /// of everything the audio picker knows.
+    ExtraInput(usize),
 }
 
 impl DeviceKind {
     pub fn title(self) -> &'static str {
         match self {
             DeviceKind::Camera => "Select Camera",
-            DeviceKind::AudioInput => "Select Audio Input",
+            DeviceKind::AudioInput | DeviceKind::ExtraInput(_) => "Select Audio Input",
         }
     }
 
@@ -1373,6 +1380,9 @@ impl DeviceKind {
         match self {
             DeviceKind::Camera => "Camera to record and preview:",
             DeviceKind::AudioInput => "Audio input to record:",
+            // The channels of the interface that is already open, because one
+            // interface is one clock — see `Selection::extra`.
+            DeviceKind::ExtraInput(_) => "A second input of the same interface:",
         }
     }
 
@@ -1390,6 +1400,7 @@ impl DeviceKind {
         match self {
             DeviceKind::Camera => "None  -  record without video",
             DeviceKind::AudioInput => "None  -  record the instrument, not an input",
+            DeviceKind::ExtraInput(_) => "None  -  leave this channel empty",
         }
     }
 
@@ -1413,6 +1424,10 @@ impl DeviceKind {
             DeviceKind::AudioInput => {
                 "No audio inputs found. If an interface is connected, check                  that it appears under Settings > System > Sound > Input."
             }
+            DeviceKind::ExtraInput(_) => {
+                "No other inputs on this interface. Tick the ones you want in \
+                 Setup, under the device."
+            }
         }
     }
 
@@ -1427,6 +1442,10 @@ impl DeviceKind {
             DeviceKind::AudioInput => {
                 "No audio inputs found. If an interface is connected, check \
                  that it shows up in your sound settings (or `arecord -l`)."
+            }
+            DeviceKind::ExtraInput(_) => {
+                "No other inputs on this interface. Tick the ones you want in \
+                 Setup, under the device."
             }
         }
     }
@@ -1443,6 +1462,10 @@ impl DeviceKind {
                 "No audio inputs found. If an interface is connected, Tangent \
                  may not have been granted microphone access yet - check \
                  System Settings > Privacy & Security."
+            }
+            DeviceKind::ExtraInput(_) => {
+                "No other inputs on this interface. Tick the ones you want in \
+                 Setup, under the device."
             }
         }
     }

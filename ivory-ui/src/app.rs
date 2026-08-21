@@ -1398,7 +1398,11 @@ impl IvoryApp {
                         *g = gain;
                     }
                 }
-                Some(Strip::Input) => self.settings.input_gain = gain,
+                Some(Strip::Input(n)) => {
+                    if let Some(g) = self.settings.input_gains.get_mut(*n) {
+                        *g = gain;
+                    }
+                }
                 Some(Strip::Track) => self.settings.track_gain = gain,
                 Some(Strip::Click) => self.settings.metronome_gain = gain,
                 Some(Strip::Fx) => self.settings.fx_return_gain = gain,
@@ -1417,8 +1421,18 @@ impl IvoryApp {
             // The plus on an empty slot: the same picker the rack opens, so
             // there is one way to choose an instrument and two ways to reach it.
             H::Add(i) => {
-                if let Some(Strip::Slot(n)) = strips.get(i) {
-                    self.open_plugin_picker(*n);
+                match strips.get(i) {
+                    Some(Strip::Slot(n)) => self.open_plugin_picker(*n),
+                    // **The first input is the band's own picker**, because it
+                    // is the same choice: the row in the band and the first
+                    // column of the desk are two views of one microphone.
+                    Some(Strip::Input(0)) => {
+                        self.open_device_picker(dialogs::DeviceKind::AudioInput);
+                    }
+                    Some(Strip::Input(n)) => {
+                        self.open_device_picker(dialogs::DeviceKind::ExtraInput(*n));
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -1487,6 +1501,18 @@ impl IvoryApp {
         let g = self.settings.knobs().gains;
         let desk = self.desk();
         let peaks = self.recorder.strip_peaks;
+        // **The inputs that are open, and one spare to add to.** Four empty
+        // microphone columns is not a rack with room in it, it is a desk that
+        // is mostly plus signs. The first is always drawn — it is the band's
+        // own microphone row seen a second time, and it is there whether or
+        // not anything is plugged in.
+        let filled = self
+            .recorder
+            .inputs
+            .iter()
+            .filter(|s| !s.name.is_empty())
+            .count()
+            .max(1);
         let strip = |s: Strip| {
             let i = s.index();
             let (name, detail, gain, empty) = match s {
@@ -1502,14 +1528,20 @@ impl IvoryApp {
                         loaded.is_none(),
                     )
                 }
-                Strip::Input => (
+                // **An input strip is a strip whether or not one is chosen**,
+                // for the same reason a slot is: five sources that appear one
+                // at a time as they are picked is a desk that changes shape
+                // under your hands.
+                // **The first input is never "empty".** It is the microphone
+                // row the band has always had: a column that says INPUT with
+                // nothing under it is what a rig with no interface looks like,
+                // and an outline with a plus in its place would be a channel
+                // that had disappeared.
+                Strip::Input(n) => (
                     "INPUT",
-                    self.audio_status
-                        .input
-                        .as_ref()
-                        .map_or("", |(n, _)| n.as_str()),
-                    g.input,
-                    false,
+                    self.recorder.inputs.get(n).map_or("", |s| s.name.as_str()),
+                    g.inputs.get(n).copied().unwrap_or(1.0),
+                    n > 0 && self.recorder.inputs.get(n).is_none_or(|s| s.name.is_empty()),
                 ),
                 Strip::Track => ("BACKING", self.track.name.as_str(), g.track, false),
                 Strip::Click => ("CLICK", "", g.metronome, false),
@@ -1525,11 +1557,14 @@ impl IvoryApp {
                 // claiming a stereo signal; the input knows its own width and
                 // an instrument's is on its `Loaded`.
                 stereo: match s {
-                    Strip::Input => self
-                        .audio_status
-                        .input
-                        .as_ref()
-                        .is_none_or(|(_, st)| st.channels != 1),
+                    // A strip with nothing on it draws the pair, like every
+                    // other empty channel: one bar is a claim about a device,
+                    // and there is no device to make a claim about.
+                    Strip::Input(n) => self
+                        .recorder
+                        .inputs
+                        .get(n)
+                        .is_none_or(|st| st.name.is_empty() || st.stereo),
                     _ => true,
                 },
                 gr_db: 0.0,
@@ -1539,6 +1574,8 @@ impl IvoryApp {
                     ""
                 },
                 empty,
+                // Past the ones that are open, plus the one spare.
+                hidden: matches!(s, Strip::Input(n) if n > filled),
                 gain,
                 send: desk.send[i],
                 peak: peaks[i],
@@ -1562,6 +1599,7 @@ impl IvoryApp {
                         .unwrap_or(0) as usize,
                     insert: "",
                     empty: false,
+                    hidden: false,
                     gain: g.master,
                     send: 0.0,
                     // The master's own meter, which the band already has: the
@@ -3092,7 +3130,7 @@ impl IvoryApp {
         match hit {
             H::SetFx(fx, _) => self.fx_value(fx),
             H::SetMetronomeGain(_) => fader(self.settings.metronome_gain),
-            H::SetInputGain(_) => fader(self.settings.input_gain),
+            H::SetInputGain(_) => fader(self.settings.input_gains[0]),
             H::SetMaster(_) => fader(self.settings.master_gain),
             H::SetTrackGain(_) => fader(self.settings.track_gain),
             H::SetSlotGain(i, _) => self
@@ -3479,7 +3517,7 @@ impl IvoryApp {
                 self.save_settings_soon();
             }
             Hit::SetInputGain(p) => {
-                self.settings.input_gain = f64::from(recorder::fader_to_gain(p));
+                self.settings.input_gains[0] = f64::from(recorder::fader_to_gain(p));
                 self.save_settings_soon();
             }
             Hit::SetMaster(p) => {
@@ -3638,6 +3676,14 @@ impl IvoryApp {
     /// The user effect the host should put across the effects bus, if any.
     pub fn bus_effect(&self) -> Option<&str> {
         self.settings.bus_effect.as_deref()
+    }
+
+    /// The inputs open BESIDE the first, as the host's own opaque uids.
+    ///
+    /// Input 2 upward, in strip order. The host drops any that name a
+    /// different device from the first.
+    pub fn extra_inputs(&self) -> &[String] {
+        &self.settings.record_extra_inputs
     }
 
     /// The inputs of an interface the picker should offer as rows of their
@@ -4058,6 +4104,15 @@ impl IvoryApp {
             dialogs::DeviceKind::AudioInput => (
                 self.audio_device_list(),
                 self.settings.record_audio_device.clone(),
+            ),
+            // The same list. Which strip it fills is the only difference, and
+            // the kind carries it.
+            dialogs::DeviceKind::ExtraInput(n) => (
+                self.audio_device_list(),
+                self.settings
+                    .record_extra_inputs
+                    .get(n.saturating_sub(1))
+                    .cloned(),
             ),
         };
         // Preselect what is already chosen, so OK on an unchanged dialog is a
@@ -5109,6 +5164,28 @@ impl IvoryApp {
                         if let Some(d) = self.audio_devices.as_mut() {
                             let _ = d.open(uid.as_deref().unwrap_or(""));
                         }
+                    }
+                    // **A list with holes in it is a desk with holes in it.**
+                    // Input 3 chosen while input 2 is empty would leave a gap
+                    // the host has no way to express — the picks are laid out
+                    // in order — so an empty one is removed and the rest close
+                    // up, which is what the strips then show.
+                    dialogs::DeviceKind::ExtraInput(n) => {
+                        let at = n.saturating_sub(1);
+                        let list = &mut self.settings.record_extra_inputs;
+                        while list.len() < at {
+                            list.push(String::new());
+                        }
+                        match uid.clone() {
+                            Some(u) if at < list.len() => list[at] = u,
+                            Some(u) => list.push(u),
+                            None if at < list.len() => {
+                                list.remove(at);
+                            }
+                            None => {}
+                        }
+                        list.retain(|u| !u.is_empty());
+                        list.truncate(recorder::INPUTS.saturating_sub(1));
                     }
                 }
                 self.save_settings();
@@ -7027,9 +7104,9 @@ mod tests {
         assert!(loud > quiet, "the mixer's fader moved nothing: {quiet} then {loud}");
 
         // A send is a percentage and lands where the host reads it.
-        app.apply_mixer_hit(Hit::Send(Strip::Input.index()), 0.4);
+        app.apply_mixer_hit(Hit::Send(Strip::Input(0).index()), 0.4);
         assert!(
-            (app.desk().send[Strip::Input.index()] - 0.4).abs() < 1.0e-6,
+            (app.desk().send[Strip::Input(0).index()] - 0.4).abs() < 1.0e-6,
             "the input's send did not stick"
         );
 
@@ -9669,7 +9746,7 @@ mod tests {
                 (|a: &IvoryApp| a.settings.plugin_gains[1]) as fn(&IvoryApp) -> f64,
             ),
             (recorder::NumField::Metronome, |a| a.settings.metronome_gain),
-            (recorder::NumField::Input, |a| a.settings.input_gain),
+            (recorder::NumField::Input, |a| a.settings.input_gains[0]),
         ] {
             app.num_edit = Some(recorder::NumEdit {
                 field,

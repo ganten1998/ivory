@@ -1063,7 +1063,7 @@ mod shot {
         settings.limiter_mix = 0.75;
         settings.master_gain = 0.7;
         settings.metronome_gain = 0.5;
-        settings.input_gain = 1.0;
+        settings.input_gains = [1.0; ivory_ui::recorder::INPUTS];
         settings.plugin_slots[0] = Some(ivory_ui::dialogs::BUILTIN_PATH.to_owned());
         let mut app = IvoryApp::new(c.context(), settings, ivory_ui::host::Caps::DESKTOP);
         app.set_effect_defaults(crate::desktop::effect_defaults_for_shot());

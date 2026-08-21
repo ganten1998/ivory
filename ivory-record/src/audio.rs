@@ -1196,6 +1196,7 @@ pub fn capture_channel_monitored(
         marks: mark_rx,
         stats,
         channels,
+        picks,
     };
     let monitor = (monitor_frames > 0).then(|| {
         let (tx, rx) = RingBuffer::<f32>::new(monitor_frames * channels);
@@ -1402,11 +1403,33 @@ pub struct CaptureSink {
     marks: Consumer<TimingMark>,
     stats: Arc<CaptureStats>,
     channels: usize,
+    /// The picks this stream actually honoured, AFTER the ones the device
+    /// could not fit were dropped.
+    ///
+    /// **The layout has to come from here and not from what was asked for.**
+    /// An interface narrower than it was drops a pick, and everything
+    /// downstream that shares the block out between input strips would then be
+    /// reading the wrong columns — silently, and with plausible audio in them.
+    picks: Picks,
 }
 
 impl CaptureSink {
     pub fn channels(&self) -> usize {
         self.channels
+    }
+
+    /// How the block's channels are shared out between the inputs, as a width
+    /// each. No picks at all is one input as wide as the device.
+    pub fn widths<const N: usize>(&self) -> [u8; N] {
+        if self.picks.is_empty() {
+            let mut out = [0u8; N];
+            if let Some(first) = out.first_mut() {
+                *first = self.channels.min(u8::MAX as usize) as u8;
+            }
+            return out;
+        }
+        let mut it = self.picks.iter();
+        std::array::from_fn(|_| it.next().map_or(0, |p| p.channels() as u8))
     }
 
     pub fn stats(&self) -> &Arc<CaptureStats> {

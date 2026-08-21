@@ -43,6 +43,17 @@ pub struct Selection {
     /// mapping both to `None` meant picking None opened the built-in
     /// microphone and showed its name in the band.
     pub wanted: Option<String>,
+    /// The OTHER inputs open at the same time, as channel uids.
+    ///
+    /// **All of the same device as `wanted`.** One interface is one clock, and
+    /// the app declines a second device on purpose — anyone with that rig
+    /// makes an aggregate device, which presents as one. Anything here whose
+    /// device key does not match `wanted` is dropped rather than obeyed, so a
+    /// settings file from a machine with different hardware costs the extra
+    /// inputs and not the microphone.
+    ///
+    /// `wanted` is input 1 and these are inputs 2 upward, in order.
+    pub extra: Vec<String>,
     /// The user has actually made a choice, as opposed to never having looked.
     pub explicit: bool,
     /// The uid actually open. Lags `wanted` by up to one frame.
@@ -329,10 +340,25 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
                 Some(node) => InputSelection::PipewireNode(node.to_owned()),
                 None => InputSelection::Key(DeviceKey::from_setting(key)),
             };
-            let channels = match channel {
-                Some(pick) => ivory_record::audio::Picks::one(pick),
-                None => ivory_record::audio::Picks::EVERYTHING,
-            };
+            // **The extras, and only the ones on the same box.** A uid from
+            // another device is not a second interface this app can open; it
+            // is a leftover, and obeying it would open a channel number
+            // against hardware that never had it.
+            let mut picks: Vec<ChannelPick> = channel.into_iter().collect();
+            if !picks.is_empty() {
+                for uid in &sel.extra {
+                    let (k, pick) = split_channel(uid);
+                    if k != key {
+                        continue;
+                    }
+                    if let Some(p) = pick {
+                        if !picks.contains(&p) {
+                            picks.push(p);
+                        }
+                    }
+                }
+            }
+            let channels = ivory_record::audio::Picks::from_slice(&picks);
             Some(AudioChoice { selection, channels })
         }
         // **Nothing chosen means nothing opened.** There used to be a fallback
@@ -588,6 +614,55 @@ impl CaptureDevices for Cameras {
     }
 }
 
+/// What each open input is called and how wide it is, in strip order.
+///
+/// **The primary first**, because `wanted` is input 1 and the extras are
+/// inputs 2 upward — the same order `audio_selection` builds the picks in, and
+/// the same order the capture lays their channels out in. Three orders that
+/// have to agree, and they agree by all coming from here.
+///
+/// Empty while nothing is open. An extra whose device key does not match the
+/// primary's is dropped, exactly as `audio_selection` drops it.
+pub fn open_inputs(shared: &Shared) -> Vec<(String, bool)> {
+    let sel = lock(shared);
+    let (Some(name), Some(uid)) = (sel.open_name.clone(), sel.wanted.clone()) else {
+        return Vec::new();
+    };
+    let (key, pick) = split_channel(&uid);
+    let described = |p: Option<ChannelPick>| match p {
+        Some(p) => (with_channel(&name, p), p.channels() == 2),
+        // The whole device: as wide as it is, and a stereo interface is the
+        // ordinary case.
+        None => (name.clone(), true),
+    };
+    let mut out = vec![described(pick)];
+    // Only when the primary is one channel of the device. With the whole
+    // device open there is nothing left to add beside it.
+    if pick.is_some() {
+        for extra in &sel.extra {
+            let (k, p) = split_channel(extra);
+            if k == key {
+                if let Some(p) = p {
+                    out.push(described(Some(p)));
+                }
+            }
+        }
+    }
+    out.truncate(ivory_ui::recorder::INPUTS);
+    out
+}
+
+/// Choose the inputs open beside the primary, as channel uids.
+pub fn set_extra_inputs(shared: &Shared, uids: Vec<String>) {
+    let mut sel = lock(shared);
+    if sel.extra != uids {
+        sel.extra = uids;
+        // The stream has to be rebuilt: how many channels it carries and which
+        // ones is decided when it opens.
+        sel.settled = false;
+    }
+}
+
 /// A snapshot of the selection, for the reconciler to read.
 ///
 /// Cloned out rather than handing back a guard: the reconciler goes on to open
@@ -597,6 +672,7 @@ pub fn selection(shared: &Shared) -> Selection {
     let sel = lock(shared);
     Selection {
         wanted: sel.wanted.clone(),
+        extra: sel.extra.clone(),
         explicit: sel.explicit,
         open: sel.open.clone(),
         open_name: sel.open_name.clone(),
@@ -614,7 +690,13 @@ pub fn selection(shared: &Shared) -> Selection {
 /// because the reconciler only ever acts on a difference and `wanted` would
 /// start empty — so the app would silently fall back to the system default and
 /// look like it had forgotten the choice.
-pub fn restore(shared: &Shared, uid: Option<&str>, explicitly_off: bool, exposed: &[String]) {
+pub fn restore(
+    shared: &Shared,
+    uid: Option<&str>,
+    explicitly_off: bool,
+    exposed: &[String],
+    extra: &[String],
+) {
     let mut sel = lock(shared);
     // `explicitly_off` is what makes "None - record MIDI only" survive a
     // restart. Deriving `explicit` from `uid.is_some()` alone would turn an
@@ -626,6 +708,10 @@ pub fn restore(shared: &Shared, uid: Option<&str>, explicitly_off: bool, exposed
     // row only for hardware it can see, and an interface that comes back
     // should come back set up the way it was left.
     sel.exposed = exposed.to_vec();
+    // The inputs open beside the first. Kept whole here and filtered where the
+    // picks are built, so an interface that comes back comes back with all of
+    // them rather than with whichever ones happened to be visible at launch.
+    sel.extra = extra.to_vec();
 }
 
 
@@ -700,7 +786,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "a row appeared for hardware that is not here");
 
         let (_a, shared) = AudioInputs::new();
-        restore(&shared, None, false, std::slice::from_ref(&gone));
+        restore(&shared, None, false, std::slice::from_ref(&gone), &[]);
         assert_eq!(
             lock(&shared).exposed,
             vec![gone],
@@ -720,7 +806,7 @@ mod tests {
         let key = "Scarlett 18i20#0";
         let (_a, shared) = AudioInputs::new();
         let pair = channel_uid(key, ChannelPick::Stereo(0, 1));
-        restore(&shared, Some(&pair), false, &[pair.clone()]);
+        restore(&shared, Some(&pair), false, &[pair.clone()], &[]);
 
         let mut setup = Setup::new(&shared);
         assert_eq!(setup.exposed(), vec![(0, Some(1))]);
@@ -742,7 +828,7 @@ mod tests {
         use ivory_ui::ports::AudioSetup as _;
         let other = channel_uid("Behringer UMC1820#0", ChannelPick::Mono(7));
         let (_a, shared) = AudioInputs::new();
-        restore(&shared, Some("Scarlett 18i20#0"), false, &[other.clone()]);
+        restore(&shared, Some("Scarlett 18i20#0"), false, &[other.clone()], &[]);
 
         let mut setup = Setup::new(&shared);
         assert!(
@@ -846,18 +932,18 @@ mod tests {
 
         // Seeded from settings, both ways round: an explicit "None"...
         let (_b, restarted) = AudioInputs::new();
-        restore(&restarted, None, true, &[]);
+        restore(&restarted, None, true, &[], &[]);
         assert_eq!(audio_selection(&restarted), None);
 
         // ...and a file from somebody who never chose. Same answer.
         let (_c, fresh) = AudioInputs::new();
-        restore(&fresh, None, false, &[]);
+        restore(&fresh, None, false, &[], &[]);
         assert_eq!(audio_selection(&fresh), None);
 
         // A chosen device is still opened, which is the half that must not
         // regress while fixing the other one.
         let (_d, picked) = AudioInputs::new();
-        restore(&picked, Some("Scarlett 2i2#0"), false, &[]);
+        restore(&picked, Some("Scarlett 2i2#0"), false, &[], &[]);
         assert!(matches!(
             audio_selection(&picked),
             Some(AudioChoice {
@@ -917,7 +1003,7 @@ mod tests {
         use ivory_record::audio::InputSelection;
         let node = "alsa_input.usb-Focusrite_Scarlett_Solo_USB_Y771VU50AAEF28-00.pro-input-0";
         let (_a, shared) = AudioInputs::new();
-        restore(&shared, Some(&format!("{PIPEWIRE_UID}{node}")), false, &[]);
+        restore(&shared, Some(&format!("{PIPEWIRE_UID}{node}")), false, &[], &[]);
         let choice = audio_selection(&shared).expect("a device was chosen");
         assert_eq!(
             choice.selection,
@@ -933,6 +1019,7 @@ mod tests {
             Some(&channel_uid(&format!("{PIPEWIRE_UID}{node}"), ChannelPick::Stereo(1, 2))),
             false,
             &[],
+            &[],
         );
         let choice = audio_selection(&with_ch).expect("a device was chosen");
         assert_eq!(
@@ -946,6 +1033,72 @@ mod tests {
         );
     }
 
+    /// **Several inputs of one interface, in the order they were chosen.**
+    ///
+    /// The owner's case: a microphone on input 6 and a synth across 4/5, live
+    /// at the same time. `wanted` is input 1 and the extras are inputs 2
+    /// upward — and that ORDER is load-bearing three times over: it is the
+    /// order the picks are built in, the order the capture lays the channels
+    /// out in, and the order the desk draws the strips in. All three come from
+    /// here so they cannot drift.
+    #[test]
+    fn several_inputs_of_one_interface_open_together() {
+        let key = "Scarlett 18i20#0";
+        let mono6 = channel_uid(key, ChannelPick::Mono(5));
+        let pair45 = channel_uid(key, ChannelPick::Stereo(3, 4));
+        let (_b, shared) = AudioInputs::new();
+        restore(&shared, Some(&mono6), false, &[], std::slice::from_ref(&pair45));
+        let choice = audio_selection(&shared).expect("a device was chosen");
+        assert_eq!(
+            choice.channels.iter().collect::<Vec<_>>(),
+            vec![ChannelPick::Mono(5), ChannelPick::Stereo(3, 4)],
+            "the chosen order is not the order the stream will be laid out in"
+        );
+        assert_eq!(choice.channels.channels(), 3, "one channel plus two");
+
+        // **A uid from another interface is dropped, not obeyed.** One box is
+        // one clock; a leftover from a machine with different hardware would
+        // open a channel number against an interface that never had it.
+        let (_b2, mixed) = AudioInputs::new();
+        let elsewhere = channel_uid("Behringer UMC1820#0", ChannelPick::Mono(7));
+        restore(
+            &mixed,
+            Some(&mono6),
+            false,
+            &[],
+            &[elsewhere, pair45.clone()],
+        );
+        let choice = audio_selection(&mixed).expect("a device was chosen");
+        assert_eq!(
+            choice.channels.iter().collect::<Vec<_>>(),
+            vec![ChannelPick::Mono(5), ChannelPick::Stereo(3, 4)],
+            "an input from another interface was opened"
+        );
+
+        // And the names line up with the picks, one strip each, primary first.
+        // `open_name` is what the reconciler writes when the device actually
+        // opens, and a strip named after a device that did not open would be a
+        // lie — so the test says it opened.
+        lock(&shared).open_name = Some("Scarlett 18i20".to_owned());
+        let named = open_inputs(&shared);
+        assert_eq!(named.len(), 2);
+        assert!(named[0].0.ends_with("input 6"), "{}", named[0].0);
+        assert!(named[1].0.ends_with("inputs 4/5"), "{}", named[1].0);
+        assert!(!named[0].1, "a mono input is not stereo");
+        assert!(named[1].1, "a pair is stereo");
+    }
+
+    /// The same uid twice is one input, not two strips of the same microphone.
+    #[test]
+    fn one_input_cannot_be_opened_twice() {
+        let key = "Scarlett 18i20#0";
+        let mono6 = channel_uid(key, ChannelPick::Mono(5));
+        let (_b, shared) = AudioInputs::new();
+        restore(&shared, Some(&mono6), false, &[], std::slice::from_ref(&mono6));
+        let choice = audio_selection(&shared).expect("a device was chosen");
+        assert_eq!(choice.channels.len(), 1, "the same input opened twice");
+    }
+
     /// A chosen channel reaches the stream open, with its device intact.
     #[test]
     fn a_chosen_channel_reaches_the_stream_open() {
@@ -955,7 +1108,7 @@ mod tests {
             &DeviceKey::named("Scarlett 18i20 USB").to_setting(),
             ChannelPick::Mono(2),
         );
-        restore(&shared, Some(&uid), false, &[]);
+        restore(&shared, Some(&uid), false, &[], &[]);
         let choice = audio_selection(&shared).expect("a device was chosen");
         assert_eq!(
             choice.selection,
@@ -974,7 +1127,7 @@ mod tests {
     fn a_malformed_channel_still_opens_the_device() {
         use ivory_record::audio::{DeviceKey, InputSelection};
         let (_a, shared) = AudioInputs::new();
-        restore(&shared, Some(&format!("Scarlett{CHANNEL_SEP}left")), false, &[]);
+        restore(&shared, Some(&format!("Scarlett{CHANNEL_SEP}left")), false, &[], &[]);
         let choice = audio_selection(&shared).expect("the device still opens");
         assert_eq!(
             choice.selection,
@@ -989,7 +1142,7 @@ mod tests {
     fn a_remembered_device_is_stale_at_startup_so_it_gets_opened() {
         use ivory_record::audio::InputSelection;
         let (_a, shared) = AudioInputs::new();
-        restore(&shared, Some("Scarlett 2i2#0"), false, &[]);
+        restore(&shared, Some("Scarlett 2i2#0"), false, &[], &[]);
         assert!(selection(&shared).is_stale());
         assert!(matches!(
             audio_selection(&shared),
