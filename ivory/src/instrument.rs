@@ -455,6 +455,102 @@ fn is_pedal(status: u8, data1: u8) -> bool {
     status >= 0x80 && status & 0xF0 == 0xB0 && matches!(data1, 64 | 66 | 67)
 }
 
+/// A channel of the mixer, and the bit it owns in `muted` / `soloed`.
+///
+/// **The master is not here on purpose.** Muting the master is the same as
+/// turning it down and soloing it means nothing, so a strip that cannot do
+/// either does not get a bit that would have to be defended against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Strip {
+    Instrument = 0,
+    Input = 1,
+    Track = 2,
+    Click = 3,
+    /// What comes back from the effects bus.
+    Fx = 4,
+}
+
+impl Strip {
+    /// Every strip, for a caller that wants to ask about all of them.
+    pub const ALL: [Strip; 5] = [
+        Strip::Instrument,
+        Strip::Input,
+        Strip::Track,
+        Strip::Click,
+        Strip::Fx,
+    ];
+
+    fn bit(self) -> u32 {
+        1 << (self as u8)
+    }
+}
+
+/// Apply a strip's fader in place and add what it sends to the bus.
+///
+/// **One pass over the block for both**, because they are the same signal read
+/// twice: the fader is what leaves the strip and the send is a percentage of
+/// exactly that. Doing them apart would mean two passes and an intermediate
+/// nobody needs.
+///
+/// `gain` is the slewed value and is carried between blocks — a fader that
+/// jumped in one sample would click, and these are moved by a hand.
+fn fold_strip(
+    mix: &mut [f32],
+    aux: &mut [f32],
+    frames: usize,
+    gain: &mut f32,
+    target: f32,
+    send: f32,
+    coeff: f32,
+) {
+    for f in 0..frames {
+        *gain += (target - *gain) * coeff;
+        let at = f * TAP_CHANNELS;
+        for c in 0..TAP_CHANNELS {
+            let Some(v) = mix.get_mut(at + c) else { return };
+            *v *= *gain;
+            if let Some(a) = aux.get_mut(at + c) {
+                *a += *v * send;
+            }
+        }
+    }
+}
+
+/// Add what came back from the effects bus, at the bus's own fader.
+fn add_return(
+    mix: &mut [f32],
+    aux: &[f32],
+    frames: usize,
+    gain: &mut f32,
+    target: f32,
+    coeff: f32,
+) {
+    for f in 0..frames {
+        *gain += (target - *gain) * coeff;
+        let at = f * TAP_CHANNELS;
+        for c in 0..TAP_CHANNELS {
+            let (Some(v), Some(a)) = (mix.get_mut(at + c), aux.get(at + c)) else {
+                return;
+            };
+            *v += *a * *gain;
+        }
+    }
+}
+
+/// Whether a strip is heard, given the mute and solo masks.
+///
+/// **Solo is exclusive and mute loses to it.** With anything soloed, only the
+/// soloed strips are heard — including a soloed strip that is also muted,
+/// because pressing solo on a muted channel is unambiguously a request to hear
+/// it and the alternative is a solo button that sometimes does nothing.
+fn strip_is_heard(strip: Strip, muted: u32, soloed: u32) -> bool {
+    if soloed != 0 {
+        return soloed & strip.bit() != 0;
+    }
+    muted & strip.bit() == 0
+}
+
 /// Where an event goes inside a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Placement {
@@ -917,8 +1013,39 @@ struct Shared {
     /// Decibels of gain reduction the limiter has applied since the UI last
     /// looked — a positive number, zero for none. Read and reset.
     gr_db: AtomicU32,
-    /// The six effect knobs, 0..=1. On the instrument bus only — see
-    /// `effects.rs` for what that includes and what it deliberately does not.
+    /// A linear trim on everything the slots and the built-in make, before
+    /// anything else on the bus sees it. The instrument's own fader.
+    ///
+    /// **New, and unity by default.** The slots have had faders for releases;
+    /// what they have not had is a level for the instrument bus AS a channel,
+    /// which is what a strip needs to exist.
+    instrument_gain: AtomicU32,
+    /// How much of each strip goes to the effects bus, 0..=1.
+    ///
+    /// **Post-fader, which is the one that behaves.** Pull a channel down and
+    /// its reverb comes down with it; a pre-fader send is a thing you want
+    /// twice a year and explains itself badly the other three hundred days.
+    ///
+    /// The instrument defaults to 1.0 and everything else to 0.0, which is
+    /// exactly the routing this app had when the effects were an insert on the
+    /// instrument bus — so an upgrade sounds identical.
+    send_instrument: AtomicU32,
+    send_input: AtomicU32,
+    send_track: AtomicU32,
+    send_click: AtomicU32,
+    /// The effects bus's own fader, applied to what comes back from it.
+    fx_return: AtomicU32,
+    /// One bit per strip. See [`Strip`].
+    ///
+    /// **Two masks rather than a flag each**, because solo is a question about
+    /// ALL the strips at once — "is anything soloed" decides what every other
+    /// strip does — and reading eight atomics to answer it would be eight
+    /// chances for the answer to change halfway through.
+    muted: AtomicU32,
+    soloed: AtomicU32,
+    /// The six effect knobs, 0..=1. Three of them are sends on the effects bus
+    /// and three are inserts on the master — see `effects.rs`, and see
+    /// `Renderer::render` for which is which and why.
     reverb_mix: AtomicU32,
     delay_mix: AtomicU32,
     chorus_mix: AtomicU32,
@@ -1023,6 +1150,15 @@ impl Shared {
             pending_track: std::sync::Mutex::new(None),
             pending_monitor: std::sync::Mutex::new(None),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
+            instrument_gain: AtomicU32::new(1.0f32.to_bits()),
+            // The routing every build before the mixer had, written down.
+            send_instrument: AtomicU32::new(1.0f32.to_bits()),
+            send_input: AtomicU32::new(0.0f32.to_bits()),
+            send_track: AtomicU32::new(0.0f32.to_bits()),
+            send_click: AtomicU32::new(0.0f32.to_bits()),
+            fx_return: AtomicU32::new(1.0f32.to_bits()),
+            muted: AtomicU32::new(0),
+            soloed: AtomicU32::new(0),
             gr_db: AtomicU32::new(0),
             reverb_mix: AtomicU32::new(0.0f32.to_bits()),
             hpf_mix: AtomicU32::new(0.0f32.to_bits()),
@@ -1353,7 +1489,31 @@ struct Renderer {
     /// plugin's: stepping a gain at a block boundary is a click.
     builtin_gain: f32,
     /// Reverb, delay and chorus on the instrument sum. Free at rest.
+    /// The effects BUS: reverb, delay and chorus, fed by the strips' sends.
+    ///
+    /// **Two instances, and the second one's reverb is never used.** An
+    /// `Effects` can only be in one place in the graph, and these are two
+    /// places: time effects belong on a send everything can reach, and a
+    /// limiter belongs across the output it is protecting. The unused
+    /// allocations cost about a megabyte of RAM that is never touched, which
+    /// is a better trade than making every buffer in `effects.rs` optional to
+    /// save it.
     effects: crate::effects::Effects,
+    /// The master INSERT: high-pass, low-pass and the limiter, across
+    /// everything on its way out.
+    master_effects: crate::effects::Effects,
+    /// The click, one value per frame of the current chunk, and the same
+    /// again as it should reach the FILE — zero on the frames the take is not
+    /// meant to carry it. Two buffers rather than a flag, so the pass that
+    /// writes the take does not re-derive a per-frame condition.
+    click_out: Vec<f32>,
+    click_taped: Vec<f32>,
+    /// The effects bus's own buffer, one block long, interleaved like `mix`.
+    aux: Vec<f32>,
+    /// Slewed, like every other gain here: a fader jumping in one sample is a
+    /// click, and these are moved by a hand on a knob.
+    instrument_gain: f32,
+    fx_return_gain: f32,
     /// The renderer's OWN copy of the parameters.
     ///
     /// Refreshed from `Shared` only when the dirty flag says to, so the audio
@@ -1599,11 +1759,6 @@ impl Renderer {
             self.sum_slots(n, &widths, &slot_targets);
             self.render_builtin(n, &widths, &slot_targets);
 
-            // **Here, and this position is the feature.** Downstream of every
-            // instrument, so a VST3 and the built-in FM are treated alike;
-            // upstream of the tap, so what is recorded is what was heard;
-            // upstream of the click and the input monitor, so neither of those
-            // ends up in a room they were never in.
             // A parameter change, if one is waiting and the lock is free this
             // block. Same shape as the DX7's pending voice, and for the same
             // reason: the audio thread waits for nothing.
@@ -1613,62 +1768,81 @@ impl Renderer {
                     self.shared.params_dirty.store(false, Ordering::Release);
                 }
             }
-            if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
-                self.effects.process(
-                    mix,
-                    n,
-                    TAP_CHANNELS,
-                    crate::effects::Sends {
-                        reverb: Shared::f32_of(&self.shared.reverb_mix),
-                        delay: Shared::f32_of(&self.shared.delay_mix),
-                        chorus: Shared::f32_of(&self.shared.chorus_mix),
-                        hpf: Shared::f32_of(&self.shared.hpf_mix),
-                        lpf: Shared::f32_of(&self.shared.lpf_mix),
-                        limiter: Shared::f32_of(&self.shared.limiter_mix),
-                    },
-                    &self.effect_params,
-                    f64::from_bits(self.shared.bpm.load(Ordering::Relaxed)),
-                );
-                // **The master, last on the bus and after the limiter.** A
-                // master that fed the limiter would be a second drive control;
-                // this one is what leaves, which is what a master fader is.
-                // Turning it above unity CAN go past the limiter's ceiling,
-                // exactly as it does on a desk, and the master meter shows it.
-                // **The backing track, after the effects and before the
-                // master.** After, because it arrived finished — a reverb on
-                // somebody else's mix is not a thing anybody asked for.
-                // Before, because the master is the master.
-                //
-                // It reaches the tap as well as the device, the same as the
-                // effects do: a take of somebody playing along to a backing
-                // track, with the backing track missing, is not a take of what
-                // happened.
-                // How hard the limiter worked, for the meter beside it. Kept
-                // as the WORST since the UI last looked: it asks sixty times a
-                // second and the moment worth showing is a few samples long.
-                let gr = self.effects.gain_reduction_db();
-                if gr > 0.0 {
-                    self.shared.gr_db.fetch_max(gr.to_bits(), Ordering::Relaxed);
+
+            // ── the desk ───────────────────────────────────────────────────
+            //
+            // **The effects used to be an insert on the instrument bus** and
+            // everything else joined downstream of them, which is why nothing
+            // but the instrument could ever be reverberated and why the
+            // limiter never saw the backing track it was supposed to be
+            // protecting the output from.
+            //
+            // They are two things now. Reverb, delay and chorus are a BUS: a
+            // strip sends a percentage of itself to them and what comes back
+            // is added to the mix. The high-pass, the low-pass and the limiter
+            // are an INSERT on the master, across everything on its way out.
+            // Only three of the six were ever wet amounts; the other three are
+            // a corner frequency, a corner frequency and a threshold, and a
+            // send knob into those would not be a question anybody could
+            // answer.
+            //
+            // The defaults are the old routing exactly — instrument sends
+            // everything, nothing else sends anything — so an upgrade with the
+            // mixer untouched sounds the same.
+            let muted = self.shared.muted.load(Ordering::Relaxed);
+            let soloed = self.shared.soloed.load(Ordering::Relaxed);
+            let bpm = f64::from_bits(self.shared.bpm.load(Ordering::Relaxed));
+            let level = |strip: Strip, gain: &AtomicU32| {
+                if strip_is_heard(strip, muted, soloed) {
+                    Shared::f32_of(gain).clamp(0.0, 8.0)
+                } else {
+                    0.0
                 }
-            }
-            // Its own statement rather than inside the block above, because it
-            // borrows `self.mix` itself: a method taking `&mut self` cannot be
-            // called while a slice of one of self's fields is still alive.
-            self.mix_track(n);
-            // **After the effects and beside the backing track**, for the same
-            // reason: what arrives at the microphone is not something a reverb
-            // in this app was asked to process. Before the master, because the
-            // master is the master.
-            self.mix_monitor(n);
-            if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
-                let master = Shared::f32_of(&self.shared.master_gain);
-                if (master - 1.0).abs() > 1.0e-6 {
-                    for v in mix.iter_mut() {
-                        *v *= master;
-                    }
-                }
+            };
+            let send_of = |gain: &AtomicU32| Shared::f32_of(gain).clamp(0.0, 1.0);
+
+            // The bus starts empty every block: it holds what was sent to it,
+            // not what it had last time.
+            if let Some(aux) = self.aux.get_mut(..n * TAP_CHANNELS) {
+                aux.fill(0.0);
             }
 
+            // The INSTRUMENT strip. Its fader, then its send — post-fader, so
+            // pulling the instrument down takes its reverb with it.
+            let inst_target = level(Strip::Instrument, &self.shared.instrument_gain);
+            let inst_send = send_of(&self.shared.send_instrument);
+            let coeff = self.gain_coeff;
+            fold_strip(
+                &mut self.mix,
+                &mut self.aux,
+                n,
+                &mut self.instrument_gain,
+                inst_target,
+                inst_send,
+                coeff,
+            );
+
+            // The BACKING TRACK and the INPUT, each adding itself to the mix
+            // and to the bus in one pass. Both were downstream of the effects
+            // before and reached neither.
+            self.mix_track(n, muted, soloed);
+            self.mix_monitor(n, muted, soloed);
+            // ── the click, and what it sends ───────────────────────────
+            //
+            // **Its own pass, because the bus has to be finished before the
+            // master is.** The click is generated per frame, in step with the
+            // beat clock, and it now has a send like every other strip — so it
+            // has to reach the bus BEFORE the bus is processed, while the tap
+            // and the device it also feeds are written AFTER the master is.
+            // One loop cannot be on both sides of that.
+            // `metro_target` was read at the top of the block with the rest of
+            // the metronome's state; the strip only decides whether it is heard.
+            let click_level = if strip_is_heard(Strip::Click, muted, soloed) {
+                metro_target
+            } else {
+                0.0
+            };
+            let click_send = send_of(&self.shared.send_click);
             for i in 0..n {
                 let frame_index = done + i;
 
@@ -1693,37 +1867,112 @@ impl Renderer {
                     }
                 }
 
-                self.metro_gain += (metro_target - self.metro_gain) * self.gain_coeff;
+                self.metro_gain += (click_level - self.metro_gain) * self.gain_coeff;
                 let click = self.voice.next(&self.click) * self.metro_gain;
-
-                // The three instruments, already summed and already at their own
-                // gains: `sum_slots` did that in one pass per slot, which is one
-                // pass over a contiguous buffer rather than three interleaved
-                // reads per frame.
-                let at2 = i * TAP_CHANNELS;
-                let src = &self.mix[at2..at2 + TAP_CHANNELS];
-
-                // ── the tap mix: instruments only, unless asked otherwise ──
-                map_frame(src, &mut self.frame[..TAP_CHANNELS]);
-                let tap_at = tap_frames * TAP_CHANNELS;
+                self.click_out[i] = click;
                 // The click reaches the FILE when the performance is meant to
                 // carry it, or while a count-in that was asked to be in the
                 // take is still sounding. `counting_in` rather than a beat
                 // number, because the click is a decaying sample: the sound of
                 // beat four is still going during beat five and has to be
                 // recorded for as long as it lasts.
-                let click_recorded = in_take || (count_in_recorded && counting_in);
+                //
+                // Kept as a second BUFFER rather than a flag, so the pass that
+                // writes the take does not have to re-derive a per-frame
+                // condition it can no longer see.
+                self.click_taped[i] = if in_take || (count_in_recorded && counting_in) {
+                    click
+                } else {
+                    0.0
+                };
+                let at = i * TAP_CHANNELS;
                 for c in 0..TAP_CHANNELS {
-                    let s = self.frame[c] + if click_recorded { click } else { 0.0 };
+                    if let Some(v) = self.aux.get_mut(at + c) {
+                        *v += click * click_send;
+                    }
+                }
+            }
+
+            // ── the bus, and then the master ───────────────────────────────
+            let sends = crate::effects::Sends {
+                reverb: Shared::f32_of(&self.shared.reverb_mix),
+                delay: Shared::f32_of(&self.shared.delay_mix),
+                chorus: Shared::f32_of(&self.shared.chorus_mix),
+                // Not on the bus. See the comment above the desk — and note
+                // that the limiter's "off" is the TOP of its travel, so this
+                // is 1.0 rather than the 0.0 the others use.
+                hpf: 0.0,
+                lpf: 0.0,
+                limiter: 1.0,
+            };
+            if let Some(aux) = self.aux.get_mut(..n * TAP_CHANNELS) {
+                self.effects
+                    .process(aux, n, TAP_CHANNELS, sends, &self.effect_params, bpm);
+            }
+            // What comes back, at the bus's own fader.
+            let return_target = level(Strip::Fx, &self.shared.fx_return);
+            add_return(
+                &mut self.mix,
+                &self.aux,
+                n,
+                &mut self.fx_return_gain,
+                return_target,
+                coeff,
+            );
+
+            let master_sends = crate::effects::Sends {
+                reverb: 0.0,
+                delay: 0.0,
+                chorus: 0.0,
+                hpf: Shared::f32_of(&self.shared.hpf_mix),
+                lpf: Shared::f32_of(&self.shared.lpf_mix),
+                limiter: Shared::f32_of(&self.shared.limiter_mix),
+            };
+            if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
+                self.master_effects.process(
+                    mix,
+                    n,
+                    TAP_CHANNELS,
+                    master_sends,
+                    &self.effect_params,
+                    bpm,
+                );
+                // **The master, last on the bus and after the limiter.** A
+                // master that fed the limiter would be a second drive control;
+                // this one is what leaves, which is what a master fader is.
+                let master = Shared::f32_of(&self.shared.master_gain);
+                if (master - 1.0).abs() > 1.0e-6 {
+                    for v in mix.iter_mut() {
+                        *v *= master;
+                    }
+                }
+            }
+            // How hard the limiter worked, for the meter beside it. Kept as
+            // the WORST since the UI last looked: it asks sixty times a second
+            // and the moment worth showing is a few samples long.
+            let gr = self.master_effects.gain_reduction_db();
+            if gr > 0.0 {
+                self.shared.gr_db.fetch_max(gr.to_bits(), Ordering::Relaxed);
+            }
+
+            // ── out, to the take and to the speakers ───────────────────────
+            for i in 0..n {
+                let frame_index = done + i;
+                let at2 = i * TAP_CHANNELS;
+                let src = &self.mix[at2..at2 + TAP_CHANNELS];
+
+                map_frame(src, &mut self.frame[..TAP_CHANNELS]);
+                let tap_at = tap_frames * TAP_CHANNELS;
+                for c in 0..TAP_CHANNELS {
+                    let s = self.frame[c] + self.click_taped[i];
                     self.tap_scratch[tap_at + c] = s;
                 }
                 tap_frames += 1;
 
-                // ── the device mix: instruments plus click, always ──
                 let at = frame_index * dev_ch;
                 map_frame(src, &mut self.frame[..dev_ch]);
                 for c in 0..dev_ch {
-                    let s = self.frame[c] + click;
+                    let s = self.frame[c] + self.click_out[i];
                     out[at + c] = s;
                     let mag = s.abs();
                     if mag >= CLIP_LEVEL {
@@ -1780,7 +2029,7 @@ impl Renderer {
     /// written by the writer thread from the capture ring, which this does not
     /// share. Turning monitoring on during a take changes what the player
     /// hears and not one sample of the file.
-    fn mix_monitor(&mut self, frames: usize) {
+    fn mix_monitor(&mut self, frames: usize, muted: u32, soloed: u32) {
         // A ring arriving, or being taken away. `try_lock`, never `lock`.
         if let Ok(mut pending) = self.shared.pending_monitor.try_lock() {
             if let Some(next) = pending.take() {
@@ -1821,12 +2070,14 @@ impl Renderer {
             Err(_) => 0,
         };
 
-        let on = self.shared.monitor_on.load(Ordering::Relaxed);
+        let on = self.shared.monitor_on.load(Ordering::Relaxed)
+            && strip_is_heard(Strip::Input, muted, soloed);
         let target = if on {
             Shared::f32_of(&self.shared.monitor_gain)
         } else {
             0.0
         };
+        let send = Shared::f32_of(&self.shared.send_input).clamp(0.0, 1.0);
         // Silent and already faded out: the drain above was the whole job.
         if !on && self.monitor_gain <= 1.0e-6 {
             self.monitor_gain = 0.0;
@@ -1841,9 +2092,13 @@ impl Renderer {
                 // sides. Anything wider is folded down by taking the first two,
                 // which is what a monitor is for — hearing that something is
                 // arriving, not auditioning a surround mix.
-                let src = scratch[i * ch_in + c.min(ch_in - 1)];
+                let src = scratch[i * ch_in + c.min(ch_in - 1)] * self.monitor_gain;
                 if let Some(v) = self.mix.get_mut(at + c) {
-                    *v += src * self.monitor_gain;
+                    *v += src;
+                }
+                // Post-fader, like every other send here.
+                if let Some(a) = self.aux.get_mut(at + c) {
+                    *a += src * send;
                 }
             }
         }
@@ -1854,7 +2109,7 @@ impl Renderer {
     /// The clip is stereo at the device's rate — `decode` guarantees both — so
     /// there is no resampling and no channel mapping here, which is the whole
     /// reason it is guaranteed there.
-    fn mix_track(&mut self, frames: usize) {
+    fn mix_track(&mut self, frames: usize, muted: u32, soloed: u32) {
         // A clip arriving, or being taken away. `try_lock`, never `lock`.
         if let Ok(mut pending) = self.shared.pending_track.try_lock() {
             if let Some(next) = pending.take() {
@@ -1886,9 +2141,19 @@ impl Renderer {
             0 => total,
             n => n.min(total),
         };
-        let target = Shared::f32_of(&self.shared.track_gain).clamp(0.0, 8.0);
+        let target = if strip_is_heard(Strip::Track, muted, soloed) {
+            Shared::f32_of(&self.shared.track_gain).clamp(0.0, 8.0)
+        } else {
+            0.0
+        };
+        let send = Shared::f32_of(&self.shared.send_track).clamp(0.0, 1.0);
         let coeff = self.gain_coeff;
-        let Some(mix) = self.mix.get_mut(..frames * TAP_CHANNELS) else {
+        // Both at once, and they are different fields — which is the only
+        // reason the loop below can write to the mix and the bus together.
+        let (Some(mix), Some(aux)) = (
+            self.mix.get_mut(..frames * TAP_CHANNELS),
+            self.aux.get_mut(..frames * TAP_CHANNELS),
+        ) else {
             return;
         };
         for f in 0..frames {
@@ -1901,8 +2166,14 @@ impl Renderer {
             // clip's length above, and this is the line that would panic on
             // the audio thread if that ever stopped being true.
             if let (Some(l), Some(r)) = (clip.samples.get(at), clip.samples.get(at + 1)) {
-                mix[f * TAP_CHANNELS] += l * self.track_gain;
-                mix[f * TAP_CHANNELS + 1] += r * self.track_gain;
+                let (l, r) = (l * self.track_gain, r * self.track_gain);
+                mix[f * TAP_CHANNELS] += l;
+                mix[f * TAP_CHANNELS + 1] += r;
+                // Post-fader, like every other send here. A backing track
+                // arrives finished and usually wants none of the room the
+                // piano is in, which is why this defaults to zero.
+                aux[f * TAP_CHANNELS] += l * send;
+                aux[f * TAP_CHANNELS + 1] += r * send;
             }
             self.track_pos += 1;
         }
@@ -2482,7 +2753,13 @@ impl Engine {
             builtin: crate::dx7::Dx7::new(rate as f32),
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             builtin_gain: 1.0,
-            effects: crate::effects::Effects::new(rate as f32),
+            effects: crate::effects::Effects::new_send(rate as f32),
+            master_effects: crate::effects::Effects::new(rate as f32),
+            aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            click_out: vec![0.0; MAX_BLOCK as usize],
+            click_taped: vec![0.0; MAX_BLOCK as usize],
+            instrument_gain: 1.0,
+            fx_return_gain: 1.0,
             effect_params: crate::effects::Params::default(),
             builtin_slot: None,
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
@@ -4787,6 +5064,12 @@ mod tests {
             monitor_channels: 0,
             monitor_gain: 0.0,
             monitor_scratch: Vec::new(),
+            master_effects: crate::effects::Effects::new(RATE as f32),
+            aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            click_out: vec![0.0; MAX_BLOCK as usize],
+            click_taped: vec![0.0; MAX_BLOCK as usize],
+            instrument_gain: 1.0,
+            fx_return_gain: 1.0,
             track: None,
             track_pos: 0,
             track_gain: 1.0,
@@ -4812,7 +5095,7 @@ mod tests {
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             builtin: crate::dx7::Dx7::new(RATE as f32),
-            effects: crate::effects::Effects::new(RATE as f32),
+            effects: crate::effects::Effects::new_send(RATE as f32),
             effect_params: crate::effects::Params::default(),
             builtin_slot: None,
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
@@ -4851,6 +5134,130 @@ mod tests {
             data2: bytes[2],
         })
         .expect("the test ring is large enough");
+    }
+
+    /// **Mute, solo, and the one interaction between them.**
+    ///
+    /// Solo is exclusive and mute loses to it: pressing solo on a channel that
+    /// is muted is unambiguously a request to hear it, and the alternative is a
+    /// solo button that sometimes does nothing.
+    #[test]
+    fn solo_beats_mute_and_silences_everything_else() {
+        use Strip::*;
+        let none = 0;
+        // Nothing muted, nothing soloed: everybody is heard.
+        for s in Strip::ALL {
+            assert!(strip_is_heard(s, none, none), "{s:?} was silent for no reason");
+        }
+        // One muted: it alone is silent.
+        let m = Input.bit();
+        assert!(!strip_is_heard(Input, m, none));
+        assert!(strip_is_heard(Track, m, none));
+        // One soloed: it alone is heard, and mute does not enter into it.
+        let so = Track.bit();
+        assert!(strip_is_heard(Track, none, so));
+        assert!(!strip_is_heard(Input, none, so));
+        assert!(!strip_is_heard(Instrument, none, so));
+        // Soloed AND muted: heard, because pressing solo asked for it.
+        assert!(
+            strip_is_heard(Track, Track.bit(), Track.bit()),
+            "a soloed channel was silenced by its own mute"
+        );
+        // Two soloed: both, and nothing else.
+        let two = Track.bit() | Fx.bit();
+        assert!(strip_is_heard(Track, none, two) && strip_is_heard(Fx, none, two));
+        assert!(!strip_is_heard(Click, none, two));
+        // Every strip owns a bit of its own, or two of them would mute together.
+        let mut bits: Vec<u32> = Strip::ALL.iter().map(|s| s.bit()).collect();
+        let n = bits.len();
+        bits.sort_unstable();
+        bits.dedup();
+        assert_eq!(bits.len(), n, "two strips share a bit");
+    }
+
+    /// **A strip's fader and its send are one pass over one signal.**
+    ///
+    /// The send is post-fader, which is the whole of what this asserts: pull
+    /// the channel down and its reverb comes down with it.
+    #[test]
+    fn a_send_is_a_percentage_of_what_leaves_the_fader() {
+        let frames = 4;
+        let mut mix = vec![1.0_f32; frames * TAP_CHANNELS];
+        let mut aux = vec![0.0_f32; frames * TAP_CHANNELS];
+        let mut gain = 0.5;
+        // `coeff` of 1.0 reaches the target on the first frame, so the
+        // arithmetic can be checked without modelling the slew.
+        fold_strip(&mut mix, &mut aux, frames, &mut gain, 0.5, 0.25, 1.0);
+        for (i, v) in mix.iter().enumerate() {
+            assert!((v - 0.5).abs() < 1.0e-6, "frame {i} left the fader at {v}");
+        }
+        for (i, v) in aux.iter().enumerate() {
+            assert!(
+                (v - 0.125).abs() < 1.0e-6,
+                "frame {i} sent {v}, not a quarter of what left the fader"
+            );
+        }
+
+        // A muted strip sends nothing, because its target is zero and the send
+        // is taken from what LEAVES it.
+        let mut mix = vec![1.0_f32; frames * TAP_CHANNELS];
+        let mut aux = vec![0.0_f32; frames * TAP_CHANNELS];
+        let mut gain = 0.0;
+        fold_strip(&mut mix, &mut aux, frames, &mut gain, 0.0, 1.0, 1.0);
+        assert!(
+            aux.iter().all(|v| v.abs() < 1.0e-9),
+            "a silent strip still fed the effects bus"
+        );
+    }
+
+    /// The bus comes back at its own fader, and adds rather than replaces.
+    #[test]
+    fn the_effects_bus_returns_at_its_own_level() {
+        let frames = 3;
+        let mut mix = vec![1.0_f32; frames * TAP_CHANNELS];
+        let aux = vec![0.5_f32; frames * TAP_CHANNELS];
+        let mut gain = 0.0;
+        add_return(&mut mix, &aux, frames, &mut gain, 1.0, 1.0);
+        for (i, v) in mix.iter().enumerate() {
+            assert!(
+                (v - 1.5).abs() < 1.0e-6,
+                "frame {i} came back as {v} rather than dry plus wet"
+            );
+        }
+        // At zero return the bus is inaudible and the dry is untouched.
+        let mut mix = vec![1.0_f32; frames * TAP_CHANNELS];
+        let mut gain = 0.0;
+        add_return(&mut mix, &aux, frames, &mut gain, 0.0, 1.0);
+        assert!(mix.iter().all(|v| (v - 1.0).abs() < 1.0e-6));
+    }
+
+    /// **Muting the instrument silences the app.**
+    ///
+    /// End to end through the real renderer, because the gating happens in
+    /// three places — the fader, the send and the strip — and a unit test of
+    /// any one of them would pass with the wiring wrong.
+    #[test]
+    fn a_muted_instrument_reaches_neither_the_speakers_nor_the_bus() {
+        let (mut r, mut tx, shared) = renderer_with_midi(2);
+        shared
+            .muted
+            .store(Strip::Instrument.bit(), Ordering::Relaxed);
+        // Everything the bus could carry it with, turned up.
+        shared.reverb_mix.store(1.0f32.to_bits(), Ordering::Relaxed);
+        shared
+            .send_instrument
+            .store(1.0f32.to_bits(), Ordering::Relaxed);
+
+        queue(&mut tx, 0, [0x90, 60, 100]);
+        let mut out = vec![0.0_f32; 2 * 2048];
+        for _ in 0..4 {
+            r.render(&mut out, 0, 0);
+            let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+            assert!(
+                peak < 1.0e-4,
+                "a muted instrument produced {peak} at the device"
+            );
+        }
     }
 
     /// **A fresh install makes a sound.**

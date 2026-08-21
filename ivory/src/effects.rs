@@ -1148,6 +1148,25 @@ pub struct Effects {
     /// Everything was off last block, so the tails are already flushed and do
     /// not need flushing again.
     idle: bool,
+    /// Return the WET signal alone, with no copy of what came in.
+    ///
+    /// **This is the difference between an insert and a send, and getting it
+    /// wrong is inaudible in the code and unmissable in the room.** Every
+    /// effect here is ADDITIVE — `out = dry + wet * knob`, never a crossfade —
+    /// which is right for an insert across a bus, where the dry has to come
+    /// out the other side.
+    ///
+    /// A SEND is handed a copy of signal that is already going to the master by
+    /// another route. Returning `dry + wet` from that would add the dry a
+    /// second time: up to six decibels louder and comb-filtered against
+    /// itself, at every setting, which reads as "the reverb makes everything
+    /// louder and strange" rather than as a routing mistake.
+    ///
+    /// The chain still RUNS on the dry — the reverb has to be fed something,
+    /// and with the chorus at zero there would otherwise be nothing to feed it
+    /// — so this subtracts the dry from the sum at the end rather than
+    /// withholding it at the start.
+    wet_only: bool,
     /// The lowest gain the limiter applied since anybody last asked, as a
     /// linear multiplier. 1.0 is "it did nothing".
     ///
@@ -1160,9 +1179,21 @@ pub struct Effects {
 
 impl Effects {
     pub fn new(sample_rate: f32) -> Self {
+        Self::build(sample_rate, false)
+    }
+
+    /// An `Effects` for a SEND: the wet signal alone. See [`wet_only`].
+    ///
+    /// [`wet_only`]: Effects::wet_only
+    pub fn new_send(sample_rate: f32) -> Self {
+        Self::build(sample_rate, true)
+    }
+
+    fn build(sample_rate: f32, wet_only: bool) -> Self {
         let sr = sample_rate.max(8_000.0);
         let p = Params::default();
         Self {
+            wet_only,
             reverb: Self::build_reverb(sr, p.reverb_width),
             delay: Delay::new(sr),
             chorus: Chorus::new(sr),
@@ -1224,6 +1255,12 @@ impl Effects {
                 && Sends::threshold_db(m.limiter) >= LIMITER_IN_AT_DB
         };
         if quiet(&want) && quiet(&self.mix) {
+            // **A send returns silence, not its input.** The buffer holds a
+            // copy of signal that is already reaching the master; handing it
+            // back untouched because nothing is switched on would double it.
+            if self.wet_only {
+                buf.iter_mut().take(frames * channels).for_each(|v| *v = 0.0);
+            }
             if !self.idle {
                 // Once, on the way down: whatever was still ringing when the
                 // knob reached zero must not be waiting inside the buffers to
@@ -1235,6 +1272,9 @@ impl Effects {
         }
         self.idle = false;
         if channels < 2 {
+            if self.wet_only {
+                buf.iter_mut().take(frames * channels).for_each(|v| *v = 0.0);
+            }
             return;
         }
         // The one parameter that is a buffer length rather than a coefficient.
@@ -1364,6 +1404,12 @@ impl Effects {
             let mut out = [0.0f32; 2];
             for ch in 0..2 {
                 out[ch] = chorused[ch] + wet_d[ch] * self.mix.delay + wet_r[ch] * self.mix.reverb;
+                // A send keeps only what it made. See `wet_only`: `chorused`
+                // is `dry + wet_c * chorus`, so taking the dry back out of the
+                // sum leaves exactly the three wet terms.
+                if self.wet_only {
+                    out[ch] -= dry[ch];
+                }
             }
 
             // **After the effects, not before them.** These two are the tone
@@ -1435,6 +1481,60 @@ impl Effects {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A send returns what it made, and nothing it was given.**
+    ///
+    /// Every effect here is additive — `out = dry + wet * knob` — which is
+    /// right for an insert and wrong for a send: the bus is handed a COPY of
+    /// signal that already reaches the master by another route, so returning
+    /// the dry with it would add that signal twice. Six decibels and a comb
+    /// filter, at every setting.
+    #[test]
+    fn a_send_never_returns_the_signal_it_was_handed() {
+        // Long enough for a comb to come back: the shortest one in a
+        // Freeverb-shaped reverb is over a thousand samples, so a short buffer
+        // would show silence and prove nothing.
+        const FRAMES: usize = 4096;
+        let p = Params::default();
+
+        // Nothing switched on: a send is silent, an insert is a wire.
+        let mut send = Effects::new_send(48_000.0);
+        let mut buf = vec![0.5_f32; FRAMES * 2];
+        send.process(&mut buf, FRAMES, 2, Sends::default(), &p, 120.0);
+        assert!(
+            buf.iter().all(|v| v.abs() < 1.0e-9),
+            "an idle send handed its input back, which would double it"
+        );
+
+        let mut insert = Effects::new(48_000.0);
+        let mut buf = vec![0.5_f32; FRAMES * 2];
+        insert.process(&mut buf, FRAMES, 2, Sends::default(), &p, 120.0);
+        assert!(
+            buf.iter().all(|v| (v - 0.5).abs() < 1.0e-6),
+            "an idle insert was supposed to pass its input through untouched"
+        );
+
+        // Reverb up: the send returns a tail and no copy of the input. The
+        // first frame is the one that says so — a reverb has pre-delay before
+        // anything comes back, so anything there is the dry leaking through.
+        let mut send = Effects::new_send(48_000.0);
+        let sends = Sends {
+            reverb: 1.0,
+            limiter: 1.0,
+            ..Sends::default()
+        };
+        let mut buf = vec![0.5_f32; FRAMES * 2];
+        send.process(&mut buf, FRAMES, 2, sends, &p, 120.0);
+        assert!(
+            buf[0].abs() < 0.05,
+            "the first frame came back at {}, which is the dry signal",
+            buf[0]
+        );
+        // And it did something: silence would mean the chain never ran.
+        let peak = buf.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+        assert!(peak > 1.0e-6, "the send produced nothing at all");
+    }
+
 
     const SR: f32 = 48_000.0;
 

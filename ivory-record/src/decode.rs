@@ -19,7 +19,7 @@
 //! what a mono backing track should do.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// A decoded audio file, ready to mix.
 #[derive(Debug, Clone, PartialEq)]
