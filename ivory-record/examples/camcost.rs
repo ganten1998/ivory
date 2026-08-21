@@ -98,6 +98,20 @@ pub fn main() {
 
     println!("\n{delivered} frames in {wall:.2} s  ({:.2} fps)", delivered as f64 / wall);
     println!("  unreadable            {unreadable}");
+    // The thing the app could not previously tell anyone.
+    match stream.rate_limited() {
+        Some(r) => println!(
+            "  RATE LIMITED          delivering {:.2} fps against {:.2} negotiated \
+             ({:.0}% of it)",
+            r.actual_fps,
+            r.negotiated_fps,
+            r.ratio() * 100.0
+        ),
+        None => println!(
+            "  rate                  keeping up with the negotiated {:.2} fps",
+            stream.format().fps
+        ),
+    }
     println!("  process CPU           {cpu:.3} s  ({:.1}% of one core)", 100.0 * cpu / wall);
     if delivered > 0 {
         println!("  CPU per frame         {:.3} ms", cpu * 1000.0 / delivered as f64);

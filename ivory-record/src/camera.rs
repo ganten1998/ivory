@@ -933,6 +933,55 @@ pub struct CameraStats {
     /// [`FrameSlot::want`].
     frames_skipped: AtomicU64,
     device_state: AtomicU8,
+    /// Monotonic nanoseconds at the first and most recent delivery, for
+    /// [`delivered_fps`](Self::delivered_fps). Zero until a frame arrives.
+    ///
+    /// Two stamps rather than a start time and a count, because the answer
+    /// wanted is the rate *while running* — a camera opened long before the
+    /// first frame would otherwise read as slow for the rest of the session.
+    first_delivery_ns: AtomicU64,
+    last_delivery_ns: AtomicU64,
+}
+
+/// Monotonic nanoseconds from a process-wide origin.
+///
+/// Not [`Timebase`], which belongs to a take: this outlives takes and is only
+/// ever used for differences.
+fn monotonic_ns() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+/// A camera delivering materially fewer frames than the format it agreed to.
+///
+/// **This is a real condition with a real fix, and it is invisible today.** A
+/// UVC webcam integrates for as long as the light needs and cannot produce
+/// frames faster than that, so in a dim room it silently halves its rate:
+/// measured on a 2012 FaceTime HD, `fps = min(30, 1/exposure)` exactly —
+/// 66.6 ms of exposure gives 15 fps, 30 ms gives 30. Nothing in the app says
+/// so, and the frames that never arrive are indistinguishable from frames the
+/// app lost, which sends anyone looking in exactly the wrong place.
+///
+/// The fix belongs to the user — more light, or a shorter exposure and a
+/// darker picture — which is precisely why it is worth saying out loud.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RateLimited {
+    /// What the driver agreed to when the format was negotiated.
+    pub negotiated_fps: f64,
+    /// What is actually arriving.
+    pub actual_fps: f64,
+}
+
+impl RateLimited {
+    /// Delivered rate as a fraction of the negotiated one.
+    pub fn ratio(&self) -> f64 {
+        if self.negotiated_fps <= 0.0 {
+            return 1.0;
+        }
+        self.actual_fps / self.negotiated_fps
+    }
 }
 
 impl CameraStats {
@@ -980,7 +1029,35 @@ impl CameraStats {
     }
 
     pub fn note_delivered(&self) {
-        self.frames_delivered.fetch_add(1, Ordering::Relaxed);
+        let n = self.frames_delivered.fetch_add(1, Ordering::Relaxed);
+        // Two relaxed stores on the capture thread, which is already doing
+        // atomics here; the reader tolerates a torn pair by returning `None`.
+        let now = monotonic_ns();
+        if n == 0 {
+            self.first_delivery_ns.store(now, Ordering::Relaxed);
+        }
+        self.last_delivery_ns.store(now, Ordering::Relaxed);
+    }
+
+    /// The rate the camera is **actually** delivering, or `None` before there
+    /// is enough to say.
+    ///
+    /// Measured between the first and most recent delivery, so it is the rate
+    /// while running rather than an average that includes the time before the
+    /// stream produced anything.
+    pub fn delivered_fps(&self) -> Option<f64> {
+        /// Enough arrivals that a slow start cannot masquerade as a slow
+        /// camera. At 15 fps this is a couple of seconds.
+        const ENOUGH: u64 = 30;
+        let n = self.frames_delivered();
+        if n < ENOUGH {
+            return None;
+        }
+        let first = self.first_delivery_ns.load(Ordering::Relaxed);
+        let last = self.last_delivery_ns.load(Ordering::Relaxed);
+        let span = last.checked_sub(first).filter(|s| *s > 0)?;
+        // n frames span n-1 intervals.
+        Some((n - 1) as f64 * 1_000_000_000.0 / span as f64)
     }
 
     pub fn note_dropped_late(&self) {
@@ -1217,6 +1294,27 @@ impl CameraStream {
         self.source.format()
     }
 
+    /// Whether the camera is delivering materially fewer frames than the
+    /// format it agreed to, and by how much.
+    ///
+    /// `None` means either that it is keeping up, or that too few frames have
+    /// arrived to say — never "no idea". It is a statement about the *camera*,
+    /// not about the app losing frames, and that distinction is the whole
+    /// point. See [`RateLimited`].
+    pub fn rate_limited(&self) -> Option<RateLimited> {
+        /// Below this fraction of the negotiated rate, say so. A camera that
+        /// halves itself lands at 0.5; 25 against 30 is 0.83 and not worth
+        /// interrupting anyone about.
+        const SHORTFALL: f64 = 0.8;
+        let negotiated_fps = self.source.format().fps;
+        if negotiated_fps <= 0.0 {
+            return None;
+        }
+        let actual_fps = self.stats.delivered_fps()?;
+        let limited = RateLimited { negotiated_fps, actual_fps };
+        (limited.ratio() < SHORTFALL).then_some(limited)
+    }
+
     pub fn stats(&self) -> &Arc<CameraStats> {
         &self.stats
     }
@@ -1263,6 +1361,46 @@ impl CameraStream {
 
 #[cfg(test)]
 mod tests {
+
+    /// **A camera that halves itself must be reported, and one that keeps up
+    /// must not.**
+    ///
+    /// The condition is real and invisible: a UVC webcam integrates for as long
+    /// as the light needs, so in a dim room it delivers half the rate it
+    /// negotiated. Measured on a 2012 FaceTime HD, `fps = min(30, 1/exposure)`
+    /// exactly. Today those missing frames look exactly like frames the app
+    /// lost, which sends anyone looking in the wrong place.
+    #[test]
+    fn a_rate_limited_camera_is_distinguishable_from_a_healthy_one() {
+        let stats = CameraStats::new();
+        assert_eq!(stats.delivered_fps(), None, "answered before it could know");
+        for _ in 0..60 {
+            stats.note_delivered();
+        }
+        let fps = stats
+            .delivered_fps()
+            .expect("60 frames is enough to have an opinion");
+        assert!(fps > 0.0, "a rate of {fps} is not a rate");
+
+        let halved = RateLimited { negotiated_fps: 30.0, actual_fps: 15.0 };
+        assert!((halved.ratio() - 0.5).abs() < 1e-9);
+        let fine = RateLimited { negotiated_fps: 30.0, actual_fps: 29.97 };
+        assert!(fine.ratio() > 0.99, "a healthy camera read as limited");
+        let bad = RateLimited { negotiated_fps: 0.0, actual_fps: 0.0 };
+        assert_eq!(bad.ratio(), 1.0, "an unknown rate must not read as a fault");
+    }
+
+    /// A slow start must not read as a slow camera.
+    #[test]
+    fn the_rate_needs_enough_frames_before_it_will_answer() {
+        let stats = CameraStats::new();
+        for _ in 0..29 {
+            stats.note_delivered();
+        }
+        assert_eq!(stats.delivered_fps(), None, "answered on 29 frames");
+        stats.note_delivered();
+        assert!(stats.delivered_fps().is_some(), "still silent at 30 frames");
+    }
 
     /// **The camera pays for a frame only when somebody is looking.**
     ///

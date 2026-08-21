@@ -43,8 +43,9 @@ use crate::clock::Nanos;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
+use std::collections::VecDeque;
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::time::{Duration, Instant};
+
 
 /// How many composited frames may be waiting for the encoder.
 ///
@@ -62,55 +63,30 @@ const QUEUE: usize = 10;
 /// would be inventing a recording of something that did not happen.
 const MAX_PAD: u32 = 60;
 
-/// How many frame intervals a frame may wait before it is given up on.
-///
-/// **Not zero.** An encoder is briefly busy all the time, so a push that gave
-/// up the instant the queue was full threw away eleven frames in twenty.
-const WAIT_FRAMES: u32 = 2;
 
-/// And the ceiling on that, in wall time, whatever the frame rate is.
-///
-/// **Because this blocks the UI thread**, and the UI thread is what composites
-/// the next frame. Two intervals is 66 ms at 30 fps and 133 at 15 — a stall
-/// that slows the window, which slows the compositor, which fills the queue
-/// again: a machine that falls behind once used to stay behind, and the owner
-/// measured the result at about half the camera's frames lost on every take.
-///
-/// It could be this long before because a dropped frame SHORTENED the video:
-/// the pipe was stamped in arrival order, so a frame given up on was a slot
-/// that vanished, and "a two-second clip became a quarter of a second". That
-/// is fixed — a gap is filled from the frame's own timestamp now, see
-/// `Frame::pad` — so the trade is finally an honest one. Waiting costs the
-/// window; dropping costs one repeated picture. Four milliseconds is a quarter
-/// of a 60 fps frame: long enough for the ordinary hiccup the wait exists for,
-/// short enough that nobody can feel it.
-///
-/// **Four milliseconds was too few, and the Linux box said so**: three
-/// encoder tests that push a burst and expect every frame to arrive lost
-/// between a fifth and a half of them. The cause is not steady-state
-/// throughput — the frames in those tests are 64x48 — it is that ffmpeg takes
-/// a moment to START, and the first frames arrive while it is still doing so.
-/// That is what the QUEUE is for, so the queue got deeper rather than the wait
-/// longer: ten frames of headroom absorbs a process launch, where waiting for
-/// one would have meant blocking the window through it.
-const MAX_WAIT: Duration = Duration::from_millis(12);
 
-/// How long a frame may wait while the encoder is still STARTING, and for how
-/// long that allowance lasts.
+/// How many bytes of composited frames may wait on the UI thread for room.
 ///
-/// **Two different problems wearing one number.** A steady-state hiccup is a
-/// few milliseconds and blocking the window through it is the right trade. A
-/// process launch is hundreds, and blocking the window through THAT is what
-/// the four-millisecond ceiling was written to stop — but ffmpeg has not read
-/// a byte yet, so the queue fills and every frame of the opening is dropped
-/// instead. Three encoder tests on the Linux box lost between a fifth and a
-/// half of a burst that way.
+/// **This replaced a sleep, and the sleep was a feedback loop.** `push` runs on
+/// the window's thread. When the queue filled it slept in one-millisecond
+/// steps — up to 12 ms in steady state and up to 250 ms while ffmpeg was still
+/// launching — and every one of those milliseconds was a repaint that did not
+/// happen, which is a camera frame that arrived with nobody to convert it,
+/// which fills the queue further. Blocking the window to save a frame cost
+/// more frames than it saved.
 ///
-/// So the allowance is generous exactly while it is a launch. The first
-/// seconds of a take are the count-in; a window that hitches there and keeps
-/// the opening is the better bargain, and after that responsiveness wins.
-const WARMUP: Duration = Duration::from_millis(2500);
-const WARMUP_WAIT: Duration = Duration::from_millis(250);
+/// So the wait became memory instead of time. A frame that finds no room is
+/// held here and offered again on the next push, and the UI thread never
+/// sleeps. The budget is in BYTES rather than frames because that is what the
+/// machine actually has: 48 MB is about thirteen frames at 720p and eight at
+/// 1080p, comfortably more slack than the 250 ms of blocking it replaces, and
+/// still bounded — a long take on a slow disk cannot end with the machine out
+/// of memory.
+///
+/// Beyond it, frames are shed and counted. That costs nothing in timing: the
+/// slot each picture belongs to is computed from its own timestamp, so the gap
+/// a shed frame leaves is filled by the next one's padding, automatically.
+const OVERFLOW_BYTES: usize = 48 * 1024 * 1024;
 
 /// Where `ffmpeg` is, or why it is not.
 ///
@@ -206,10 +182,12 @@ pub struct Encoder {
     tmp: PathBuf,
     out: PathBuf,
     frame_bytes: usize,
-    /// How long `push` will wait for room before it gives the frame up.
-    wait: Duration,
-    /// When the encoder was created, for the warm-up allowance. See [`WARMUP`].
-    started: Instant,
+    /// Frames that found no room, waiting to be offered again. See
+    /// [`OVERFLOW_BYTES`].
+    overflow: VecDeque<Frame>,
+    /// The bytes `overflow` is holding, tracked rather than recomputed: it is
+    /// consulted on every frame.
+    overflow_bytes: usize,
     last_pts: Option<Nanos>,
     /// When the first frame of the take happened, which is where the video's
     /// own timeline starts.
@@ -320,9 +298,8 @@ impl Encoder {
             tmp,
             out: path.to_path_buf(),
             frame_bytes: spec.width as usize * spec.height as usize * 4,
-            wait: Duration::from_secs_f64(f64::from(WAIT_FRAMES) / f64::from(spec.fps.max(1)))
-                .min(MAX_WAIT),
-            started: Instant::now(),
+            overflow: VecDeque::new(),
+            overflow_bytes: 0,
             last_pts: None,
             first_pts: None,
             slots: 0,
@@ -403,26 +380,10 @@ impl Encoder {
                 self.frame_bytes
             ));
         }
-        let Some(tx) = self.tx.as_ref() else {
-            return Err("the encoder is already finished".to_owned());
-        };
-        // `SyncSender::send_timeout` is still unstable, so this is that: try,
-        // and if there is no room, wait a millisecond and try again until the
-        // deadline. `try_send` hands the frame back on a full channel, so the
-        // retry costs no second copy of eight megabytes.
-        // Generous while the encoder is still coming up, short once it is
-        // running. See `WARMUP`.
-        let now = Instant::now();
-        let wait = if now.duration_since(self.started) < WARMUP {
-            WARMUP_WAIT
-        } else {
-            self.wait
-        };
-        let deadline = now + wait;
         // **The padding rides with the picture it precedes**, not with the one
         // it repeats. The writer holds no state, and a gap can therefore never
         // be written for a frame that was then dropped for want of room.
-        let mut frame = Frame {
+        let frame = Frame {
             bgra: bgra[..self.frame_bytes].to_vec(),
             // Capped, because a stall of several seconds should not write
             // several seconds of one picture into a file the user is going to
@@ -430,31 +391,75 @@ impl Encoder {
             // honest about there having been nothing to show.
             pad: gap.min(u64::from(MAX_PAD)) as u32,
         };
-        loop {
+        // Anything held from an earlier push goes first, or the video would be
+        // out of order. Non-blocking: whatever does not fit stays held.
+        if !self.drain_overflow()? {
+            // The channel is still full, so this frame joins the queue behind
+            // the ones already waiting rather than jumping them.
+            return Ok(self.hold(frame, pts_ns, slot, gap));
+        }
+        let Some(tx) = self.tx.as_ref() else {
+            return Err("the encoder is already finished".to_owned());
+        };
+        match tx.try_send(frame) {
+            Ok(()) => {
+                self.accept(pts_ns, slot, gap);
+                Ok(())
+            }
+            // Backpressure, and the whole reason the queue is bounded. Not an
+            // error: `take.json` carries the count so "the video is juddery"
+            // has an answer.
+            Err(TrySendError::Full(back)) => Ok(self.hold(back, pts_ns, slot, gap)),
+            Err(TrySendError::Disconnected(_)) => Err("the encoder stopped".to_owned()),
+        }
+    }
+
+    /// Book a frame in as written: it is either in the channel or held.
+    fn accept(&mut self, pts_ns: Nanos, slot: u64, gap: u64) {
+        self.last_pts = Some(pts_ns);
+        self.frames += 1;
+        self.slots = slot + 1;
+        self.repeated += gap;
+    }
+
+    /// Hold a frame for the next push, or shed it if the budget is spent.
+    ///
+    /// Shedding costs nothing in timing. `slot` comes from the frame's own
+    /// timestamp and `self.slots` only advances for a frame that was kept, so
+    /// the next picture's `gap` covers whatever was shed, automatically.
+    fn hold(&mut self, frame: Frame, pts_ns: Nanos, slot: u64, gap: u64) {
+        if self.overflow_bytes + frame.bgra.len() > OVERFLOW_BYTES {
+            self.dropped += 1;
+            return;
+        }
+        self.overflow_bytes += frame.bgra.len();
+        self.overflow.push_back(frame);
+        self.accept(pts_ns, slot, gap);
+    }
+
+    /// Offer held frames to the channel without waiting.
+    ///
+    /// `Ok(true)` means the overflow is empty and the channel has room for one
+    /// more; `Ok(false)` means it is still backed up.
+    fn drain_overflow(&mut self) -> Result<bool, String> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err("the encoder is already finished".to_owned());
+        };
+        while let Some(frame) = self.overflow.pop_front() {
+            let bytes = frame.bgra.len();
             match tx.try_send(frame) {
-                Ok(()) => {
-                    self.last_pts = Some(pts_ns);
-                    self.frames += 1;
-                    self.slots = slot + 1;
-                    self.repeated += gap;
-                    return Ok(());
-                }
-                // Backpressure, and the whole reason the queue is bounded. Not
-                // an error: `take.json` carries the count so "the video is
-                // juddery" has an answer.
+                Ok(()) => self.overflow_bytes -= bytes,
                 Err(TrySendError::Full(back)) => {
-                    if Instant::now() >= deadline {
-                        self.dropped += 1;
-                        return Ok(());
-                    }
-                    frame = back;
-                    std::thread::sleep(Duration::from_millis(1));
+                    self.overflow.push_front(back);
+                    return Ok(false);
                 }
                 Err(TrySendError::Disconnected(_)) => {
-                    return Err("the encoder stopped".to_owned())
+                    self.overflow_bytes -= bytes;
+                    return Err("the encoder stopped".to_owned());
                 }
             }
         }
+        Ok(true)
     }
 
     pub fn out_of_order(&self) -> u64 {
@@ -474,6 +479,23 @@ impl Encoder {
     }
 
     pub fn finish(mut self) -> Result<(), String> {
+        // **Anything still held goes down the pipe first.** `push` never waits
+        // for room — it holds the frame and offers it again next time — so at
+        // the end of a take there may be frames that have been counted as
+        // written and are still here. Blocking is right this once: the take is
+        // over, there is no window to keep responsive, and the alternative is
+        // losing the last second of the video.
+        if self.tx.is_some() {
+            let held: Vec<Frame> = self.overflow.drain(..).collect();
+            self.overflow_bytes = 0;
+            for frame in held {
+                let Some(tx) = self.tx.as_ref() else { break };
+                if tx.send(frame).is_err() {
+                    // The writer is gone; the count already says so.
+                    break;
+                }
+            }
+        }
         // Closing the pipe is what ends the stream, so the sender goes before
         // the wait. Without this, ffmpeg sits on a read that will never return
         // and the take never finishes.
@@ -709,6 +731,68 @@ mod tests {
             "the file has {n} frames where the take was 19 slots long - the \
              video is short and fast, which is the bug"
         );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// **`push` must not sleep, however full the queue is.**
+    ///
+    /// It runs on the window's thread. It used to wait in one-millisecond
+    /// steps for room — up to 12 ms in steady state and up to 250 ms while
+    /// ffmpeg was still launching — and every one of those milliseconds was a
+    /// repaint that did not happen, which is a camera frame that arrived with
+    /// nobody to convert it, which fills the queue further. Blocking the
+    /// window to save a frame cost more frames than it saved.
+    ///
+    /// So: push a burst several times the queue depth, faster than any encoder
+    /// could drain it, and hold the whole burst to a budget that the old code
+    /// would have blown by two orders of magnitude.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn a_burst_that_fills_the_queue_never_blocks_the_window() {
+        if !have_ffmpeg() {
+            eprintln!("no ffmpeg on PATH, the encoder was not exercised");
+            return;
+        }
+        const W: u32 = 64;
+        const H: u32 = 48;
+        let dir = std::env::temp_dir().join("ivory-ffmpeg-noblock");
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("noblock.mp4");
+        let _ = std::fs::remove_file(&out);
+        let mut enc = Encoder::create(
+            &out,
+            super::super::VideoSpec { width: W, height: H, fps: 30 },
+            None,
+        )
+        .expect("ffmpeg is on PATH");
+        let f = vec![0x40u8; (W * H * 4) as usize];
+
+        // Several times QUEUE, pushed as fast as the loop can go — which is
+        // exactly the launch case, when ffmpeg has not read a byte yet.
+        let burst = (QUEUE * 6) as u64;
+        let t0 = std::time::Instant::now();
+        for i in 0..burst {
+            enc.push(&f, (i * 33_333_333) as Nanos).expect("push");
+        }
+        let elapsed = t0.elapsed();
+
+        // The old code slept up to 250 ms PER FRAME during warm-up. Sixty
+        // frames of that is fifteen seconds; this budget is generous for
+        // sixty memcpys and impossible for sixty sleeps.
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "a burst of {burst} frames took {elapsed:?} - push is blocking the \
+             window again"
+        );
+        // And nothing was silently lost: the budget is large enough to hold a
+        // burst this size, so every frame is either queued or held.
+        assert_eq!(
+            enc.frames_written(),
+            burst,
+            "frames went missing that the overflow had room for"
+        );
+        assert_eq!(enc.dropped_not_ready(), 0, "shed a frame with budget to spare");
+        enc.finish().expect("finish");
         let _ = std::fs::remove_file(&out);
     }
 

@@ -1030,6 +1030,17 @@ pub struct VideoReport {
     /// What the camera actually delivered. Every USB webcam is VFR in practice;
     /// the gap between these two is the number that explains a stutter.
     pub frames_received: u64,
+    /// Frames the capture thread produced that nobody read: the preview took a
+    /// newer one first. The price of newest-wins, and the number that says the
+    /// UI thread could not keep up.
+    pub frames_superseded: u64,
+    /// Frames that arrived and could not be converted at all — a truncated
+    /// JPEG, a format the backend cannot read.
+    pub frames_unreadable: u64,
+    /// Frames deliberately not converted, because the preview's budget said
+    /// there was no point. Not a loss; it is here so the three numbers above
+    /// add up against what the camera sent.
+    pub frames_skipped: u64,
 }
 
 impl VideoReport {
@@ -1043,6 +1054,9 @@ impl VideoReport {
             ("fps", Json::Num(self.fps)),
             ("frames_expected", Json::Int(self.frames_expected as i64)),
             ("frames_received", Json::Int(self.frames_received as i64)),
+            ("frames_superseded", Json::Int(self.frames_superseded as i64)),
+            ("frames_unreadable", Json::Int(self.frames_unreadable as i64)),
+            ("frames_skipped", Json::Int(self.frames_skipped as i64)),
         ])
     }
 }
@@ -1844,6 +1858,9 @@ mod tests {
             audio_codec: "lpcm".to_string(),
             frames_expected: 36_000,
             frames_received: 35_997,
+            frames_superseded: 0,
+            frames_unreadable: 0,
+            frames_skipped: 0,
             ..VideoReport::default()
         });
         m.plugin = Some(PluginReport {

@@ -3026,6 +3026,11 @@ struct TakeVideo {
     /// `Session::camera_frames_delivered` at take start. The camera opens with
     /// the band, not the take, so the per-take figure is a difference.
     cam_frames_at_start: u64,
+    /// The same baselines for the three loss counters, so the manifest reports
+    /// what happened during THIS take rather than since the camera opened.
+    cam_superseded_at_start: u64,
+    cam_unreadable_at_start: u64,
+    cam_skipped_at_start: u64,
 }
 
 #[cfg(feature = "recorder")]
@@ -3114,6 +3119,9 @@ impl DesktopApp {
             stride: 1,
             has_audio,
             cam_frames_at_start: self.recorder.session.camera_frames_delivered(),
+            cam_superseded_at_start: self.recorder.session.camera_frames_superseded(),
+            cam_unreadable_at_start: self.recorder.session.camera_frames_unreadable(),
+            cam_skipped_at_start: self.recorder.session.camera_frames_skipped(),
         });
     }
 
@@ -3282,7 +3290,36 @@ impl DesktopApp {
         let path = v.path.clone();
         match v.encoder.finish() {
             Ok(()) => {
-                if dropped > 0 || v.padded > 0 {
+                // **The camera's own shortfall comes first, because it has a
+                // different cause and a different fix.**
+                //
+                // A UVC webcam integrates for as long as the light needs and
+                // cannot produce frames faster than that, so in a dim room it
+                // silently halves its rate — measured on the owner's machine,
+                // `fps = min(30, 1/exposure)` exactly: 66.6 ms of exposure is
+                // 15 fps against a negotiated 29.97. Nothing said so, and the
+                // frames that never arrived were indistinguishable from frames
+                // the take lost. Telling somebody to lower the video size when
+                // the room is dark is advice that cannot work.
+                //
+                // **Only when it actually cost THIS take.** The camera
+                // negotiates its own rate and the take composites at its own,
+                // and those are different numbers: a camera at 15 feeding a
+                // 15 fps take has not cost anybody anything, and saying so
+                // after every take would be crying wolf. It becomes true the
+                // moment the take asks for more than the room can give.
+                let starved = self
+                    .recorder
+                    .session
+                    .camera_rate_limited()
+                    .filter(|r| r.actual_fps < f64::from(v.fps) * 0.9);
+                if let Some(r) = starved {
+                    self.recorder.take_note = Some(format!(
+                        "camera gave {:.0} fps of the {} this take wanted - it \
+                         needs more light",
+                        r.actual_fps, v.fps
+                    ));
+                } else if dropped > 0 || v.padded > 0 {
                     // Both numbers, because they are different failures: a
                     // dropped frame is a hole, a padded one is a freeze —
                     // and both mean the same advice about this machine.
@@ -3332,6 +3369,28 @@ impl DesktopApp {
                             .session
                             .camera_frames_delivered()
                             .saturating_sub(v.cam_frames_at_start),
+                        // **The three loss counters, which until now nothing
+                        // read outside a unit test.** They are the difference
+                        // between "the camera did not send it", "the UI could
+                        // not keep up with it" and "we chose not to convert
+                        // it" — three different faults with three different
+                        // fixes, and a take that stutters is unexplainable
+                        // without them.
+                        frames_superseded: self
+                            .recorder
+                            .session
+                            .camera_frames_superseded()
+                            .saturating_sub(v.cam_superseded_at_start),
+                        frames_unreadable: self
+                            .recorder
+                            .session
+                            .camera_frames_unreadable()
+                            .saturating_sub(v.cam_unreadable_at_start),
+                        frames_skipped: self
+                            .recorder
+                            .session
+                            .camera_frames_skipped()
+                            .saturating_sub(v.cam_skipped_at_start),
                     },
                     &file_name,
                 );

@@ -1410,6 +1410,15 @@ impl Session {
             .is_some_and(|c| c.state().is_running())
     }
 
+    /// Whether the camera is delivering materially less than it agreed to.
+    ///
+    /// The condition is the camera's, not the app's, and saying so is the whole
+    /// point: those frames were never captured, so counting them as frames the
+    /// take *lost* sends anyone looking in exactly the wrong place.
+    pub fn camera_rate_limited(&self) -> Option<camera::RateLimited> {
+        self.camera.as_ref()?.rate_limited()
+    }
+
     /// The newest frame, if one has arrived since the last call.
     ///
     /// **Consuming, and newest-wins.** `None` means "nothing new", not "no
@@ -1451,6 +1460,27 @@ impl Session {
         self.camera
             .as_ref()
             .map_or(0, |c| c.stats().frames_delivered())
+    }
+
+    /// Frames produced that nobody read — the preview took a newer one first.
+    pub fn camera_frames_superseded(&self) -> u64 {
+        self.camera
+            .as_ref()
+            .map_or(0, |c| c.stats().frames_superseded())
+    }
+
+    /// Frames that arrived and could not be converted.
+    pub fn camera_frames_unreadable(&self) -> u64 {
+        self.camera
+            .as_ref()
+            .map_or(0, |c| c.stats().frames_unreadable())
+    }
+
+    /// Frames deliberately not converted, on the preview's own budget.
+    pub fn camera_frames_skipped(&self) -> u64 {
+        self.camera
+            .as_ref()
+            .map_or(0, |c| c.stats().frames_skipped())
     }
 
     /// Fold the finished video into the last take's manifest.
@@ -2838,6 +2868,9 @@ mod tests {
                 fps: 30.0,
                 frames_expected: 300,
                 frames_received: 297,
+                frames_superseded: 0,
+                frames_unreadable: 0,
+                frames_skipped: 0,
             },
             "take.mp4",
         );
@@ -2880,6 +2913,9 @@ mod tests {
                 fps: 30.0,
                 frames_expected: 10,
                 frames_received: 10,
+                frames_superseded: 0,
+                frames_unreadable: 0,
+                frames_skipped: 0,
             },
             "take.mp4",
         );
