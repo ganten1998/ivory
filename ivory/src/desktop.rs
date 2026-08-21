@@ -124,6 +124,9 @@ struct Recorder {
     /// What the engine has in each slot, so a change in settings is noticed on
     /// the edge rather than re-decided every frame.
     plugin_loaded: [Option<String>; ivory_ui::recorder::SLOTS],
+    /// What was last ASKED for on the effects bus, whether or not it loaded.
+    /// Settled either way, so a plugin that refuses is not retried every frame.
+    bus_effect_loaded: Option<String>,
     /// The slot whose load has been announced but not yet performed.
     ///
     /// `load_plugin` blocks for **about five seconds** — the module's own
@@ -1218,6 +1221,33 @@ impl DesktopApp {
             let extra = self.app.plugin_folders();
             self.app.set_plugin_list(ivory_host::discover_in(&extra));
         }
+        // **The user's effect, across the effects bus.**
+        //
+        // Reconciled here with the plugin rack and for the same reasons:
+        // `Module::open` runs somebody else's initialiser and `Instance::create`
+        // can take seconds, so it happens after a frame and never inside one.
+        // Once per change, because `bus_effect_loaded` remembers what was asked
+        // for whether or not it worked — a plugin that will not load must not
+        // be retried sixty times a second.
+        let want_fx = self.app.bus_effect().map(str::to_owned);
+        if want_fx != self.recorder.bus_effect_loaded {
+            self.recorder.bus_effect_loaded = want_fx.clone();
+            if let Some(e) = self.recorder.engine.as_mut() {
+                let path = want_fx.as_ref().map(std::path::Path::new);
+                match e.load_bus_effect(path) {
+                    Ok(_) => self.recorder.engine_error = None,
+                    Err(err) => {
+                        let which = want_fx
+                            .as_deref()
+                            .and_then(|p| p.rsplit('/').next())
+                            .unwrap_or("that plugin");
+                        self.recorder.engine_error =
+                            Some(format!("{which} did not load on the effects bus: {err}"));
+                    }
+                }
+            }
+        }
+
         // **The shipped bank, put back.** The same call a first launch makes,
         // which is the point: there is one definition of "the cartridge that
         // ships" and both paths read it.
@@ -2557,6 +2587,7 @@ impl DesktopApp {
                 engine: None,
                 engine_error: None,
                 plugin_loaded: [const { None }; ivory_ui::recorder::SLOTS],
+                bus_effect_loaded: None,
                 plugin_opening: None,
                 camera_opening: false,
                 camera_silent_since: None,

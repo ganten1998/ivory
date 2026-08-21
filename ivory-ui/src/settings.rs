@@ -486,6 +486,13 @@ pub struct Settings {
     pub master_gain: f64,
     /// The backing track's level, linear.
     pub track_gain: f64,
+    /// A user effect plugin across the effects bus, as a bundle path.
+    ///
+    /// **On the bus, not on every channel.** A reverb is a send effect: one
+    /// instance that four channels feed at four different amounts is what a
+    /// desk does, and per-channel inserts would be nine copies of the same
+    /// reverb running for a machine this app is careful about.
+    pub bus_effect: Option<String>,
     /// The interval column beside the guitar neck.
     ///
     /// **On by default.** It is the one part of the guitar view that answers a
@@ -718,6 +725,7 @@ impl Default for Settings {
             input_gain: 1.0,
             master_gain: 1.0,
             track_gain: 1.0,
+            bus_effect: None,
             guitar_intervals: true,
             fx_return_gain: 1.0,
             // The instrument sends everything; nothing else sends anything.
@@ -1205,6 +1213,7 @@ impl Settings {
         take_opt_str(&mut map, "record_take_name", &mut s.record_take_name);
         take_opt_str(&mut map, "record_camera_uid", &mut s.record_camera_uid);
         take_opt_str(&mut map, "record_audio_device", &mut s.record_audio_device);
+        take_opt_str(&mut map, "bus_effect", &mut s.bus_effect);
         if let Some(Value::Array(v)) = map.shift_remove("strip_sends") {
             for (i, x) in v.iter().take(crate::recorder::STRIPS).enumerate() {
                 if let Some(n) = x.as_f64() {
@@ -1715,6 +1724,7 @@ impl Settings {
             ("record_take_name", &self.record_take_name),
             ("record_camera_uid", &self.record_camera_uid),
             ("record_audio_device", &self.record_audio_device),
+            ("bus_effect", &self.bus_effect),
         ] {
             if let Some(v) = value {
                 map.insert(key.into(), Value::String(v.clone()));

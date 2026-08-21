@@ -1311,7 +1311,7 @@ impl IvoryApp {
                 .get(i)
                 .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
             H::Send(i) => view.strips.get(i).map_or(0.0, |s| s.send),
-            H::Mute(_) | H::Solo(_) | H::Add(_) => 0.0,
+            H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(_) => 0.0,
         }
     }
 
@@ -1356,6 +1356,11 @@ impl IvoryApp {
                 if let Some(Strip::Slot(n)) = strips.get(i) {
                     self.open_plugin_picker(*n);
                 }
+                return;
+            }
+            // The bus's own effect. One picker, aimed somewhere else.
+            H::Insert(_) => {
+                self.open_bus_effect_picker();
                 return;
             }
         }
@@ -1426,6 +1431,11 @@ impl IvoryApp {
                 strip: Some(s),
                 name,
                 detail,
+                insert: if s == Strip::Fx {
+                    self.settings.bus_effect.as_deref().map_or("", plugin_display_name)
+                } else {
+                    ""
+                },
                 empty,
                 gain,
                 send: desk.send[i],
@@ -1442,6 +1452,7 @@ impl IvoryApp {
                     strip: None,
                     name: "MASTER",
                     detail: "",
+                    insert: "",
                     empty: false,
                     gain: g.master,
                     send: 0.0,
@@ -3500,6 +3511,11 @@ impl IvoryApp {
         }
     }
 
+    /// The user effect the host should put across the effects bus, if any.
+    pub fn bus_effect(&self) -> Option<&str> {
+        self.settings.bus_effect.as_deref()
+    }
+
     /// The inputs of an interface the picker should offer as rows of their
     /// own, as the host's own opaque uids. Handed back verbatim at startup.
     pub fn exposed_input_channels(&self) -> &[String] {
@@ -3591,6 +3607,22 @@ impl IvoryApp {
     /// The dialog does not know about slots — it chooses a bundle — so the app
     /// remembers what the question was. Set when the picker opens and read when
     /// the answer comes back.
+    /// The picker, aimed at the effects BUS rather than at an instrument slot.
+    ///
+    /// `usize::MAX` as the target, following `ChoosePatch`'s own precedent: it
+    /// rides the same request the real indices do and the answer has one arm
+    /// to read instead of two.
+    fn open_bus_effect_picker(&mut self) {
+        if !self.caps.capture_devices {
+            return;
+        }
+        self.picker_slot = usize::MAX;
+        self.dialog = Some(Dialog::plugin_picker(
+            &self.plugin_list,
+            self.settings.bus_effect.clone(),
+        ));
+    }
+
     fn open_plugin_picker(&mut self, slot: usize) {
         if !self.caps.capture_devices || slot >= recorder::SLOTS {
             return;
@@ -4829,6 +4861,12 @@ impl IvoryApp {
                 self.save_settings();
             }
             DialogAction::LoadPlugin { path } => {
+                // The bus, not a slot. See `open_bus_effect_picker`.
+                if self.picker_slot == usize::MAX {
+                    self.settings.bus_effect = path;
+                    self.save_settings();
+                    return;
+                }
                 let slot = self.picker_slot.min(recorder::SLOTS - 1);
                 // Written to settings and nothing else: loading is the host's
                 // job, done after the frame, because `Module::open` runs
@@ -6346,7 +6384,9 @@ impl IvoryApp {
                     let view = self.mixer_view();
                     match crate::mixer_panel::hit_test(rect, &view, pos) {
                         Some(hit @ (crate::mixer_panel::Hit::Mute(_)
-                        | crate::mixer_panel::Hit::Solo(_))) => {
+                        | crate::mixer_panel::Hit::Solo(_)
+                        | crate::mixer_panel::Hit::Add(_)
+                        | crate::mixer_panel::Hit::Insert(_))) => {
                             self.apply_mixer_hit(hit, 0.0);
                         }
                         Some(hit) => {

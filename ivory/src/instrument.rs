@@ -1568,6 +1568,21 @@ struct Renderer {
     /// writes the take does not re-derive a per-frame condition.
     click_out: Vec<f32>,
     click_taped: Vec<f32>,
+    /// A user effect ACROSS the effects bus, if one is loaded.
+    ///
+    /// **On the bus rather than on every channel**, and that is a design
+    /// decision rather than a shortcut. A reverb is a send effect: one
+    /// instance that four channels feed at four different amounts is what a
+    /// desk does and what the plugin expects, and per-channel inserts would be
+    /// nine instances of the same reverb running at once for a machine this
+    /// app is careful about.
+    fx_plugin: PluginBox,
+    fx_incoming: Consumer<PluginBox>,
+    fx_retiring: Producer<PluginBox>,
+    /// Deinterleaved in and out for it. Preallocated, like everything else the
+    /// audio thread touches.
+    fx_in: Vec<Vec<f32>>,
+    fx_out: Vec<Vec<f32>>,
     /// The effects bus's own buffer, one block long, interleaved like `mix`.
     aux: Vec<f32>,
     /// Slewed, like every other gain here: a fader jumping in one sample is a
@@ -1642,7 +1657,60 @@ impl Renderer {
     /// rather than indexed so that the fault flag beside a slot is *that* slot's
     /// by construction — an index into a second array is a way to clear the
     /// wrong one, and the audio thread does not get to `assert!`.
+    /// Run the bus through the user's effect, in place.
+    ///
+    /// **Silently skipped when there is none**, which is the ordinary state.
+    /// A plugin that refuses a block leaves the bus as the built-in effects
+    /// made it rather than silencing it: an effect that faults should cost its
+    /// own contribution, not the reverb underneath it.
+    fn run_bus_effect(&mut self, frames: usize) {
+        let Some(p) = self.fx_plugin.0.as_mut() else {
+            return;
+        };
+        let Some(aux) = self.aux.get(..frames * TAP_CHANNELS) else {
+            return;
+        };
+        // Interleaved to planar and back. The plugin wants one array per
+        // channel and the bus is a stereo interleave; both buffers were sized
+        // at construction so neither allocates here.
+        for c in 0..TAP_CHANNELS {
+            let Some(dst) = self.fx_in.get_mut(c) else {
+                return;
+            };
+            for (f, d) in dst.iter_mut().take(frames).enumerate() {
+                *d = aux[f * TAP_CHANNELS + c];
+            }
+        }
+        if p.inst.process_effect(&self.fx_in, frames, &mut self.fx_out).is_err() {
+            return;
+        }
+        let Some(aux) = self.aux.get_mut(..frames * TAP_CHANNELS) else {
+            return;
+        };
+        for c in 0..TAP_CHANNELS {
+            // A plugin that wrote fewer channels than asked has its last one
+            // read twice rather than leaving a silent side.
+            let Some(src) = self.fx_out.get(c.min(p.channels.saturating_sub(1))) else {
+                continue;
+            };
+            for f in 0..frames {
+                if let (Some(v), Some(s)) = (aux.get_mut(f * TAP_CHANNELS + c), src.get(f)) {
+                    *v = *s;
+                }
+            }
+        }
+    }
+
     fn swap_plugins(&mut self) -> usize {
+        // The bus effect first, and by the same protocol: whatever arrives
+        // replaces what is there and the old one goes back to be dropped on
+        // the thread that made it.
+        if self.fx_retiring.slots() > 0 {
+            if let Ok(next) = self.fx_incoming.pop() {
+                let old = std::mem::replace(&mut self.fx_plugin, next);
+                let _ = self.fx_retiring.push(old);
+            }
+        }
         let mut swapped = 0;
         for (slot, faulted) in self.slots.iter_mut().zip(&self.shared.slot_faulted) {
             if slot.retiring.slots() == 0 {
@@ -1979,6 +2047,10 @@ impl Renderer {
                 self.effects
                     .process(aux, n, TAP_CHANNELS, sends, &self.effect_params, bpm);
             }
+            // **And then whatever the user put across the bus.** After the
+            // built-in three, so somebody who loads a reverb and leaves the
+            // knobs alone hears their reverb rather than theirs through ours.
+            self.run_bus_effect(n);
             // What comes back, at the bus's own fader.
             let return_target = level(Strip::Fx, &self.shared.fx_return);
             let fx_peak = add_return(
@@ -2684,6 +2756,9 @@ pub struct Engine {
 
     /// This thread's end of each slot's handoff, one pair per slot.
     handoff: [Handoff; SLOTS],
+    /// The bus effect's half of the same protocol.
+    fx_handoff: Handoff,
+    fx_loaded: Option<Loaded>,
     loaded: [Option<Loaded>; SLOTS],
     warm: [Option<WarmUp>; SLOTS],
 
@@ -2850,6 +2925,13 @@ impl Engine {
         let mut ends = ends.into_iter();
         let handoff: [Handoff; SLOTS] =
             std::array::from_fn(|_| ends.next().expect("one Handoff was pushed per slot"));
+        // One more pair, for the effect that sits across the bus.
+        let (fx_to_audio, fx_incoming) = RingBuffer::<PluginBox>::new(1);
+        let (fx_retiring, fx_from_audio) = RingBuffer::<PluginBox>::new(1);
+        let fx_handoff = Handoff {
+            to_audio: fx_to_audio,
+            from_audio: fx_from_audio,
+        };
 
         let dev_ch = channels as usize;
         let widest = dev_ch.max(TAP_CHANNELS);
@@ -2876,6 +2958,11 @@ impl Engine {
             effects: crate::effects::Effects::new_send(rate as f32),
             master_effects: crate::effects::Effects::new(rate as f32),
             aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            fx_plugin: PluginBox(None),
+            fx_incoming,
+            fx_retiring,
+            fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],
             click_taped: vec![0.0; MAX_BLOCK as usize],
             instrument_gain: 1.0,
@@ -2929,6 +3016,8 @@ impl Engine {
             timebase,
             midi: RefCell::new(midi_tx),
             handoff,
+            fx_handoff,
+            fx_loaded: None,
             loaded: std::array::from_fn(|_| None),
             warm: std::array::from_fn(|_| None),
             tap: Some(RecorderTap {
@@ -3009,6 +3098,95 @@ impl Engine {
     /// `Instance::load_state` refuses a restore after the instance has rendered
     /// anything, so this ordering is enforced by the host rather than by
     /// convention.
+    /// Put a user effect across the effects bus, or take it away with `None`.
+    ///
+    /// **No warm-up, unlike an instrument.** `ready::warm_up` plays a note and
+    /// waits to hear something, which is the right gate for a thing that makes
+    /// sound and a meaningless one for a thing that changes it: an effect
+    /// handed silence correctly produces silence, so the gate would fail every
+    /// reverb ever written.
+    ///
+    /// Blocking, like every other load here — `Module::open` runs somebody
+    /// else's initialiser — so the host calls it after a frame, never inside
+    /// one.
+    pub fn load_bus_effect(&mut self, bundle: Option<&Path>) -> Result<Option<Loaded>, String> {
+        let Some(bundle) = bundle else {
+            self.hand_off_effect(PluginBox(None));
+            self.fx_loaded = None;
+            return Ok(None);
+        };
+        let module = Module::open(bundle)?;
+        let classes = module.audio_modules();
+        let class = classes
+            .first()
+            .ok_or_else(|| format!("{} has no Audio Module Class", bundle.display()))?
+            .clone();
+        // **The other half of the rack's rule.** An instrument slot refuses an
+        // effect; the bus refuses an instrument, for the same reason and with
+        // the same wording: it would be handed audio it has no input for and
+        // would answer with silence.
+        if class.kind() == ivory_host::scan::Kind::Instrument {
+            return Err(format!("{} is an instrument, not an effect", class.name));
+        }
+        let setup = Setup {
+            sample_rate: f64::from(self.output.sample_rate),
+            max_block: MAX_BLOCK,
+        };
+        let mut inst = Instance::create(&module, &class, setup)?;
+        if inst.audio_inputs().is_empty() {
+            return Err(format!(
+                "{} has no audio input, so there is nothing to send to it",
+                class.name
+            ));
+        }
+        let channels = inst
+            .audio_outputs()
+            .first()
+            .map(|b| b.channels.max(0) as usize)
+            .unwrap_or(0);
+        if channels == 0 {
+            return Err(format!("{} has no audio output channels", class.name));
+        }
+        // Processing on, or the plugin is active and refuses every block.
+        inst.set_processing(true)?;
+        let loaded = Loaded {
+            bundle: bundle.to_path_buf(),
+            class: class.name.clone(),
+            vendor: module.vendor().to_owned(),
+            channels: u16::try_from(channels).unwrap_or(u16::MAX),
+            sample_rate: self.output.sample_rate,
+        };
+        self.hand_off_effect(PluginBox(Some(Box::new(Hosted {
+            inst,
+            module,
+            bufs: vec![vec![0.0; MAX_BLOCK as usize]; channels.max(TAP_CHANNELS)],
+            channels,
+        }))));
+        self.fx_loaded = Some(loaded.clone());
+        Ok(Some(loaded))
+    }
+
+    /// What is across the bus, if anything.
+    pub fn bus_effect(&self) -> Option<&Loaded> {
+        self.fx_loaded.as_ref()
+    }
+
+    /// The bus effect's half of [`Engine::hand_off`], and the same wait.
+    fn hand_off_effect(&mut self, next: PluginBox) {
+        while self.fx_handoff.from_audio.pop().is_ok() {}
+        if self.fx_handoff.to_audio.push(next).is_err() {
+            return;
+        }
+        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Ok(old) = self.fx_handoff.from_audio.pop() {
+                drop(old);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     pub fn load_plugin_with_state(
         &mut self,
         slot: usize,
@@ -5226,11 +5404,18 @@ mod tests {
         // abandoned peer (`pop` reports empty, `push` fills to capacity), so a
         // renderer under test needs no partner threads at all.
         let (_, midi) = RingBuffer::<MidiEvent>::new(1024);
+        let (_fx_to, fx_incoming) = RingBuffer::<PluginBox>::new(1);
+        let (fx_retiring, _fx_from) = RingBuffer::<PluginBox>::new(1);
         Renderer {
             monitor: None,
             monitor_channels: 0,
             monitor_gain: 0.0,
             monitor_scratch: Vec::new(),
+            fx_plugin: PluginBox(None),
+            fx_incoming,
+            fx_retiring,
+            fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             master_effects: crate::effects::Effects::new(RATE as f32),
             aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],

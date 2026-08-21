@@ -27,6 +27,8 @@ pub struct StripView<'a> {
     pub name: &'a str,
     /// The second line under the name: the device, the file, the patch.
     pub detail: &'a str,
+    /// A user effect across this strip, by name. Empty for none.
+    pub insert: &'a str,
     /// An instrument slot with nothing in it.
     ///
     /// **Drawn, not hidden.** Five slots that appear one at a time as they are
@@ -99,6 +101,8 @@ pub enum Hit {
     Solo(usize),
     /// The plus on an empty slot: put an instrument here.
     Add(usize),
+    /// The insert chip: put an effect across this strip.
+    Insert(usize),
 }
 
 impl Hit {
@@ -111,7 +115,7 @@ impl Hit {
         match self {
             Hit::Fader(_) => Some(DragAxis::Vertical),
             Hit::Send(_) => Some(DragAxis::Vertical),
-            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) => None,
+            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(_) => None,
         }
     }
 
@@ -120,7 +124,7 @@ impl Hit {
         match self {
             Hit::Fader(_) => Some(FADER_TRAVEL),
             Hit::Send(_) => Some(SEND_TRAVEL),
-            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) => None,
+            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(_) => None,
         }
     }
 }
@@ -164,6 +168,8 @@ pub struct StripStrip {
     pub db: Rect,
     pub mute: Rect,
     pub solo: Rect,
+    /// A user effect plugin across this strip. Only the bus has one today.
+    pub insert: Rect,
     /// The plus on an empty slot.
     pub add: Rect,
 }
@@ -183,6 +189,7 @@ impl StripStrip {
         db: Rect::NOTHING,
         mute: Rect::NOTHING,
         solo: Rect::NOTHING,
+        insert: Rect::NOTHING,
         add: Rect::NOTHING,
     };
 }
@@ -264,6 +271,16 @@ impl Layout {
         let send = if sends { cut(0.19, 0.37) } else { Rect::NOTHING };
         // Short of the bottom edge: a switch flush against the frame reads as
         // something that has been cut off rather than as the end of the strip.
+        // **An insert, on the bus alone.** A reverb is a send effect: one
+        // instance the channels feed at their own amounts is what a desk does.
+        // Per-channel inserts would be nine copies of the same plugin running
+        // on a machine this app is careful about, and they can come later
+        // without moving anything that is here.
+        let insert = if view.strip == Some(Strip::Fx) {
+            cut(0.20, 0.31)
+        } else {
+            Rect::NOTHING
+        };
         let switches = if switchable { cut(0.90, 0.975) } else { Rect::NOTHING };
         let (mute, solo) = if switchable {
             let mid = switches.center().x;
@@ -277,7 +294,21 @@ impl Layout {
         // A strip with no send starts its fader where the send would have been,
         // rather than leaving a hole: a hole reads as a control that failed to
         // draw.
-        let travel = cut(if sends { 0.41 } else { 0.24 }, 0.82);
+        // A strip with no send starts its fader where the send would have been,
+        // rather than leaving a hole — unless something else took that room.
+        // The effects bus has no send and DOES have an insert, and the two
+        // wanted the same band; the guard test found it before anybody could
+        // press one and get the other.
+        let travel = cut(
+            if sends {
+                0.41
+            } else if insert.is_positive() {
+                0.35
+            } else {
+                0.24
+            },
+            0.82,
+        );
         // The meter takes the left third and the fader the rest, so the fader
         // still sits near the middle of the strip where a hand expects it.
         let split = travel.left() + travel.width() * 0.34;
@@ -291,6 +322,7 @@ impl Layout {
             db: cut(0.83, 0.90),
             mute,
             solo,
+            insert,
             add: Rect::NOTHING,
         }
     }
@@ -309,6 +341,7 @@ impl Layout {
                 (s.mute, Hit::Mute(i)),
                 (s.solo, Hit::Solo(i)),
                 (s.add, Hit::Add(i)),
+                (s.insert, Hit::Insert(i)),
             ] {
                 if r.is_positive() {
                     out.push((r, hit));
@@ -432,6 +465,20 @@ fn strip(painter: &Painter, l: &StripStrip, v: &StripView<'_>, p: &Ink, heard: b
 
     if l.send.is_positive() {
         send_knob(painter, l.send, v.send, p);
+    }
+    if l.insert.is_positive() {
+        let filled = !v.insert.is_empty();
+        painter.rect_filled(l.insert, 2.0, if filled { p.lit } else { p.track });
+        centred(
+            painter,
+            l.insert,
+            if filled { v.insert } else { "+ EFFECT" },
+            FontId::new(
+                (l.insert.height() * 0.52).clamp(6.5, 10.0),
+                crate::fonts::courier_bold(),
+            ),
+            if filled { p.face } else { p.face.gamma_multiply(0.7) },
+        );
     }
 
     fader(painter, l.fader, v.gain, p);
@@ -601,6 +648,7 @@ mod tests {
             strip,
             name: "CHANNEL",
             detail: "",
+            insert: "",
             empty,
             gain: 1.0,
             send: 0.0,
