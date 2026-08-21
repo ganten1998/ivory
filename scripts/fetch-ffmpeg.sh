@@ -55,6 +55,16 @@ LINUX_URLS="https://johnvansickle.com/ffmpeg/releases/$LINUX_FILE
 https://johnvansickle.com/ffmpeg/old-releases/$LINUX_FILE"
 LINUX_SHA="abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67"
 
+# The same release for aarch64, because until now there was NOTHING: the arm64
+# tarball shipped no encoder at all, so video silently depended on a distro
+# ffmpeg that a clean machine does not have — the exact hole the x86_64 tarball
+# fixed in 4.11 (docs/LINUX-4.11-FINDINGS.md, finding 2), still open on the
+# other architecture. Same source, same licence, same caveats as above.
+ARM64_FILE="ffmpeg-7.0.2-arm64-static.tar.xz"
+ARM64_URLS="https://johnvansickle.com/ffmpeg/releases/$ARM64_FILE
+https://johnvansickle.com/ffmpeg/old-releases/$ARM64_FILE"
+ARM64_SHA="f4149bb2b0784e30e99bdda85471c9b5930d3402014e934a5098b41d0f7201b1"
+
 # ffmpeg 8.1.2, win64, BtbN's autobuilds — an IMMUTABLE dated tag, never the
 # rolling `latest` release, whose assets are rebuilt in place.
 WIN_FILE="ffmpeg-n8.1.2-44-g7c533d0f86-win64-gpl-8.1.zip"
@@ -63,8 +73,8 @@ WIN_SHA="19b9b43e6df8839473ba22c8e22bf14b937c1e2ca40ecbd19d58afedc83ac908"
 
 PLATFORM="${1:-}"
 case "$PLATFORM" in
-    linux|windows) ;;
-    *) echo "usage: scripts/fetch-ffmpeg.sh <linux|windows>" >&2; exit 2 ;;
+    linux|linux-arm64|windows) ;;
+    *) echo "usage: scripts/fetch-ffmpeg.sh <linux|linux-arm64|windows>" >&2; exit 2 ;;
 esac
 
 # macOS (where the Windows artifact is packaged) ships `shasum`, Linux ships
@@ -125,6 +135,19 @@ linux)
     chmod 755 "$OUT/tangent-ffmpeg"
     mv "$OUT/GPLv3.txt" "$OUT/ffmpeg-licenses/GPLv3.txt"
     provenance "$OUT/ffmpeg-licenses" "${LINUX_URLS%%$'\n'*}" "$LINUX_SHA"
+    echo "==> $OUT/tangent-ffmpeg"
+    ;;
+linux-arm64)
+    # shellcheck disable=SC2086
+    fetch "$ARM64_FILE" "$ARM64_SHA" $ARM64_URLS
+    OUT="dist/vendor/linux-arm64"
+    rm -rf "$OUT"; mkdir -p "$OUT/ffmpeg-licenses"
+    tar -xJf "dist/vendor/$ARM64_FILE" -C "$OUT" --strip-components=1 \
+        "${ARM64_FILE%.tar.xz}/ffmpeg" "${ARM64_FILE%.tar.xz}/GPLv3.txt"
+    mv "$OUT/ffmpeg" "$OUT/tangent-ffmpeg"
+    chmod 755 "$OUT/tangent-ffmpeg"
+    mv "$OUT/GPLv3.txt" "$OUT/ffmpeg-licenses/GPLv3.txt"
+    provenance "$OUT/ffmpeg-licenses" "${ARM64_URLS%%$'\n'*}" "$ARM64_SHA"
     echo "==> $OUT/tangent-ffmpeg"
     ;;
 windows)

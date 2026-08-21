@@ -308,18 +308,16 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   # to have distro ffmpeg, and broke on every clean one. Found by a tester on
   # a clean box; see docs/LINUX-4.11-FINDINGS.md, finding 2.
   #
-  # x86_64 only: there is no aarch64 Linux build in `fetch-ffmpeg.sh` yet, and
-  # shipping the wrong architecture is worse than shipping none — so that arch
-  # says so out loud rather than looking complete.
-  if [ "$arch" = "x86_64" ]; then
-    scripts/fetch-ffmpeg.sh linux || { rm -rf "$stage"; return 1; }
-    cp dist/vendor/linux/tangent-ffmpeg "$stage/" || { rm -rf "$stage"; return 1; }
-    chmod 0755 "$stage/tangent-ffmpeg" || { rm -rf "$stage"; return 1; }
-    cp -R dist/vendor/linux/ffmpeg-licenses "$stage/ffmpeg-licenses" \
-      || { rm -rf "$stage"; return 1; }
-  else
-    echo "   (no aarch64 ffmpeg build yet: video needs ffmpeg on PATH there)"
-  fi
+  # Both architectures now. The arm64 tarball shipped NO encoder for as long
+  # as it existed — video silently depended on a distro ffmpeg a clean machine
+  # does not have, which is the 4.11 hole all over again on the other arch.
+  local vendor="linux"
+  [ "$arch" = "x86_64" ] || vendor="linux-arm64"
+  scripts/fetch-ffmpeg.sh "$vendor" || { rm -rf "$stage"; return 1; }
+  cp "dist/vendor/$vendor/tangent-ffmpeg" "$stage/" || { rm -rf "$stage"; return 1; }
+  chmod 0755 "$stage/tangent-ffmpeg" || { rm -rf "$stage"; return 1; }
+  cp -R "dist/vendor/$vendor/ffmpeg-licenses" "$stage/ffmpeg-licenses" \
+    || { rm -rf "$stage"; return 1; }
   # The same user-facing readme the macOS and Windows artifacts carry.
   cp docs/ARTIFACT-README.md "$stage/README.txt" \
     || { rm -rf "$stage"; return 1; }

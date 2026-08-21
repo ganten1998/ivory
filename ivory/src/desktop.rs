@@ -2029,20 +2029,61 @@ impl DesktopApp {
 
         // A session bus at all. Without one there is no portal by definition.
         let has_bus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some();
-        let portal_dirs = [
-            std::path::PathBuf::from("/usr/share/xdg-desktop-portal/portals"),
-            std::path::PathBuf::from("/usr/local/share/xdg-desktop-portal/portals"),
-        ];
+        // **The SERVICE, not the files.** This used to look for portal backend
+        // definitions on disk, and a sway machine promptly disproved it: the
+        // package's files were present, no portal service was running, rfd
+        // asked the portal and got nothing, fell back to a zenity that was not
+        // installed, and Save, Load and Export all silently did nothing. The
+        // files say a portal COULD run; only the bus says one will answer.
+        //
+        // So ask the bus: does `org.freedesktop.portal.Desktop` have an owner,
+        // or is it activatable (systemd desktops start it on first call)?
+        // `dbus-send` ships with dbus itself, so wherever a session bus
+        // exists the question can be asked. Where it somehow cannot, fall
+        // back to the file heuristic — wrong only in the direction that costs
+        // a native panel, never the picker.
+        let ask_bus = |method: &str, arg: Option<&str>| -> Option<String> {
+            let mut cmd = std::process::Command::new("dbus-send");
+            cmd.args([
+                "--session",
+                "--print-reply",
+                "--dest=org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+            ]);
+            cmd.arg(format!("org.freedesktop.DBus.{method}"));
+            if let Some(a) = arg {
+                cmd.arg(format!("string:{a}"));
+            }
+            let out = cmd.output().ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        const PORTAL: &str = "org.freedesktop.portal.Desktop";
         let chooser = has_bus
-            && portal_dirs.iter().any(|dir| {
-                std::fs::read_dir(dir).is_ok_and(|rd| {
-                    rd.flatten().any(|e| {
-                        e.path().extension().is_some_and(|x| x == "portal")
-                            && std::fs::read_to_string(e.path())
-                                .is_ok_and(|t| t.contains("FileChooser"))
+            && match ask_bus("NameHasOwner", Some(PORTAL)) {
+                Some(reply) if reply.contains("boolean true") => true,
+                Some(_) => ask_bus("ListActivatableNames", None)
+                    .is_some_and(|names| names.contains(PORTAL)),
+                // dbus-send missing or the call failed: the old heuristic,
+                // which at least distinguishes "no portal installed" from
+                // "portal installed".
+                None => {
+                    let portal_dirs = [
+                        std::path::PathBuf::from("/usr/share/xdg-desktop-portal/portals"),
+                        std::path::PathBuf::from("/usr/local/share/xdg-desktop-portal/portals"),
+                    ];
+                    portal_dirs.iter().any(|dir| {
+                        std::fs::read_dir(dir).is_ok_and(|rd| {
+                            rd.flatten().any(|e| {
+                                e.path().extension().is_some_and(|x| x == "portal")
+                                    && std::fs::read_to_string(e.path())
+                                        .is_ok_and(|t| t.contains("FileChooser"))
+                            })
+                        })
                     })
-                })
-            });
+                }
+            };
         chooser || which_on_path("zenity")
     }
 
