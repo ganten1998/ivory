@@ -7,6 +7,8 @@
 #   ./install.sh --system        into /usr/local and /usr/lib/vst3 (needs root)
 #   ./install.sh --prefix DIR    somewhere else entirely
 #   ./install.sh --desktop       menu entry + icon, without being asked
+#   ./install.sh --deps          install missing video-acceleration packages
+#   ./install.sh --no-deps       never touch the package manager, just advise
 #   ./install.sh --no-desktop    the binary only, no menu entry
 #   ./install.sh --uninstall     take it all back out
 #   ./install.sh --dry-run       print what would happen and do nothing
@@ -39,6 +41,8 @@ Install Tangent — the application, the VST3 plugin, or both.
   ./install.sh --prefix DIR    somewhere else entirely
   ./install.sh --desktop       menu entry + icon, without being asked
   ./install.sh --no-desktop    the binary only, no menu entry
+  ./install.sh --deps          install missing video-acceleration packages
+  ./install.sh --no-deps       never touch the package manager, just advise
   ./install.sh --uninstall     take it all back out
   ./install.sh --dry-run       print what would happen and do nothing
 
@@ -50,6 +54,13 @@ Desktop integration is the menu entry and the icon: it is what makes Tangent
 appear in your application menu and in launchers like rofi, wofi and dmenu.
 You are asked about it unless --desktop or --no-desktop says so; with no
 terminal to ask in, it is installed.
+
+Video acceleration is checked at the end. Tangent records correctly without it;
+what it costs is processor — a take encoded on the CPU can use two and a half
+cores where the GPU uses a twentieth of one. If something is missing you are
+shown the exact command for your distribution and asked whether to run it.
+--deps runs it without asking, --no-deps never touches the package manager.
+Nothing here can fail the install.
 USAGE
 }
 
@@ -67,6 +78,10 @@ VST3_EXPLICIT=0
 # see the prompt below. Not a plain 1, because "install it" and "the user has
 # not said" are different states and the flags have to be able to say both.
 WANT_DESKTOP=""
+# Hardware video acceleration packages. Empty means "ask", for the same reason
+# WANT_DESKTOP is: "install them" and "the user has not been asked" are
+# different states, and a non-interactive run must be able to tell them apart.
+WANT_DEPS=""
 DRY=0
 UNINSTALL=0
 MODE=user
@@ -79,6 +94,8 @@ while [ $# -gt 0 ]; do
         --both)      WANT_APP=1; WANT_VST3=1; VST3_EXPLICIT=1 ;;
         --desktop)    WANT_DESKTOP=1 ;;
         --no-desktop) WANT_DESKTOP=0 ;;
+        --deps)       WANT_DEPS=1 ;;
+        --no-deps)    WANT_DEPS=0 ;;
         --system)    MODE=system ;;
         --user)      MODE=user ;;
         --prefix)    shift; [ $# -gt 0 ] || { echo "--prefix needs a directory" >&2; exit 2; }
@@ -123,6 +140,251 @@ run() {
     else
         "$@"
     fi
+}
+
+# ── Hardware video acceleration ─────────────────────────────────────────────
+#
+# Tangent works without any of this, and that is why none of it is ever an
+# error. What it buys is the difference between a take that costs a few percent
+# of a core and one that costs two and a half: hardware MJPEG decode for the
+# camera and hardware H.264 encode for the file. Measured on the machine this
+# is built on, over 10 s of 720p, software x264 spent 25.54 s of CPU and VA-API
+# spent 0.70 s.
+#
+# So: look for each piece, offer to install what is missing, and if that is not
+# possible say the exact command. Never fail.
+
+# The distribution family, from ID and then ID_LIKE.
+#
+# **ID_LIKE is the part that matters**, because it is what makes this work on
+# the derivatives people actually run rather than only on the five names
+# someone thought of. Zorin is `ID=zorin` with `ID_LIKE="ubuntu debian"`, Mint
+# is `ID=linuxmint`, Pop is `ID=pop` — an enumerated list of names misses all
+# of them silently, which is worse than not checking at all.
+distro_family() {
+    (
+        # Overridable so the mapping can be TESTED against a real Zorin or Mint
+        # os-release rather than reasoned about. Defaults to the real file.
+        . "${OS_RELEASE:-/etc/os-release}" 2>/dev/null || exit 0
+        for _id in "${ID:-}" ${ID_LIKE:-}; do
+            case "$_id" in
+                debian|ubuntu)       echo debian; exit 0 ;;
+                fedora|rhel|centos)  echo fedora; exit 0 ;;
+                arch)                echo arch;   exit 0 ;;
+                void)                echo void;   exit 0 ;;
+                suse|opensuse*|sles) echo suse;   exit 0 ;;
+            esac
+        done
+    )
+}
+
+# Which GPU is in the render node, because the driver package differs per
+# vendor and recommending the wrong one is worse than recommending nothing.
+gpu_vendor() {
+    for _v in /sys/class/drm/renderD*/device/vendor; do
+        [ -r "$_v" ] || continue
+        case "$(cat "$_v" 2>/dev/null)" in
+            0x8086) echo intel;  return ;;
+            0x1002) echo amd;    return ;;
+            0x10de) echo nvidia; return ;;
+        esac
+    done
+}
+
+have_libva() {
+    if command -v ldconfig >/dev/null 2>&1 &&
+       ldconfig -p 2>/dev/null | grep -q "libva\.so\.2"; then
+        return 0
+    fi
+    for _d in /usr/lib64 /usr/lib /usr/lib/x86_64-linux-gnu; do
+        [ -e "$_d/libva.so.2" ] && return 0
+    done
+    return 1
+}
+
+# libva is only a dispatcher: it dlopens a per-vendor backend, and having the
+# dispatcher without a backend is the common case on a minimal install. It is
+# also the case that looks fine until something asks it to decode.
+have_va_driver() {
+    for _d in ${LIBVA_DRIVERS_PATH:-} /usr/lib64/dri /usr/lib/dri \
+              /usr/lib/x86_64-linux-gnu/dri; do
+        [ -d "$_d" ] || continue
+        for _f in "$_d"/*_drv_video.so; do
+            [ -e "$_f" ] && return 0
+        done
+    done
+    return 1
+}
+
+# **A separate question from "is ffmpeg installed".** The ffmpeg bundled with
+# Tangent is a static build with no VA-API in it at all, so hardware ENCODE
+# depends on a system ffmpeg that has it. Without one, takes still record —
+# they just encode on the CPU, and nothing says so.
+have_vaapi_ffmpeg() {
+    _ff="$(command -v ffmpeg 2>/dev/null)"
+    [ -n "$_ff" ] || return 1
+    "$_ff" -hide_banner -hwaccels </dev/null 2>/dev/null | grep -q "^vaapi$"
+}
+
+# **Package names, and how far each one is trusted.** The Void row is verified
+# on the machine this is built on. The Debian and Arch rows are the names those
+# distributions actually ship and are high confidence. Fedora and openSUSE are
+# from documentation rather than from a running system, which is why a failed
+# install falls back to printing the command rather than pretending it worked.
+#
+# Fedora takes `ffmpeg-free` and not `ffmpeg`: the plain name lives in RPM
+# Fusion, which a stock Fedora does not have enabled, so recommending it gives
+# "No match for argument". `ffmpeg-free` is in the default repositories and is
+# built with VA-API.
+va_packages() {     # $1 family, $2 vendor
+    case "$1:$2" in
+        debian:intel) echo "i965-va-driver intel-media-va-driver vainfo" ;;
+        debian:amd)   echo "mesa-va-drivers vainfo" ;;
+        fedora:intel) echo "libva-intel-driver intel-media-driver libva-utils" ;;
+        fedora:amd)   echo "mesa-va-drivers libva-utils" ;;
+        arch:intel)   echo "libva-intel-driver intel-media-driver libva-utils" ;;
+        arch:amd)     echo "libva-mesa-driver libva-utils" ;;
+        void:intel)   echo "libva-intel-driver intel-media-driver libva-utils" ;;
+        void:amd)     echo "mesa-vaapi libva-utils" ;;
+        suse:intel)   echo "libva-intel-driver intel-media-driver libva-utils" ;;
+        suse:amd)     echo "Mesa-libva libva-utils" ;;
+    esac
+}
+
+install_cmd() {     # $1 family, rest packages
+    _f="$1"; shift
+    [ "$#" -gt 0 ] || return 1
+    _sudo=""
+    [ "$(id -u)" = "0" ] || _sudo="sudo "
+    case "$_f" in
+        debian) echo "${_sudo}apt install -y $*" ;;
+        fedora) echo "${_sudo}dnf install -y $*" ;;
+        arch)   echo "${_sudo}pacman -S --needed $*" ;;
+        void)   echo "${_sudo}xbps-install -Sy $*" ;;
+        suse)   echo "${_sudo}zypper install -y $*" ;;
+        *)      return 1 ;;
+    esac
+}
+
+# Look for every piece, install what is missing if allowed to, and otherwise
+# print the command that fixes it. Called once, at the end of a successful
+# install, and it never changes the exit status.
+media_prereqs() {
+    _fam="$(distro_family)"
+    _ven="$(gpu_vendor)"
+
+    # **The one prerequisite no package manager can supply.** Without a render
+    # node there is nothing to accelerate against, and the reason is a driver
+    # or a permission rather than a missing library.
+    _node=""
+    for _n in /dev/dri/renderD*; do
+        [ -e "$_n" ] && { _node="$_n"; break; }
+    done
+    if [ -z "$_node" ]; then
+        echo
+        echo "  NOTE: no GPU render node (/dev/dri/renderD*) was found, so video"
+        echo "        will be decoded and encoded on the CPU. Takes still work;"
+        echo "        they cost a great deal more processor. This usually means"
+        echo "        no graphics driver is loaded for your card."
+        return 0
+    fi
+    if [ ! -r "$_node" ] || [ ! -w "$_node" ]; then
+        echo
+        echo "  NOTE: $_node exists but this account cannot open it, so video"
+        echo "        will be handled on the CPU. Add yourself to its group,"
+        echo "        then log out and back in - a new group does not apply to"
+        echo "        a session that is already running:"
+        echo "          sudo usermod -aG video,render \"${USER:-$(id -un)}\""
+        return 0
+    fi
+
+    # NVIDIA can do this, but not through the VA-API path Tangent uses: it
+    # needs the proprietary driver plus a translation layer, version-matched.
+    # Saying so is more use than recommending a package that may not help.
+    if [ "$_ven" = "nvidia" ]; then
+        echo
+        echo "  NOTE: NVIDIA graphics detected. Tangent's hardware video path is"
+        echo "        VA-API, which NVIDIA does not provide directly, so takes"
+        echo "        will encode on the CPU. Everything else works normally."
+        return 0
+    fi
+
+    _miss_driver=0; _miss_ffmpeg=0
+    have_libva     || _miss_driver=1
+    have_va_driver || _miss_driver=1
+    have_vaapi_ffmpeg || _miss_ffmpeg=1
+
+    if [ "$_miss_driver" = "0" ] && [ "$_miss_ffmpeg" = "0" ]; then
+        echo
+        echo "  Hardware video acceleration: ready."
+        return 0
+    fi
+
+    _pkgs="$(va_packages "$_fam" "$_ven")"
+    [ "$_miss_driver" = "1" ] || _pkgs=""
+    if [ "$_miss_ffmpeg" = "1" ]; then
+        case "$_fam" in
+            fedora) _pkgs="$_pkgs ffmpeg-free" ;;
+            *)      _pkgs="$_pkgs ffmpeg" ;;
+        esac
+    fi
+    _pkgs="$(echo $_pkgs)"          # squeeze the spaces the two branches leave
+
+    echo
+    echo "  NOTE: hardware video acceleration is not available yet, so takes"
+    if [ "$_miss_driver" = "1" ]; then
+        echo "        will decode the camera on the CPU"
+    fi
+    if [ "$_miss_ffmpeg" = "1" ]; then
+        echo "        will encode the video on the CPU (the ffmpeg shipped with"
+        echo "        Tangent is a static build without VA-API in it)"
+    fi
+    echo "        Everything records correctly either way; this is about how"
+    echo "        much processor a take costs."
+
+    _cmd="$(install_cmd "$_fam" $_pkgs)" || {
+        echo "        Install your distribution's VA-API driver for your GPU,"
+        echo "        and an ffmpeg built with VA-API."
+        return 0
+    }
+
+    _do="$WANT_DEPS"
+    if [ -z "$_do" ]; then
+        # Ask only where there is somebody to answer. A piped or scripted
+        # install must not stop on a question nobody can see.
+        if [ -t 0 ] && [ -t 1 ]; then
+            echo
+            echo "        $_cmd"
+            printf '  Run that now? [Y/n] '
+            read -r _reply || _reply=""
+            case "$_reply" in [Nn]*) _do=0 ;; *) _do=1 ;; esac
+        else
+            _do=0
+        fi
+    fi
+
+    if [ "$_do" = "1" ]; then
+        if [ "$DRY" = "1" ]; then
+            printf '  would: %s\n' "$_cmd"
+            return 0
+        fi
+        echo "  running: $_cmd"
+        # Deliberately not fatal. A refused sudo, a held package or no network
+        # is a reason to fall back to telling the user, not to fail an install
+        # that has already succeeded.
+        if sh -c "$_cmd"; then
+            echo "  done. Restart Tangent if it is running."
+        else
+            echo
+            echo "  That did not complete. You can run it yourself later:"
+            echo "        $_cmd"
+        fi
+    else
+        echo
+        echo "  To enable it later:"
+        echo "        $_cmd"
+    fi
+    return 0
 }
 
 # The nearest ancestor of $1 that exists.
@@ -355,19 +617,21 @@ if [ "$WANT_APP" = "1" ]; then
         echo "  NOTE: no Vulkan driver was found, so takes will record audio and"
         echo "        MIDI but not video. Any Vulkan driver fixes it - mesa's"
         echo "        lavapipe works on every GPU:"
-        . /etc/os-release 2>/dev/null || ID=""
-        case "$ID" in
-            debian|ubuntu|linuxmint|pop)
-                     echo "          sudo apt install mesa-vulkan-drivers" ;;
-            fedora)  echo "          sudo dnf install mesa-vulkan-drivers" ;;
-            arch|manjaro|endeavouros)
-                     echo "          sudo pacman -S vulkan-swrast" ;;
-            void)    echo "          sudo xbps-install mesa-vulkan-lavapipe" ;;
-            opensuse*|suse*)
-                     echo "          sudo zypper install libvulkan1 Mesa-vulkan-device-select" ;;
-            *)       echo "          (install your distribution's mesa Vulkan package)" ;;
+        # `distro_family` rather than a list of ID values: the list missed every
+        # derivative that does not name itself after its parent. Zorin, Mint and
+        # Pop all landed in the `*)` branch and were told to work it out
+        # themselves, which is precisely who the note is for.
+        case "$(distro_family)" in
+            debian) echo "          sudo apt install mesa-vulkan-drivers" ;;
+            fedora) echo "          sudo dnf install mesa-vulkan-drivers" ;;
+            arch)   echo "          sudo pacman -S vulkan-swrast" ;;
+            void)   echo "          sudo xbps-install mesa-vulkan-lavapipe" ;;
+            suse)   echo "          sudo zypper install libvulkan1 Mesa-vulkan-device-select" ;;
+            *)      echo "          (install your distribution's mesa Vulkan package)" ;;
         esac
     fi
+
+    media_prereqs
 fi
 [ "$WANT_VST3" = "1" ] && echo "Your DAW will find the plugin the next time it scans for plugins."
 echo "Hold H in either one to see every keyboard shortcut."

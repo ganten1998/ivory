@@ -339,7 +339,28 @@ build_linux() {
     echo "FAIL: $out does not contain exactly one plugin binary" >&2
     exit 1
   fi
-  echo "    binary, plugin and installer all present"
+  # **The installer itself has to RUN, not merely be present.** `sh -n` catches
+  # a syntax error; it does not catch a line that parses fine and does the wrong
+  # thing. A stray uncommented line in the header comment block — one lost '#' —
+  # is valid shell that re-invokes the script, and each invocation does it
+  # again: an exponential fork bomb that only appears when someone runs it.
+  # `--help` exercises argument parsing and exits, under a process cap so a
+  # regression fails this build instead of the machine running it.
+  _inst="$(mktemp -d)"
+  tar -xzf "$out" -C "$_inst" --wildcards '*/install.sh' 2>/dev/null ||
+    tar -xzf "$out" -C "$_inst"
+  _sh="$(find "$_inst" -name install.sh -print -quit)"
+  if ! sh -n "$_sh"; then
+    echo "FAIL: install.sh is not valid POSIX sh" >&2; rm -rf "$_inst"; exit 1
+  fi
+  if ! ( ulimit -u 200; timeout 20 sh "$_sh" --help >/dev/null 2>&1 </dev/null ); then
+    echo "FAIL: install.sh --help did not exit cleanly under a process cap" >&2
+    echo "      (a self-invoking line in the header will look exactly like this)" >&2
+    rm -rf "$_inst"; exit 1
+  fi
+  rm -rf "$_inst"
+
+  echo "    binary, plugin and installer all present; install.sh --help runs"
 }
 
 mkdir -p dist
