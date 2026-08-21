@@ -2279,21 +2279,35 @@ which strips are lost. One needs a test, the other needs an engine.
 - `a_mono_input_still_writes_a_stereo_take` puts two different numbers on the
   two sides.
 
-### Stage 4, half done
+### Stage 4, done (4.28.0)
 
-`ivory-record`'s capture takes several inputs of one interface now — `Picks`,
-up to `MAX_PICKS`, laid end to end in one ring, one callback, one clock. What
-is NOT done is everything above it: nothing can choose more than one yet, there
-is one `Strip::Input`, and the mixer draws one input column.
+Several inputs of one interface, one strip each.
 
-The remaining work, in order:
+- **The capture** keeps up to `MAX_PICKS` inputs in ONE ring, laid end to end —
+  a mono input then a stereo pair is one channel then two. One callback, one
+  clock, one set of marks, which is what makes them sample-aligned with each
+  other for free and why a second DEVICE stays declined.
+- **`Strip::Input(usize)`**, `STRIPS = SLOTS + INPUTS + 3`, `INPUTS = 4`. Three
+  copies of that number — `ivory-ui`'s, the host's, and `ivory-record`'s
+  `MAX_PICKS` — pinned together by
+  `the_desk_has_as_many_inputs_as_the_capture_can_keep`.
+- **`Selection::extra`** carries the inputs open beside `wanted`. Anything
+  naming a different device is DROPPED, not obeyed: one box is one clock, and a
+  settings file from other hardware must cost the extras and not the
+  microphone.
+- **Three orders that have to agree** — the picks, the capture's channel
+  layout, and the strips — all come from `devices::open_inputs`. The widths
+  come off the SINK (`CaptureSink::widths`), not off what was asked for: a
+  device that dropped a pick would otherwise point every strip at the wrong
+  column, silently, with plausible audio in it.
+- **The desk draws the open inputs and ONE spare.** `StripView::hidden` is what
+  makes a column disappear rather than sit there as a plus. The first input is
+  never "empty" — it is the band's microphone row seen twice.
 
-1. `Selection` and settings carry N chosen inputs, all of the same device.
-2. `Strip::Input(usize)`, `STRIPS = SLOTS + INPUTS + 3` — **and that moves
-   every index in `strip_colors`/`strip_sends`/the mute masks**, so it needs
-   the same kind of migration `strip_colors_v2` just did.
-3. The mixer draws the chosen inputs plus one empty outline with a plus, which
-   is the idiom the instrument slots already use.
+**Every array indexed by a channel moved**, so `settings_version` 10 shifts
+`strip_colors`, `strip_sends` and the mute/solo masks past the new columns.
+Without it a violet backing track comes back on input 2. See
+`desk_channel_moved`.
 
 ---
 
