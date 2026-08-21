@@ -1,6 +1,8 @@
 # Ivory 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-20. **The app is now called TANGENT.** Newest work is
+§2v: a strip per instrument slot, the mixer as a real surface, and the neck's
+interval margin. Before it,
 §2u: the DESK — the effects as a bus, the limiter on the master, and a mixer
 view behind Tab — plus the camera preview, two DX7 reports and the plugin rack
 that was listing effects it could not load. Before it,
@@ -1991,6 +1993,53 @@ is a second decision.
 **A second interface is declined, not deferred.** An aggregate device presents
 as one device with one clock, so anyone with that rig arrives at stage 4's
 cheap case anyway. The feature would be a worse version of what the OS does.
+
+---
+
+## 2v. 2026-08-20 — a strip per slot, and the neck says what you are playing
+
+Shipped as **4.25.0**, on the owner's report against 4.24.0's mixer.
+
+### Every instrument slot is a channel
+
+They loaded a second instrument and found no second strip, which is fair: a
+rack of five with one fader is a master with extra steps. The lumped
+"instrument" channel is gone and so is the trim invented for it
+(`instrument_gain`, which never reached a control). Each slot has its own
+fader — the one the rack has always had — its own send, its own mute and its
+own solo. An empty slot is an outline with a plus that opens the same picker
+the rack opens.
+
+`Strip` is `Slot(usize) | Input | Track | Click | Fx` on both sides of the
+firewall now, converted by an exhaustive match, and `STRIPS` is `SLOTS + 4`.
+
+**Two bugs the tests caught doing it, both worth remembering.** The effects bus
+was being cleared AFTER the slots wrote their sends into it — a reverb knob
+that did nothing at all except for the click. And the built-in bypassed
+`mix_in` entirely, so neither mute nor send reached it; it also plays as a
+FALLBACK with no slot assigned, and in that mode it belonged to no channel and
+ran at unity past every fader on the desk. It is the first slot's now.
+
+### The mixer is a surface
+
+With the view up the piano is not hidden, it is NOT THERE. Handing `piano_rect`
+to the hit test left an invisible keyboard under the strips that still sounded
+when a fader near the bottom of the window was pressed — the owner's words were
+"it's like the piano is just invisible".
+
+### The neck's interval strip
+
+A thin margin at the right of the guitar view, on by default, with a row in the
+Fretboard hover. **Aligned to the STRINGS**: a C major with its root at the
+third fret of the A string reads `R` beside the A string, because the view is
+vertical because a neck is. That is why it is fed by the VOICING and not by a
+pitch-class set — which notes are on which strings is something only the shape
+knows — while the tonic still comes from the detector.
+
+The neck stretches rather than losing frets: the strip is taken out of the rect
+BEFORE `Geom` is built. Sized from the panel's HEIGHT so it stays proportional
+to the string spacing, clamped, and with no heading — the first version took
+two frets' width under a word that was the widest thing in it.
 
 ---
 
