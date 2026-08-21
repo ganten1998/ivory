@@ -3401,12 +3401,8 @@ impl IvoryApp {
 
     /// The backing track's level, trim and length, for the host to push at the
     /// engine. Seconds, because that is what the settings hold.
-    pub fn track_playback(&self) -> (f32, f64, f64) {
-        (
-            self.settings.track_gain as f32,
-            self.settings.track_in,
-            self.settings.track_out,
-        )
+    pub fn track_playback(&self) -> f32 {
+        self.settings.track_gain as f32
     }
 
     /// What the effects ship as. Told by the host; see [`EffectDefaults`].

@@ -32,6 +32,7 @@ mod midi;
 /// anyone can flip (docs/RECORDER-PLAN.md §12a).
 #[cfg(feature = "recorder")]
 mod record;
+mod transport;
 
 use ivory_ui::settings::Settings;
 

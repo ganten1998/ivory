@@ -110,6 +110,11 @@ impl MidiPorts for DeviceMidi {
 #[cfg(feature = "recorder")]
 struct Recorder {
     session: crate::record::Session,
+    /// The playhead's one owner. See `transport.rs` for the whole argument;
+    /// the short form is that the engine is dropped and rebuilt whenever the
+    /// audio path changes, and a position that lived only in the engine
+    /// returned to 0:00 mid-session with nothing host-side to restore it.
+    transport: crate::transport::Transport,
     /// The monitor output: the hosted instrument and the click, summed in one
     /// callback.
     ///
@@ -1088,6 +1093,15 @@ impl DesktopApp {
             name.as_deref().and_then(take::sanitise_slug).as_deref(),
         );
         state.audio_name = open_name.or(audio_uid);
+        // The playhead and the audition, as plain data. The rate is the
+        // engine's own; with no engine the transport answers from its last
+        // known truth, which is the whole reason it owns the number.
+        state.playing = self.recorder.transport.playing();
+        state.position_s = {
+            let engine = self.recorder.engine.as_ref();
+            let rate = engine.map_or(0.0, |e| f64::from(e.output().sample_rate));
+            self.recorder.transport.position_s(engine, rate)
+        };
         // **One strip per input, filled from the selection.** The names and
         // the widths come from the same function the picks do, so the column
         // the mixer draws and the channels the capture keeps cannot drift
@@ -1260,6 +1274,26 @@ impl DesktopApp {
         // at all — so it also has to ask for the next frame.
         if self.recorder.session.tick(&root, name.as_deref()) {
             ctx.request_repaint();
+        }
+        // **The transport, reconciled AFTER the session has ticked** — the
+        // rolling level is derived from the session's state, and publishing it
+        // a frame early was how the take's first block started from the old
+        // position. Rolling during the take proper, never the count-in: the
+        // count-in is what counts you IN to the track, and a track that
+        // started under it would have its downbeat a bar from the one being
+        // clicked.
+        {
+            let session_rolling = matches!(
+                self.recorder.session.state(),
+                ivory_ui::recorder::RecordState::Rolling
+            );
+            let engine = self.recorder.engine.as_ref();
+            self.recorder.transport.push(engine, session_rolling);
+        }
+        // And a repaint while the audition rolls, or the playhead only moves
+        // when the mouse does.
+        if self.recorder.transport.playing() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
         // And a repaint while anything is live, or the meter and the clock
         // update only when the mouse moves.
@@ -1471,6 +1505,20 @@ impl DesktopApp {
         }
         while let Some(request) = self.app.take_recorder_request() {
             match request {
+                // The transport's own two. Handled here rather than queued
+                // deeper: `Transport` is plain state, and the reconcile in
+                // `push_transport` is what carries it to the engine.
+                R::Play => {
+                    // Record owns the transport while a take is writing — a
+                    // green button that could stop the backing track mid-take
+                    // would be a second stop button with worse manners.
+                    if !self.recorder.session.is_recording() {
+                        self.recorder.transport.toggle_play();
+                    }
+                }
+                R::Locate(seconds) => {
+                    self.recorder.transport.locate(seconds);
+                }
                 R::Toggle => {
                     // **Whatever the last take had to say, it is not about
                     // this one.** Stale post-take advice that outlives the
@@ -2178,8 +2226,11 @@ impl DesktopApp {
                 });
                 self.app
                     .set_track_path(file.to_string_lossy().into_owned());
-                if let Some(e) = self.recorder.engine.as_ref() {
-                    e.set_track(Some(Arc::clone(&clip)));
+                if let Some(e) = self.recorder.engine.as_mut() {
+                    e.set_track(Some(crate::instrument::Placed {
+                        clip: Arc::clone(&clip),
+                        start: 0,
+                    }));
                 }
                 self.track = Some(clip);
             }
@@ -2418,30 +2469,16 @@ impl DesktopApp {
         // is pushed every frame like every other monitor setting, and its value
         // at launch is false because the field it comes from starts false.
         e.set_monitor_on(self.app.input_monitor());
-        // The backing track's level and trim, pushed with the rest for the
-        // same reason: the settings are the one live value, so a fader moved,
-        // a project loaded and a hand-edited file all arrive by one path.
-        let (track_gain, from_s, to_s) = self.app.track_playback();
+        // The backing track's level, pushed with the rest for the same
+        // reason: the settings are the one live value, so a fader moved, a
+        // project loaded and a hand-edited file all arrive by one path.
+        //
+        // **The transport is NOT pushed here.** This function runs before the
+        // session ticks, so a level derived here lags the state change by one
+        // frame — the take's first block used to start from the old position.
+        // See `Transport::push`, called after the tick.
+        let track_gain = self.app.track_playback();
         e.set_track_gain(track_gain);
-        let rate = f64::from(e.output().sample_rate);
-        // Seconds to frames HERE, because seconds are what survives a machine
-        // whose device runs at a different rate than the one that set them.
-        let frames = |s: f64| (s.max(0.0) * rate) as u64;
-        e.set_track_trim(frames(from_s), frames(to_s));
-        // **Rolling with the transport — and only while it is Rolling.**
-        //
-        // Not during the count-in: the count-in is what counts you IN to the
-        // track, and a track that started under it would have its downbeat a
-        // bar away from the one being clicked. Not during `Finishing` either,
-        // which is a file flushing after the performance ended.
-        //
-        // Starting at the same instant the take starts writing is also what
-        // makes the two line up: the backing track and the recorded audio
-        // begin on the same sample.
-        e.set_track_playing(matches!(
-            self.recorder.session.state(),
-            ivory_ui::recorder::RecordState::Rolling
-        ));
         // Pushed every frame with the gains, and for the same reason: the
         // settings are the one live value, so a knob dragged, a project loaded
         // and a settings file hand-edited all arrive by the same path.
@@ -2896,6 +2933,7 @@ impl DesktopApp {
             let extra = app.plugin_folders();
             app.set_plugin_list(ivory_host::discover_in(&extra));
             Recorder {
+                transport: crate::transport::Transport::new(),
                 pending_monitor: None,
                 input_names: std::array::from_fn(|_| String::new()),
                 take_note: None,

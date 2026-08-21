@@ -715,6 +715,13 @@ pub struct InputState {
 
 #[derive(Debug, Clone, Default)]
 pub struct RecorderState {
+    /// The playhead, in seconds from 0:00 — what the readout and the waveform
+    /// draw. Filled by the host once a frame; `ivory-ui` never advances a
+    /// clock of its own, so this is a measurement, not a prediction.
+    pub position_s: f64,
+    /// Whether the green button's audition is running. Distinct from
+    /// `state`, which is the TAKE's machine — play is the transport's.
+    pub playing: bool,
     pub state: RecordState,
     pub elapsed_s: f64,
     /// The loudest thing each strip made since the last frame, in
@@ -920,8 +927,9 @@ pub struct SlotState {
 /// copy of the menu. What is here is what needs a THING the app does not own: a
 /// take, or a window belonging to somebody else's code.
 // Not `Copy`: `Audition` carries the notes it wants heard, and a list of them
-// is the only honest shape for a chord.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// is the only honest shape for a chord. Not `Eq`: `Locate` carries seconds,
+// and seconds are `f64`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum RecorderRequest {
     /// The one button. Start a pre-roll, start a take, or stop one — the
     /// session decides which, because only it knows what state it is in.
@@ -945,6 +953,15 @@ pub enum RecorderRequest {
     /// the same reason as `OpenPluginEditor` — a native window may not be
     /// built with an egui frame on the stack.
     OpenInsertEditor(usize, usize),
+    /// The green button: audition from the playhead, no take. Pressed while
+    /// auditioning, it stops and the playhead returns to 0:00. The host
+    /// ignores it while a take is writing — record owns the transport then.
+    Play,
+    /// Put the playhead at this many SECONDS from 0:00. Seconds, because
+    /// seconds survive a device that changes rate; the host converts at the
+    /// engine's own rate. Legal while rolling — that is what the generation
+    /// stamp on the engine side is for.
+    Locate(f64),
     /// Open the patch editor on what the built-in is playing: the host
     /// answers with `IvoryApp::set_patch_edit`.
     EditPatch {

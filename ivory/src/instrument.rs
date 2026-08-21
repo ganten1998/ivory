@@ -1052,7 +1052,27 @@ struct Shared {
     /// The backing track's level, linear.
     track_gain: AtomicU32,
     /// Whether the backing track should be rolling. Set by the transport.
-    track_playing: AtomicBool,
+    /// Where to go, and the generation that makes it an EVENT.
+    ///
+    /// Two fields, because a bare store cannot be told from the same value
+    /// re-asserted — which is exactly how the old `set_track_playing` level
+    /// made a locate inexpressible: the edges were found ON the audio thread,
+    /// so a seek while rolling changed nothing and a seek while stopped was
+    /// overwritten by the rewind. The host stores the payload first and the
+    /// generation last, Release; the callback consumes generation-first,
+    /// Acquire. See `Renderer::run_transport`.
+    transport_at: AtomicU64,
+    transport_req: AtomicU64,
+    /// The generation the callback has APPLIED. `ack == req` means
+    /// `transport_pos` answers the question the host asked.
+    transport_ack: AtomicU64,
+    /// The transport is moving. A LEVEL, and correctly so — "should I be
+    /// moving" genuinely is a level; only the seek was ever an event wearing a
+    /// level's clothes. Safe to re-assert every frame, because nothing keys
+    /// off its edges any more.
+    rolling: AtomicBool,
+    /// The frame the callback reached at the end of the last chunk.
+    transport_pos: AtomicU64,
     /// A backing track has been handed over, playing or not.
     ///
     /// Read from the UI thread, which cannot see `Renderer::track` — that lives
@@ -1073,14 +1093,20 @@ struct Shared {
     /// Where the track starts and stops, in frames. `out` of zero means "to
     /// the end", so a clip with no trim needs no knowledge of its own length
     /// down here.
-    track_in: AtomicU64,
-    track_out: AtomicU64,
+
     /// A clip on its way to the renderer, or `Some(None)` to take one away.
     ///
     /// **A mutex the audio thread only ever `try_lock`s**, exactly like
     /// `pending_voice`: importing a file is a thing that happens once and can
     /// wait a block; a block that waits on a file import is a dropout.
-    pending_track: std::sync::Mutex<Option<Option<Arc<ivory_record::decode::Clip>>>>,
+    /// The take: the clip travels by RING now, in each direction, exactly as a
+    /// plugin does — because the mutex it replaced had no return channel, so
+    /// `self.track = next` freed up to 460 MB of `Vec<f32>` INSIDE the audio
+    /// callback whenever the renderer held the last reference. The displaced
+    /// clip goes back on `track_retiring` and is dropped by the UI thread that
+    /// sent its replacement. The rings live on `Engine`/`Renderer`; this
+    /// struct keeps only the flag.
+    track_loaded_flag: (),
     /// A live-input ring on its way to the renderer, or `None` taking one away.
     ///
     /// Behind a mutex and picked up with `try_lock`, exactly like the backing
@@ -1246,13 +1272,16 @@ impl Shared {
             // instrument and not like a room, and `Effects::process` skips its
             // whole cost at zero.
             track_gain: AtomicU32::new(1.0f32.to_bits()),
-            track_playing: AtomicBool::new(false),
+            transport_at: AtomicU64::new(0),
+            transport_req: AtomicU64::new(0),
+            transport_ack: AtomicU64::new(0),
+            rolling: AtomicBool::new(false),
+            transport_pos: AtomicU64::new(0),
             track_loaded: AtomicBool::new(false),
             monitor_on: AtomicBool::new(false),
             monitor_gain: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
-            track_in: AtomicU64::new(0),
-            track_out: AtomicU64::new(0),
-            pending_track: std::sync::Mutex::new(None),
+
+            track_loaded_flag: (),
             pending_monitor: std::sync::Mutex::new(None),
             monitor_slip: AtomicU64::new(0),
             monitor_backlog: AtomicU32::new(0),
@@ -1314,39 +1343,9 @@ impl Shared {
         f32::from_bits(cell.load(Ordering::Relaxed))
     }
 
-    /// Publish one slot's gain. **A slot that does not exist is ignored**, not
-    /// an index: this is reached from UI code, and the app's panic hook turns a
-    /// panic into a dialog and `exit(1)`.
-    /// Hand the renderer a backing track, or `None` to take one away.
-    fn set_track(&self, clip: Option<Arc<ivory_record::decode::Clip>>) {
-        // Recorded HERE rather than when the renderer picks the clip up: the
-        // question it answers is "did the user choose a track", and they had
-        // by the time this was called. A flag set on the audio thread's next
-        // buffer would be false for anybody who loaded a track and pressed
-        // record inside the same frame.
-        self.track_loaded.store(clip.is_some(), Ordering::Relaxed);
-        if let Ok(mut g) = self.pending_track.lock() {
-            *g = Some(clip);
-        }
-    }
-
     fn set_track_gain(&self, linear: f32) {
         self.track_gain
             .store(sane_gain(linear).to_bits(), Ordering::Relaxed);
-    }
-
-    fn set_track_trim(&self, from: u64, to: u64) {
-        self.track_in.store(from, Ordering::Relaxed);
-        self.track_out.store(to, Ordering::Relaxed);
-    }
-
-    /// Roll the backing track, or stop it and rewind to the in-point.
-    ///
-    /// **Rewind on stop, not on start.** Both would work; only this one also
-    /// makes stopping leave the track where a person expects to find it, and
-    /// "pressing stop puts it back to the top" is what everybody assumes.
-    fn set_track_playing(&self, playing: bool) {
-        self.track_playing.store(playing, Ordering::Relaxed);
     }
 
     fn set_slot_gain(&self, slot: usize, linear: f32) {
@@ -1547,6 +1546,21 @@ struct Slot {
     gain: f32,
 }
 
+/// A clip and where it begins on the timeline, in frames.
+///
+/// **`start` is 0 for the backing track, and it is one field and one
+/// subtraction** — the whole difference between "the backing track" and "a
+/// clip". It rides WITH the clip rather than in a separate atomic, so a clip
+/// and its position can never disagree; the renderer positions it as
+/// `transport_pos - start` and everything before the clip or past its end is
+/// silence. A second clip on a lane needs no new concept and no change to the
+/// handover protocol.
+#[derive(Clone)]
+pub struct Placed {
+    pub clip: Arc<ivory_record::decode::Clip>,
+    pub start: u64,
+}
+
 /// How many effect inserts a channel has room for. See the UI's own copy.
 pub const INSERTS: usize = ivory_ui::recorder::INSERTS;
 
@@ -1709,11 +1723,25 @@ struct Renderer {
     /// megabytes of `Vec<f32>` and the audio thread must never allocate or
     /// free one, so it arrives behind an `Arc` through `pending_track` and the
     /// old one is dropped by whoever pushed the new one.
-    track: Option<Arc<ivory_record::decode::Clip>>,
-    track_pos: u64,
+    track: Option<Placed>,
+    /// The transport's position in frames, advanced by `run_transport` and
+    /// nothing else. Project frames, not clip frames: a clip positions itself
+    /// as `pos - placed.start`.
+    pos: u64,
     track_gain: f32,
-    /// Whether it was rolling last block, so the rewind happens once.
-    track_was_playing: bool,
+    /// The transport generation this callback has applied. See `run_transport`.
+    seen_req: u64,
+    /// Whether the last chunk rolled, for the note flush on a falling edge —
+    /// renderer-local, because nothing OUTSIDE the callback keys off edges any
+    /// more; this one exists so a stop can end the notes it strands.
+    was_rolling: bool,
+    /// Every pitch currently sounding, from the note stream this renderer
+    /// itself handed out. What a stop or a jump has to end.
+    sounding: u128,
+    /// The clip arriving, and the one going back to be dropped where it came
+    /// from. The pair IS the routing, exactly as a plugin's is.
+    track_incoming: Consumer<Option<Placed>>,
+    track_retiring: Producer<Option<Placed>>,
     builtin: crate::dx7::Dx7,
     /// The built-in's own output, before its slot gain.
     ///
@@ -1991,6 +2019,18 @@ impl Renderer {
                 break;
             }
             if let Some(note) = note_from_midi(event.status, event.data1, event.data2) {
+                // The ledger of what is sounding, kept beside the push so
+                // every path that delivers a note also records it — a stop or
+                // a locate reads this to know which pitches it strands.
+                if let Ok(pitch) = u8::try_from(note.pitch) {
+                    if pitch < 128 {
+                        if note.on {
+                            self.sounding |= 1 << pitch;
+                        } else {
+                            self.sounding &= !(1 << pitch);
+                        }
+                    }
+                }
                 self.notes.push(Note { offset, ..note });
             } else if is_pedal(event.status, event.data1) {
                 // Delivered as a VST3 parameter change, which is the only door
@@ -2187,7 +2227,32 @@ impl Renderer {
             // The BACKING TRACK and the INPUT, each adding itself to the mix
             // and to the bus in one pass. Both were downstream of the effects
             // before and reached neither.
-            self.mix_track(n, muted, soloed);
+            //
+            // **The transport first, once per chunk.** A locate or a falling
+            // edge strands whatever notes are sounding — the keys did not come
+            // up just because the timeline moved — so the strands are ENDED:
+            // the built-in by its own switch, every hosted voice by note-offs
+            // appended to this block's list, which is the same list they were
+            // struck from.
+            let (at, rolling, jumped) = self.run_transport(n);
+            if (jumped || (self.was_rolling && !rolling)) && self.sounding != 0 {
+                self.builtin.all_notes_off();
+                for pitch in 0..128u8 {
+                    if self.sounding & (1 << pitch) != 0
+                        && self.notes.len() < MAX_EVENTS_PER_BLOCK
+                    {
+                        self.notes.push(ivory_host::Note {
+                            offset: 0,
+                            pitch: i16::from(pitch),
+                            velocity: 0.0,
+                            on: false,
+                        });
+                    }
+                }
+                self.sounding = 0;
+            }
+            self.was_rolling = rolling;
+            self.mix_track(at, rolling, n, muted, soloed);
             self.mix_monitor(n, muted, soloed);
             // ── the click, and what it sends ───────────────────────────
             //
@@ -2692,43 +2757,62 @@ impl Renderer {
         self.room_live = withheld > 1.0e-4;
     }
 
-    /// Add the backing track to the bus, if one is loaded and rolling.
+    /// The whole transport: where this chunk starts, and whether it moves.
+    ///
+    /// **The locate is consumed BEFORE the level is read, in one call**, so a
+    /// seek published before a stop can never be honoured after it — the
+    /// Acquire pairs with the host's Release, and a callback that sees the new
+    /// generation is guaranteed to see every store that preceded it. Per
+    /// CHUNK, not per callback: `mix_track` runs inside the chunk loop, and
+    /// advancing once per callback would hand every chunk after the first the
+    /// same clip samples.
+    ///
+    /// Returns `(at, rolling, jumped)`. A jump — or the level falling — is what
+    /// ends the notes the move strands; see the flush at the call site.
+    fn run_transport(&mut self, frames: usize) -> (u64, bool, bool) {
+        let req = self.shared.transport_req.load(Ordering::Acquire);
+        let jumped = req != self.seen_req;
+        if jumped {
+            self.seen_req = req;
+            self.pos = self.shared.transport_at.load(Ordering::Relaxed);
+            self.shared.transport_ack.store(req, Ordering::Release);
+        }
+        let rolling = self.shared.rolling.load(Ordering::Relaxed);
+        let at = self.pos;
+        if rolling {
+            self.pos += frames as u64;
+        }
+        self.shared.transport_pos.store(self.pos, Ordering::Relaxed);
+        (at, rolling, jumped)
+    }
+
+    /// Add the backing track to the bus, if one is loaded and the transport is
+    /// rolling.
     ///
     /// The clip is stereo at the device's rate — `decode` guarantees both — so
     /// there is no resampling and no channel mapping here, which is the whole
     /// reason it is guaranteed there.
-    fn mix_track(&mut self, frames: usize, muted: u32, soloed: u32) {
-        // A clip arriving, or being taken away. `try_lock`, never `lock`.
-        if let Ok(mut pending) = self.shared.pending_track.try_lock() {
-            if let Some(next) = pending.take() {
-                self.track = next;
-                self.track_pos = 0;
-                self.track_was_playing = false;
+    fn mix_track(&mut self, at: u64, rolling: bool, frames: usize, muted: u32, soloed: u32) {
+        // A clip arriving — and the displaced one going BACK, by the racks'
+        // own protocol: no room to return it, no swap this block. Dropping it
+        // here would free a hundred megabytes inside the callback.
+        if self.track_retiring.slots() > 0 {
+            if let Ok(next) = self.track_incoming.pop() {
+                let old = std::mem::replace(&mut self.track, next);
+                let _ = self.track_retiring.push(old);
             }
         }
-        let playing = self.shared.track_playing.load(Ordering::Relaxed);
-        let from = self.shared.track_in.load(Ordering::Relaxed);
-        if !playing {
-            // Stopped: back to the in-point, once, so the next press starts
-            // where the trim says and not where the last stop left it.
-            if self.track_was_playing {
-                self.track_pos = from;
-                self.track_was_playing = false;
-            }
+        // **Stopped means silent, exactly as it always has.** Without this the
+        // parked position is re-read every callback and the clip buzzes one
+        // block of itself under a readout that says nothing is moving.
+        if !rolling {
             return;
         }
-        if !self.track_was_playing {
-            self.track_pos = from;
-            self.track_was_playing = true;
-        }
-        let Some(clip) = self.track.clone() else {
+        let Some(placed) = self.track.clone() else {
             return;
         };
+        let clip = &placed.clip;
         let total = clip.frames() as u64;
-        let out = match self.shared.track_out.load(Ordering::Relaxed) {
-            0 => total,
-            n => n.min(total),
-        };
         let target = if strip_is_heard(Strip::Track, muted, soloed) {
             Shared::f32_of(&self.shared.track_gain).clamp(0.0, 8.0)
         } else {
@@ -2750,19 +2834,22 @@ impl Renderer {
         // what the buffer buys is somewhere for an insert to stand.
         for f in 0..frames {
             self.track_gain += (target - self.track_gain) * coeff;
-            let (l, r) = if self.track_pos >= out {
-                (0.0, 0.0)
-            } else {
-                let at = (self.track_pos as usize) * 2;
-                // Bounds-checked rather than trusted: `out` is clamped to the
-                // clip's length above, and this is the line that would panic
-                // on the audio thread if that ever stopped being true.
-                let pair = match (clip.samples.get(at), clip.samples.get(at + 1)) {
-                    (Some(l), Some(r)) => (l * self.track_gain, r * self.track_gain),
-                    _ => (0.0, 0.0),
-                };
-                self.track_pos += 1;
-                pair
+            // Project frame -> clip frame. The u64 compare comes BEFORE any
+            // cast, because `p` grows without bound; before the clip and past
+            // its end are both silence, and both are ordinary.
+            let p = at + f as u64;
+            let (l, r) = match p.checked_sub(placed.start) {
+                Some(k) if k < total => {
+                    let i = (k as usize) * 2;
+                    // Bounds-checked rather than trusted: `k < total` is the
+                    // clamp, and this is the line that would panic on the
+                    // audio thread if that ever stopped being true.
+                    match (clip.samples.get(i), clip.samples.get(i + 1)) {
+                        (Some(l), Some(r)) => (l * self.track_gain, r * self.track_gain),
+                        _ => (0.0, 0.0),
+                    }
+                }
+                _ => (0.0, 0.0),
             };
             if let Some(dst) = self.fx_in.get_mut(0) {
                 dst[f] = l;
@@ -3260,6 +3347,12 @@ pub struct Engine {
     /// The bus effect's half of the same protocol.
     /// The UI thread's ends of every rack's hand-offs. See `Rack`.
     insert_handoff: [[Handoff; INSERTS]; STRIPS + 1],
+    /// The clip's two rings, in the plugin handoff's exact shape and for its
+    /// exact reason: the audio thread must never free a hundred megabytes of
+    /// samples, so the displaced clip comes BACK here and is dropped by the
+    /// thread that sent its replacement.
+    track_to_audio: Producer<Option<Placed>>,
+    track_from_audio: Consumer<Option<Placed>>,
     /// What is in each of them, for the desk to name.
     inserts_loaded: [[Option<Loaded>; INSERTS]; STRIPS + 1],
     loaded: [Option<Loaded>; SLOTS],
@@ -3490,6 +3583,10 @@ impl Engine {
 
         let dev_ch = channels as usize;
         let widest = dev_ch.max(TAP_CHANNELS);
+        // The clip's pair: capacity two, one in flight plus the spare that
+        // lets the swap check for room, exactly as a slot's.
+        let (track_to_audio, track_incoming) = RingBuffer::<Option<Placed>>::new(2);
+        let (track_retiring, track_from_audio) = RingBuffer::<Option<Placed>>::new(2);
         let renderer = Renderer {
             shared: Arc::clone(&shared),
             timebase,
@@ -3504,9 +3601,13 @@ impl Engine {
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             track: None,
-            track_pos: 0,
+            pos: 0,
             track_gain: 1.0,
-            track_was_playing: false,
+            seen_req: 0,
+            was_rolling: false,
+            sounding: 0,
+            track_incoming,
+            track_retiring,
             builtin: crate::dx7::Dx7::new(rate as f32),
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             builtin_gain: 1.0,
@@ -3577,6 +3678,8 @@ impl Engine {
             midi: RefCell::new(midi_tx),
             handoff,
             insert_handoff,
+            track_to_audio,
+            track_from_audio,
             inserts_loaded: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             loaded: std::array::from_fn(|_| None),
             warm: std::array::from_fn(|_| None),
@@ -4566,23 +4669,67 @@ impl Engine {
         self.shared.set_effect_params(params);
     }
 
-    /// Hand the renderer a backing track, or `None` to take one away.
-    pub fn set_track(&self, clip: Option<Arc<ivory_record::decode::Clip>>) {
-        self.shared.set_track(clip);
+    /// Hand the renderer a clip and its place on the timeline, or `None` to
+    /// take the lane's clip away.
+    ///
+    /// **The displaced clip dies HERE, on this thread.** The push waits for the
+    /// return by the racks' own bargain: whatever the callback was holding
+    /// comes back on `track_from_audio` and is dropped by the caller that sent
+    /// its replacement — never by the audio thread, whose `drop` of a
+    /// hundred-megabyte `Vec` was a measured, reachable stall.
+    pub fn set_track(&mut self, placed: Option<Placed>) {
+        // Whatever came back earlier is dropped first, so the ring always has
+        // room and two rapid loads cannot wedge.
+        while self.track_from_audio.pop().is_ok() {}
+        self.shared
+            .track_loaded
+            .store(placed.is_some(), Ordering::Relaxed);
+        if self.track_to_audio.push(placed).is_err() {
+            return;
+        }
+        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Ok(old) = self.track_from_audio.pop() {
+                drop(old);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Put the playhead at `frames`, stamped with the host's generation.
+    ///
+    /// Payload first, generation last with Release — `run_transport`'s Acquire
+    /// pairs with it, so a callback that sees the new generation sees the new
+    /// position. The generation is the HOST's monotonic counter, stored rather
+    /// than incremented here, so a freshly built engine (req 0, ack 0) never
+    /// matches a host that has published anything and is re-located on its
+    /// first pushed frame.
+    pub fn set_transport(&self, generation: u64, frames: u64) {
+        self.shared.transport_at.store(frames, Ordering::Relaxed);
+        self.shared.transport_req.store(generation, Ordering::Release);
+    }
+
+    /// The transport level: rolling or stopped. Safe to re-assert every frame;
+    /// nothing keys off its edges.
+    pub fn set_rolling(&self, rolling: bool) {
+        self.shared.rolling.store(rolling, Ordering::Relaxed);
+    }
+
+    /// Where the callback's clock actually is, in frames. Monotone while
+    /// rolling, constant while stopped, and exact for a given locate once
+    /// [`Engine::transport_acked`] answers true for its generation.
+    pub fn transport_position(&self) -> u64 {
+        self.shared.transport_pos.load(Ordering::Relaxed)
+    }
+
+    /// Whether the callback has applied the locate stamped `generation`.
+    pub fn transport_acked(&self, generation: u64) -> bool {
+        self.shared.transport_ack.load(Ordering::Acquire) == generation
     }
 
     pub fn set_track_gain(&self, linear: f32) {
         self.shared.set_track_gain(linear);
-    }
-
-    /// Where the track starts and stops, in frames. `out` of 0 is "the end".
-    pub fn set_track_trim(&self, from: u64, to: u64) {
-        self.shared.set_track_trim(from, to);
-    }
-
-    /// Roll the backing track, or stop it and rewind to the in-point.
-    pub fn set_track_playing(&self, playing: bool) {
-        self.shared.set_track_playing(playing);
     }
 
     /// Hear the live input, or stop hearing it.
@@ -6211,6 +6358,21 @@ mod tests {
 
     /// A renderer with no device, no plugin and no click. Everything below
     /// drives this directly, which is why none of it needs hardware.
+    impl Renderer {
+        /// Replace the track rings with fresh ones and hand back the far
+        /// ends, so a test can send clips and collect what comes back —
+        /// the same two-way trip the engine makes.
+        fn hijack_track_rings(
+            &mut self,
+        ) -> (Producer<Option<Placed>>, Consumer<Option<Placed>>) {
+            let (to, incoming) = RingBuffer::<Option<Placed>>::new(2);
+            let (retiring, from) = RingBuffer::<Option<Placed>>::new(2);
+            self.track_incoming = incoming;
+            self.track_retiring = retiring;
+            (to, from)
+        }
+    }
+
     fn test_renderer(shared: Arc<Shared>, tap: Producer<f32>, dev_ch: usize) -> Renderer {
         // The far halves are dropped here on purpose: `rtrb` handles an
         // abandoned peer (`pop` reports empty, `push` fills to capacity), so a
@@ -6257,9 +6419,15 @@ mod tests {
             instrument_gain: 1.0,
             fx_return_gain: 1.0,
             track: None,
-            track_pos: 0,
+            pos: 0,
             track_gain: 1.0,
-            track_was_playing: false,
+            seen_req: 0,
+            was_rolling: false,
+            sounding: 0,
+            // Abandoned peers, like the MIDI ring above: pop reports empty
+            // and push fills to capacity, which is all a test needs.
+            track_incoming: RingBuffer::<Option<Placed>>::new(2).1,
+            track_retiring: RingBuffer::<Option<Placed>>::new(2).0,
             shared,
             timebase: Timebase::new(),
             rate: RATE,
@@ -6769,18 +6937,22 @@ mod tests {
     ///
     /// Two patches chosen to be unmistakably different: an organ (algorithm 32,
     /// six carriers, no modulation) against the tine piano.
-    /// **The backing track rolls with the transport, trims where it is told,
-    /// and reaches the take.**
+    /// **The transport is the position, and the clip merely stands on it.**
     ///
-    /// Four claims in one test because they are one feature: a track that
-    /// plays but ignores the trim is not usable, and one that is heard but
-    /// missing from the take is a take of half a performance.
+    /// This replaces the trim-points test — trim is gone, the playhead is the
+    /// feature — and it is the audio half of `transport.rs`'s contract:
+    ///
+    /// 1. stopped is silent and the position does not move;
+    /// 2. a locate is an EVENT — the same generation re-asserted moves nothing;
+    /// 3. a locate lands while rolling, which the old level could never say;
+    /// 4. `Placed::start` positions a clip with one subtraction;
+    /// 5. the callback acks the generation it applied;
+    /// 6. a displaced clip comes BACK on the ring — never dropped on the
+    ///    audio thread, which used to free a hundred megabytes mid-callback;
+    /// 7. a stop ends the notes it strands.
     #[test]
-    fn the_backing_track_plays_between_its_trim_points() {
+    fn the_backing_track_follows_the_transport() {
         use std::sync::Arc;
-
-        // A clip whose value IS its frame index, so where playback started and
-        // stopped can be read straight off the output.
         let frames = 1000usize;
         let clip = Arc::new(ivory_record::decode::Clip {
             samples: (0..frames).flat_map(|i| [i as f32, i as f32]).collect(),
@@ -6788,12 +6960,15 @@ mod tests {
             source: std::path::PathBuf::from("t.wav"),
         });
 
-        let (mut r, _tx, shared) = renderer_with_midi(2);
-        shared.set_track(Some(Arc::clone(&clip)));
+        let (mut r, mut tx, shared) = renderer_with_midi(2);
+        let (mut to_audio, mut from_audio) = r.hijack_track_rings();
+        to_audio
+            .push(Some(Placed { clip: Arc::clone(&clip), start: 0 }))
+            .expect("room");
         shared.set_track_gain(1.0);
         r.track_gain = 1.0;
 
-        // Not rolling: nothing comes out.
+        // 1. Stopped: silence, and the clock does not move.
         let mut out = vec![0.0_f32; 2 * 256];
         r.render(&mut out, 0, 0);
         assert_eq!(
@@ -6801,45 +6976,100 @@ mod tests {
             0.0,
             "the track played with the transport stopped"
         );
+        assert_eq!(shared.transport_pos.load(Ordering::Relaxed), 0);
 
-        // Rolling, trimmed to frames 100..200.
-        shared.set_track_trim(100, 200);
-        shared.set_track_playing(true);
+        // 2 + 3. Locate to 100 and roll: playback starts at frame 100.
+        shared.transport_at.store(100, Ordering::Relaxed);
+        shared.transport_req.store(1, Ordering::Release);
+        shared.rolling.store(true, Ordering::Relaxed);
         let mut out = vec![0.0_f32; 2 * 256];
         r.render(&mut out, 0, 0);
         let left: Vec<f32> = out.iter().step_by(2).copied().collect();
         assert!(
             (left[0] - 100.0).abs() < 0.5,
-            "it started at frame {} and the in-point is 100",
+            "it started at frame {} and the locate said 100",
             left[0]
         );
-        assert!(
-            (left[99] - 199.0).abs() < 0.5,
-            "frame 99 of playback is {} and should be 199",
-            left[99]
-        );
-        // Past the out-point: silence, not the rest of the file.
-        assert_eq!(left[120], 0.0, "it played past the out-point");
+        // 5. And the callback has acked the generation it applied.
+        assert_eq!(shared.transport_ack.load(Ordering::Acquire), 1);
 
-        // Stopping rewinds to the in-point rather than leaving it where it was.
-        shared.set_track_playing(false);
-        let mut out = vec![0.0_f32; 2 * 64];
-        r.render(&mut out, 0, 0);
-        shared.set_track_playing(true);
+        // 2. The SAME generation re-asserted is not a second locate.
+        shared.transport_req.store(1, Ordering::Release);
         let mut out = vec![0.0_f32; 2 * 64];
         r.render(&mut out, 0, 0);
         assert!(
-            (out[0] - 100.0).abs() < 0.5,
-            "after a stop it resumed at {} instead of the in-point",
+            (out[0] - 356.0).abs() < 0.5,
+            "re-asserting a generation re-located: got {}, wanted continuity at 356",
             out[0]
         );
 
-        // Taking it away takes it away.
-        shared.set_track(None);
-        shared.set_track_playing(true);
+        // 3. A JUMP while rolling lands mid-flight — the thing the old
+        // edge-detected level made inexpressible.
+        shared.transport_at.store(500, Ordering::Relaxed);
+        shared.transport_req.store(2, Ordering::Release);
         let mut out = vec![0.0_f32; 2 * 64];
         r.render(&mut out, 0, 0);
-        assert_eq!(out.iter().fold(0.0f32, |m, s| m.max(s.abs())), 0.0);
+        assert!(
+            (out[0] - 500.0).abs() < 0.5,
+            "a locate while rolling did nothing: got {}, wanted 500",
+            out[0]
+        );
+
+        // 1 again. Stop: silence, and the position FREEZES — returning to
+        // zero is the HOST's rule, applied by a locate, not the callback's.
+        shared.rolling.store(false, Ordering::Relaxed);
+        let mut out = vec![0.0_f32; 2 * 64];
+        r.render(&mut out, 0, 0);
+        let frozen = shared.transport_pos.load(Ordering::Relaxed);
+        let mut out = vec![0.0_f32; 2 * 64];
+        r.render(&mut out, 0, 0);
+        assert_eq!(
+            shared.transport_pos.load(Ordering::Relaxed),
+            frozen,
+            "the clock moved while stopped"
+        );
+
+        // 4. A clip PLACED at 300, located to 250: fifty frames of silence,
+        // then the clip from its own first sample.
+        to_audio
+            .push(Some(Placed { clip: Arc::clone(&clip), start: 300 }))
+            .expect("room");
+        shared.transport_at.store(250, Ordering::Relaxed);
+        shared.transport_req.store(3, Ordering::Release);
+        shared.rolling.store(true, Ordering::Relaxed);
+        let mut out = vec![0.0_f32; 2 * 128];
+        r.render(&mut out, 0, 0);
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        assert_eq!(left[0], 0.0, "before the clip's start is not silence");
+        assert_eq!(left[49], 0.0, "frame 299 is inside the clip somehow");
+        assert!(
+            (left[50] - 0.0).abs() < 0.5 && (left[60] - 10.0).abs() < 0.5,
+            "the placed clip did not start at its own frame 0: {} then {}",
+            left[50],
+            left[60]
+        );
+
+        // 6. The displaced clip came BACK rather than dying in the callback.
+        // The ring holds every displacement in order — the first swap
+        // displaced the initial `None` — so drain it and the clip must be in
+        // what returns.
+        let mut came_back = false;
+        while let Ok(returned) = from_audio.pop() {
+            if returned.is_some_and(|p| Arc::ptr_eq(&p.clip, &clip)) {
+                came_back = true;
+            }
+        }
+        assert!(came_back, "the displaced clip never came back on the ring");
+
+        // 7. A note sounding when the transport stops is ENDED, not stranded.
+        queue(&mut tx, r.timebase.now(), [0x90, 60, 100]);
+        let mut out = vec![0.0_f32; 2 * 64];
+        r.render(&mut out, 0, 0);
+        assert_ne!(r.sounding & (1 << 60), 0, "the note-on was never seen");
+        shared.rolling.store(false, Ordering::Relaxed);
+        let mut out = vec![0.0_f32; 2 * 64];
+        r.render(&mut out, 0, 0);
+        assert_eq!(r.sounding, 0, "stopping left a note stranded");
     }
 
     /// **The built-in's slot fader moves the built-in.**
