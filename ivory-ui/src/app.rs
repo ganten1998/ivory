@@ -378,6 +378,8 @@ pub struct IvoryApp {
     /// can see, and the owner sat through ten minutes of a Tangent that looked
     /// hung and was not. The press is now the cue to bring it to the front.
     raise_dialog: bool,
+    /// The last displayed set written by `log_fret_state`. Dev hook only.
+    dbg_fret_last: Option<Vec<u8>>,
     /// The × on the status row was pressed. Taken by the host.
     dismiss_message: bool,
     /// The effect panel a right-click on a knob opened, if any.
@@ -731,6 +733,7 @@ impl IvoryApp {
             recorder_request: std::collections::VecDeque::new(),
             dir_request: None,
             raise_dialog: false,
+            dbg_fret_last: None,
             dismiss_message: false,
             mixer_open: false,
             mixer_grab: None,
@@ -938,6 +941,83 @@ impl IvoryApp {
     /// same tick instead of a frame apart. It runs whether or not the panel is
     /// visible and whether or not chord detection is on — the guitar view is
     /// its own instrument, not a decoration on the chord strip.
+    /// Write down what the neck was asked to draw and what it decided.
+    ///
+    /// **A dev hook, and the reason it exists is that three screenshots were
+    /// not enough.** "Play one note and another shows up" has at least four
+    /// candidate causes — the transpose, the capo, a pin, the solver — and
+    /// every one of them was correct in isolation when tested here. This
+    /// prints all four at once, from the machine where it actually happens.
+    ///
+    ///   IVORY_DBG_FRET=/tmp/fret.log /Applications/Tangent.app/Contents/MacOS/tangent
+    ///
+    /// One line per CHANGE of the displayed set, so holding a key writes one
+    /// line rather than sixty a second.
+    fn log_fret_state(&mut self) {
+        let Ok(path) = std::env::var("IVORY_DBG_FRET") else {
+            return;
+        };
+        let display = self.display_notes();
+        let mut shown: Vec<u8> = display.iter().copied().collect();
+        shown.sort_unstable();
+        if self.dbg_fret_last.as_deref() == Some(shown.as_slice()) {
+            return;
+        }
+        self.dbg_fret_last = Some(shown.clone());
+        let spec = self.settings.fretboard_spec();
+        let mut held: Vec<u8> = self.notes.held().iter().copied().collect();
+        held.sort_unstable();
+        let mut manual: Vec<u8> = self.manual_notes.iter().copied().collect();
+        manual.sort_unstable();
+        let mut pins: Vec<(u8, usize, u8)> = self
+            .manual_positions
+            .iter()
+            .map(|(&n, &(st, f))| (n, st, f))
+            .collect();
+        pins.sort_unstable();
+        let v = self.voicing.current();
+        let placed: Vec<String> = v
+            .notes
+            .iter()
+            .map(|n| match n.outcome {
+                ivory_core::voicing::Outcome::Placed { pos, octave_shift, .. } => format!(
+                    "{}->s{}f{}{}{}",
+                    n.pitch,
+                    pos.string,
+                    pos.fret,
+                    if octave_shift == 0 {
+                        String::new()
+                    } else {
+                        format!("(oct{octave_shift:+})")
+                    },
+                    match spec.pitch_at(pos.string, pos.fret) {
+                        Some(p) if p == n.pitch => String::new(),
+                        Some(p) => format!("[MAKES {p}]"),
+                        None => "[OFF BOARD]".to_owned(),
+                    }
+                ),
+                ref other => format!("{}->{other:?}", n.pitch),
+            })
+            .collect();
+        let line = format!(
+            "held={held:?} transpose={} keytoggle={} manual={manual:?} pins={pins:?}              display={shown:?} tuning={} capo={} intervals={} placed=[{}]\n",
+            self.settings.transpose,
+            self.settings.keytoggle_enabled,
+            spec.tuning.name,
+            spec.capo,
+            self.settings.guitar_intervals,
+            placed.join(" ")
+        );
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
     fn voicing_tick(&mut self, force: bool) {
         let due = force || self.last_voicing.is_none_or(|t| t.elapsed() >= DETECT_TICK);
         if !due {
@@ -948,6 +1028,7 @@ impl IvoryApp {
             .map_or(0, |t| t.elapsed().as_millis().min(u32::MAX as u128) as u32);
         self.last_voicing = Some(Instant::now());
         self.voicing.update(&self.display_notes(), dt);
+        self.log_fret_state();
     }
 
     /// Point the solver at whatever the settings now describe. Both calls
