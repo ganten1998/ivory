@@ -1578,6 +1578,44 @@ impl IvoryApp {
         }
     }
 
+    /// Put one mixer control back where it was shipped. See the double-click.
+    ///
+    /// **From `Settings::default()`, not from a constant written here.** "The
+    /// default" is one fact and it already has a home; a second copy in this
+    /// function is a number that goes stale the first time somebody changes
+    /// what a fresh install sounds like.
+    ///
+    /// Only the controls that HAVE a resting value. A mute is not reset by
+    /// double-clicking it — that is just two presses, which is what it looks
+    /// like — and a name or a decibel field is typed, not dragged.
+    fn reset_mixer_hit(&mut self, hit: crate::mixer_panel::Hit) {
+        use crate::mixer_panel::Hit as H;
+        use crate::recorder::Strip;
+        let d = Settings::default();
+        match hit {
+            H::Fader(i) => {
+                let to = match Strip::column(i) {
+                    Some(Strip::Slot(n)) => d.plugin_gains.get(n).copied().unwrap_or(1.0),
+                    Some(Strip::Input(n)) => d.input_gains.get(n).copied().unwrap_or(1.0),
+                    Some(Strip::Track) => d.track_gain,
+                    Some(Strip::Click) => d.metronome_gain,
+                    Some(Strip::Fx) => d.fx_return_gain,
+                    None => d.master_gain,
+                };
+                self.apply_mixer_hit(hit, recorder::gain_to_fader(to as f32));
+            }
+            H::Send(i) => {
+                let at = Strip::column_index(i);
+                let to = d.strip_sends.get(at).copied().unwrap_or(0.0);
+                if let Some(slot) = self.settings.strip_sends.get_mut(at) {
+                    *slot = to;
+                }
+                self.save_settings();
+            }
+            _ => {}
+        }
+    }
+
     /// Move a mixer control. `value` is 0..=1 off the drag.
     ///
     /// **Written to settings, like every other fader in this app.** The band
@@ -1589,39 +1627,45 @@ impl IvoryApp {
         use crate::recorder::Strip;
         let v = value.clamp(0.0, 1.0);
         let gain = f64::from(recorder::fader_to_gain(v));
-        let strips = Strip::all();
         match hit {
-            H::Fader(i) => match strips.get(i) {
+            // **By COLUMN, not by `Strip::all()`.** See `Strip::column`: the
+            // two lists differ by the click and the bus, so the master column
+            // used to land on the metronome — a fader that did not move and
+            // moved another one instead.
+            H::Fader(i) => match Strip::column(i) {
                 Some(Strip::Slot(n)) => {
-                    if let Some(g) = self.settings.plugin_gains.get_mut(*n) {
+                    if let Some(g) = self.settings.plugin_gains.get_mut(n) {
                         *g = gain;
                     }
                 }
                 Some(Strip::Input(n)) => {
-                    if let Some(g) = self.settings.input_gains.get_mut(*n) {
+                    if let Some(g) = self.settings.input_gains.get_mut(n) {
                         *g = gain;
                     }
                 }
                 Some(Strip::Track) => self.settings.track_gain = gain,
                 Some(Strip::Click) => self.settings.metronome_gain = gain,
                 Some(Strip::Fx) => self.settings.fx_return_gain = gain,
-                // Past the channels is the master, which is the last column.
+                // Past the channels is the master, which is the last column —
+                // and the same number the band's master dial turns, so the two
+                // views of it move together.
                 None => self.settings.master_gain = gain,
             },
             H::Send(i) => {
+                let i = Strip::column_index(i);
                 if let Some(slot) = self.settings.strip_sends.get_mut(i) {
                     *slot = f64::from(v);
                 }
             }
             // **A press, not a drag**, so it acts on the way down and the
             // value is ignored.
-            H::Mute(i) => self.settings.strip_muted ^= 1 << i,
-            H::Solo(i) => self.settings.strip_soloed ^= 1 << i,
+            H::Mute(i) => self.settings.strip_muted ^= 1 << Strip::column_index(i),
+            H::Solo(i) => self.settings.strip_soloed ^= 1 << Strip::column_index(i),
             // The plus on an empty slot: the same picker the rack opens, so
             // there is one way to choose an instrument and two ways to reach it.
             H::Add(i) => {
-                match strips.get(i) {
-                    Some(Strip::Slot(n)) => self.open_plugin_picker(*n),
+                match Strip::column(i) {
+                    Some(Strip::Slot(n)) => self.open_plugin_picker(n),
                     // **The first input is the band's own picker**, because it
                     // is the same choice: the row in the band and the first
                     // column of the desk are two views of one microphone.
@@ -1629,7 +1673,7 @@ impl IvoryApp {
                         self.open_device_picker(dialogs::DeviceKind::AudioInput);
                     }
                     Some(Strip::Input(n)) => {
-                        self.open_device_picker(dialogs::DeviceKind::ExtraInput(*n));
+                        self.open_device_picker(dialogs::DeviceKind::ExtraInput(n));
                     }
                     // The waveform above BACKING. Same question again: what is
                     // playing on this channel.
@@ -1640,16 +1684,25 @@ impl IvoryApp {
             }
             // One of a channel's three inserts. The same picker the bus used
             // to have to itself, aimed at whichever slot was pressed.
+            // **A filled bay opens its window; an empty one opens the
+            // picker.** Same gesture, same question answered twice: what is on
+            // this insert, and then what is it set to. An effect whose every
+            // control lives inside a window nothing opens is an effect you
+            // cannot use — which is what a rack was until now.
             H::Insert(i, n) => {
-                let at = strips.get(i).map_or(crate::recorder::STRIPS, |s| s.index());
-                self.open_insert_picker(at, n);
+                let at = Strip::column_index(i);
+                if self.insert(at, n).is_some() {
+                    self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(at, n));
+                } else {
+                    self.open_insert_picker(at, n);
+                }
                 return;
             }
             // **Not the master.** Its colour is the one thing on the desk
             // that means something on sight: red is where the output is, and a
             // master somebody painted teal is a desk with no landmark on it.
             H::Palette(i) => {
-                if strips.get(i).is_some() {
+                if Strip::column(i).is_some() {
                     self.mixer_palette = Some(i);
                 }
                 return;
@@ -1689,6 +1742,7 @@ impl IvoryApp {
             H::Paint(i, c) => {
                 self.mixer_palette = None;
                 if c != usize::MAX {
+                    let i = Strip::column_index(i);
                     if let Some(slot) = self.settings.strip_colors.get_mut(i) {
                         *slot = c as i64;
                         self.save_settings();
@@ -1727,6 +1781,14 @@ impl IvoryApp {
     /// file: the values live in settings and in the meters the host pushed, so
     /// there is one copy of each and no chance of a fader that disagrees with
     /// the sound.
+    /// The desk's view, for a picture of it. See `composite::shot::mixer`.
+    ///
+    /// The real one, built by the real function — a shot assembled from a
+    /// hand-written `MixerView` would be a picture of the test.
+    pub fn mixer_view_for_shot(&self) -> crate::mixer_panel::MixerView<'_> {
+        self.mixer_view()
+    }
+
     fn mixer_view(&self) -> crate::mixer_panel::MixerView<'_> {
         use crate::recorder::Strip;
         let g = self.settings.knobs().gains;
@@ -6979,17 +7041,54 @@ impl IvoryApp {
             if self.mixer_naming.is_some() {
                 self.name_in_mixer(&ctx);
             }
-            // **A right-click paints.** Anywhere on a channel opens its palette,
-            // which is the only gesture in the mixer that is not a control —
-            // so it needs no target of its own and cannot collide with one.
+            // **A right-click paints, but only on the paint.**
+            //
+            // It used to open the palette from anywhere on a channel, on the
+            // reasoning that it is the one gesture that is not a control and
+            // so cannot collide with one. That stopped being true the moment
+            // anything else wanted a right-click: an effect you meant to throw
+            // away answered with twenty-seven swatches over the rack.
+            //
+            // So the rule is now what it looks like — right-click the coloured
+            // surface of a channel and you get its colours; right-click a
+            // control and you get whatever that control does, which for an
+            // insert is "take it out" and for everything else is nothing.
             if ctx.input(|i| i.pointer.secondary_pressed()) {
                 if let Some(pos) = ctx.pointer_interact_pos().filter(|p| rect.contains(*p)) {
                     let view = self.mixer_view();
-                    // Not the master: see `Hit::Palette`. `strip_at` answers
-                    // with the master's index like any other, so the refusal
-                    // belongs here as well as there.
-                    self.mixer_palette = crate::mixer_panel::strip_at(rect, &view, pos)
-                        .filter(|i| *i < crate::recorder::Strip::shown().len());
+                    match crate::mixer_panel::hit_test(rect, &view, pos) {
+                        // **The only right-click that does something.** An
+                        // effect is put in with a press and taken out with the
+                        // other button, which is one gesture each way and no
+                        // second control to draw in a bay this size.
+                        Some(crate::mixer_panel::Hit::Insert(i, n)) => {
+                            let at = crate::recorder::Strip::column_index(i);
+                            self.set_insert(at, n, None);
+                        }
+                        // A control, and not one that answers this button.
+                        Some(_) => {}
+                        // Bare panel: the paint. Not the master — see
+                        // `Hit::Palette`.
+                        None => {
+                            self.mixer_palette =
+                                crate::mixer_panel::strip_at(rect, &view, pos)
+                                    .filter(|i| crate::recorder::Strip::column(*i).is_some());
+                        }
+                    }
+                }
+            }
+            // **Double-click puts a control back where it started.** Every
+            // fader on the desk has a value it was shipped with, and getting
+            // back to it by dragging is a hunt for a number rather than a
+            // gesture. Read before the press, because the same frame carries
+            // both and the press would grab it into a drag.
+            let double = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+            if double {
+                if let Some(pos) = ctx.pointer_interact_pos().filter(|p| rect.contains(*p)) {
+                    let view = self.mixer_view();
+                    if let Some(hit) = crate::mixer_panel::hit_test(rect, &view, pos) {
+                        self.reset_mixer_hit(hit);
+                    }
                 }
             }
             let pressed = ctx.input(|i| i.pointer.primary_pressed());
@@ -7487,12 +7586,31 @@ mod tests {
         use crate::mixer_panel::Hit;
         use crate::recorder::Strip;
 
-        // The click is index three, and its fader is the band's metronome.
-        app.apply_mixer_hit(Hit::Fader(Strip::Click.index()), 0.25);
-        let quiet = app.settings.knobs().gains.metronome;
-        app.apply_mixer_hit(Hit::Fader(Strip::Click.index()), 0.75);
-        let loud = app.settings.knobs().gains.metronome;
+        // **A COLUMN, not a strip index.** This test used to pass
+        // `Strip::Click.index()` and read the band's metronome back, which
+        // looked like proof and was the bug: the click has no column, so that
+        // index is the MASTER's column, and what the test proved was that the
+        // master moved the metronome. Both halves are now named by the column
+        // they really are.
+        let column = |s: Strip| {
+            Strip::shown()
+                .iter()
+                .position(|c| *c == s)
+                .expect("that strip has no column")
+        };
+        app.apply_mixer_hit(Hit::Fader(column(Strip::Track)), 0.25);
+        let quiet = app.settings.knobs().gains.track;
+        app.apply_mixer_hit(Hit::Fader(column(Strip::Track)), 0.75);
+        let loud = app.settings.knobs().gains.track;
         assert!(loud > quiet, "the mixer's fader moved nothing: {quiet} then {loud}");
+        // And the metronome, which has a fader in the band and none here, is
+        // untouched by either of those.
+        assert!(
+            (app.settings.knobs().gains.metronome - Settings::default().metronome_gain as f32)
+                .abs()
+                < 1.0e-6,
+            "the backing track's fader moved the click"
+        );
 
         // A send is a percentage and lands where the host reads it.
         app.apply_mixer_hit(Hit::Send(Strip::Input(0).index()), 0.4);
@@ -7837,6 +7955,135 @@ mod tests {
         let ctx = egui::Context::default();
         let app = IvoryApp::new(&ctx, settings, caps);
         (ctx, app)
+    }
+
+    /// **Every mixer column moves its own control and nothing else.**
+    ///
+    /// The master's fader used to move the METRONOME. `apply_mixer_hit` read
+    /// `Strip::all()` with a column index, and the two lists differ by the
+    /// click and the effects bus — neither of which has a column — so every
+    /// index past the backing track was off by one. The master appeared frozen
+    /// (its own number was never written) and dragged a fader in a different
+    /// panel at the same time.
+    ///
+    /// Written as "move one, and only that one changes", because the fault was
+    /// never in one arm: any handler that maps a column to a strip by hand can
+    /// make it again.
+    #[test]
+    fn a_column_moves_its_own_fader_and_no_other() {
+        use crate::mixer_panel::Hit;
+        use crate::recorder::{Strip, COLUMNS_FOR_TEST};
+        let snapshot = |s: &Settings| {
+            let mut v: Vec<f64> = s.plugin_gains.to_vec();
+            v.extend_from_slice(&s.input_gains);
+            v.push(s.track_gain);
+            v.push(s.metronome_gain);
+            v.push(s.fx_return_gain);
+            v.push(s.master_gain);
+            v
+        };
+        for col in 0..COLUMNS_FOR_TEST {
+            let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+            let before = snapshot(&app.settings);
+            // A position nothing defaults to, so "it changed" is unambiguous.
+            app.apply_mixer_hit(Hit::Fader(col), 0.31);
+            let after = snapshot(&app.settings);
+            let moved: Vec<usize> = (0..before.len())
+                .filter(|i| (before[*i] - after[*i]).abs() > 1e-9)
+                .collect();
+            // Which slot in the snapshot this column owns.
+            let want = match Strip::column(col) {
+                Some(Strip::Slot(n)) => n,
+                Some(Strip::Input(n)) => crate::recorder::SLOTS + n,
+                Some(s) => crate::recorder::SLOTS + crate::recorder::INPUTS
+                    + match s {
+                        Strip::Track => 0,
+                        Strip::Click => 1,
+                        _ => 2,
+                    },
+                None => before.len() - 1,
+            };
+            assert_eq!(
+                moved,
+                vec![want],
+                "column {col} ({:?}) moved {moved:?}, not just {want}",
+                Strip::column(col)
+            );
+        }
+    }
+
+    /// **And the master is the band's master.** Two views of one number: the
+    /// desk's last column and the red dial in the recorder band are the same
+    /// control, so a hand on either moves the other.
+    #[test]
+    fn the_desks_master_is_the_bands_master_dial() {
+        use crate::mixer_panel::Hit;
+        use crate::recorder::COLUMNS_FOR_TEST;
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.apply_mixer_hit(Hit::Fader(COLUMNS_FOR_TEST - 1), 0.42);
+        let desk = app.settings.master_gain;
+        assert!(
+            (desk - f64::from(recorder::fader_to_gain(0.42))).abs() < 1e-9,
+            "the master column wrote {desk}, not the position it was dragged to"
+        );
+        assert!(
+            (app.settings.knobs().gains.master - desk as f32).abs() < 1e-6,
+            "the band's dial reads {} where the desk reads {desk}",
+            app.settings.knobs().gains.master
+        );
+    }
+
+    /// **Double-click puts a fader back where it was shipped.**
+    ///
+    /// From `Settings::default()` and not from a constant in the reset itself,
+    /// which is what this checks: move every column somewhere it is not, reset
+    /// it, and it must read exactly what a fresh install reads.
+    #[test]
+    fn a_double_click_puts_a_fader_back_to_its_default() {
+        use crate::mixer_panel::Hit;
+        use crate::recorder::COLUMNS_FOR_TEST;
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        let fresh = Settings::default();
+        for col in 0..COLUMNS_FOR_TEST {
+            app.apply_mixer_hit(Hit::Fader(col), 0.13);
+        }
+        assert_ne!(
+            app.settings.master_gain, fresh.master_gain,
+            "nothing moved, so resetting proves nothing"
+        );
+        for col in 0..COLUMNS_FOR_TEST {
+            app.reset_mixer_hit(Hit::Fader(col));
+        }
+        for (what, got, want) in [
+            ("master", app.settings.master_gain, fresh.master_gain),
+            ("track", app.settings.track_gain, fresh.track_gain),
+            ("slot 0", app.settings.plugin_gains[0], fresh.plugin_gains[0]),
+            ("input 0", app.settings.input_gains[0], fresh.input_gains[0]),
+        ] {
+            assert!(
+                (got - want).abs() < 1.0e-6,
+                "{what} reset to {got}, not to its default {want}"
+            );
+        }
+    }
+
+    /// **Right-clicking a loaded insert takes it out.**
+    ///
+    /// One gesture each way: a press puts an effect in a bay, the other button
+    /// takes it out. And it must not open the palette on the way — the whole
+    /// reason the palette stopped answering a right-click anywhere on a
+    /// channel.
+    #[test]
+    fn the_other_button_empties_an_insert() {
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        let at = crate::recorder::Strip::Track.index();
+        app.set_insert(at, 1, Some("/x/Pro-R 2.vst3"));
+        assert!(app.insert(at, 1).is_some(), "nothing was loaded to remove");
+        app.set_insert(at, 1, None);
+        assert!(app.insert(at, 1).is_none(), "the bay kept its effect");
+        // The other two bays are untouched, because they are other bays.
+        assert!(app.insert(at, 0).is_none());
+        assert!(app.insert(at, 2).is_none());
     }
 
     // ── the built-in's patch picker ─────────────────────────────────────────

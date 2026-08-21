@@ -1605,6 +1605,19 @@ impl DesktopApp {
                         e.set_builtin_voice(v);
                     }
                 }
+                // An insert's own window. Same one-row-two-names bargain as an
+                // instrument's: press it again and the window that is up goes
+                // away.
+                R::OpenInsertEditor(strip, slot) => {
+                    if let Some(e) = self.recorder.engine.as_mut() {
+                        if e.insert_editor_open(strip, slot) {
+                            e.close_insert_editor(strip, slot);
+                        } else if let Err(err) = e.open_insert_editor(strip, slot) {
+                            self.recorder.engine_error =
+                                Some(format!("could not open the effect's window: {err}"));
+                        }
+                    }
+                }
                 R::OpenPluginEditor(slot) => {
                     // The plugin's own window, created here rather than in the
                     // frame: VST3 requires the main thread and AppKit will not

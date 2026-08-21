@@ -359,6 +359,26 @@ impl Compositor {
         camera: Option<(&[u8], u32, u32)>,
         pts_ns: i64,
     ) -> Result<Option<i64>, String> {
+        self.frame_painting(app, layout, shows, want_camera, want_display, camera, pts_ns, None)
+    }
+
+    /// [`Compositor::frame`], with the option of painting something else.
+    ///
+    /// `paint` is `None` everywhere in the app. It exists so a test can put one
+    /// pure painter through the identical pipeline the take uses — see
+    /// `shot::mixer`.
+    #[allow(clippy::too_many_arguments)]
+    fn frame_painting(
+        &mut self,
+        app: &IvoryApp,
+        layout: Layout,
+        shows: DisplayShows,
+        want_camera: bool,
+        want_display: bool,
+        camera: Option<(&[u8], u32, u32)>,
+        pts_ns: i64,
+        paint: Option<&dyn Fn(&egui::Painter, egui::Rect)>,
+    ) -> Result<Option<i64>, String> {
         if let Some((pixels, w, h)) = camera {
             self.upload_camera(pixels, w, h)?;
         }
@@ -398,20 +418,30 @@ impl Compositor {
                 .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
                 .show(ctx, |ui| {
                     let painter = ui.painter();
-                    app.paint_composite(
-                        painter,
-                        display_pane,
-                        shows,
-                        // The camera as THIS context knows it. The window's
-                        // texture handle means nothing here — they are
-                        // different `egui::Context`s with different atlases,
-                        // so it would draw whatever else happened to carry
-                        // that id, or nothing at all.
-                        camera_id.map(|(texture, (w, h))| ivory_ui::recorder::Preview {
-                            texture,
-                            size: egui::vec2(w as f32, h as f32),
-                        }),
-                    );
+                    // **One painter, chosen by the caller.** `frame` paints the
+                    // window; the shot harness paints one panel at a time, so
+                    // a desk can be photographed without a desk being on
+                    // screen — see `shot::mixer`. Everything before and after
+                    // this line is identical either way, which is the point:
+                    // a picture taken through a second code path is a picture
+                    // of the second code path.
+                    match paint {
+                        Some(f) => f(painter, display_pane),
+                        None => app.paint_composite(
+                            painter,
+                            display_pane,
+                            shows,
+                            // The camera as THIS context knows it. The window's
+                            // texture handle means nothing here — they are
+                            // different `egui::Context`s with different atlases,
+                            // so it would draw whatever else happened to carry
+                            // that id, or nothing at all.
+                            camera_id.map(|(texture, (w, h))| ivory_ui::recorder::Preview {
+                                texture,
+                                size: egui::vec2(w as f32, h as f32),
+                            }),
+                        ),
+                    }
                 });
         });
 
@@ -1190,6 +1220,77 @@ mod shot {
             rows,
         );
         println!("wrote {out} ({rows} rows)");
+    }
+
+    /// The desk on its own, at the size it really is, for a person to look at.
+    ///
+    /// **Because the take does not draw it.** `paint_composite` paints what the
+    /// video records, and the mixer is deliberately not in that — so the one
+    /// panel whose faults are all proportional (a rack too narrow to read, a
+    /// tick too small to count, a label a band lower than the master's) was
+    /// the one panel that could not be photographed without running the app
+    /// and standing on the user's desktop to do it.
+    ///
+    ///   IVORY_SHOT=/tmp/desk.png cargo test -p ivory --bins shot::mixer \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore = "writes a picture for a person to look at"]
+    fn mixer() {
+        let Ok(out) = std::env::var("IVORY_SHOT") else {
+            eprintln!("IVORY_SHOT not set");
+            return;
+        };
+        // SAFETY: single-threaded test setup, before any app exists.
+        unsafe {
+            std::env::set_var(
+                "IVORY_SETTINGS_PATH",
+                std::env::temp_dir().join("tangent-shot-settings.json"),
+            );
+        }
+        // The proportions of the real panel: the desk fills the window under
+        // the recorder band, so it is wide and about two thirds as tall.
+        let (w, h) = (1220u32, 500u32);
+        let mut c = match Compositor::standalone(w, h) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("no GPU here: {e}");
+                return;
+            }
+        };
+        let mut settings = ivory_ui::settings::Settings::default();
+        settings.show_recorder = true;
+        settings.plugin_slots[0] = Some(ivory_ui::dialogs::BUILTIN_PATH.to_owned());
+        let mut app = IvoryApp::new(c.context(), settings, ivory_ui::host::Caps::DESKTOP);
+        app.open_mixer_for_shot();
+        let mut shoot = |app: &IvoryApp| {
+            let draw = |painter: &egui::Painter, rect: egui::Rect| {
+                ivory_ui::mixer_panel::draw(painter, rect, &app.mixer_view_for_shot());
+            };
+            c.frame_painting(
+                app,
+                Layout::default(),
+                DisplayShows::default(),
+                false,
+                true,
+                None,
+                0,
+                Some(&draw),
+            )
+            .and_then(|_| c.flush())
+            .map(|_| ())
+        };
+        for _ in 0..2 {
+            if let Err(e) = shoot(&app) {
+                eprintln!("frame: {e}");
+                return;
+            }
+        }
+        let Some(px) = c.last_frame() else {
+            eprintln!("nothing came back");
+            return;
+        };
+        write_png(std::path::Path::new(&out), &px[..(h * w * 4) as usize], w, h);
+        println!("wrote {out}");
     }
 
     /// A minimal RGBA PNG, so this needs no image crate.

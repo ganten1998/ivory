@@ -375,13 +375,14 @@ impl Layout {
         // dead fader on it would be five controls that do nothing, which is
         // the thing the plugin rack was already doing wrong.
         if view.empty {
-            let plus = Rect::from_center_size(
-                panel.center(),
-                Vec2::splat(panel.width().min(panel.height()) * 0.34),
-            );
             return StripStrip {
                 panel,
-                add: plus,
+                // **The whole column, not the plus in the middle of it.** The
+                // plus is a picture of what pressing here does; a hundred
+                // points of empty channel that ignores a press is a column
+                // that looks dead until you find the one spot that is not.
+                // Nothing else is on an empty strip, so nothing can collide.
+                add: panel,
                 ..StripStrip::NONE
             };
         }
@@ -476,8 +477,13 @@ impl Layout {
             view.strip,
             Some(Strip::Input(_) | Strip::Track | Strip::Slot(_))
         );
+        // **Under the name, not over it.** The master has no source to choose
+        // and so no icon, and with the icon on top every other channel's name
+        // sat a band lower than the master's — twelve labels at one height and
+        // one at another, which reads as the master being a different kind of
+        // object rather than the same strip with nothing to pick.
         let icon = if has_icon {
-            let r = cut(0.015, 0.075);
+            let r = cut(0.088, 0.145);
             Rect::from_center_size(r.center(), Vec2::splat(r.height().min(r.width())))
         } else {
             Rect::NOTHING
@@ -489,8 +495,9 @@ impl Layout {
             // fifteenth of the strip each, which at any usable window size is
             // three times the height of what is written in them: the plate
             // behind them then reads as a panel with a word lost in it.
-            name: if has_icon { cut(0.085, 0.135) } else { cut(0.03, 0.088) },
-            detail: if has_icon { cut(0.14, 0.185) } else { cut(0.092, 0.14) },
+            // The same band on every channel now, master included.
+            name: cut(0.022, 0.078),
+            detail: if has_icon { cut(0.152, 0.19) } else { cut(0.086, 0.128) },
             meter: Rect::from_min_max(travel.min, Pos2::new(split, travel.max.y)),
             send,
             fader: Rect::from_min_max(Pos2::new(split, travel.min.y), travel.max),
@@ -709,19 +716,25 @@ fn strip(
     let cap = |size: f32| FontId::new(size, crate::fonts::courier_bold());
     let plain = |size: f32| FontId::new(size, crate::fonts::courier());
     let h = l.panel.height();
+    // **Everything printed ON the panel, in ink the panel can carry.**
+    //
+    // The name sits on a plate of the ordinary face and is always dark on
+    // bone. Nothing else does: the icon, the second line, the decibel readout
+    // and the fader's scale are all painted straight onto the channel — so on
+    // a channel somebody painted dark red they were dark on dark, which is
+    // where the keyboard icon and "+0.0 dB" went when the desk got colours.
+    // Chosen from the face as composited, for the reason `flatten` gives.
+    let solid = flatten(face, p.wood);
+    let ink = print_on(solid, p);
 
     // The plate the label sits on, so it reads on any colour.
-    // **Down to where the writing stops.** A channel with no second line —
-    // which is most of them — was getting a plate sized for two, and an empty
-    // half of a box reads as something that failed to draw.
-    let bottom = if v.detail.is_empty() {
-        l.name.bottom()
-    } else {
-        l.detail.bottom()
-    };
+    // **The name and nothing else.** It used to run down to the second line
+    // when there was one, which was a plate sized for two lines on a channel
+    // with one — and now the icon sits between them, so a plate that reached
+    // the second line would paint over the icon as well.
     let plate = Rect::from_min_max(
         Pos2::new(l.panel.left() + 3.0, l.name.top() - 2.0),
-        Pos2::new(l.panel.right() - 3.0, bottom + 2.0),
+        Pos2::new(l.panel.right() - 3.0, l.name.bottom() + 2.0),
     );
     // **Under every name, painted or not.** It was drawn only on a coloured
     // channel, where it exists to keep the label legible on any background —
@@ -731,11 +744,12 @@ fn strip(
     if plate.is_positive() {
         painter.rect_filled(plate, 2.0, p.face);
     }
-    // **The band's own icons, above the names.** The microphone and the
+    // **The band's own icons, under the names.** The microphone and the
     // waveform are how the input and the backing track are already labelled
-    // one band up; drawing them again here is what makes the two channels that
-    // are not instruments read as the same two things rather than as two more
-    // rows of text.
+    // one band up; drawing them again here is what makes the three kinds of
+    // source read as three kinds of thing rather than as three rows of text.
+    // Under, so that every label on the desk — the master's included — sits at
+    // one height.
     if let Some(buf) = naming {
         painter.rect_filled(l.name, 2.0, p.face);
         painter.rect_stroke(
@@ -754,15 +768,15 @@ fn strip(
     }
     let named = match v.strip {
         Some(Strip::Input(_)) => {
-            crate::recorder_panel::draw_microphone(painter, l.icon, p.engrave);
+            crate::recorder_panel::draw_microphone(painter, l.icon, ink);
             true
         }
         Some(Strip::Track) => {
-            crate::recorder_panel::draw_waveform_icon(painter, l.icon, p.engrave);
+            crate::recorder_panel::draw_waveform_icon(painter, l.icon, ink);
             true
         }
         Some(Strip::Slot(_)) => {
-            crate::recorder_panel::draw_instrument_icon(painter, l.icon, p.engrave);
+            crate::recorder_panel::draw_instrument_icon(painter, l.icon, ink);
             true
         }
         _ => false,
@@ -777,7 +791,7 @@ fn strip(
             l.detail,
             v.detail,
             plain((h * 0.024).clamp(7.0, 11.0)),
-            p.faint,
+            ink.gamma_multiply(0.72),
         );
     }
     // A dimmed channel is dimmed by a veil rather than by a paler face, so
@@ -803,7 +817,7 @@ fn strip(
         v.gr_db,
         heard,
         ticks,
-        flatten(face, p.wood),
+        solid,
         p,
     );
 
@@ -885,7 +899,7 @@ fn strip(
         }
     }
 
-    fader(painter, l.fader, v.gain, p);
+    fader(painter, l.fader, v.gain, solid, p);
     let db_font = plain((h * 0.026).clamp(8.0, 12.0));
     match typed {
         Some(buf) => {
@@ -898,7 +912,7 @@ fn strip(
             );
             centred(painter, l.db, &format!("{buf}_"), db_font, p.engrave);
         }
-        None => centred(painter, l.db, &gain_text(v.gain), db_font, p.engrave),
+        None => centred(painter, l.db, &gain_text(v.gain), db_font, ink),
     }
 
     if l.mute.is_positive() {
@@ -961,7 +975,12 @@ fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink) {
     if !r.is_positive() {
         return;
     }
-    let arm = r.width().min(r.height()) * 0.5;
+    // **A plus the size of a plus, on a target the size of the channel.** The
+    // whole panel is pressable now — see `Layout::one` — but drawing the mark
+    // at the size of the target gives a cross from corner to corner, which
+    // reads as a channel that has been struck out rather than one waiting to
+    // be filled.
+    let arm = r.width().min(r.height()) * 0.17;
     let c = r.center();
     let ink = p.face.gamma_multiply(0.55);
     let w = (arm * 0.16).clamp(1.5, 4.0);
@@ -1134,7 +1153,7 @@ fn send_knob(painter: &Painter, r: Rect, amount: f32, p: &Ink) {
 ///
 /// The ribs are drawn only when there is room for them to be ribs; below that
 /// they are a smear and the cap is better plain.
-fn fader(painter: &Painter, r: Rect, gain: f32, p: &Ink) {
+fn fader(painter: &Painter, r: Rect, gain: f32, face: Color32, p: &Ink) {
     if !r.is_positive() {
         return;
     }
@@ -1152,6 +1171,52 @@ fn fader(painter: &Painter, r: Rect, gain: f32, p: &Ink) {
         Stroke::new(1.0, p.engrave.gamma_multiply(0.25)),
         egui::StrokeKind::Inside,
     );
+
+    // **The scale, printed on the panel either side of the slot.** The band's
+    // faders have had one since they were drawn; the desk's had a cap in a
+    // channel and no way to see where along it you were. Eleven marks, the
+    // fifths longer, in the panel's own ink faded well back — a scale is
+    // something you read when you look for it, not something that competes
+    // with the cap.
+    //
+    // Nothing at all where the arms would be under three points wide: eleven
+    // marks that short are a grey smudge, which is the band's rule too.
+    let arm = (r.width() - slot_w) * 0.5 - 2.0;
+    if arm >= 3.0 && r.height() >= 60.0 {
+        let ink = print_on(face, p).gamma_multiply(0.30);
+        for i in 0_u8..=10 {
+            let y = r.bottom() - r.height() * f32::from(i) / 10.0;
+            // A hair inside, so the first and last are marks rather than the
+            // ends of the travel.
+            let y = y.clamp(r.top() + 0.5, r.bottom() - 0.5);
+            let len = if i % 5 == 0 { arm * 0.85 } else { arm * 0.45 };
+            painter.line_segment(
+                [
+                    Pos2::new(slot.left() - 2.0 - len, y),
+                    Pos2::new(slot.left() - 2.0, y),
+                ],
+                Stroke::new(1.0, ink),
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(slot.right() + 2.0, y),
+                    Pos2::new(slot.right() + 2.0 + len, y),
+                ],
+                Stroke::new(1.0, ink),
+            );
+        }
+        // Unity, which is the one position a hand looks for and is nowhere
+        // near the middle of a decibel scale. Across the slot, so it reads as
+        // a mark ON the scale and not as a twelfth tick.
+        let uy = r.bottom() - r.height() * gain_to_fader(1.0).clamp(0.0, 1.0);
+        painter.line_segment(
+            [
+                Pos2::new(slot.left() - 1.0, uy),
+                Pos2::new(slot.right() + 1.0, uy),
+            ],
+            Stroke::new(1.0, p.cap.gamma_multiply(0.5)),
+        );
+    }
 
     let t = gain_to_fader(gain).clamp(0.0, 1.0);
     let y = r.bottom() - r.height() * t;
@@ -1497,6 +1562,64 @@ mod tests {
             Some(Hit::Add(0)),
             "the icon does not open the picker"
         );
+    }
+
+    /// **An empty channel is pressable everywhere, not just on the plus.**
+    ///
+    /// A hundred points of empty column that ignores a press is a channel that
+    /// looks dead until you find the one spot in the middle that is not.
+    #[test]
+    fn an_empty_channel_is_pressable_anywhere_on_it() {
+        let mut v = a_view();
+        v.strips[0].empty = true;
+        let r = rect();
+        let l = Layout::new(r, &v);
+        let panel = l.strips[0].panel;
+        for (what, at) in [
+            ("the middle", panel.center()),
+            ("the top-left", Pos2::new(panel.left() + 3.0, panel.top() + 3.0)),
+            ("the bottom-right", Pos2::new(panel.right() - 3.0, panel.bottom() - 3.0)),
+            ("the top edge", Pos2::new(panel.center().x, panel.top() + 1.0)),
+            ("the bottom edge", Pos2::new(panel.center().x, panel.bottom() - 1.0)),
+        ] {
+            assert_eq!(
+                hit_test(r, &v, at),
+                Some(Hit::Add(0)),
+                "{what} of an empty channel does nothing"
+            );
+        }
+    }
+
+    /// **The label sits at the same height on every column, master included.**
+    ///
+    /// The icon used to go above the name, and the master has no source to
+    /// choose and so no icon — so twelve labels sat at one height and the
+    /// master's at another, which reads as the master being a different kind
+    /// of object rather than the same strip with nothing to pick.
+    #[test]
+    fn every_label_is_at_the_same_height_as_the_masters() {
+        let v = a_view();
+        let l = Layout::new(rect(), &v);
+        let master = l.strips[COLUMNS - 1].name;
+        assert!(master.is_positive(), "the master has no name plate");
+        for (i, s) in l.strips.iter().enumerate() {
+            if !s.name.is_positive() {
+                continue;
+            }
+            assert!(
+                (s.name.top() - master.top()).abs() < 0.5,
+                "column {i}'s label is at {} where the master's is at {}",
+                s.name.top(),
+                master.top()
+            );
+            // And where a column has an icon it is UNDER the writing.
+            if s.icon.is_positive() {
+                assert!(
+                    s.icon.top() >= s.name.bottom(),
+                    "column {i} draws its icon over its own name"
+                );
+            }
+        }
     }
 
     /// **The scale beside a meter can be read on every channel.**

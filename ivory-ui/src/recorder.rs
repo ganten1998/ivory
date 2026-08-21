@@ -450,6 +450,13 @@ pub const INPUTS: usize = 4;
 /// How many channels the desk has, master aside.
 pub const STRIPS: usize = SLOTS + INPUTS + 3;
 
+/// How many COLUMNS the desk draws: every strip that has one, then the master.
+///
+/// Re-exported from `mixer_panel::COLUMNS` would be the other direction and
+/// this crate's panels do not depend on each other, so it is stated here and
+/// `a_column_and_a_strip_agree_about_the_desk` holds the two together.
+pub const COLUMNS_FOR_TEST: usize = SLOTS + INPUTS + 2;
+
 impl Strip {
     /// The channels the MIXER draws, in order.
     ///
@@ -482,6 +489,29 @@ impl Strip {
                 [Strip::Track, Strip::Click, Strip::Fx][i - SLOTS - INPUTS]
             }
         })
+    }
+
+    /// Which strip the mixer's `n`th COLUMN is, or `None` for the master.
+    ///
+    /// **The one place a column becomes a strip.** `shown()` and `all()` are
+    /// not the same list — the click and the effects bus are strips with no
+    /// column of their own — so `all()[n]` for a column index is off by
+    /// however many of those come before it. It was, and the symptom was the
+    /// master fader silently moving the metronome: column `SLOTS + INPUTS + 1`
+    /// is the master, and `all()` at that index is `Strip::Click`.
+    ///
+    /// Everything that turns a press into a change goes through this.
+    pub fn column(n: usize) -> Option<Strip> {
+        Self::shown().get(n).copied()
+    }
+
+    /// Where the `n`th COLUMN's settings live. See [`Strip::column`].
+    ///
+    /// The master's are last, past every channel — it is not in `shown()` and
+    /// has no `Strip` of its own, so `STRIPS` is its slot by convention and
+    /// this is where that convention is written down.
+    pub fn column_index(n: usize) -> usize {
+        Self::column(n).map_or(STRIPS, Strip::index)
     }
 
     /// Its place in `Desk`'s arrays.
@@ -888,6 +918,10 @@ pub enum RecorderRequest {
     /// egui frame still on the stack is the same re-entrancy the folder picker
     /// avoids.
     OpenPluginEditor(usize),
+    /// Open one insert's own window: `(desk index, bay)`. Deferred for exactly
+    /// the same reason as `OpenPluginEditor` — a native window may not be
+    /// built with an egui frame on the stack.
+    OpenInsertEditor(usize, usize),
     /// Open the patch editor on what the built-in is playing: the host
     /// answers with `IvoryApp::set_patch_edit`.
     EditPatch {

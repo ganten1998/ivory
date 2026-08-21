@@ -3173,6 +3173,20 @@ pub struct Engine {
     /// window and its `IPlugView` before the controller references that made
     /// them.
     editors: [Option<ivory_host::Editor>; SLOTS],
+    /// The same, for the racks. **An insert is a plugin with a window like any
+    /// other**, and until this existed there was no way to reach one: a
+    /// reverb loaded into a channel came up, worked, and could not be adjusted
+    /// — every control it has is inside a window nothing opened.
+    ///
+    /// Declared before `insert_editor_handles`, exactly as `editors` is before
+    /// `editor_handles`, and for the identical reason: a plain `drop(engine)`
+    /// has to release every window and its `IPlugView` before the controller
+    /// references that built them.
+    insert_editors: [[Option<ivory_host::Editor>; INSERTS]; STRIPS + 1],
+    /// Each loaded insert's edit controller, taken in [`Engine::load_insert`]
+    /// **before** the instance leaves for the audio thread — the one moment
+    /// there is an `&Instance` on this thread. See [`Engine::open_editor`].
+    insert_editor_handles: [[Option<ivory_host::EditorHandle>; INSERTS]; STRIPS + 1],
     /// A reference to each loaded plugin's edit controller, taken in
     /// [`Engine::load_plugin`] **before** the instance is handed to the audio
     /// thread — see [`Engine::open_editor`], where that is the whole trick.
@@ -3463,6 +3477,8 @@ impl Engine {
             }),
             fault,
             editors: std::array::from_fn(|_| None),
+            insert_editors: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            insert_editor_handles: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             editor_handles: std::array::from_fn(|_| None),
             state_handles: std::array::from_fn(|_| None),
             state_errors: std::array::from_fn(|_| None),
@@ -3554,6 +3570,15 @@ impl Engine {
             return Ok(None);
         }
         let Some(bundle) = bundle else {
+            // Window first, then the controller reference, then the instance.
+            self.close_insert_editor(strip, slot);
+            if let Some(h) = self
+                .insert_editor_handles
+                .get_mut(strip)
+                .and_then(|r| r.get_mut(slot))
+            {
+                *h = None;
+            }
             self.hand_off_insert(strip, slot, PluginBox(None));
             self.inserts_loaded[strip][slot] = None;
             return Ok(None);
@@ -3592,6 +3617,12 @@ impl Engine {
         }
         // Processing on, or the plugin is active and refuses every block.
         inst.set_processing(true)?;
+        // **The editor's only chance to get a reference**, for exactly the
+        // reason spelled out in `load_plugin_with_state`: one line below,
+        // `inst` goes into a `Hosted`, into a `PluginBox`, and across a ring
+        // into the audio callback, and after that there is no `&Instance` on
+        // this thread and no safe way to make one.
+        let editor_handle = inst.editor_handle();
         let loaded = Loaded {
             bundle: bundle.to_path_buf(),
             class: class.name.clone(),
@@ -3599,6 +3630,18 @@ impl Engine {
             channels: u16::try_from(channels).unwrap_or(u16::MAX),
             sample_rate: self.output.sample_rate,
         };
+        // Whatever was in THIS bay is going away, so its window and then its
+        // controller reference go first — the lifetime rule from `editors`.
+        // `hand_off_insert` is where the old instance is dropped, and dropping
+        // it terminates the controller the old handle points at.
+        self.close_insert_editor(strip, slot);
+        if let Some(h) = self
+            .insert_editor_handles
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *h = None;
+        }
         self.hand_off_insert(
             strip,
             slot,
@@ -3609,6 +3652,13 @@ impl Engine {
                 channels,
             }))),
         );
+        if let Some(h) = self
+            .insert_editor_handles
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *h = editor_handle;
+        }
         self.inserts_loaded[strip][slot] = Some(loaded.clone());
         Ok(Some(loaded))
     }
@@ -3939,6 +3989,70 @@ impl Engine {
         self.editors.get(slot).is_some_and(Option::is_some)
     }
 
+    /// One insert's own window: open it, or raise it if it is already up.
+    ///
+    /// The same handle trick as [`Engine::open_editor`] — see the long comment
+    /// in `load_plugin_with_state` for why a reference taken at load time is
+    /// the only way to reach a plugin the audio thread owns.
+    pub fn open_insert_editor(&mut self, strip: usize, slot: usize) -> Result<(), String> {
+        if strip > STRIPS || slot >= INSERTS {
+            return Ok(());
+        }
+        self.poll_editor();
+        if let Some(editor) = self
+            .insert_editors
+            .get(strip)
+            .and_then(|r| r.get(slot))
+            .and_then(Option::as_ref)
+        {
+            editor.focus();
+            return Ok(());
+        }
+        let Some(handle) = self
+            .insert_editor_handles
+            .get(strip)
+            .and_then(|r| r.get(slot))
+            .and_then(Option::as_ref)
+        else {
+            return Err(format!("nothing is loaded in insert {}", slot + 1));
+        };
+        // The CHANNEL and the bay, both, because the same compressor on four
+        // channels gives four windows that are otherwise identical.
+        let title = match self.insert(strip, slot) {
+            Some(l) => format!("{} - Tangent, insert {}", l.class, slot + 1),
+            None => format!("Insert {} - Tangent", slot + 1),
+        };
+        let editor =
+            ivory_host::Editor::open_handle(handle, &title).map_err(|e| e.to_string())?;
+        if let Some(e) = self
+            .insert_editors
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *e = Some(editor);
+        }
+        Ok(())
+    }
+
+    /// Close one insert's window if it is open. Safe when it is not.
+    pub fn close_insert_editor(&mut self, strip: usize, slot: usize) {
+        if let Some(e) = self
+            .insert_editors
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *e = None;
+        }
+    }
+
+    /// Is this insert's window open right now?
+    pub fn insert_editor_open(&self, strip: usize, slot: usize) -> bool {
+        self.insert_editors
+            .get(strip)
+            .and_then(|r| r.get(slot))
+            .is_some_and(Option::is_some)
+    }
+
     /// Notice windows the user closed and let go of them. Call once a frame.
     ///
     /// **All three at once**, because the caller has one frame loop and should
@@ -3951,6 +4065,16 @@ impl Engine {
         for editor in &mut self.editors {
             if editor.as_ref().is_some_and(ivory_host::Editor::closed) {
                 *editor = None;
+            }
+        }
+        // **And the racks', in the same sweep.** An insert's window closed by
+        // its own close button would otherwise stay "open" here for ever, and
+        // the click that should reopen it would silently raise nothing.
+        for rack in &mut self.insert_editors {
+            for editor in rack {
+                if editor.as_ref().is_some_and(ivory_host::Editor::closed) {
+                    *editor = None;
+                }
             }
         }
     }
