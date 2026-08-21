@@ -276,7 +276,13 @@ const MAX_CONTROLS_PER_BLOCK: usize = 32;
 /// and a take whose channel count changes halfway through is not a file any tool
 /// will open. A mono instrument is written to both channels; a multi-output one
 /// contributes its first two. See [`map_frame`].
-const TAP_CHANNELS: usize = 2;
+///
+/// **And so is the take**, because the take IS the tap — see
+/// `record::TakeSource`. The file used to be as wide as the INPUT, so choosing
+/// a mono microphone folded a stereo piano down to mono. That was defensible
+/// while a take could be the dry microphone alone; it is not defensible now
+/// that a take is the desk.
+pub const TAP_CHANNELS: usize = 2;
 
 /// Gain smoothing time constant. 10 ms is short enough to feel instant on a
 /// fader and long enough that a jump from 0.0 to 1.0 is a fade rather than a
@@ -3688,17 +3694,6 @@ impl Engine {
     pub fn any_plugin_loaded(&self) -> bool {
         self.loaded.iter().any(Option::is_some)
     }
-
-    /// Whether ANY instrument is loaded — a VST3 in a slot, or the built-in.
-    ///
-    /// The question every caller actually wants. `any_plugin_loaded` asks about
-    /// VST3 slots alone, and the built-in is not one: it is a sentinel path
-    /// that never writes `loaded`. Asking the narrow question is what made a
-    /// take of the built-in record the microphone instead.
-    pub fn any_instrument_loaded(&self) -> bool {
-        self.any_plugin_loaded() || self.shared.builtin_slot.load(Ordering::Relaxed) >= 0
-    }
-
     /// Whether a backing track is loaded, playing or not.
     ///
     /// Loaded is the question, not playing: a take is armed before the

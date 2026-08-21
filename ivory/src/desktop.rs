@@ -2140,17 +2140,12 @@ impl DesktopApp {
         // every frame, like the gains above and for the same reason.
         e.set_fx_return(gains.fx_return);
         e.set_desk(&self.app.desk());
-        // **And the microphone, which used to stop here.** `gains.input` was
-        // packaged, drawn and dragged and had no consumer anywhere in
-        // `ivory/src`: the fader moved nothing at all. It goes to the SESSION
-        // rather than to the engine, because the engine has no input in it —
-        // the input stream belongs to `ivory-record` and is drained by the
-        // writer thread, which is where the gain has to be applied to reach
-        // both the meter and the file.
-        self.recorder.session.set_input_gain(gains.input);
-        // **The same number, the monitor's level.** The fader means "how loud
-        // is the microphone", and it means it in both places it can be heard:
-        // in the take and, when monitoring is on, out of the speakers.
+        // **The microphone fader, and it goes to ONE place now.** It used to
+        // go to two — the session's writer thread and the engine — because the
+        // writer was where the dry capture became the take. The take is the
+        // desk, so the desk's own fader is the whole of it, and the second
+        // copy would have been the fader applied to everything in the file
+        // rather than to the microphone.
         e.set_monitor_gain(gains.input);
         // Never read from a settings file — see `IvoryApp::input_monitor`. It
         // is pushed every frame like every other monitor setting, and its value
