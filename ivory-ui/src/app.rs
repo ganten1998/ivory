@@ -1362,6 +1362,27 @@ impl IvoryApp {
         self.save_settings_soon();
     }
 
+    /// What the neck's interval column should say, or nothing when it is off.
+    ///
+    /// **From the MIDI, not from the fingering.** The question is "what am I
+    /// playing, in intervals", and that has the same answer whether the notes
+    /// came from a guitar the solver fingered or from a keyboard — so it is
+    /// built from the same `theory_panel::Input` the circle and the triangles
+    /// use, which is every sounding note and the detected root.
+    fn guitar_intervals(
+        &self,
+        display: &HashSet<u8>,
+    ) -> Option<fretboard_panel::Intervals> {
+        if !self.settings.guitar_intervals {
+            return None;
+        }
+        let input = self.theory_input(display);
+        (input.pcs != 0).then(|| fretboard_panel::Intervals {
+            pcs: input.pcs,
+            tonic: input.tonic(),
+        })
+    }
+
     /// The desk, as the painter wants it.
     ///
     /// **Assembled here rather than stored**, like every other view in this
@@ -1585,6 +1606,7 @@ impl IvoryApp {
             chord_strip: self.settings.show_chord_strip,
             key_note_names: self.settings.show_piano_note_names,
             fret_note_names: self.settings.show_fret_note_names,
+            guitar_intervals: self.settings.guitar_intervals,
             recorder_first: self.menu_over_recorder && self.settings.show_recorder,
             staff_first: self.menu_over_staff,
             staff_key: self.settings.staff_key,
@@ -4344,6 +4366,10 @@ impl IvoryApp {
                 self.settings.show_piano_note_names = !self.settings.show_piano_note_names;
                 self.save_settings();
             }
+            MenuAction::ToggleGuitarIntervals => {
+                self.settings.guitar_intervals = !self.settings.guitar_intervals;
+                self.save_settings();
+            }
             MenuAction::ToggleFretNoteNames => {
                 self.settings.show_fret_note_names = !self.settings.show_fret_note_names;
                 self.save_settings();
@@ -5611,6 +5637,7 @@ impl IvoryApp {
                 &s,
                 s.fretboard_wood(),
                 self.barre_to_draw(),
+                self.guitar_intervals(&display),
             );
             fretboard_panel::draw_top_edge(painter, r, &s);
         }
@@ -6120,6 +6147,7 @@ impl IvoryApp {
                 &self.settings,
                 self.settings.fretboard_wood(),
                 self.barre_to_draw(),
+                self.guitar_intervals(&display),
             );
             fretboard_panel::draw_top_edge(ui.painter(), fret_rect, &self.settings);
         }

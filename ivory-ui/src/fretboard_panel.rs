@@ -422,6 +422,32 @@ fn pc_name(pc: u8, prefer_flats: bool) -> &'static str {
 /// Draw the neck and everything on it. `voicing` must have been solved for
 /// `spec`; a mismatch is a wiring bug, and the assertion in the tests is what
 /// catches it.
+/// What is sounding, for the interval column beside the neck.
+///
+/// **Pitch classes and a tonic, not a voicing.** The column answers "what am I
+/// playing, in intervals" and that question has the same answer whether the
+/// notes arrived from a guitar the solver fingered or from a keyboard — so it
+/// is fed from the MIDI, not from the shape on the board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Intervals {
+    /// Bit `i` for pitch class `i`.
+    pub pcs: u16,
+    /// What everything is measured from: the detected root, else the bass.
+    pub tonic: u8,
+}
+
+/// The names, in semitones from the tonic.
+const INTERVAL_NAMES: [&str; 12] = [
+    "R", "♭2", "2", "♭3", "3", "4", "♭5", "5", "♭6", "6", "♭7", "7",
+];
+
+/// The share of the panel the interval column takes.
+///
+/// **About two frets.** Enough for a label and its space, and taken from the
+/// NECK rather than laid over it: the board is drawn into what is left, so it
+/// stretches rather than losing its last two frets off the end.
+const INTERVAL_COL: f32 = 0.11;
+
 pub fn draw(
     painter: &Painter,
     rect: Rect,
@@ -430,9 +456,29 @@ pub fn draw(
     s: &Settings,
     wood: Wood,
     barre: Option<Barre>,
+    intervals: Option<Intervals>,
 ) {
     let p = palette(s, wood);
     painter.rect_filled(rect, 0.0, p.bg);
+
+    // The column first, so the neck knows how much room it has left. The board
+    // is laid out into `rect` and every fret is a fraction of it, so handing
+    // over a narrower one stretches the neck instead of cropping it.
+    let (rect, column) = match intervals {
+        Some(i) if rect.width() > 200.0 => {
+            let w = rect.width() * INTERVAL_COL;
+            (
+                Rect::from_min_max(rect.min, Pos2::new(rect.max.x - w, rect.max.y)),
+                Some((Rect::from_min_max(Pos2::new(rect.max.x - w, rect.min.y), rect.max), i)),
+            )
+        }
+        // Too narrow to spare it: a neck squeezed to make room for a label is
+        // a worse guitar view than one with no labels.
+        _ => (rect, None),
+    };
+    if let Some((r, i)) = column {
+        draw_intervals(painter, r, i, &p, s);
+    }
 
     let caption = voicing.caption();
     let Some(g) = Geom::new(rect, spec) else {
@@ -879,6 +925,76 @@ fn draw_capo(painter: &Painter, band: Rect, g: &Geom, style: CapoStyle) {
     }
 }
 
+/// What is sounding, named in semitones from the tonic and in pitch order.
+///
+/// **From the tonic upward, not from C.** A chord is spelled from its root, so
+/// a G7 held anywhere on the neck reads R 3 5 ♭7 rather than as four letters
+/// somebody has to subtract in their head.
+///
+/// Its own function so it can be checked without a painter: the arithmetic is
+/// a modulo and an ordering, and both are easy to get one out.
+fn interval_names(i: Intervals) -> Vec<&'static str> {
+    (0..12u8)
+        .filter(|n| i.pcs & (1 << ((u16::from(i.tonic) + u16::from(*n)) % 12)) != 0)
+        .map(|n| INTERVAL_NAMES[n as usize])
+        .collect()
+}
+
+/// Every interval sounding, in a column beside the neck.
+///
+/// Read top to bottom in pitch order from the tonic, which is the order a
+/// chord is spelled in and the order somebody checking a voicing expects.
+fn draw_intervals(painter: &Painter, rect: Rect, i: Intervals, p: &Palette, s: &Settings) {
+    if !rect.is_positive() {
+        return;
+    }
+    // **The board's own colour, not the band's.** The neck runs the full width
+    // of the band, so a column carved out of it shows the pale background
+    // underneath and reads as a hole rather than as the end of the
+    // fingerboard. Filled and then divided by a hairline, which is what the
+    // end of a neck looks like.
+    painter.rect_filled(rect, 0.0, p.board);
+    painter.line_segment(
+        [rect.left_top(), rect.left_bottom()],
+        Stroke::new(1.0, p.wire),
+    );
+    let names = interval_names(i);
+    let cap = FontId::new(
+        (rect.width() * 0.30).clamp(8.0, 15.0),
+        crate::fonts::courier_bold(),
+    );
+    painter.text(
+        Pos2::new(rect.center().x, rect.top() + rect.height() * 0.11),
+        egui::Align2::CENTER_CENTER,
+        "INTERVALS",
+        FontId::new((rect.width() * 0.21).clamp(7.0, 11.0), crate::fonts::courier()),
+        p.on_board.gamma_multiply(0.62),
+    );
+    if names.is_empty() {
+        return;
+    }
+    // Spread down the rest of the panel, however many there are: six notes on
+    // a guitar is the most anybody can hold down at once.
+    let top = rect.top() + rect.height() * 0.22;
+    let room = rect.height() * 0.72;
+    let step = room / names.len().max(1) as f32;
+    for (n, name) in names.iter().enumerate() {
+        painter.text(
+            Pos2::new(rect.center().x, top + step * (n as f32 + 0.5)),
+            egui::Align2::CENTER_CENTER,
+            name,
+            cap.clone(),
+            // The root in the app's own chord colour, so the thing everything
+            // else is measured FROM is the thing the eye lands on first.
+            if n == 0 && *name == "R" {
+                s.chord_text_color.to_color32()
+            } else {
+                p.on_board
+            },
+        );
+    }
+}
+
 pub fn draw_top_edge(painter: &Painter, rect: Rect, s: &Settings) {
     let c = if s.dark_mode {
         Color32::from_rgb(60, 60, 60)
@@ -965,7 +1081,7 @@ pub fn show_detached_window(
     ctx.show_viewport_immediate(viewport_id(), builder, |vp, _class| {
         crate::shell::viewport_ui(vp, |ui| {
             let rect = ui.max_rect();
-            draw(ui.painter(), rect, voicing, spec, s, wood, barre);
+            draw(ui.painter(), rect, voicing, spec, s, wood, barre, None);
             painter_border(ui.painter(), rect);
 
             let (close, inner_rect, outer_rect, pressed, secondary, pointer) = ui.input(|i| {
@@ -1007,6 +1123,58 @@ fn painter_border(painter: &Painter, rect: Rect) {
 
 #[cfg(test)]
 mod tests {
+    use super::{interval_names, Intervals};
+
+    fn pcs(notes: &[u8]) -> u16 {
+        notes.iter().fold(0u16, |m, n| m | 1 << (n % 12))
+    }
+
+    /// **A chord is spelled from its root, wherever it is being held.**
+    ///
+    /// The column answers "what am I playing, in intervals", and the whole
+    /// value of that answer is that it does not change when the same chord
+    /// moves up the neck or arrives from a keyboard instead.
+    #[test]
+    fn intervals_are_named_from_the_tonic_upward() {
+        // G7 with G as the tonic: root, third, fifth, flat seventh.
+        let g7 = Intervals {
+            pcs: pcs(&[7, 11, 2, 5]),
+            tonic: 7,
+        };
+        assert_eq!(interval_names(g7), vec!["R", "3", "5", "♭7"]);
+
+        // The same notes with C as the tonic are a different spelling, which
+        // is the point: the tonic is what everything is measured from.
+        let over_c = Intervals { tonic: 0, ..g7 };
+        assert_eq!(interval_names(over_c), vec!["2", "4", "5", "7"]);
+
+        // A minor triad, and one an octave up: octaves are gone by the time
+        // this sees them, so the answer is the same.
+        let am = Intervals {
+            pcs: pcs(&[9, 0, 4]),
+            tonic: 9,
+        };
+        assert_eq!(interval_names(am), vec!["R", "♭3", "5"]);
+        let am_high = Intervals {
+            pcs: pcs(&[9 + 12, 0 + 24, 4 + 12]),
+            tonic: 9,
+        };
+        assert_eq!(interval_names(am_high), interval_names(am));
+
+        // Nothing sounding is nothing to say.
+        assert!(interval_names(Intervals::default()).is_empty());
+
+        // **A tonic near the top of the octave must not run off the end.** The
+        // arithmetic is a modulo and this is the case that would panic on an
+        // index if it were done wrong.
+        // B D F#, a B minor triad.
+        let high = Intervals {
+            pcs: pcs(&[11, 2, 6]),
+            tonic: 11,
+        };
+        assert_eq!(interval_names(high), vec!["R", "♭3", "5"]);
+    }
+
 
     /// A barre is one line across the strings, so the bar must be at least as
     /// wide as the dots drawn on top of it. At 1.7 radii against a 2.0-radius
@@ -1570,7 +1738,19 @@ mod tests {
                     for wood in Wood::ALL {
                         let _ = ctx.run(Default::default(), |ctx| {
                             egui::CentralPanel::default().show(ctx, |ui| {
-                                draw(ui.painter(), rect(), &v, &spec, &s, wood, v.shape.barre);
+                                draw(
+                            ui.painter(),
+                            rect(),
+                            &v,
+                            &spec,
+                            &s,
+                            wood,
+                            v.shape.barre,
+                            // A voicing under test is a shape, not a sound:
+                            // the column answers a question about MIDI and
+                            // there is none here.
+                            None,
+                        );
                                 draw_top_edge(ui.painter(), rect(), &s);
                             });
                         });

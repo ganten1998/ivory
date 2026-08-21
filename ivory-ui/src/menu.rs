@@ -73,6 +73,8 @@ pub enum MenuAction {
     ToggleHeart,
     /// D-UI-15: the guitar view.
     ToggleFretboard,
+    /// The interval column beside the neck.
+    ToggleGuitarIntervals,
     /// Show or hide the camera pane beside the theory band.
     ToggleCameraPane,
     /// The take's destination and devices, which moved out of the band.
@@ -194,6 +196,8 @@ pub struct MenuView {
     pub prefer_flats: bool,
     pub key_note_names: bool,
     pub fret_note_names: bool,
+    /// The interval column beside the neck is showing.
+    pub guitar_intervals: bool,
     pub detection_enabled: bool,
     /// Whether the chord strip band is up. Independent of detection: the staff
     /// reads the same chord, so detection can be on with no strip at all.
@@ -984,6 +988,14 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                     },
                     MenuAction::ToggleFretNoteNames,
                 ),
+                row(
+                    if view.guitar_intervals {
+                        "Hide Intervals"
+                    } else {
+                        "Show Intervals"
+                    },
+                    MenuAction::ToggleGuitarIntervals,
+                ),
                 row("Custom Tuning...", MenuAction::EditCustomTuning),
             ],
         );
@@ -1772,6 +1784,7 @@ mod tests {
             prefer_flats: true,
             key_note_names: false,
             fret_note_names: false,
+            guitar_intervals: true,
             detection_enabled: true,
             chord_strip: true,
             detached: false,

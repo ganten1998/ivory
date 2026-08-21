@@ -486,6 +486,12 @@ pub struct Settings {
     pub master_gain: f64,
     /// The backing track's level, linear.
     pub track_gain: f64,
+    /// The interval column beside the guitar neck.
+    ///
+    /// **On by default.** It is the one part of the guitar view that answers a
+    /// question rather than showing a position, and somebody who does not want
+    /// it turns it off in one row.
+    pub guitar_intervals: bool,
     /// The effects bus's return.
     ///
     /// **New with the mixer, and unity.** Every other level on the desk already
@@ -712,6 +718,7 @@ impl Default for Settings {
             input_gain: 1.0,
             master_gain: 1.0,
             track_gain: 1.0,
+            guitar_intervals: true,
             fx_return_gain: 1.0,
             // The instrument sends everything; nothing else sends anything.
             // Every instrument slot sends everything; nothing else sends
@@ -1341,6 +1348,7 @@ impl Settings {
         take_gain(&mut map, "master_gain", &mut s.master_gain);
         take_gain(&mut map, "track_gain", &mut s.track_gain);
         take_gain(&mut map, "fx_return_gain", &mut s.fx_return_gain);
+        take_bool(&mut map, "guitar_intervals", &mut s.guitar_intervals);
         if let Some(Value::String(path)) = map.shift_remove("track_path") {
             s.track_path = path;
         }
@@ -1713,6 +1721,10 @@ impl Settings {
             }
         }
         map.insert("fx_return_gain".into(), Value::from(self.fx_return_gain));
+        map.insert(
+            "guitar_intervals".into(),
+            Value::Bool(self.guitar_intervals),
+        );
         map.insert(
             "strip_sends".into(),
             Value::Array(self.strip_sends.iter().map(|v| Value::from(*v)).collect()),
