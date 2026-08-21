@@ -2191,6 +2191,112 @@ leave the HAL wedged for every other app on the machine.
 
 ---
 
+## 2y. 2026-08-21 — what you hear is what you get
+
+Shipped as **4.27.0**, on the owner's answer to the one question stage 4 could
+not be built without: *does a take become "the desk output", with mute as the
+way to leave something out?* Yes.
+
+### `TakeSource` is gone, and the choice it offered was the bug
+
+It was `input`, `plugin` or `both`. `input` meant the dry capture ring, so a
+microphone recorded that way arrived with none of the effects that had been
+audible while it was played. `both` summed that same dry ring INTO the desk
+mix, which wrote a monitored microphone twice — six decibels up and
+comb-filtered against its own monitor latency, which is the version of wrong
+that survives a listen. `resolve` was eight rules about the other arms.
+
+**No control ever emitted `SetRecordSources` in any build that shipped.** The
+whole thing was a setting nobody could reach, deciding the one question a
+recorder has to answer.
+
+The mixer made it unnecessary: a source that should not be in the take has a
+mute, which is a control you can see in a view that shows you what it did.
+`Desk::heard` is that rule, written once, and the audio thread's
+`strip_is_heard` is the same rule over the bit masks the same `Desk` was pushed
+as.
+
+### Monitoring narrows to the room
+
+It used to decide both, and the take was the casualty: **a microphone monitored
+through the interface's own hardware — the ordinary way anybody records one,
+because it is the only way with no latency — is not monitored HERE**, and
+produced a take with no microphone in it.
+
+So two mixes leave the renderer and they are not always the same one:
+
+- the take is `mix`, the whole desk;
+- the room is `mix` minus the input monitoring is withholding.
+
+The subtraction happens while the sum is still a sum. After the master insert
+it could not be done at all — a limiter is not linear and no arithmetic takes
+one voice back out of what it decided — so the speakers get their own instance
+of that insert, `room_effects`, and only while the two actually differ
+(`room_live`). A rig with no input device never reaches it.
+
+The withholding is SLEWED (`room_gain`), not switched, because a whole
+microphone appearing in one sample is a click; the same slew closes the send,
+so a channel nobody can hear cannot arrive back in the speakers through the
+reverb. Feedback is why the room half exists and why monitoring is still off at
+every launch — see `IvoryApp::input_monitor`.
+
+### The take is as wide as the desk
+
+The file used to be `config.channels` wide, which was right for as long as the
+capture WAS the take. Choose a mono microphone now and a stereo piano folds
+onto one channel. It is `TAP_CHANNELS` always, and the writer rebuilds its
+block at the desk's width rather than the device's.
+
+The microphone fader goes to ONE place because of it. It went to the writer
+thread as well — that was where the dry capture became the take — and the
+writer's block is the desk now, so that copy would have been the microphone's
+fader applied to everything in the file. `apply_input_gain`, `walk_gain`,
+`gain_slew_coefficient` and `Session::set_input_gain` went with it.
+
+**The band's needle shows what would be recorded**, because the idle path fills
+its block from the tap too. It used to show the dry input.
+
+### The band says what a take is about to be missing
+
+One rule instead of four is worth having, but a rule nobody is told about is
+the setting it replaced — and that setting cost the owner twelve takes across
+three releases. A muted source with something in it says so, by name, while
+there is still a take to save. Only sources that EXIST, and only while a take
+is RUNNING: muting the microphone to practise is normal, and a band that
+complained about it all afternoon would teach everybody to ignore the line that
+also says the camera was denied.
+
+`ivory-ui::recorder::missing_from_take` writes the sentence; the host decides
+which strips are lost. One needs a test, the other needs an engine.
+
+### Tests that fail when the old behaviour comes back
+
+- `the_take_is_the_desk_and_not_the_capture_ring` reads the take's peak and
+  knows what each wrong answer means: **0.75 is the microphone written twice,
+  0.25 is the dry ring with no effects on it, 0.5 is the desk.**
+- `an_unmonitored_input_is_in_the_take_and_out_of_the_room` asserts on both
+  sides of one render.
+- `a_mono_input_still_writes_a_stereo_take` puts two different numbers on the
+  two sides.
+
+### Stage 4, half done
+
+`ivory-record`'s capture takes several inputs of one interface now — `Picks`,
+up to `MAX_PICKS`, laid end to end in one ring, one callback, one clock. What
+is NOT done is everything above it: nothing can choose more than one yet, there
+is one `Strip::Input`, and the mixer draws one input column.
+
+The remaining work, in order:
+
+1. `Selection` and settings carry N chosen inputs, all of the same device.
+2. `Strip::Input(usize)`, `STRIPS = SLOTS + INPUTS + 3` — **and that moves
+   every index in `strip_colors`/`strip_sends`/the mute masks**, so it needs
+   the same kind of migration `strip_colors_v2` just did.
+3. The mixer draws the chosen inputs plus one empty outline with a plus, which
+   is the idiom the instrument slots already use.
+
+---
+
 ## 3. Repo layout
 
 ```
