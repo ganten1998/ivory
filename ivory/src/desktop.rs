@@ -126,7 +126,10 @@ struct Recorder {
     plugin_loaded: [Option<String>; ivory_ui::recorder::SLOTS],
     /// What was last ASKED for on the effects bus, whether or not it loaded.
     /// Settled either way, so a plugin that refuses is not retried every frame.
-    bus_effect_loaded: Option<String>,
+    /// What is loaded in each insert slot, flat like `Settings::strip_inserts`.
+    /// Remembered whether or not the load worked, so a plugin that refuses is
+    /// asked once.
+    inserts_loaded: Vec<Option<String>>,
     /// The slot whose load has been announced but not yet performed.
     ///
     /// `load_plugin` blocks for **about five seconds** — the module's own
@@ -1346,20 +1349,36 @@ impl DesktopApp {
         // Once per change, because `bus_effect_loaded` remembers what was asked
         // for whether or not it worked — a plugin that will not load must not
         // be retried sixty times a second.
-        let want_fx = self.app.bus_effect().map(str::to_owned);
-        if want_fx != self.recorder.bus_effect_loaded {
-            self.recorder.bus_effect_loaded = want_fx.clone();
+        // **ONE per call, like the instrument rack**, and for the same reason:
+        // loading blocks for seconds, and thirty-nine slots reconciled in one
+        // frame would be a window that stopped for a minute. Each is
+        // remembered whether or not it worked, so a plugin that will not load
+        // is not retried sixty times a second.
+        let inserts = ivory_ui::recorder::INSERTS;
+        let want_at = |i: usize| {
+            self.app
+                .insert(i / inserts, i % inserts)
+                .map(str::to_owned)
+        };
+        if let Some(i) = (0..self.recorder.inserts_loaded.len())
+            .find(|i| want_at(*i) != self.recorder.inserts_loaded[*i])
+        {
+            let want = want_at(i);
+            self.recorder.inserts_loaded[i] = want.clone();
             if let Some(e) = self.recorder.engine.as_mut() {
-                let path = want_fx.as_ref().map(std::path::Path::new);
-                match e.load_bus_effect(path) {
+                let path = want.as_ref().map(std::path::Path::new);
+                match e.load_insert(i / inserts, i % inserts, path) {
                     Ok(_) => self.recorder.engine_error = None,
                     Err(err) => {
-                        let which = want_fx
+                        let which = want
                             .as_deref()
                             .and_then(|p| p.rsplit('/').next())
                             .unwrap_or("that plugin");
+                        let channel = ivory_ui::recorder::Strip::all()
+                            .get(i / inserts)
+                            .map_or_else(|| "the master".to_owned(), |s| s.label());
                         self.recorder.engine_error =
-                            Some(format!("{which} did not load on the effects bus: {err}"));
+                            Some(format!("{which} did not load on {channel}: {err}"));
                     }
                 }
             }
@@ -2768,7 +2787,10 @@ impl DesktopApp {
                 engine: None,
                 engine_error: None,
                 plugin_loaded: [const { None }; ivory_ui::recorder::SLOTS],
-                bus_effect_loaded: None,
+                inserts_loaded: vec![
+                    None;
+                    (ivory_ui::recorder::STRIPS + 1) * ivory_ui::recorder::INSERTS
+                ],
                 plugin_opening: None,
                 camera_opening: false,
                 camera_silent_since: None,

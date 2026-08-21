@@ -10,7 +10,7 @@
 //! [`Layout::targets`] is the single source of truth both are derived from. No
 //! state, no `egui::Ui`, and nothing here can open a device or read a file.
 
-use crate::recorder::{gain_text, gain_to_fader, Strip, SLOTS};
+use crate::recorder::{gain_text, gain_to_fader, Strip, INSERTS, SLOTS};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 /// One channel, as the painter sees it.
@@ -28,7 +28,9 @@ pub struct StripView<'a> {
     /// The second line under the name: the device, the file, the patch.
     pub detail: &'a str,
     /// A user effect across this strip, by name. Empty for none.
-    pub insert: &'a str,
+    /// What is in each of this channel's three insert slots, by short name.
+    /// Empty for an empty slot, which is drawn as somewhere to put one.
+    pub inserts: [&'a str; INSERTS],
     /// Index into [`STRIP_COLORS`]. Zero is the desk's own wood.
     pub color: usize,
     /// An instrument slot with nothing in it.
@@ -118,8 +120,8 @@ pub enum Hit {
     Solo(usize),
     /// The plus on an empty slot: put an instrument here.
     Add(usize),
-    /// The insert chip: put an effect across this strip.
-    Insert(usize),
+    /// One of the three insert chips: put an effect in it, or take one out.
+    Insert(usize, usize),
     /// A swatch in the open palette: paint strip `n` colour `c`.
     Paint(usize, usize),
     /// A right-click anywhere on a strip: open its palette.
@@ -145,7 +147,7 @@ impl Hit {
             | Hit::Mute(i)
             | Hit::Solo(i)
             | Hit::Add(i)
-            | Hit::Insert(i)
+            | Hit::Insert(i, _)
             | Hit::Palette(i)
             | Hit::Db(i)
             | Hit::Name(i)
@@ -162,7 +164,7 @@ impl Hit {
         match self {
             Hit::Fader(_) => Some(DragAxis::Vertical),
             Hit::Send(_) => Some(DragAxis::Vertical),
-            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(_) | Hit::Paint(..)
+            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..) | Hit::Paint(..)
             | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) => None,
         }
     }
@@ -172,7 +174,7 @@ impl Hit {
         match self {
             Hit::Fader(_) => Some(FADER_TRAVEL),
             Hit::Send(_) => Some(SEND_TRAVEL),
-            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(_) | Hit::Paint(..)
+            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..) | Hit::Paint(..)
             | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) => None,
         }
     }
@@ -279,7 +281,7 @@ pub struct StripStrip {
     pub mute: Rect,
     pub solo: Rect,
     /// A user effect plugin across this strip. Only the bus has one today.
-    pub insert: Rect,
+    pub inserts: [Rect; INSERTS],
     /// The plus on an empty slot.
     pub add: Rect,
 }
@@ -300,7 +302,7 @@ impl StripStrip {
         db: Rect::NOTHING,
         mute: Rect::NOTHING,
         solo: Rect::NOTHING,
-        insert: Rect::NOTHING,
+        inserts: [Rect::NOTHING; INSERTS],
         add: Rect::NOTHING,
     };
 }
@@ -388,19 +390,36 @@ impl Layout {
         // arriving and how much you are letting through — and reading them
         // means looking at one place. Stacked, the meter also left a hand's
         // width of empty face above the fader that nothing could use.
-        let send = if sends { cut(0.19, 0.37) } else { Rect::NOTHING };
+        // BELOW the insert row, which every channel has now. The two shared a
+        // band for one build and the guard test found it before anybody could
+        // press a send and get an effect picker.
+        let send = if sends { cut(0.31, 0.45) } else { Rect::NOTHING };
         // Short of the bottom edge: a switch flush against the frame reads as
         // something that has been cut off rather than as the end of the strip.
-        // **An insert, on the bus alone.** A reverb is a send effect: one
-        // instance the channels feed at their own amounts is what a desk does.
-        // Per-channel inserts would be nine copies of the same plugin running
-        // on a machine this app is careful about, and they can come later
-        // without moving anything that is here.
-        let insert = if view.strip == Some(Strip::Fx) {
-            cut(0.20, 0.31)
-        } else {
-            Rect::NOTHING
-        };
+        // **Three inserts, on every channel, and the number never changes.**
+        //
+        // There used to be ONE, on the effects bus alone, on the argument that
+        // a reverb is a send effect and per-channel inserts would be nine
+        // copies of the same plugin. That argument is still true of reverb and
+        // was never true of an amp sim on the input, a compressor on the piano
+        // or an EQ on the backing track.
+        //
+        // Three because a desk you have to remember the rules of is not a desk
+        // you can see, and because this started as a MIDI monitor: a rack that
+        // grows until the machine gives out is a different program. Thirty-six
+        // across the desk if every one is filled, which is deliberately
+        // reachable — anybody who fills thirty-six finds out what their
+        // hardware does, and that is worth learning from the app rather than
+        // from a number the app made up.
+        let insert_row = cut(0.205, 0.295);
+        let inserts: [Rect; INSERTS] = std::array::from_fn(|i| {
+            let w = insert_row.width() / INSERTS as f32;
+            let x = insert_row.left() + w * i as f32;
+            Rect::from_min_max(
+                Pos2::new(x + 1.0, insert_row.top()),
+                Pos2::new(x + w - 1.0, insert_row.bottom()),
+            )
+        });
         let switches = if switchable { cut(0.902, 0.975) } else { Rect::NOTHING };
         let (mute, solo) = if switchable {
             let mid = switches.center().x;
@@ -419,16 +438,9 @@ impl Layout {
         // The effects bus has no send and DOES have an insert, and the two
         // wanted the same band; the guard test found it before anybody could
         // press one and get the other.
-        let travel = cut(
-            if sends {
-                0.41
-            } else if insert.is_positive() {
-                0.35
-            } else {
-                0.24
-            },
-            0.82,
-        );
+        // Every channel has an insert row now, so every channel's travel
+        // starts below it — a send is what still moves the line.
+        let travel = cut(if sends { 0.47 } else { 0.32 }, 0.82);
         // The meter takes the left third and the fader the rest, so the fader
         // still sits near the middle of the strip where a hand expects it.
         let split = travel.left() + travel.width() * 0.34;
@@ -451,7 +463,7 @@ impl Layout {
             db: cut(0.83, 0.888),
             mute,
             solo,
-            insert,
+            inserts,
             add: Rect::NOTHING,
         }
     }
@@ -470,7 +482,9 @@ impl Layout {
                 (s.mute, Hit::Mute(i)),
                 (s.solo, Hit::Solo(i)),
                 (s.add, Hit::Add(i)),
-                (s.insert, Hit::Insert(i)),
+                (s.inserts[0], Hit::Insert(i, 0)),
+                (s.inserts[1], Hit::Insert(i, 1)),
+                (s.inserts[2], Hit::Insert(i, 2)),
                 (s.db, Hit::Db(i)),
                 (s.name, Hit::Name(i)),
             ] {
@@ -723,18 +737,38 @@ fn strip(
     if l.send.is_positive() {
         send_knob(painter, l.send, v.send, p);
     }
-    if l.insert.is_positive() {
-        let filled = !v.insert.is_empty();
-        painter.rect_filled(l.insert, 2.0, if filled { p.lit } else { p.track });
+    // **Three chips, always three.** An empty one is an outline with a plus,
+    // which is the same offer an empty instrument slot makes — and drawing the
+    // row on every channel is what stops the desk having two kinds of strip.
+    for (n, cell) in l.inserts.iter().enumerate() {
+        if !cell.is_positive() {
+            continue;
+        }
+        let name = v.inserts.get(n).copied().unwrap_or("");
+        let filled = !name.is_empty();
+        if filled {
+            painter.rect_filled(*cell, 2.0, p.lit);
+        } else {
+            painter.rect_stroke(
+                *cell,
+                2.0,
+                Stroke::new(1.0, p.engrave.gamma_multiply(0.35)),
+                egui::StrokeKind::Inside,
+            );
+        }
         centred(
             painter,
-            l.insert,
-            if filled { v.insert } else { "+ EFFECT" },
+            *cell,
+            if filled { name } else { "+" },
             FontId::new(
-                (l.insert.height() * 0.52).clamp(6.5, 10.0),
+                (cell.height() * 0.5).clamp(6.0, 9.5),
                 crate::fonts::courier_bold(),
             ),
-            if filled { p.face } else { p.face.gamma_multiply(0.7) },
+            if filled {
+                p.face
+            } else {
+                p.engrave.gamma_multiply(0.45)
+            },
         );
     }
 
@@ -1072,7 +1106,7 @@ mod tests {
             strip,
             name: "CHANNEL",
             detail: "",
-            insert: "",
+            inserts: [""; INSERTS],
             color: 0,
             stereo: true,
             gr_db: 0.0,
@@ -1257,6 +1291,49 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), n, "two channels share an index");
+    }
+
+    /// **Three inserts on every channel, and all three can be pressed.**
+    ///
+    /// There used to be ONE, on the effects bus alone. A desk where one
+    /// channel can hold an effect and another cannot is a desk you have to
+    /// remember the rules of.
+    #[test]
+    fn every_channel_has_three_inserts_you_can_fill() {
+        let v = a_view();
+        let r = rect();
+        let l = Layout::new(r, &v);
+        for (i, s) in l.strips.iter().enumerate() {
+            if !s.panel.is_positive() || v.strips[i].empty {
+                continue;
+            }
+            for n in 0..INSERTS {
+                assert!(
+                    s.inserts[n].is_positive(),
+                    "channel {i} has no room for insert {n}"
+                );
+                assert_eq!(
+                    hit_test(r, &v, s.inserts[n].center()),
+                    Some(Hit::Insert(i, n)),
+                    "channel {i}'s insert {n} cannot be pressed"
+                );
+            }
+            // Side by side and not on top of each other.
+            for n in 1..INSERTS {
+                assert!(
+                    s.inserts[n].left() >= s.inserts[n - 1].right(),
+                    "channel {i}'s inserts {} and {n} overlap",
+                    n - 1
+                );
+            }
+        }
+        // An EMPTY slot is an outline and a plus, and nothing else: three
+        // effect chips on a channel with no instrument in it would be three
+        // controls for something that is not there.
+        let mut empty = a_view();
+        empty.strips[0] = a_strip(Some(Strip::Slot(0)), true);
+        let l = Layout::new(r, &empty);
+        assert!(!l.strips[0].inserts[0].is_positive());
     }
 
     /// **A channel's name is a field, and a long one is cut.**

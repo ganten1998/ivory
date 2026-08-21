@@ -324,6 +324,8 @@ pub struct IvoryApp {
     /// Which instrument slot the open picker is filling. See
     /// [`open_plugin_picker`](IvoryApp::open_plugin_picker).
     picker_slot: usize,
+    /// Which insert the open picker is filling, if it is filling one.
+    picker_insert: Option<(usize, usize)>,
     /// Every VST3 bundle the host found, for the picker.
     ///
     /// Supplied by the host rather than discovered here: `ivory-ui` cannot
@@ -753,6 +755,7 @@ impl IvoryApp {
             export_override: None,
             settings_save_at: None,
             picker_slot: 0,
+            picker_insert: None,
             grabbed: None,
             num_edit: None,
             track: crate::ports::TrackInfo::default(),
@@ -1545,7 +1548,7 @@ impl IvoryApp {
                 .get(i)
                 .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
             H::Send(i) => view.strips.get(i).map_or(0.0, |s| s.send),
-            H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(_) | H::Paint(..)
+            H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..) | H::Paint(..)
             | H::Palette(_) | H::Db(_) | H::Name(_) => 0.0,
         }
     }
@@ -1607,9 +1610,11 @@ impl IvoryApp {
                 }
                 return;
             }
-            // The bus's own effect. One picker, aimed somewhere else.
-            H::Insert(_) => {
-                self.open_bus_effect_picker();
+            // One of a channel's three inserts. The same picker the bus used
+            // to have to itself, aimed at whichever slot was pressed.
+            H::Insert(i, n) => {
+                let at = strips.get(i).map_or(crate::recorder::STRIPS, |s| s.index());
+                self.open_insert_picker(at, n);
                 return;
             }
             H::Palette(i) => {
@@ -1766,11 +1771,9 @@ impl IvoryApp {
                     _ => true,
                 },
                 gr_db: 0.0,
-                insert: if s == Strip::Fx {
-                    self.settings.bus_effect.as_deref().map_or("", plugin_display_name)
-                } else {
-                    ""
-                },
+                inserts: std::array::from_fn(|n| {
+                    self.insert(i, n).map_or("", plugin_display_name)
+                }),
                 empty,
                 gain,
                 send: desk.send[i],
@@ -1797,7 +1800,10 @@ impl IvoryApp {
                         .last()
                         .copied()
                         .unwrap_or(0) as usize,
-                    insert: "",
+                    inserts: std::array::from_fn(|n| {
+                        self.insert(crate::recorder::STRIPS, n)
+                            .map_or("", plugin_display_name)
+                    }),
                     empty: false,
                     gain: g.master,
                     send: 0.0,
@@ -3900,6 +3906,31 @@ impl IvoryApp {
         self.settings.bus_effect.as_deref()
     }
 
+    /// What is in one of the desk's insert slots, if anything.
+    ///
+    /// `strip` is `Strip::index`, with the master at `STRIPS`. See
+    /// `Settings::strip_inserts`.
+    pub fn insert(&self, strip: usize, slot: usize) -> Option<&str> {
+        self.settings
+            .strip_inserts
+            .get(strip * crate::recorder::INSERTS + slot)
+            .map(String::as_str)
+            .filter(|p| !p.is_empty())
+    }
+
+    /// Put an effect in one, or take one out.
+    pub fn set_insert(&mut self, strip: usize, slot: usize, path: Option<&str>) {
+        let need = (crate::recorder::STRIPS + 1) * crate::recorder::INSERTS;
+        if self.settings.strip_inserts.len() < need {
+            self.settings.strip_inserts.resize(need, String::new());
+        }
+        let at = strip * crate::recorder::INSERTS + slot;
+        if let Some(cell) = self.settings.strip_inserts.get_mut(at) {
+            *cell = path.unwrap_or_default().to_owned();
+        }
+        self.save_settings();
+    }
+
     /// A short name for the audio interface, used on every one of its inputs.
     ///
     /// Empty means "use the interface's own name". See `Settings::input_alias`.
@@ -4011,14 +4042,20 @@ impl IvoryApp {
     /// `usize::MAX` as the target, following `ChoosePatch`'s own precedent: it
     /// rides the same request the real indices do and the answer has one arm
     /// to read instead of two.
-    fn open_bus_effect_picker(&mut self) {
-        if !self.caps.capture_devices {
+    /// The picker for ONE of a channel's three inserts.
+    ///
+    /// `strip` is `Strip::index`, master at `STRIPS`. Remembered as a
+    /// (strip, slot) pair rather than a sentinel: there used to be exactly one
+    /// insert and `usize::MAX` meant "the bus", which stops being expressible
+    /// the moment there are thirty-nine of them.
+    fn open_insert_picker(&mut self, strip: usize, slot: usize) {
+        if !self.caps.capture_devices || strip > recorder::STRIPS || slot >= recorder::INSERTS {
             return;
         }
-        self.picker_slot = usize::MAX;
+        self.picker_insert = Some((strip, slot));
         self.dialog = Some(Dialog::plugin_picker(
             &self.plugin_list,
-            self.settings.bus_effect.clone(),
+            self.insert(strip, slot).map(str::to_owned),
         ));
     }
 
@@ -4026,6 +4063,7 @@ impl IvoryApp {
         if !self.caps.capture_devices || slot >= recorder::SLOTS {
             return;
         }
+        self.picker_insert = None;
         self.picker_slot = slot;
         // The dialog's own constructor rather than building the variant here:
         // it sorts, it derives the rows from the paths, and it preselects the
@@ -5266,9 +5304,8 @@ impl IvoryApp {
             }
             DialogAction::LoadPlugin { path } => {
                 // The bus, not a slot. See `open_bus_effect_picker`.
-                if self.picker_slot == usize::MAX {
-                    self.settings.bus_effect = path;
-                    self.save_settings();
+                if let Some((strip, at)) = self.picker_insert.take() {
+                    self.set_insert(strip, at, path.as_deref());
                     return;
                 }
                 let slot = self.picker_slot.min(recorder::SLOTS - 1);
@@ -6865,7 +6902,7 @@ impl IvoryApp {
                         Some(hit @ (crate::mixer_panel::Hit::Mute(_)
                         | crate::mixer_panel::Hit::Solo(_)
                         | crate::mixer_panel::Hit::Add(_)
-                        | crate::mixer_panel::Hit::Insert(_)
+                        | crate::mixer_panel::Hit::Insert(..)
                         | crate::mixer_panel::Hit::Paint(..)
                         | crate::mixer_panel::Hit::Palette(_)
                         | crate::mixer_panel::Hit::Db(_)

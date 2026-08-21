@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 10;
+const SETTINGS_VERSION: u64 = 11;
 
 /// Where a desk channel written before the INPUT STRIPS ended up.
 ///
@@ -561,6 +561,17 @@ pub struct Settings {
     /// shortening is the half that is the same on every channel of it: call it
     /// "x" and the strips read "x - 3", "x - 4/5".
     pub input_alias: String,
+    /// The effect in each of the desk's insert slots, as bundle paths.
+    ///
+    /// **Flat, `strip * INSERTS + slot`**, with the master last — the same
+    /// index `strip_colors` uses, plus a slot. A `Vec` rather than an array
+    /// because it is thirty-nine strings and an array of those is a large
+    /// thing to move around for no gain.
+    ///
+    /// Empty means empty. The old `bus_effect` is read into the effects bus's
+    /// first slot and then left alone: a bus is a channel with a send instead
+    /// of a fader, and it had the only insert this app used to have.
+    pub strip_inserts: Vec<String>,
     /// A user effect plugin across the effects bus, as a bundle path.
     ///
     /// **On the bus, not on every channel.** A reverb is a send effect: one
@@ -822,6 +833,7 @@ impl Default for Settings {
                 if i < crate::recorder::SLOTS { 1.0 } else { 0.0 }
             }),
             strip_names: Vec::new(),
+            strip_inserts: Vec::new(),
             input_alias: String::new(),
             strip_muted: 0,
             strip_soloed: 0,
@@ -1334,6 +1346,13 @@ impl Settings {
                 }
             }
         }
+        if let Some(Value::Array(v)) = map.shift_remove("strip_inserts") {
+            s.strip_inserts = v
+                .into_iter()
+                .map(|x| x.as_str().unwrap_or_default().to_owned())
+                .take((crate::recorder::STRIPS + 1) * crate::recorder::INSERTS)
+                .collect();
+        }
         if let Some(Value::Array(v)) = map.shift_remove("strip_names") {
             s.strip_names = v
                 .into_iter()
@@ -1559,6 +1578,23 @@ impl Settings {
         legacy_staff: bool,
         saw_order: bool,
     ) {
+        if was < 11 {
+            // **The one insert this app had becomes the first of the bus's
+            // three.** A bus is a channel with a send instead of a fader; it
+            // simply had the only rack there was.
+            if let Some(path) = self.bus_effect.clone() {
+                let at = crate::recorder::Strip::Fx.index() * crate::recorder::INSERTS;
+                let need = (crate::recorder::STRIPS + 1) * crate::recorder::INSERTS;
+                if self.strip_inserts.len() < need {
+                    self.strip_inserts.resize(need, String::new());
+                }
+                if let Some(slot) = self.strip_inserts.get_mut(at) {
+                    if slot.is_empty() {
+                        *slot = path;
+                    }
+                }
+            }
+        }
         if was < 10 {
             // **The desk grew four input columns where there had been one**,
             // and everything indexed by a channel moved with it. See
@@ -1887,6 +1923,15 @@ impl Settings {
             Value::Array(self.strip_sends.iter().map(|v| Value::from(*v)).collect()),
         );
         map.insert("strip_muted".into(), Value::from(self.strip_muted));
+        map.insert(
+            "strip_inserts".into(),
+            Value::Array(
+                self.strip_inserts
+                    .iter()
+                    .map(|p| Value::String(p.clone()))
+                    .collect(),
+            ),
+        );
         map.insert(
             "strip_names".into(),
             Value::Array(

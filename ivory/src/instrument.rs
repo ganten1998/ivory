@@ -1529,6 +1529,83 @@ struct Slot {
     gain: f32,
 }
 
+/// How many effect inserts a channel has room for. See the UI's own copy.
+pub const INSERTS: usize = ivory_ui::recorder::INSERTS;
+
+/// One channel's insert chain: up to [`INSERTS`] effects, in series.
+///
+/// **A rack per channel, and each slot its own hand-off.** The pair of rings
+/// IS the routing, exactly as it is for an instrument slot — an instance
+/// arriving on this consumer belongs in this slot of this channel, and no
+/// index has to say so. One pair carrying `(where, PluginBox)` would need the
+/// audio thread to trust a number a UI thread wrote.
+///
+/// An empty rack costs nothing: `run` returns before it touches a buffer, and
+/// the channel folds by exactly the path it did before racks existed.
+struct Rack {
+    slots: [PluginBox; INSERTS],
+    incoming: [Consumer<PluginBox>; INSERTS],
+    retiring: [Producer<PluginBox>; INSERTS],
+}
+
+impl Rack {
+    /// Take whatever the UI thread has sent, and give back what it displaces.
+    ///
+    /// Same shape as an instrument slot's swap and for the same reason: the
+    /// callback never DROPS a plugin — dropping runs the vendor's teardown,
+    /// which is not something to do between two blocks of audio — it returns
+    /// it for the UI thread to drop.
+    fn swap(&mut self) {
+        for i in 0..INSERTS {
+            while let Ok(next) = self.incoming[i].pop() {
+                let old = std::mem::replace(&mut self.slots[i], next);
+                let _ = self.retiring[i].push(old);
+            }
+        }
+    }
+
+    /// Whether anything is loaded. The whole point of asking is to leave the
+    /// common path exactly as it was.
+    fn is_empty(&self) -> bool {
+        self.slots.iter().all(|s| s.0.is_none())
+    }
+}
+
+/// Run a rack over one channel's PLANAR audio, in place.
+///
+/// A free function rather than a method, because every caller holds the rack
+/// and the scratch as separate fields of the renderer and the borrow checker
+/// only sees that if they are named separately.
+///
+/// `planar[c]` must hold at least `frames`. Channels a plugin does not write
+/// keep what they had, and a plugin that answers with fewer channels than it
+/// was given has its last one read twice rather than leaving a silent side —
+/// the same rule the bus insert has always followed.
+fn run_rack(rack: &mut Rack, planar: &mut [Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+    for slot in &mut rack.slots {
+        let Some(p) = slot.0.as_mut() else {
+            continue;
+        };
+        if p.inst.process_effect(planar, frames, out).is_err() {
+            // A refused block leaves the audio ALONE rather than replacing it
+            // with whatever was in the output buffers: a faulted insert is a
+            // channel that stops being processed, not one that starts making
+            // noise.
+            continue;
+        }
+        let wrote = p.channels.max(1);
+        for c in 0..planar.len() {
+            let Some(src) = out.get(c.min(wrote - 1)) else {
+                continue;
+            };
+            let Some(dst) = planar.get_mut(c) else {
+                continue;
+            };
+            dst[..frames].copy_from_slice(&src[..frames]);
+        }
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // The renderer: everything that runs on the audio thread
 // ───────────────────────────────────────────────────────────────────────────
@@ -1650,9 +1727,13 @@ struct Renderer {
     /// desk does and what the plugin expects, and per-channel inserts would be
     /// nine instances of the same reverb running at once for a machine this
     /// app is careful about.
-    fx_plugin: PluginBox,
-    fx_incoming: Consumer<PluginBox>,
-    fx_retiring: Producer<PluginBox>,
+    /// One rack per channel, master last — `Strip::index` and then `STRIPS`.
+    ///
+    /// **The effects bus is one of them.** It used to be a field of its own
+    /// with its own hand-off and its own function; a bus is a channel with a
+    /// send instead of a fader, and one mechanism that every channel uses is
+    /// worth more than a special case that only the bus understands.
+    racks: [Rack; STRIPS + 1],
     /// Deinterleaved in and out for it. Preallocated, like everything else the
     /// audio thread touches.
     fx_in: Vec<Vec<f32>>,
@@ -1723,57 +1804,55 @@ struct Renderer {
 }
 
 impl Renderer {
-    /// Take each slot's waiting plugin, if one is waiting and the old one can be
-    /// returned.
+    /// Run one channel's insert rack over an INTERLEAVED stereo buffer.
     ///
-    /// The order matters: the retire ring is checked for room *first*, because
-    /// accepting a new instance with nowhere to put the old one would leave the
-    /// callback holding two, and dropping one here is exactly what condition 4
-    /// of [`PluginBox`]'s safety argument forbids.
+    /// The racks want planar — one array per channel, which is what every VST3
+    /// effect asks for — and the mix and the bus are interleaved, so this is
+    /// the conversion at both ends. Slots hand their audio over planar
+    /// already and skip it.
     ///
-    /// Every slot is offered a swap on every callback and the cost of a slot
-    /// with nothing waiting is one relaxed load of a ring's head index. Zipped
-    /// rather than indexed so that the fault flag beside a slot is *that* slot's
-    /// by construction — an index into a second array is a way to clear the
-    /// wrong one, and the audio thread does not get to `assert!`.
-    /// Run the bus through the user's effect, in place.
-    ///
-    /// **Silently skipped when there is none**, which is the ordinary state.
-    /// A plugin that refuses a block leaves the bus as the built-in effects
-    /// made it rather than silencing it: an effect that faults should cost its
-    /// own contribution, not the reverb underneath it.
-    fn run_bus_effect(&mut self, frames: usize) {
-        let Some(p) = self.fx_plugin.0.as_mut() else {
+    /// Returns immediately on an empty rack, so a channel nobody has put an
+    /// effect on costs one branch and folds by exactly the path it always did.
+    fn run_insert_chain(&mut self, at: usize, buf_is_aux: bool, frames: usize) {
+        let Some(rack) = self.racks.get(at) else {
             return;
         };
-        let Some(aux) = self.aux.get(..frames * TAP_CHANNELS) else {
+        if rack.is_empty() {
             return;
-        };
-        // Interleaved to planar and back. The plugin wants one array per
-        // channel and the bus is a stereo interleave; both buffers were sized
-        // at construction so neither allocates here.
-        for c in 0..TAP_CHANNELS {
-            let Some(dst) = self.fx_in.get_mut(c) else {
+        }
+        let n = frames * TAP_CHANNELS;
+        {
+            let src = if buf_is_aux { &self.aux } else { &self.mix };
+            let Some(src) = src.get(..n) else {
                 return;
             };
-            for (f, d) in dst.iter_mut().take(frames).enumerate() {
-                *d = aux[f * TAP_CHANNELS + c];
+            for c in 0..TAP_CHANNELS {
+                let Some(dst) = self.fx_in.get_mut(c) else {
+                    return;
+                };
+                for (f, d) in dst.iter_mut().take(frames).enumerate() {
+                    *d = src[f * TAP_CHANNELS + c];
+                }
             }
         }
-        if p.inst.process_effect(&self.fx_in, frames, &mut self.fx_out).is_err() {
+        let Some(rack) = self.racks.get_mut(at) else {
             return;
-        }
-        let Some(aux) = self.aux.get_mut(..frames * TAP_CHANNELS) else {
+        };
+        run_rack(rack, &mut self.fx_in, frames, &mut self.fx_out);
+        let dst = if buf_is_aux {
+            self.aux.get_mut(..n)
+        } else {
+            self.mix.get_mut(..n)
+        };
+        let Some(dst) = dst else {
             return;
         };
         for c in 0..TAP_CHANNELS {
-            // A plugin that wrote fewer channels than asked has its last one
-            // read twice rather than leaving a silent side.
-            let Some(src) = self.fx_out.get(c.min(p.channels.saturating_sub(1))) else {
+            let Some(src) = self.fx_in.get(c) else {
                 continue;
             };
             for f in 0..frames {
-                if let (Some(v), Some(s)) = (aux.get_mut(f * TAP_CHANNELS + c), src.get(f)) {
+                if let (Some(v), Some(s)) = (dst.get_mut(f * TAP_CHANNELS + c), src.get(f)) {
                     *v = *s;
                 }
             }
@@ -1781,14 +1860,11 @@ impl Renderer {
     }
 
     fn swap_plugins(&mut self) -> usize {
-        // The bus effect first, and by the same protocol: whatever arrives
-        // replaces what is there and the old one goes back to be dropped on
-        // the thread that made it.
-        if self.fx_retiring.slots() > 0 {
-            if let Ok(next) = self.fx_incoming.pop() {
-                let old = std::mem::replace(&mut self.fx_plugin, next);
-                let _ = self.fx_retiring.push(old);
-            }
+        // Every rack first, by the same protocol the slots use: whatever
+        // arrives replaces what is there and the old one goes back to be
+        // dropped on the thread that made it.
+        for rack in &mut self.racks {
+            rack.swap();
         }
         let mut swapped = 0;
         for (slot, faulted) in self.slots.iter_mut().zip(&self.shared.slot_faulted) {
@@ -2130,7 +2206,7 @@ impl Renderer {
             // **And then whatever the user put across the bus.** After the
             // built-in three, so somebody who loads a reverb and leaves the
             // knobs alone hears their reverb rather than theirs through ours.
-            self.run_bus_effect(n);
+            self.run_insert_chain(Strip::Fx.index(), true, n);
             // What comes back, at the bus's own fader.
             let return_target = level(Strip::Fx, &self.shared.fx_return);
             let fx_peak = add_return(
@@ -2173,6 +2249,10 @@ impl Renderer {
                     }
                 }
             }
+            // **The master's own rack, before the master's built-in insert.**
+            // The limiter stays last on the way out, which is what a limiter
+            // is for: an effect after it would undo the ceiling it just made.
+            self.run_insert_chain(STRIPS, false, n);
             let master = Shared::f32_of(&self.shared.master_gain);
             if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
                 self.master_effects.process(
@@ -2461,21 +2541,47 @@ impl Renderer {
             }
             let send = Shared::f32_of(&self.shared.send[strip.index()]).clamp(0.0, 1.0);
             let mut peak = [0.0f32; 2];
-            let mut room = room_from;
+            // **This strip's own audio first, then its rack, then the fold.**
+            //
+            // It used to go straight into the mix a sample at a time, which is
+            // cheaper and leaves nowhere for an insert to stand. The values
+            // are identical — this is the same arithmetic through a buffer —
+            // and what it buys is a channel that can carry an amp sim like
+            // every other channel can.
+            //
+            // A mono input goes to both sides; a stereo one keeps its sides.
+            // Anything wider is folded down by taking the first two, which is
+            // what a monitor is for — hearing that something is arriving, not
+            // auditioning a surround mix.
             for i in 0..n {
                 self.monitor_gain[input] += (target - self.monitor_gain[input]) * self.gain_coeff;
+                for c in 0..TAP_CHANNELS {
+                    let lane = at_ch + c.min(width - 1);
+                    let src = scratch[i * ch_in + lane] * self.monitor_gain[input];
+                    if let Some(dst) = self.fx_in.get_mut(c) {
+                        dst[i] = src;
+                    }
+                }
+            }
+            run_rack(
+                &mut self.racks[strip.index()],
+                &mut self.fx_in,
+                n,
+                &mut self.fx_out,
+            );
+            let mut room = room_from;
+            for i in 0..n {
+                // The room's own slew, advanced here rather than above: it
+                // moves once per frame however many inputs are open, and
+                // recomputing it in this pass is exact because both passes
+                // walk the same frames in the same order.
                 room += (room_target - room) * self.gain_coeff;
                 // How much of this frame the room is NOT being given.
                 let keep_out = 1.0 - room;
                 withheld = withheld.max(keep_out);
                 let at = i * TAP_CHANNELS;
                 for c in 0..TAP_CHANNELS {
-                    // A mono input goes to both sides; a stereo one keeps its
-                    // sides. Anything wider is folded down by taking the first
-                    // two, which is what a monitor is for — hearing that
-                    // something is arriving, not auditioning a surround mix.
-                    let lane = at_ch + c.min(width - 1);
-                    let src = scratch[i * ch_in + lane] * self.monitor_gain[input];
+                    let src = self.fx_in.get(c).map_or(0.0, |b| b[i]);
                     peak[c.min(1)] = peak[c.min(1)].max(src.abs());
                     if let Some(v) = self.mix.get_mut(at + c) {
                         *v += src;
@@ -2557,28 +2663,50 @@ impl Renderer {
             return;
         };
         let mut peak = [0.0f32; 2];
+        // **The clip at its fader, then its rack, then the fold.** Same shape
+        // as every other channel: the values are what they always were, and
+        // what the buffer buys is somewhere for an insert to stand.
         for f in 0..frames {
             self.track_gain += (target - self.track_gain) * coeff;
-            if self.track_pos >= out {
-                continue;
+            let (l, r) = if self.track_pos >= out {
+                (0.0, 0.0)
+            } else {
+                let at = (self.track_pos as usize) * 2;
+                // Bounds-checked rather than trusted: `out` is clamped to the
+                // clip's length above, and this is the line that would panic
+                // on the audio thread if that ever stopped being true.
+                let pair = match (clip.samples.get(at), clip.samples.get(at + 1)) {
+                    (Some(l), Some(r)) => (l * self.track_gain, r * self.track_gain),
+                    _ => (0.0, 0.0),
+                };
+                self.track_pos += 1;
+                pair
+            };
+            if let Some(dst) = self.fx_in.get_mut(0) {
+                dst[f] = l;
             }
-            let at = (self.track_pos as usize) * 2;
-            // Bounds-checked rather than trusted: `out` is clamped to the
-            // clip's length above, and this is the line that would panic on
-            // the audio thread if that ever stopped being true.
-            if let (Some(l), Some(r)) = (clip.samples.get(at), clip.samples.get(at + 1)) {
-                let (l, r) = (l * self.track_gain, r * self.track_gain);
-                peak[0] = peak[0].max(l.abs());
-                peak[1] = peak[1].max(r.abs());
-                mix[f * TAP_CHANNELS] += l;
-                mix[f * TAP_CHANNELS + 1] += r;
-                // Post-fader, like every other send here. A backing track
-                // arrives finished and usually wants none of the room the
-                // piano is in, which is why this defaults to zero.
-                aux[f * TAP_CHANNELS] += l * send;
-                aux[f * TAP_CHANNELS + 1] += r * send;
+            if let Some(dst) = self.fx_in.get_mut(1) {
+                dst[f] = r;
             }
-            self.track_pos += 1;
+        }
+        run_rack(
+            &mut self.racks[Strip::Track.index()],
+            &mut self.fx_in,
+            frames,
+            &mut self.fx_out,
+        );
+        for f in 0..frames {
+            let l = self.fx_in.first().map_or(0.0, |b| b[f]);
+            let r = self.fx_in.get(1).map_or(0.0, |b| b[f]);
+            peak[0] = peak[0].max(l.abs());
+            peak[1] = peak[1].max(r.abs());
+            mix[f * TAP_CHANNELS] += l;
+            mix[f * TAP_CHANNELS + 1] += r;
+            // Post-fader, like every other send here. A backing track arrives
+            // finished and usually wants none of the room the piano is in,
+            // which is why this defaults to zero.
+            aux[f * TAP_CHANNELS] += l * send;
+            aux[f * TAP_CHANNELS + 1] += r * send;
         }
         self.shared.note_strip_peak(Strip::Track, peak);
     }
@@ -2762,6 +2890,27 @@ impl Renderer {
                 None => (&[][..], &[][..]),
             };
             let send = f32::from_bits(self.shared.send[i].load(Ordering::Relaxed)).clamp(0.0, 1.0);
+            // **This slot's inserts, before its fader.** An instrument's audio
+            // is already PLANAR — one array per channel is what the host hands
+            // back and what an effect wants — so this is the one channel on
+            // the desk that needs no interleaving to reach its rack.
+            //
+            // An empty rack is a branch and nothing else: the pair goes to
+            // `mix_in` exactly as it did before racks existed.
+            let (left, right) = if self.racks[i].is_empty() {
+                (left, right)
+            } else {
+                for (c, src) in [left, right].into_iter().enumerate() {
+                    let Some(dst) = self.fx_in.get_mut(c) else {
+                        continue;
+                    };
+                    for (f, d) in dst.iter_mut().take(frames).enumerate() {
+                        *d = src.get(f).copied().unwrap_or(0.0);
+                    }
+                }
+                run_rack(&mut self.racks[i], &mut self.fx_in, frames, &mut self.fx_out);
+                (&self.fx_in[0][..frames], &self.fx_in[1][..frames])
+            };
             peaks[i] = mix_in(mix, aux, left, right, gain, *target, send, coeff);
         }
         for (i, peak) in peaks.into_iter().enumerate() {
@@ -3004,8 +3153,10 @@ pub struct Engine {
     /// This thread's end of each slot's handoff, one pair per slot.
     handoff: [Handoff; SLOTS],
     /// The bus effect's half of the same protocol.
-    fx_handoff: Handoff,
-    fx_loaded: Option<Loaded>,
+    /// The UI thread's ends of every rack's hand-offs. See `Rack`.
+    insert_handoff: [[Handoff; INSERTS]; STRIPS + 1],
+    /// What is in each of them, for the desk to name.
+    inserts_loaded: [[Option<Loaded>; INSERTS]; STRIPS + 1],
     loaded: [Option<Loaded>; SLOTS],
     warm: [Option<WarmUp>; SLOTS],
 
@@ -3172,6 +3323,41 @@ impl Engine {
         let mut ends = ends.into_iter();
         let handoff: [Handoff; SLOTS] =
             std::array::from_fn(|_| ends.next().expect("one Handoff was pushed per slot"));
+        // **A rack per channel, master last, three hand-off pairs each.**
+        // Thirty-nine small rings rather than one shared pair, for the same
+        // reason the slots have six: the ring an instance travels on is what
+        // says where it belongs, and a pair carrying an index would be the
+        // audio thread trusting a number a UI thread wrote. See `PluginBox`.
+        let mut rack_ends: Vec<[Handoff; INSERTS]> = Vec::with_capacity(STRIPS + 1);
+        let racks: [Rack; STRIPS + 1] = std::array::from_fn(|_| {
+            let mut ends: Vec<Handoff> = Vec::with_capacity(INSERTS);
+            let mut incoming = Vec::with_capacity(INSERTS);
+            let mut retiring = Vec::with_capacity(INSERTS);
+            for _ in 0..INSERTS {
+                let (to_audio, inc) = RingBuffer::<PluginBox>::new(2);
+                let (ret, from_audio) = RingBuffer::<PluginBox>::new(2);
+                ends.push(Handoff {
+                    to_audio,
+                    from_audio,
+                });
+                incoming.push(inc);
+                retiring.push(ret);
+            }
+            let mut ends = ends.into_iter();
+            rack_ends.push(std::array::from_fn(|_| {
+                ends.next().expect("one Handoff per insert")
+            }));
+            let mut inc = incoming.into_iter();
+            let mut ret = retiring.into_iter();
+            Rack {
+                slots: std::array::from_fn(|_| PluginBox(None)),
+                incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
+                retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
+            }
+        });
+        let mut rack_ends = rack_ends.into_iter();
+        let insert_handoff: [[Handoff; INSERTS]; STRIPS + 1] =
+            std::array::from_fn(|_| rack_ends.next().expect("one set per channel"));
         // One more pair, for the effect that sits across the bus.
         let (fx_to_audio, fx_incoming) = RingBuffer::<PluginBox>::new(1);
         let (fx_retiring, fx_from_audio) = RingBuffer::<PluginBox>::new(1);
@@ -3210,9 +3396,7 @@ impl Engine {
             room_live: false,
             room_gain: 0.0,
             aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
-            fx_plugin: PluginBox(None),
-            fx_incoming,
-            fx_retiring,
+            racks,
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],
@@ -3270,8 +3454,8 @@ impl Engine {
             timebase,
             midi: RefCell::new(midi_tx),
             handoff,
-            fx_handoff,
-            fx_loaded: None,
+            insert_handoff,
+            inserts_loaded: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             loaded: std::array::from_fn(|_| None),
             warm: std::array::from_fn(|_| None),
             tap: Some(RecorderTap {
@@ -3363,10 +3547,18 @@ impl Engine {
     /// Blocking, like every other load here — `Module::open` runs somebody
     /// else's initialiser — so the host calls it after a frame, never inside
     /// one.
-    pub fn load_bus_effect(&mut self, bundle: Option<&Path>) -> Result<Option<Loaded>, String> {
+    pub fn load_insert(
+        &mut self,
+        strip: usize,
+        slot: usize,
+        bundle: Option<&Path>,
+    ) -> Result<Option<Loaded>, String> {
+        if strip > STRIPS || slot >= INSERTS {
+            return Ok(None);
+        }
         let Some(bundle) = bundle else {
-            self.hand_off_effect(PluginBox(None));
-            self.fx_loaded = None;
+            self.hand_off_insert(strip, slot, PluginBox(None));
+            self.inserts_loaded[strip][slot] = None;
             return Ok(None);
         };
         let module = Module::open(bundle)?;
@@ -3410,30 +3602,41 @@ impl Engine {
             channels: u16::try_from(channels).unwrap_or(u16::MAX),
             sample_rate: self.output.sample_rate,
         };
-        self.hand_off_effect(PluginBox(Some(Box::new(Hosted {
-            inst,
-            module,
-            bufs: vec![vec![0.0; MAX_BLOCK as usize]; channels.max(TAP_CHANNELS)],
-            channels,
-        }))));
-        self.fx_loaded = Some(loaded.clone());
+        self.hand_off_insert(
+            strip,
+            slot,
+            PluginBox(Some(Box::new(Hosted {
+                inst,
+                module,
+                bufs: vec![vec![0.0; MAX_BLOCK as usize]; channels.max(TAP_CHANNELS)],
+                channels,
+            }))),
+        );
+        self.inserts_loaded[strip][slot] = Some(loaded.clone());
         Ok(Some(loaded))
     }
 
-    /// What is across the bus, if anything.
-    pub fn bus_effect(&self) -> Option<&Loaded> {
-        self.fx_loaded.as_ref()
+    /// What is in one insert, if anything.
+    pub fn insert(&self, strip: usize, slot: usize) -> Option<&Loaded> {
+        self.inserts_loaded.get(strip)?.get(slot)?.as_ref()
     }
 
-    /// The bus effect's half of [`Engine::hand_off`], and the same wait.
-    fn hand_off_effect(&mut self, next: PluginBox) {
-        while self.fx_handoff.from_audio.pop().is_ok() {}
-        if self.fx_handoff.to_audio.push(next).is_err() {
+    /// An insert's half of [`Engine::hand_off`], and the same wait.
+    fn hand_off_insert(&mut self, strip: usize, slot: usize, next: PluginBox) {
+        let Some(pair) = self
+            .insert_handoff
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        else {
+            return;
+        };
+        while pair.from_audio.pop().is_ok() {}
+        if pair.to_audio.push(next).is_err() {
             return;
         }
         let deadline = Instant::now() + RETIRE_TIMEOUT;
         while Instant::now() < deadline {
-            if let Ok(old) = self.fx_handoff.from_audio.pop() {
+            if let Ok(old) = pair.from_audio.pop() {
                 drop(old);
                 return;
             }
@@ -5667,8 +5870,25 @@ mod tests {
         // abandoned peer (`pop` reports empty, `push` fills to capacity), so a
         // renderer under test needs no partner threads at all.
         let (_, midi) = RingBuffer::<MidiEvent>::new(1024);
-        let (_fx_to, fx_incoming) = RingBuffer::<PluginBox>::new(1);
-        let (fx_retiring, _fx_from) = RingBuffer::<PluginBox>::new(1);
+        // Empty racks: every test here is about the mixing, and an empty rack
+        // is the path every channel takes until somebody loads something.
+        let racks: [Rack; STRIPS + 1] = std::array::from_fn(|_| {
+            let mut inc = Vec::new();
+            let mut ret = Vec::new();
+            for _ in 0..INSERTS {
+                let (_to, i) = RingBuffer::<PluginBox>::new(1);
+                let (r, _from) = RingBuffer::<PluginBox>::new(1);
+                inc.push(i);
+                ret.push(r);
+            }
+            let mut inc = inc.into_iter();
+            let mut ret = ret.into_iter();
+            Rack {
+                slots: std::array::from_fn(|_| PluginBox(None)),
+                incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
+                retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
+            }
+        });
         Renderer {
             monitor: None,
             monitor_channels: 0,
@@ -5676,9 +5896,7 @@ mod tests {
             monitor_widths: [0; INPUTS],
             monitor_block: 0,
             monitor_scratch: Vec::new(),
-            fx_plugin: PluginBox(None),
-            fx_incoming,
-            fx_retiring,
+            racks,
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             master_effects: crate::effects::Effects::new(RATE as f32),
