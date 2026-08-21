@@ -10,7 +10,7 @@
 //! [`Layout::targets`] is the single source of truth both are derived from. No
 //! state, no `egui::Ui`, and nothing here can open a device or read a file.
 
-use crate::recorder::{gain_text, gain_to_fader, Strip};
+use crate::recorder::{gain_text, gain_to_fader, Strip, STRIPS};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 /// One channel, as the painter sees it.
@@ -22,8 +22,19 @@ use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 pub struct StripView<'a> {
     /// `None` is the master, which has no send and cannot be muted or soloed.
     pub strip: Option<Strip>,
+    /// What the channel is called. Empty on an unfilled slot, which is drawn
+    /// as somewhere to put an instrument rather than as a channel with no name.
+    pub name: &'a str,
     /// The second line under the name: the device, the file, the patch.
     pub detail: &'a str,
+    /// An instrument slot with nothing in it.
+    ///
+    /// **Drawn, not hidden.** Five slots that appear one at a time as they are
+    /// filled is a desk that changes shape under your hands; five outlines with
+    /// a plus in them is a rack with room in it, and the plus is a second way
+    /// into the instrument picker for somebody who is already looking at the
+    /// mixer.
+    pub empty: bool,
     /// Linear, as the fader sits.
     pub gain: f32,
     /// 0..=1, how much of it reaches the effects bus.
@@ -35,28 +46,24 @@ pub struct StripView<'a> {
 }
 
 impl StripView<'_> {
-    /// The master, and the effects return, take no send.
+    /// The master and the effects return take no send, and neither does a slot
+    /// with nothing in it to send.
     fn sends(&self) -> bool {
-        matches!(
-            self.strip,
-            Some(Strip::Instrument | Strip::Input | Strip::Track | Strip::Click)
-        )
+        self.strip.is_some_and(Strip::sends) && !self.empty
     }
 
-    fn switchable(&self) -> bool {
-        self.strip.is_some()
-    }
-
-    fn name(&self) -> &'static str {
-        self.strip.map_or("MASTER", Strip::label)
+    /// Whether it has controls at all. An empty slot has one: the plus.
+    fn live(&self) -> bool {
+        self.strip.is_some() && !self.empty
     }
 }
 
 /// Everything the mixer draws, pushed in.
 pub struct MixerView<'a> {
-    /// The five channels, then the master last. Fixed, because the desk is
-    /// fixed: an app with a variable number of strips is a different app.
-    pub strips: [StripView<'a>; 6],
+    /// Every channel, then the master last. Fixed, because the desk is fixed:
+    /// an app whose strips appear and disappear as things are loaded is a desk
+    /// that changes shape under your hands.
+    pub strips: [StripView<'a>; COLUMNS],
     /// True when anything at all is soloed, so the strips that are not can be
     /// drawn as what they are — silent, not merely unlit.
     pub any_solo: bool,
@@ -71,7 +78,7 @@ impl MixerView<'_> {
         let Some(s) = self.strips.get(at) else {
             return true;
         };
-        if !s.switchable() {
+        if !s.live() {
             return true;
         }
         if self.any_solo {
@@ -90,6 +97,8 @@ pub enum Hit {
     Send(usize),
     Mute(usize),
     Solo(usize),
+    /// The plus on an empty slot: put an instrument here.
+    Add(usize),
 }
 
 impl Hit {
@@ -102,7 +111,7 @@ impl Hit {
         match self {
             Hit::Fader(_) => Some(DragAxis::Vertical),
             Hit::Send(_) => Some(DragAxis::Vertical),
-            Hit::Mute(_) | Hit::Solo(_) => None,
+            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) => None,
         }
     }
 
@@ -111,7 +120,7 @@ impl Hit {
         match self {
             Hit::Fader(_) => Some(FADER_TRAVEL),
             Hit::Send(_) => Some(SEND_TRAVEL),
-            Hit::Mute(_) | Hit::Solo(_) => None,
+            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) => None,
         }
     }
 }
@@ -136,8 +145,11 @@ const SEND_TRAVEL: f32 = 200.0;
 /// Fractions of the rect rather than points, so the same layout holds at every
 /// window size the app offers — and so the hit test and the painter cannot
 /// drift, because they read the same struct.
+/// Channels plus the master.
+pub const COLUMNS: usize = STRIPS + 1;
+
 pub struct Layout {
-    pub strips: [StripStrip; 6],
+    pub strips: [StripStrip; COLUMNS],
 }
 
 /// One strip's rectangles.
@@ -152,6 +164,8 @@ pub struct StripStrip {
     pub db: Rect,
     pub mute: Rect,
     pub solo: Rect,
+    /// The plus on an empty slot.
+    pub add: Rect,
 }
 
 impl StripStrip {
@@ -169,6 +183,7 @@ impl StripStrip {
         db: Rect::NOTHING,
         mute: Rect::NOTHING,
         solo: Rect::NOTHING,
+        add: Rect::NOTHING,
     };
 }
 
@@ -186,17 +201,21 @@ impl Layout {
         );
         if !inner.is_positive() {
             return Self {
-                strips: [StripStrip::NONE; 6],
+                strips: [StripStrip::NONE; COLUMNS],
             };
         }
-        // Six strips and five gaps, with the master counting for a little more
-        // than one so it reads as the end of the row rather than another
-        // channel.
-        let units = 5.0 + 1.0 + MASTER_EXTRA;
-        let unit = (inner.width() - GAP * 5.0) / units;
+        // Every channel one unit wide, and the master a little more so it
+        // reads as the end of the row rather than another channel.
+        let gaps = (COLUMNS - 1) as f32;
+        let units = gaps + 1.0 + MASTER_EXTRA;
+        let unit = (inner.width() - GAP * gaps) / units;
         let mut x = inner.left();
         let strips = std::array::from_fn(|i| {
-            let w = if i == 5 { unit * (1.0 + MASTER_EXTRA) } else { unit };
+            let w = if i == COLUMNS - 1 {
+                unit * (1.0 + MASTER_EXTRA)
+            } else {
+                unit
+            };
             let panel = Rect::from_min_size(Pos2::new(x, inner.top()), Vec2::new(w, inner.height()));
             x += w + GAP;
             Self::one(panel, view.strips.get(i))
@@ -214,8 +233,22 @@ impl Layout {
         let Some(view) = view else {
             return StripStrip::NONE;
         };
+        // **An empty slot is a panel and a plus, and nothing else.** Drawing a
+        // dead fader on it would be five controls that do nothing, which is
+        // the thing the plugin rack was already doing wrong.
+        if view.empty {
+            let plus = Rect::from_center_size(
+                panel.center(),
+                Vec2::splat(panel.width().min(panel.height()) * 0.34),
+            );
+            return StripStrip {
+                panel,
+                add: plus,
+                ..StripStrip::NONE
+            };
+        }
         let sends = view.sends();
-        let switchable = view.switchable();
+        let switchable = view.live();
         let cut = |a: f32, b: f32| {
             Rect::from_min_max(
                 Pos2::new(panel.left() + 4.0, panel.top() + panel.height() * a),
@@ -258,6 +291,7 @@ impl Layout {
             db: cut(0.83, 0.90),
             mute,
             solo,
+            add: Rect::NOTHING,
         }
     }
 
@@ -274,6 +308,7 @@ impl Layout {
                 (s.send, Hit::Send(i)),
                 (s.mute, Hit::Mute(i)),
                 (s.solo, Hit::Solo(i)),
+                (s.add, Hit::Add(i)),
             ] {
                 if r.is_positive() {
                     out.push((r, hit));
@@ -358,6 +393,10 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
 }
 
 fn strip(painter: &Painter, l: &StripStrip, v: &StripView<'_>, p: &Ink, heard: bool) {
+    if v.empty {
+        empty_slot(painter, l, p);
+        return;
+    }
     let face = if heard {
         p.face
     } else {
@@ -378,7 +417,7 @@ fn strip(painter: &Painter, l: &StripStrip, v: &StripView<'_>, p: &Ink, heard: b
     let plain = |size: f32| FontId::new(size, crate::fonts::courier());
     let h = l.panel.height();
 
-    centred(painter, l.name, v.name(), cap((h * 0.030).clamp(8.0, 13.0)), p.engrave);
+    centred(painter, l.name, v.name, cap((h * 0.032).clamp(7.5, 12.0)), p.engrave);
     if !v.detail.is_empty() {
         centred(
             painter,
@@ -410,6 +449,37 @@ fn strip(painter: &Painter, l: &StripStrip, v: &StripView<'_>, p: &Ink, heard: b
     }
 }
 
+/// Somewhere to put an instrument: an outline and a plus.
+///
+/// **An outline rather than a filled panel**, because it is not a channel yet
+/// and drawing it like one would be five faders that do nothing. The rack on
+/// the right of the band says "empty (click to load)"; this says the same
+/// thing in the shape a mixer says it in.
+fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink) {
+    painter.rect_stroke(
+        l.panel,
+        3.0,
+        Stroke::new(1.0, p.face.gamma_multiply(0.34)),
+        egui::StrokeKind::Inside,
+    );
+    let r = l.add;
+    if !r.is_positive() {
+        return;
+    }
+    let arm = r.width().min(r.height()) * 0.5;
+    let c = r.center();
+    let ink = p.face.gamma_multiply(0.55);
+    let w = (arm * 0.16).clamp(1.5, 4.0);
+    painter.line_segment(
+        [Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)],
+        Stroke::new(w, ink),
+    );
+    painter.line_segment(
+        [Pos2::new(c.x, c.y - arm), Pos2::new(c.x, c.y + arm)],
+        Stroke::new(w, ink),
+    );
+}
+
 /// A vertical bar, filling from the bottom.
 ///
 /// **Narrow, and centred in the room it was given.** A meter drawn the full
@@ -439,7 +509,10 @@ fn meter(painter: &Painter, r: Rect, peak: f32, heard: bool, p: &Ink) {
 /// A knob, drawn as an arc rather than a dial: it is a percentage, and an arc
 /// says how much where a pointer says where.
 fn send_knob(painter: &Painter, r: Rect, amount: f32, p: &Ink) {
-    let d = r.height().min(r.width()) * 0.9;
+    // **Smaller than the cell it sits in.** The first version filled the row
+    // and read as the biggest thing on the channel, which a send that is
+    // usually at zero has no business being.
+    let d = r.height().min(r.width() * 0.72) * 0.78;
     if d <= 2.0 {
         return;
     }
@@ -523,10 +596,12 @@ fn centred(painter: &Painter, r: Rect, text: &str, font: FontId, colour: Color32
 mod tests {
     use super::*;
 
-    fn a_strip(strip: Option<Strip>) -> StripView<'static> {
+    fn a_strip(strip: Option<Strip>, empty: bool) -> StripView<'static> {
         StripView {
             strip,
+            name: "CHANNEL",
             detail: "",
+            empty,
             gain: 1.0,
             send: 0.0,
             peak: 0.0,
@@ -535,21 +610,23 @@ mod tests {
         }
     }
 
+    /// Every slot filled, so the ordinary strip is what is being measured.
     fn a_view() -> MixerView<'static> {
+        let channels = Strip::all();
         MixerView {
-            strips: [
-                a_strip(Some(Strip::Instrument)),
-                a_strip(Some(Strip::Input)),
-                a_strip(Some(Strip::Track)),
-                a_strip(Some(Strip::Click)),
-                a_strip(Some(Strip::Fx)),
-                a_strip(None),
-            ],
+            strips: std::array::from_fn(|i| {
+                a_strip(channels.get(i).copied(), false)
+            }),
             any_solo: false,
             dark_mode: true,
             wood: (0x4A, 0x3B, 0x2C),
         }
     }
+
+    /// The index of the last channel before the master.
+    const MASTER: usize = COLUMNS - 1;
+    /// The effects return, which is the channel before that.
+    const FX: usize = COLUMNS - 2;
 
     fn rect() -> Rect {
         Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1300.0, 420.0))
@@ -607,13 +684,13 @@ mod tests {
     fn the_master_and_the_bus_are_not_offered_what_they_cannot_do() {
         let v = a_view();
         let l = Layout::new(rect(), &v);
-        let master = &l.strips[5];
+        let master = &l.strips[MASTER];
         assert!(!master.send.is_positive(), "the master was given a send");
         assert!(!master.mute.is_positive(), "the master was given a mute");
         assert!(!master.solo.is_positive(), "the master was given a solo");
         assert!(master.fader.is_positive(), "the master has no fader");
 
-        let fx = &l.strips[4];
+        let fx = &l.strips[FX];
         assert!(!fx.send.is_positive(), "the effects bus can feed itself");
         assert!(fx.mute.is_positive(), "the effects return cannot be muted");
     }
@@ -625,7 +702,7 @@ mod tests {
         let v = a_view();
         let l = Layout::new(rect(), &v);
         assert!(
-            l.strips[5].meter.height() > l.strips[0].meter.height(),
+            l.strips[MASTER].meter.height() > l.strips[0].meter.height(),
             "the master left a hole where a send would have been"
         );
     }
@@ -640,7 +717,56 @@ mod tests {
         assert!(!v.heard(0), "an unsoloed strip was still heard");
         // And the master is never taken out by a solo, or soloing anything
         // would mute the app.
-        assert!(v.heard(5), "solo silenced the master");
+        assert!(v.heard(MASTER), "solo silenced the master");
+    }
+
+    /// **An empty slot offers one control, and it is the plus.**
+    ///
+    /// Not a dead fader, a dead send and two dead switches — which is exactly
+    /// what the plugin rack was already doing wrong in the other direction.
+    #[test]
+    fn an_empty_slot_is_a_plus_and_nothing_else() {
+        let mut v = a_view();
+        v.strips[0].empty = true;
+        let l = Layout::new(rect(), &v);
+        let s = &l.strips[0];
+        assert!(s.add.is_positive(), "there is no way to fill the slot");
+        for (r, what) in [
+            (s.fader, "fader"),
+            (s.send, "send"),
+            (s.mute, "mute"),
+            (s.solo, "solo"),
+            (s.meter, "meter"),
+        ] {
+            assert!(!r.is_positive(), "an empty slot was given a {what}");
+        }
+        assert_eq!(
+            hit_test(rect(), &v, s.add.center()),
+            Some(Hit::Add(0)),
+            "the plus does not open anything"
+        );
+        // And a filled one has no plus, or there would be two ways to mean two
+        // different things in one place.
+        let filled = Layout::new(rect(), &a_view());
+        assert!(!filled.strips[0].add.is_positive());
+    }
+
+    /// Every instrument slot is a channel, filled or not.
+    #[test]
+    fn the_desk_has_a_strip_for_every_slot() {
+        use crate::recorder::SLOTS;
+        let channels = Strip::all();
+        for n in 0..SLOTS {
+            assert_eq!(channels[n], Strip::Slot(n), "slot {n} is not a channel");
+        }
+        assert_eq!(COLUMNS, SLOTS + 5, "a channel went missing");
+        // Every strip owns a distinct place in the arrays, or two of them
+        // would share a send and mute together.
+        let mut seen: Vec<usize> = channels.iter().map(|s| s.index()).collect();
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "two channels share an index");
     }
 
     /// Everything that travels does so vertically, and knows how far.

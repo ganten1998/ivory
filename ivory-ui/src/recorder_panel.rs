@@ -6761,7 +6761,6 @@ mod tests {
                                     input: 0.5,
                                     master: if dark { 1.0 } else { 0.35 },
                                     track: 0.7,
-                                    instrument: 1.0,
                                     fx_return: 1.0,
                                 },
                                 // Both ends of each knob's travel, so a slot or

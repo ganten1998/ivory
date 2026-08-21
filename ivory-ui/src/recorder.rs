@@ -385,10 +385,6 @@ pub struct Gains {
     pub master: f32,
     /// The backing track, which rolls with the transport.
     pub track: f32,
-    /// **The instrument bus, as a channel.** The slots have had faders for
-    /// releases; what they have not had is a level for the bus they are summed
-    /// onto, which is what a strip needs to exist.
-    pub instrument: f32,
     /// What comes back from the effects bus, at its own fader.
     pub fx_return: f32,
 }
@@ -401,7 +397,13 @@ pub struct Gains {
 /// rather than the same by inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Strip {
-    Instrument,
+    /// One instrument slot. **One strip each, loaded or not.**
+    ///
+    /// There used to be a single "instrument" channel for the sum of them,
+    /// which was wrong the moment somebody loaded a second: a rack of five
+    /// with one fader is not a mixer, it is a master with extra steps. An
+    /// empty slot still gets a strip, drawn as an outline you can load into.
+    Slot(usize),
     Input,
     Track,
     Click,
@@ -410,33 +412,35 @@ pub enum Strip {
     Fx,
 }
 
+/// How many channels the desk has, master aside.
+pub const STRIPS: usize = SLOTS + 4;
+
 impl Strip {
     /// Every strip, in the order they are drawn.
-    pub const ALL: [Strip; 5] = [
-        Strip::Instrument,
-        Strip::Input,
-        Strip::Track,
-        Strip::Click,
-        Strip::Fx,
-    ];
-
-    /// The four that can send to the effects bus.
-    pub const SENDERS: [Strip; 4] = [Strip::Instrument, Strip::Input, Strip::Track, Strip::Click];
+    pub fn all() -> [Strip; STRIPS] {
+        std::array::from_fn(|i| {
+            if i < SLOTS {
+                Strip::Slot(i)
+            } else {
+                [Strip::Input, Strip::Track, Strip::Click, Strip::Fx][i - SLOTS]
+            }
+        })
+    }
 
     /// Its place in `Desk`'s arrays.
     pub const fn index(self) -> usize {
-        self as usize
+        match self {
+            Strip::Slot(i) => i,
+            Strip::Input => SLOTS,
+            Strip::Track => SLOTS + 1,
+            Strip::Click => SLOTS + 2,
+            Strip::Fx => SLOTS + 3,
+        }
     }
 
-    /// What the strip is called on screen.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Strip::Instrument => "INSTRUMENT",
-            Strip::Input => "INPUT",
-            Strip::Track => "BACKING",
-            Strip::Click => "CLICK",
-            Strip::Fx => "FX BUS",
-        }
+    /// Whether it can send to the effects bus. Everything but the bus itself.
+    pub const fn sends(self) -> bool {
+        !matches!(self, Strip::Fx)
     }
 }
 
@@ -447,11 +451,11 @@ impl Strip {
 /// a second time, which is the whole reason the band can stay exactly as it is.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Desk {
-    /// How much of each sender goes to the effects bus, 0..=1. Indexed by
+    /// How much of each strip goes to the effects bus, 0..=1. Indexed by
     /// [`Strip::index`]; the `Fx` slot is unused and stays zero.
-    pub send: [f32; 5],
-    pub muted: [bool; 5],
-    pub soloed: [bool; 5],
+    pub send: [f32; STRIPS],
+    pub muted: [bool; STRIPS],
+    pub soloed: [bool; STRIPS],
 }
 
 impl Default for Desk {
@@ -460,12 +464,18 @@ impl Default for Desk {
     /// soloed — so a settings file written before any of this existed comes up
     /// sounding exactly as it did.
     fn default() -> Self {
-        let mut send = [0.0; 5];
-        send[Strip::Instrument.index()] = 1.0;
+        // **Every instrument sends everything, and nothing else sends
+        // anything.** That is what an insert on the instrument bus was, so a
+        // settings file written before any of this existed comes up sounding
+        // exactly as it did.
+        let mut send = [0.0; STRIPS];
+        for i in 0..SLOTS {
+            send[i] = 1.0;
+        }
         Self {
             send,
-            muted: [false; 5],
-            soloed: [false; 5],
+            muted: [false; STRIPS],
+            soloed: [false; STRIPS],
         }
     }
 }
@@ -501,7 +511,6 @@ impl Default for Gains {
             input: 1.0,
             master: 1.0,
             track: 1.0,
-            instrument: 1.0,
             fx_return: 1.0,
         }
     }
@@ -523,7 +532,7 @@ pub struct RecorderState {
     pub elapsed_s: f64,
     /// The loudest thing each strip made since the last frame, in
     /// [`Strip::ALL`] order. Pushed by the host, read by the mixer.
-    pub strip_peaks: [f32; 5],
+    pub strip_peaks: [f32; STRIPS],
     pub meters: Meters,
     /// The output's levels and the limiter's reduction. See the same two
     /// fields on [`RecorderView`].

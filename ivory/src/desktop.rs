@@ -2093,10 +2093,9 @@ impl DesktopApp {
         }
         e.set_metronome_gain(gains.metronome);
         e.set_master_gain(gains.master);
-        // **The two channels that had no fader before there was a mixer**, and
-        // the routing that decides what reaches the effects bus. Pushed whole
+        // **The channel that had no fader before there was a mixer**, and the
+        // routing that decides what reaches the effects bus. Pushed whole
         // every frame, like the gains above and for the same reason.
-        e.set_instrument_gain(gains.instrument);
         e.set_fx_return(gains.fx_return);
         e.set_desk(&self.app.desk());
         // **And the microphone, which used to stop here.** `gains.input` was

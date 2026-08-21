@@ -490,6 +490,20 @@ struct Grab {
     from_value: f32,
 }
 
+/// What an instrument is called on its strip.
+///
+/// A slot holds a PATH, and a bundle path under a channel is the sort of detail
+/// that makes an app look like it is showing you its insides.
+fn plugin_display_name(path: &str) -> &str {
+    if path == dialogs::BUILTIN_PATH {
+        return "TANGENT DX7";
+    }
+    path.rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches(".vst3")
+}
+
 /// A mixer control being dragged. The band's [`Grab`], for the other surface.
 #[derive(Clone, Copy)]
 struct MixerGrab {
@@ -1297,7 +1311,7 @@ impl IvoryApp {
                 .get(i)
                 .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
             H::Send(i) => view.strips.get(i).map_or(0.0, |s| s.send),
-            H::Mute(_) | H::Solo(_) => 0.0,
+            H::Mute(_) | H::Solo(_) | H::Add(_) => 0.0,
         }
     }
 
@@ -1312,14 +1326,19 @@ impl IvoryApp {
         use crate::recorder::Strip;
         let v = value.clamp(0.0, 1.0);
         let gain = f64::from(recorder::fader_to_gain(v));
+        let strips = Strip::all();
         match hit {
-            H::Fader(i) => match Strip::ALL.get(i) {
-                Some(Strip::Instrument) => self.settings.instrument_gain = gain,
+            H::Fader(i) => match strips.get(i) {
+                Some(Strip::Slot(n)) => {
+                    if let Some(g) = self.settings.plugin_gains.get_mut(*n) {
+                        *g = gain;
+                    }
+                }
                 Some(Strip::Input) => self.settings.input_gain = gain,
                 Some(Strip::Track) => self.settings.track_gain = gain,
                 Some(Strip::Click) => self.settings.metronome_gain = gain,
                 Some(Strip::Fx) => self.settings.fx_return_gain = gain,
-                // Past the five strips is the master, which is index five.
+                // Past the channels is the master, which is the last column.
                 None => self.settings.master_gain = gain,
             },
             H::Send(i) => {
@@ -1331,6 +1350,14 @@ impl IvoryApp {
             // value is ignored.
             H::Mute(i) => self.settings.strip_muted ^= 1 << i,
             H::Solo(i) => self.settings.strip_soloed ^= 1 << i,
+            // The plus on an empty slot: the same picker the rack opens, so
+            // there is one way to choose an instrument and two ways to reach it.
+            H::Add(i) => {
+                if let Some(Strip::Slot(n)) = strips.get(i) {
+                    self.open_plugin_picker(*n);
+                }
+                return;
+            }
         }
         self.save_settings_soon();
     }
@@ -1346,72 +1373,73 @@ impl IvoryApp {
         let g = self.settings.knobs().gains;
         let desk = self.desk();
         let peaks = self.recorder.strip_peaks;
-        let level = |s: Strip| -> f32 {
-            match s {
-                Strip::Instrument => g.instrument,
-                Strip::Input => g.input,
-                Strip::Track => g.track,
-                Strip::Click => g.metronome,
-                Strip::Fx => g.fx_return,
+        let strip = |s: Strip| {
+            let i = s.index();
+            let (name, detail, gain, empty) = match s {
+                // **A slot is a strip whether or not anything is in it.** The
+                // built-in counts: it occupies a slot like any plugin, so it
+                // gets a channel like any plugin.
+                Strip::Slot(n) => {
+                    let loaded = self.chosen_plugin(n);
+                    (
+                        loaded.map_or("", plugin_display_name),
+                        "",
+                        g.slots.get(n).copied().unwrap_or(1.0),
+                        loaded.is_none(),
+                    )
+                }
+                Strip::Input => (
+                    "INPUT",
+                    self.audio_status
+                        .input
+                        .as_ref()
+                        .map_or("", |(n, _)| n.as_str()),
+                    g.input,
+                    false,
+                ),
+                Strip::Track => ("BACKING", self.track.name.as_str(), g.track, false),
+                Strip::Click => ("CLICK", "", g.metronome, false),
+                Strip::Fx => ("FX BUS", "reverb · delay · chorus", g.fx_return, false),
+            };
+            crate::mixer_panel::StripView {
+                strip: Some(s),
+                name,
+                detail,
+                empty,
+                gain,
+                send: desk.send[i],
+                peak: peaks[i],
+                muted: desk.muted[i],
+                soloed: desk.soloed[i],
             }
         };
-        let strip = |s: Strip| crate::mixer_panel::StripView {
-            strip: Some(s),
-            detail: self.strip_detail(s),
-            gain: level(s),
-            send: desk.send[s.index()],
-            peak: peaks[s.index()],
-            muted: desk.muted[s.index()],
-            soloed: desk.soloed[s.index()],
-        };
+        let channels = Strip::all();
         crate::mixer_panel::MixerView {
-            strips: [
-                strip(Strip::Instrument),
-                strip(Strip::Input),
-                strip(Strip::Track),
-                strip(Strip::Click),
-                strip(Strip::Fx),
-                crate::mixer_panel::StripView {
+            strips: std::array::from_fn(|i| match channels.get(i) {
+                Some(s) => strip(*s),
+                None => crate::mixer_panel::StripView {
                     strip: None,
+                    name: "MASTER",
                     detail: "",
+                    empty: false,
                     gain: g.master,
                     send: 0.0,
-                    peak: self.recorder.meters.left.peak.max(self.recorder.meters.right.peak),
+                    peak: self
+                        .recorder
+                        .meters
+                        .left
+                        .peak
+                        .max(self.recorder.meters.right.peak),
                     muted: false,
                     soloed: false,
                 },
-            ],
+            }),
             any_solo: desk.any_solo(),
             dark_mode: self.settings.dark_mode,
             wood: {
                 let c = self.settings.recorder_bg_color;
                 (c.r, c.g, c.b)
             },
-        }
-    }
-
-    /// The second line on a strip: what it is actually carrying.
-    fn strip_detail(&self, strip: crate::recorder::Strip) -> &str {
-        use crate::recorder::Strip;
-        match strip {
-            // The loaded instrument, or the built-in that plays when none is.
-            // **What is playing, by the name a person gave it.** The slot
-            // holds a PATH, and a bundle path under a strip is the sort of
-            // detail that makes an app look like it is showing you its
-            // insides.
-            Strip::Instrument => match self.chosen_plugin(0) {
-                Some(p) if p == dialogs::BUILTIN_PATH => "Tangent DX7",
-                Some(p) => p
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(p)
-                    .trim_end_matches(".vst3"),
-                None => "",
-            },
-            Strip::Input => self.audio_status.input.as_ref().map_or("", |(n, _)| n.as_str()),
-            Strip::Track => self.track.name.as_str(),
-            Strip::Click => "",
-            Strip::Fx => "reverb · delay · chorus",
         }
     }
 
@@ -6184,7 +6212,16 @@ impl IvoryApp {
         self.handle_main_interaction(
             &ctx,
             ui,
-            piano_rect,
+            // **A view is a surface, not a picture over one.** With the mixer
+            // up the piano is not merely hidden, it is NOT THERE: handing its
+            // rect on would leave an invisible keyboard under the strips that
+            // still sounds when you press a fader near the bottom of the
+            // window, which is what the owner reported.
+            if mixer_rect.is_some() {
+                Rect::NOTHING
+            } else {
+                piano_rect
+            },
             chord_rect_for_hit,
             fret_rect_for_hit,
             theory_rect_for_hit,
