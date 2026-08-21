@@ -2073,10 +2073,19 @@ impl Renderer {
     /// for no reason. Drained-and-discarded is the same discipline the take's
     /// instrument ring already follows between takes.
     ///
-    /// **Listen-only.** Nothing here touches what the take records: the take is
-    /// written by the writer thread from the capture ring, which this does not
-    /// share. Turning monitoring on during a take changes what the player
-    /// hears and not one sample of the file.
+    /// **It reaches the take as well as the speakers, and that is the point.**
+    /// This adds the input to `self.mix`, and `self.mix` is what the tap
+    /// carries — so a monitored microphone arrives in the file with its fader,
+    /// its send and the master's limiter already on it, which is what was
+    /// coming out of the speakers. The owner's rule, in one line: if the
+    /// effects were audible while it was recorded, they are in the take.
+    ///
+    /// The comment that used to be here said the opposite — "listen-only,
+    /// nothing here touches what the take records" — and had been wrong since
+    /// the day it was written. The code it described never existed; what did
+    /// exist was a microphone written TWICE whenever the take's sources
+    /// included the input. See `TakeSource::resolve`, which is where that is
+    /// now prevented.
     fn mix_monitor(&mut self, frames: usize, muted: u32, soloed: u32) {
         // A ring arriving, or being taken away. `try_lock`, never `lock`.
         if let Ok(mut pending) = self.shared.pending_monitor.try_lock() {

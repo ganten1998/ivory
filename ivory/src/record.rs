@@ -249,6 +249,7 @@ impl TakeSource {
         plugin_loaded: bool,
         track_loaded: bool,
         input_open: bool,
+        monitored: bool,
     ) -> Self {
         // Everything downstream asks "is there anything on the instrument bus",
         // never "is there a plugin". Those were the same question until the
@@ -268,12 +269,37 @@ impl TakeSource {
                 }
             }
         };
-        match (want, bus, input_open) {
+        let want = match (want, bus, input_open) {
             (TakeSource::Plugin, false, _) => TakeSource::Input,
             (TakeSource::Both, false, _) => TakeSource::Input,
             (TakeSource::Both, true, false) => TakeSource::Plugin,
             (TakeSource::Input, _, false) if bus => TakeSource::Plugin,
             (other, ..) => other,
+        };
+        // **A monitored microphone is already on the bus, and must not be
+        // written twice.**
+        //
+        // Monitoring puts the live input into the mix, and the mix is what the
+        // tap carries — so `Both` would write the microphone once from the
+        // capture ring and once more inside the bus. Twice, about six decibels
+        // up, and comb-filtered against itself by the monitor ring's own
+        // latency. What that sounds like is a take that is somehow wrong in a
+        // way nobody can name.
+        //
+        // The bus is the right one to keep, and that is the owner's rule: if
+        // the effects were audible while it was recorded, they are in the take.
+        // Through the bus the microphone arrives with its fader, its send, its
+        // mute and the master's limiter already applied — which is what was
+        // coming out of the speakers.
+        //
+        // **`Input` is deliberately left alone.** Somebody who asked for the
+        // microphone ALONE cannot be given a wet one: the bus is a mix and
+        // there is no way to take the input's share back out of it. They get
+        // the dry capture, which is what they asked for and the only thing that
+        // can be delivered.
+        match (want, monitored) {
+            (TakeSource::Both, true) => TakeSource::Plugin,
+            (other, _) => other,
         }
     }
 
@@ -3505,28 +3531,71 @@ mod source_tests {
     /// So the parameter is `track_loaded` beside `plugin_loaded` and the caller
     /// passes `any_instrument_loaded()`, which counts the built-in. Every arm
     /// below is a case that produced a wrong file.
+    /// **A monitored microphone is written once, not twice.**
+    ///
+    /// Monitoring puts the live input into the mix and the mix is what the tap
+    /// carries, so `Both` wrote the microphone from the capture ring AND again
+    /// inside the bus — six decibels up and comb-filtered against itself by the
+    /// monitor ring's latency. A take that is wrong in a way nobody can name.
+    #[test]
+    fn a_monitored_microphone_is_not_recorded_twice() {
+        // Not monitoring: both sources, as it always was.
+        assert_eq!(
+            TakeSource::resolve("both", true, false, true, false),
+            TakeSource::Both
+        );
+        // Monitoring: the bus alone, because the bus already has the
+        // microphone in it — with its fader, its send and the limiter on it,
+        // which is what was coming out of the speakers.
+        assert_eq!(
+            TakeSource::resolve("both", true, false, true, true),
+            TakeSource::Plugin,
+            "the microphone was written twice"
+        );
+        // The same for the default, which resolves to `Both` when there is a
+        // bus and an input.
+        assert_eq!(
+            TakeSource::resolve("auto", true, false, true, true),
+            TakeSource::Plugin
+        );
+        // **`Input` is left alone even while monitoring.** Somebody who asked
+        // for the microphone ALONE cannot be handed a wet one — the bus is a
+        // mix and the input's share cannot be taken back out of it — so they
+        // get the dry capture, which is what they asked for.
+        assert_eq!(
+            TakeSource::resolve("input", true, false, true, true),
+            TakeSource::Input
+        );
+        // And with nothing on the bus, monitoring changes nothing: there is no
+        // second copy to collide with.
+        assert_eq!(
+            TakeSource::resolve("auto", false, false, true, true),
+            TakeSource::Input
+        );
+    }
+
     #[test]
     fn anything_on_the_instrument_bus_is_worth_recording() {
         // A backing track and a microphone: the take must have both.
         assert_eq!(
-            TakeSource::resolve("auto", false, true, true),
+            TakeSource::resolve("auto", false, true, true, false),
             TakeSource::Both,
             "a take made while a backing track plays left the track out"
         );
         // A backing track and no microphone: the bus is the whole take.
         assert_eq!(
-            TakeSource::resolve("auto", false, true, false),
+            TakeSource::resolve("auto", false, true, false, false),
             TakeSource::Plugin
         );
         // The same for an instrument, which is what the caller now passes for
         // the built-in as well as for a VST3.
         assert_eq!(
-            TakeSource::resolve("auto", true, false, true),
+            TakeSource::resolve("auto", true, false, true, false),
             TakeSource::Both
         );
         // And with neither, the input is still the only thing there is.
         assert_eq!(
-            TakeSource::resolve("auto", false, false, true),
+            TakeSource::resolve("auto", false, false, true, false),
             TakeSource::Input
         );
 
@@ -3535,18 +3604,18 @@ mod source_tests {
         // and no plugin is a real request, and it used to fall through to the
         // microphone.
         assert_eq!(
-            TakeSource::resolve("plugin", false, true, true),
+            TakeSource::resolve("plugin", false, true, true, false),
             TakeSource::Plugin,
             "instruments-only with a track loaded recorded the microphone"
         );
         assert_eq!(
-            TakeSource::resolve("both", false, true, true),
+            TakeSource::resolve("both", false, true, true, false),
             TakeSource::Both
         );
         // Microphone-only stays reachable, which is what makes the setting
         // worth having at all.
         assert_eq!(
-            TakeSource::resolve("input", true, true, true),
+            TakeSource::resolve("input", true, true, true, false),
             TakeSource::Input
         );
     }
@@ -3557,10 +3626,10 @@ mod source_tests {
     #[test]
     fn asking_for_a_plugin_that_is_not_loaded_records_the_input_instead() {
         assert_eq!(
-            TakeSource::resolve("plugin", false, false, true),
+            TakeSource::resolve("plugin", false, false, true, false),
             TakeSource::Input
         );
-        assert_eq!(TakeSource::resolve("both", false, false, true), TakeSource::Input);
+        assert_eq!(TakeSource::resolve("both", false, false, true, false), TakeSource::Input);
     }
 
     /// And the mirror: with a plugin loaded and no input device open, the
@@ -3568,10 +3637,10 @@ mod source_tests {
     #[test]
     fn with_no_input_open_a_loaded_plugin_is_the_take() {
         assert_eq!(
-            TakeSource::resolve("input", true, false, false),
+            TakeSource::resolve("input", true, false, false, false),
             TakeSource::Plugin
         );
-        assert_eq!(TakeSource::resolve("both", true, false, false), TakeSource::Plugin);
+        assert_eq!(TakeSource::resolve("both", true, false, false, false), TakeSource::Plugin);
     }
 
     /// **The bug a user hit within minutes.** Load a piano, press record, and
@@ -3581,31 +3650,31 @@ mod source_tests {
     #[test]
     fn a_loaded_instrument_is_in_the_take_unless_somebody_says_otherwise() {
         assert_eq!(
-            TakeSource::resolve("auto", true, false, true),
+            TakeSource::resolve("auto", true, false, true, false),
             TakeSource::Both,
             "an instrument you went and loaded belongs in the recording"
         );
         assert_eq!(
-            TakeSource::resolve("auto", false, false, true),
+            TakeSource::resolve("auto", false, false, true, false),
             TakeSource::Input,
             "and with none loaded there is nothing extra to add"
         );
         // An EXPLICIT choice still wins, which is what makes the other three
         // menu rows mean anything.
-        assert_eq!(TakeSource::resolve("input", true, false, true), TakeSource::Input);
+        assert_eq!(TakeSource::resolve("input", true, false, true, false), TakeSource::Input);
         assert_eq!(
-            TakeSource::resolve("plugin", true, false, true),
+            TakeSource::resolve("plugin", true, false, true, false),
             TakeSource::Plugin
         );
     }
 
     #[test]
     fn an_ordinary_setup_gets_what_it_asked_for() {
-        assert_eq!(TakeSource::resolve("input", true, false, true), TakeSource::Input);
-        assert_eq!(TakeSource::resolve("plugin", true, false, true), TakeSource::Plugin);
-        assert_eq!(TakeSource::resolve("both", true, false, true), TakeSource::Both);
+        assert_eq!(TakeSource::resolve("input", true, false, true, false), TakeSource::Input);
+        assert_eq!(TakeSource::resolve("plugin", true, false, true, false), TakeSource::Plugin);
+        assert_eq!(TakeSource::resolve("both", true, false, true, false), TakeSource::Both);
         assert_eq!(
-            TakeSource::resolve("nonsense from a later build", false, false, true),
+            TakeSource::resolve("nonsense from a later build", false, false, true, false),
             TakeSource::Input
         );
     }
@@ -3613,7 +3682,7 @@ mod source_tests {
     #[test]
     fn the_setting_round_trips() {
         for s in ["input", "plugin", "both"] {
-            assert_eq!(TakeSource::resolve(s, true, false, true).to_setting(), s);
+            assert_eq!(TakeSource::resolve(s, true, false, true, false).to_setting(), s);
         }
     }
 }

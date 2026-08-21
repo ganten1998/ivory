@@ -2198,6 +2198,10 @@ impl DesktopApp {
             plugin,
             track,
             input,
+            // Monitoring puts the microphone on the bus, and the bus is what
+            // the tap writes. See `resolve`: taking it from the capture ring
+            // as well would write it twice.
+            self.app.input_monitor(),
         );
         if want != self.recorder.session.source() {
             self.recorder.session.set_source(want);
