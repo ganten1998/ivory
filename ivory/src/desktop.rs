@@ -2413,7 +2413,7 @@ impl DesktopApp {
             Some(choice) => {
                 self.recorder.session.open_input(
                     &choice.selection,
-                    choice.channel,
+                    choice.channels,
                     self.app.buffer_frames(),
                     self.app.sample_rate(),
                 );

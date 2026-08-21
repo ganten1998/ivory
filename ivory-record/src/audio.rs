@@ -724,6 +724,102 @@ impl ChannelPick {
     }
 }
 
+/// How many inputs of one interface can be open at once.
+///
+/// **One interface, several inputs.** A second DEVICE is a second clock and is
+/// declined on purpose; anyone with that rig makes an aggregate device, which
+/// presents as one device with one clock and arrives here as the ordinary case.
+pub const MAX_PICKS: usize = 4;
+
+/// The inputs to keep, in the order they appear in the stream.
+///
+/// **One stream, one ring, channels laid end to end.** Picking input 6 and
+/// inputs 1/2 out of an eighteen-channel interface produces a three-channel
+/// stream: the mono one, then the pair. Every consumer downstream sees one
+/// interleaved block and needs to know nothing about where it came from — and
+/// there is exactly one callback, one clock and one set of timing marks, which
+/// is what keeps several inputs sample-aligned with each other for free.
+///
+/// Fixed size rather than a `Vec` so it stays `Copy` and allocates nothing:
+/// this is read on the audio callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Picks([Option<ChannelPick>; MAX_PICKS]);
+
+impl Picks {
+    /// Everything the device has, in its own order.
+    pub const EVERYTHING: Self = Self([None; MAX_PICKS]);
+
+    /// One input, which is what every caller wanted before there could be more.
+    pub fn one(pick: ChannelPick) -> Self {
+        let mut out = Self::EVERYTHING;
+        out.0[0] = Some(pick);
+        out
+    }
+
+    /// As many as fit, in the order given. Extras beyond [`MAX_PICKS`] are
+    /// dropped — a desk with a fixed number of input strips cannot show them.
+    pub fn from_slice(picks: &[ChannelPick]) -> Self {
+        let mut out = Self::EVERYTHING;
+        for (slot, pick) in out.0.iter_mut().zip(picks) {
+            *slot = Some(*pick);
+        }
+        out
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = ChannelPick> + '_ {
+        self.0.iter().flatten().copied()
+    }
+
+    /// How many inputs, not how many channels.
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    /// No picks at all means the whole device, which is a real and common
+    /// answer rather than a missing one.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// How many channels come OUT, summed over every pick.
+    pub fn channels(&self) -> usize {
+        self.iter().map(ChannelPick::channels).sum()
+    }
+
+    /// Which output channel the `i`th pick's own first channel lands on.
+    pub fn offset(&self, i: usize) -> usize {
+        self.iter().take(i).map(ChannelPick::channels).sum()
+    }
+
+    /// The device channel that feeds output channel `c`, if it is in range.
+    ///
+    /// Walks the picks rather than indexing, because a pick is one or two
+    /// channels and the answer depends on every pick before it.
+    pub fn source(&self, c: usize, device_channels: usize) -> Option<usize> {
+        let mut at = 0;
+        for pick in self.iter() {
+            let w = pick.channels();
+            if c < at + w {
+                return pick.source(c - at, device_channels);
+            }
+            at += w;
+        }
+        None
+    }
+
+    /// Drop the picks this device cannot honour, keeping the rest.
+    ///
+    /// **Per pick, not all-or-nothing.** An interface that came back from a hub
+    /// with fewer inputs should cost you the input that is gone and not the two
+    /// that are still there. A pick that half-fits is dropped whole — see
+    /// [`ChannelPick::fits`] — and if nothing is left the stream falls back to
+    /// the whole device, which is what "no picks" already means.
+    pub fn fitted(self, device_channels: usize) -> Self {
+        let kept: Vec<ChannelPick> = self.iter().filter(|p| p.fits(device_channels)).collect();
+        Self::from_slice(&kept)
+    }
+}
+
 /// What the caller would like, all of it optional.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConfigWish {
@@ -757,7 +853,7 @@ pub struct ConfigWish {
     /// refused: an interface can come back from a hub with fewer inputs than it
     /// had, and a saved "channel 12" should cost you the channel, not the
     /// session.
-    pub pick_channel: Option<ChannelPick>,
+    pub picks: Picks,
 }
 
 /// Fidelity ranking of the sample formats this module can convert to `f32`.
@@ -1032,7 +1128,7 @@ pub fn capture_channel(
     mark_slots: usize,
     stats: Arc<CaptureStats>,
 ) -> (CaptureSource, CaptureSink) {
-    capture_channel_from(channels, None, ring_frames, mark_slots, stats)
+    capture_channel_from(channels, Picks::EVERYTHING, ring_frames, mark_slots, stats)
 }
 
 /// As [`capture_channel`], but keeping only one of the device's inputs.
@@ -1047,12 +1143,12 @@ pub fn capture_channel(
 /// [`ConfigWish::pick_channel`].
 pub fn capture_channel_from(
     device_channels: usize,
-    pick: Option<ChannelPick>,
+    picks: Picks,
     ring_frames: usize,
     mark_slots: usize,
     stats: Arc<CaptureStats>,
 ) -> (CaptureSource, CaptureSink) {
-    capture_channel_monitored(device_channels, pick, ring_frames, mark_slots, stats, 0).0
+    capture_channel_monitored(device_channels, picks, ring_frames, mark_slots, stats, 0).0
 }
 
 /// As [`capture_channel_from`], with a shallow tap for live monitoring.
@@ -1061,7 +1157,7 @@ pub fn capture_channel_from(
 /// is not opening a real input wants.
 pub fn capture_channel_monitored(
     device_channels: usize,
-    pick: Option<ChannelPick>,
+    picks: Picks,
     ring_frames: usize,
     mark_slots: usize,
     stats: Arc<CaptureStats>,
@@ -1073,9 +1169,14 @@ pub fn capture_channel_monitored(
     );
     // A pick that does not fit the device is dropped whole. See
     // `ChannelPick::fits`: half-honouring a stereo pair whose right channel has
-    // gone missing would record "left twice" and say nothing.
-    let pick = pick.filter(|p| p.fits(device_channels));
-    let channels = pick.map_or(device_channels, ChannelPick::channels);
+    // gone missing would record "left twice" and say nothing. The picks that DO
+    // fit are kept — losing one input is not a reason to lose the others.
+    let picks = picks.fitted(device_channels);
+    let channels = if picks.is_empty() {
+        device_channels
+    } else {
+        picks.channels()
+    };
     let (sample_tx, sample_rx) = RingBuffer::<f32>::new(ring_frames.max(1) * channels);
     let (mark_tx, mark_rx) = RingBuffer::<TimingMark>::new(mark_slots.max(1));
     let mut source = CaptureSource {
@@ -1084,7 +1185,7 @@ pub fn capture_channel_monitored(
         stats: Arc::clone(&stats),
         channels,
         device_channels,
-        pick,
+        picks,
         frames: 0,
         stamp_epoch: None,
         scratch: vec![0.0; CHUNK_FRAMES * channels],
@@ -1121,8 +1222,9 @@ pub struct CaptureSource {
     /// channel is picked, and confusing them swaps the interleaving for the
     /// rest of the take — which is rule 1 of `accept`, one level down.
     device_channels: usize,
-    /// Which input to keep, already range-checked against `device_channels`.
-    pick: Option<ChannelPick>,
+    /// Which inputs to keep, already range-checked against `device_channels`.
+    /// Empty means the whole device, in its own order.
+    picks: Picks,
     frames: u64,
     stamp_epoch: Option<Nanos>,
     scratch: Vec<f32>,
@@ -1197,34 +1299,32 @@ impl CaptureSource {
             let want = chunk_frames.min(frames_in - pushed);
             let n = want * ch;
             let dst = &mut self.scratch[..n];
-            match self.pick {
+            if self.picks.is_empty() {
                 // Everything, in order: the straight-through case, and the only
                 // one where `ch_in == ch` so a flat zip over the slice is right.
-                None => {
-                    let src = &data[pushed * ch_in..pushed * ch_in + want * ch_in];
-                    for (d, s) in dst.iter_mut().zip(src) {
-                        *d = f32::from_sample(*s);
-                    }
+                let src = &data[pushed * ch_in..pushed * ch_in + want * ch_in];
+                for (d, s) in dst.iter_mut().zip(src) {
+                    *d = f32::from_sample(*s);
                 }
+            } else {
                 // One input of many, strided. `dst` is one sample per frame
                 // here, so the index into `data` is a frame number times the
                 // DEVICE's channel count — the one place where using `ch` would
                 // compile, run, and quietly read the wrong input.
-                // One or two inputs of many, strided. `dst` holds `ch` samples
-                // per frame here, so the index into `data` is a frame number
-                // times the DEVICE's channel count plus that output channel's
-                // own source — the one place where using `ch` would compile,
-                // run, and quietly read the wrong input.
-                Some(pick) => {
-                    for (i, frame) in dst.chunks_exact_mut(ch).enumerate() {
-                        let at = (pushed + i) * ch_in;
-                        for (c, d) in frame.iter_mut().enumerate() {
-                            // Checked at construction; `unwrap_or(0)` rather
-                            // than an index so a future pick that slipped
-                            // through cannot panic in the audio callback.
-                            let src = pick.source(c, ch_in).unwrap_or(0);
-                            *d = f32::from_sample(data[at + src]);
-                        }
+                // Some inputs of many, strided. `dst` holds `ch` samples per
+                // frame here — the picks' channels laid end to end — so the
+                // index into `data` is a frame number times the DEVICE's
+                // channel count plus that output channel's own source, which is
+                // the one place where using `ch` would compile, run, and
+                // quietly read the wrong input.
+                for (i, frame) in dst.chunks_exact_mut(ch).enumerate() {
+                    let at = (pushed + i) * ch_in;
+                    for (c, d) in frame.iter_mut().enumerate() {
+                        // Checked at construction; `unwrap_or(0)` rather than an
+                        // index so a pick that slipped through cannot panic in
+                        // the audio callback.
+                        let src = self.picks.source(c, ch_in).unwrap_or(0);
+                        *d = f32::from_sample(data[at + src]);
                     }
                 }
             }
@@ -2007,7 +2107,7 @@ pub fn open_input(
     let monitor_frames = (rate as usize / 8).max(1024);
     let ((source, sink), monitor) = capture_channel_monitored(
         channels,
-        wish.pick_channel,
+        wish.picks,
         ring_frames,
         mark_slots,
         Arc::clone(&stats),
@@ -2336,7 +2436,7 @@ mod tests {
     #[test]
     fn a_picked_channel_is_the_one_that_reaches_the_ring() {
         for ch in 0..8u16 {
-            let (mut src, mut sink) = capture_channel_from(8, Some(ChannelPick::Mono(ch)), 64, 64, stats());
+            let (mut src, mut sink) = capture_channel_from(8, Picks::one(ChannelPick::Mono(ch)), 64, 64, stats());
             assert_eq!(sink.channels(), 1, "a picked channel is a mono stream");
             src.accept(&frames(8, 16, 0), Some(0), 0);
 
@@ -2357,6 +2457,70 @@ mod tests {
         }
     }
 
+    /// **Several inputs of one interface, laid end to end in one stream.**
+    ///
+    /// The owner's case exactly: a microphone on input 6 and a synth across
+    /// 4/5, live at the same time. One callback, one ring and one set of marks,
+    /// which is what makes them sample-aligned with each other for nothing —
+    /// and the reason a second DEVICE is declined rather than deferred.
+    ///
+    /// Every way of getting the layout wrong is silent, so the lane is encoded
+    /// in the tenths: a pick's channels landing at the wrong offset reads a
+    /// neighbouring input, and the take sounds plausible and is not what was
+    /// plugged in.
+    #[test]
+    fn several_picks_arrive_side_by_side_in_pick_order() {
+        use ChannelPick::{Mono, Stereo};
+        // Mono 6 first, then the pair 4/5 — the order they were chosen in, not
+        // the order the device has them in.
+        let picks = Picks::from_slice(&[Mono(5), Stereo(3, 4)]);
+        assert_eq!(picks.len(), 2, "two inputs");
+        assert_eq!(picks.channels(), 3, "one channel plus two");
+        assert_eq!(picks.offset(0), 0);
+        assert_eq!(picks.offset(1), 1, "the pair starts after the mono one");
+
+        let (mut src, mut sink) = capture_channel_from(8, picks, 64, 64, stats());
+        assert_eq!(sink.channels(), 3, "the stream is as wide as the picks are");
+        src.accept(&frames(8, 16, 0), Some(0), 0);
+
+        let mut out = Vec::new();
+        let got = sink.drain_samples(&mut out);
+        assert_eq!(got, 16, "sixteen frames of three channels");
+        assert_eq!(out.len(), 48);
+        for frame in 0..16usize {
+            let at = frame * 3;
+            let want = |lane: u16| frame as f32 + f32::from(lane) / 10.0;
+            assert_eq!(out[at], want(5), "frame {frame}: the mono input moved");
+            assert_eq!(out[at + 1], want(3), "frame {frame}: the pair's left moved");
+            assert_eq!(out[at + 2], want(4), "frame {frame}: the pair's right moved");
+        }
+    }
+
+    /// **One input going missing costs that input and not the others.**
+    ///
+    /// An interface can come back from a hub narrower than it was, and a saved
+    /// channel 12 that is no longer there must not take the microphone on
+    /// channel 1 with it. A pick that half-fits is still dropped whole — half a
+    /// stereo pair is "left twice", which says nothing and sounds fine.
+    #[test]
+    fn a_pick_that_no_longer_fits_is_dropped_alone() {
+        use ChannelPick::{Mono, Stereo};
+        let picks = Picks::from_slice(&[Mono(0), Stereo(6, 7), Mono(11)]);
+        let kept = picks.fitted(2);
+        assert_eq!(kept.len(), 1, "only channel 1 exists on a 2-channel device");
+        assert_eq!(kept.channels(), 1);
+        assert_eq!(kept.iter().next(), Some(Mono(0)));
+
+        // And a device with none of them left falls back to the whole device
+        // rather than to silence.
+        let (_, sink) = capture_channel_from(2, Picks::one(Mono(9)), 64, 64, stats());
+        assert_eq!(
+            sink.channels(),
+            2,
+            "a pick nothing can honour opens the device instead of a dead stream"
+        );
+    }
+
     /// **Any pair, adjacent or not, in either order.**
     ///
     /// The one everybody hits is 2/3 — a stereo pair patched across the middle
@@ -2371,7 +2535,7 @@ mod tests {
     fn a_stereo_pair_can_be_any_two_inputs() {
         for (l, r) in [(1_u16, 2_u16), (0, 1), (6, 7), (3, 0), (0, 0), (7, 2)] {
             let (mut src, mut sink) =
-                capture_channel_from(8, Some(ChannelPick::Stereo(l, r)), 64, 64, stats());
+                capture_channel_from(8, Picks::one(ChannelPick::Stereo(l, r)), 64, 64, stats());
             assert_eq!(sink.channels(), 2, "a pair is a stereo stream");
             src.accept(&frames(8, 16, 0), Some(0), 0);
 
@@ -2402,7 +2566,7 @@ mod tests {
     #[test]
     fn a_pair_with_one_channel_missing_falls_back_to_the_device() {
         let (mut src, mut sink) =
-            capture_channel_from(2, Some(ChannelPick::Stereo(0, 5)), 64, 64, stats());
+            capture_channel_from(2, Picks::one(ChannelPick::Stereo(0, 5)), 64, 64, stats());
         assert_eq!(sink.channels(), 2, "the whole device, not half a pair");
         src.accept(&frames(2, 4, 0), Some(0), 0);
         let mut out = Vec::new();
@@ -2420,7 +2584,7 @@ mod tests {
     #[test]
     fn picking_a_channel_does_not_change_what_the_device_is_said_to_have_sent() {
         let stats = stats();
-        let (mut src, _sink) = capture_channel_from(8, Some(ChannelPick::Mono(3)), 64, 64, Arc::clone(&stats));
+        let (mut src, _sink) = capture_channel_from(8, Picks::one(ChannelPick::Mono(3)), 64, 64, Arc::clone(&stats));
         src.accept(&frames(8, 16, 0), Some(0), 0);
         assert_eq!(stats.frames_captured(), 16, "the device produced 16 frames");
     }
@@ -2432,7 +2596,7 @@ mod tests {
     /// would leave somebody with no microphone and a message about a number.
     #[test]
     fn a_channel_the_device_does_not_have_falls_back_to_all_of_them() {
-        let (mut src, mut sink) = capture_channel_from(2, Some(ChannelPick::Mono(9)), 64, 64, stats());
+        let (mut src, mut sink) = capture_channel_from(2, Picks::one(ChannelPick::Mono(9)), 64, 64, stats());
         assert_eq!(sink.channels(), 2, "the whole device, not one lane of it");
         src.accept(&frames(2, 4, 0), Some(0), 0);
         let mut out = Vec::new();
@@ -2444,7 +2608,7 @@ mod tests {
     /// it must be byte-for-byte what it was.
     #[test]
     fn no_pick_is_the_straight_through_path() {
-        let (mut src, mut sink) = capture_channel_from(2, None, 64, 64, stats());
+        let (mut src, mut sink) = capture_channel_from(2, Picks::EVERYTHING, 64, 64, stats());
         assert_eq!(sink.channels(), 2);
         src.accept(&frames(2, 8, 0), Some(0), 0);
         let mut out = Vec::new();

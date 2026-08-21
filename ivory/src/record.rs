@@ -579,7 +579,7 @@ struct Audio {
 impl Audio {
     fn open(
         selection: &InputSelection,
-        channel: Option<audio::ChannelPick>,
+        picks: audio::Picks,
         timebase: Timebase,
         tap_home: mpsc::Sender<Box<crate::instrument::RecorderTap>>,
         buffer_frames: Option<u32>,
@@ -594,9 +594,9 @@ impl Audio {
             buffer_frames,
             sample_rate,
             // NOT `channels`. Asking for one channel would take the FIRST one;
-            // this opens everything the device has and keeps the one that was
-            // asked for. See `ConfigWish::pick_channel`.
-            pick_channel: channel,
+            // this opens everything the device has and keeps the ones that were
+            // asked for. See `ConfigWish::picks`.
+            picks,
             ..audio::ConfigWish::default()
         };
         // Three seconds of ring. The writer thread wakes every 4 ms, so this is
@@ -1164,7 +1164,7 @@ impl Session {
     pub fn open_input(
         &mut self,
         selection: &InputSelection,
-        channel: Option<audio::ChannelPick>,
+        picks: audio::Picks,
         buffer_frames: Option<u32>,
         sample_rate: Option<u32>,
     ) {
@@ -1180,7 +1180,7 @@ impl Session {
         let tap = self.recover_tap();
         match Audio::open(
             selection,
-            channel,
+            picks,
             self.timebase,
             self.tap_tx.clone(),
             buffer_frames,
@@ -2103,7 +2103,7 @@ pub fn record_test(seconds: Option<String>) {
     let timebase = Timebase::new();
     let tap = Arc::new(RawMidiTap::new(60_000));
     let mut session = Session::new(Arc::clone(&tap), timebase);
-    session.open_input(&InputSelection::Default, None, None, None);
+    session.open_input(&InputSelection::Default, audio::Picks::EVERYTHING, None, None);
     match (session.audio_device_name(), session.audio_error()) {
         (Some(name), _) => println!("\nopen: {name}"),
         (None, Some(e)) => {

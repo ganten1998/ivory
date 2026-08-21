@@ -308,9 +308,9 @@ impl CaptureDevices for AudioInputs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioChoice {
     pub selection: ivory_record::audio::InputSelection,
-    /// Which input, or which pair. Zero-based, and never yet known to exist on
-    /// the device that opens — that is checked where the stream is built.
-    pub channel: Option<ChannelPick>,
+    /// Which inputs. Zero-based, and never yet known to exist on the device
+    /// that opens — that is checked where the stream is built.
+    pub channels: ivory_record::audio::Picks,
 }
 
 /// The selection as `ivory-record` wants it, or `None` for "open nothing".
@@ -329,7 +329,11 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
                 Some(node) => InputSelection::PipewireNode(node.to_owned()),
                 None => InputSelection::Key(DeviceKey::from_setting(key)),
             };
-            Some(AudioChoice { selection, channel })
+            let channels = match channel {
+                Some(pick) => ivory_record::audio::Picks::one(pick),
+                None => ivory_record::audio::Picks::EVERYTHING,
+            };
+            Some(AudioChoice { selection, channels })
         }
         // **Nothing chosen means nothing opened.** There used to be a fallback
         // to `InputSelection::Default` here, for the case where the user had
@@ -858,8 +862,8 @@ mod tests {
             audio_selection(&picked),
             Some(AudioChoice {
                 selection: InputSelection::Key(_),
-                channel: None
-            })
+                channels
+            }) if channels.is_empty()
         ));
     }
 
@@ -919,7 +923,7 @@ mod tests {
             choice.selection,
             InputSelection::PipewireNode(node.to_owned())
         );
-        assert_eq!(choice.channel, None);
+        assert!(choice.channels.is_empty());
 
         // And with one of its inputs picked out. The channel suffix and the
         // node prefix have to survive each other.
@@ -936,7 +940,10 @@ mod tests {
             InputSelection::PipewireNode(node.to_owned()),
             "the channel suffix ate the node name"
         );
-        assert_eq!(choice.channel, Some(ChannelPick::Stereo(1, 2)));
+        assert_eq!(
+            choice.channels.iter().collect::<Vec<_>>(),
+            vec![ChannelPick::Stereo(1, 2)]
+        );
     }
 
     /// A chosen channel reaches the stream open, with its device intact.
@@ -955,7 +962,10 @@ mod tests {
             InputSelection::Key(DeviceKey::named("Scarlett 18i20 USB"))
         );
         // Zero-based here; the chooser's label said "input 3".
-        assert_eq!(choice.channel, Some(ChannelPick::Mono(2)));
+        assert_eq!(
+            choice.channels.iter().collect::<Vec<_>>(),
+            vec![ChannelPick::Mono(2)]
+        );
     }
 
     /// A hand-edited channel that is not a number costs the channel, not the
@@ -970,7 +980,7 @@ mod tests {
             choice.selection,
             InputSelection::Key(DeviceKey::named("Scarlett"))
         );
-        assert_eq!(choice.channel, None);
+        assert!(choice.channels.is_empty());
     }
 
     /// A remembered device has to be re-opened at launch, or the app looks like
@@ -985,8 +995,8 @@ mod tests {
             audio_selection(&shared),
             Some(AudioChoice {
                 selection: InputSelection::Key(_),
-                channel: None
-            })
+                channels
+            }) if channels.is_empty()
         ));
     }
 
