@@ -216,14 +216,40 @@ have_va_driver() {
     return 1
 }
 
-# **A separate question from "is ffmpeg installed".** The ffmpeg bundled with
-# Tangent is a static build with no VA-API in it at all, so hardware ENCODE
-# depends on a system ffmpeg that has it. Without one, takes still record —
-# they just encode on the CPU, and nothing says so.
+# **Probe the ffmpeg the app will actually run, not the one on PATH.**
+#
+# `encode::ffmpeg::program()` resolves `$IVORY_FFMPEG`, then the `tangent-ffmpeg`
+# sitting beside the installed binary, and only then the bare name — so the
+# BUNDLED copy wins over PATH. Checking `command -v ffmpeg` therefore answers a
+# question nobody asked: a machine with a perfect system ffmpeg and a bundled
+# copy built without VA-API would be told it was ready while every take encoded
+# on the CPU. That was true of every Linux release before 4.39.
+#
+# `FFMPEG_TESTED` is left holding whichever binary was probed, because the
+# remedy depends on which one it is and the message has to name it.
+FFMPEG_TESTED=""
 have_vaapi_ffmpeg() {
-    _ff="$(command -v ffmpeg 2>/dev/null)"
-    [ -n "$_ff" ] || return 1
-    "$_ff" -hide_banner -hwaccels </dev/null 2>/dev/null | grep -q "^vaapi$"
+    FFMPEG_TESTED=""
+    if [ -n "${IVORY_FFMPEG:-}" ] && [ -x "${IVORY_FFMPEG:-}" ]; then
+        FFMPEG_TESTED="$IVORY_FFMPEG"
+    elif [ -x "$BIN_DIR/tangent-ffmpeg" ]; then
+        FFMPEG_TESTED="$BIN_DIR/tangent-ffmpeg"
+    elif [ -x "$SELF_DIR/tangent-ffmpeg" ]; then
+        FFMPEG_TESTED="$SELF_DIR/tangent-ffmpeg"
+    else
+        FFMPEG_TESTED="$(command -v ffmpeg 2>/dev/null)"
+    fi
+    [ -n "$FFMPEG_TESTED" ] || return 1
+    "$FFMPEG_TESTED" -hide_banner -hwaccels </dev/null 2>/dev/null | grep -q "^vaapi$"
+}
+
+# Is the encoder we probed the one we ship? If so, no package fixes it — the
+# bundled copy takes precedence over anything the package manager installs.
+tested_is_bundled() {
+    case "$FFMPEG_TESTED" in
+        "$BIN_DIR/tangent-ffmpeg"|"$SELF_DIR/tangent-ffmpeg") return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # **Package names, and how far each one is trusted.** The Void row is verified
@@ -322,11 +348,20 @@ media_prereqs() {
 
     _pkgs="$(va_packages "$_fam" "$_ven")"
     [ "$_miss_driver" = "1" ] || _pkgs=""
+    # **A bundled encoder without VA-API is not a package-manager problem.**
+    # The copy beside the binary is resolved before PATH, so installing a system
+    # ffmpeg would change nothing about which one runs. Flagged here, said after
+    # the NOTE below, because advice before the problem reads backwards.
+    _bundled_ffmpeg=0
     if [ "$_miss_ffmpeg" = "1" ]; then
-        case "$_fam" in
-            fedora) _pkgs="$_pkgs ffmpeg-free" ;;
-            *)      _pkgs="$_pkgs ffmpeg" ;;
-        esac
+        if tested_is_bundled; then
+            _bundled_ffmpeg=1
+        else
+            case "$_fam" in
+                fedora) _pkgs="$_pkgs ffmpeg-free" ;;
+                *)      _pkgs="$_pkgs ffmpeg" ;;
+            esac
+        fi
     fi
     _pkgs="$(echo $_pkgs)"          # squeeze the spaces the two branches leave
 
@@ -336,11 +371,24 @@ media_prereqs() {
         echo "        will decode the camera on the CPU"
     fi
     if [ "$_miss_ffmpeg" = "1" ]; then
-        echo "        will encode the video on the CPU (the ffmpeg shipped with"
-        echo "        Tangent is a static build without VA-API in it)"
+        echo "        will encode the video on the CPU"
+        echo "        ($FFMPEG_TESTED has no VA-API in it)"
     fi
     echo "        Everything records correctly either way; this is about how"
     echo "        much processor a take costs."
+
+    if [ "$_bundled_ffmpeg" = "1" ]; then
+        echo
+        echo "        Installing ffmpeg will NOT fix this: Tangent runs the copy"
+        echo "        beside its own binary before anything on PATH, so that copy"
+        echo "        is the one that decides. Use a build of 4.39.0 or later, or"
+        echo "        point Tangent at an encoder that has VA-API:"
+        echo "          IVORY_FFMPEG=/usr/bin/ffmpeg tangent"
+    fi
+
+    # Nothing a package manager can supply — everything outstanding has been
+    # explained above.
+    [ -n "$_pkgs" ] || return 0
 
     _cmd="$(install_cmd "$_fam" $_pkgs)" || {
         echo "        Install your distribution's VA-API driver for your GPU,"
