@@ -271,6 +271,8 @@ pub struct IvoryApp {
     mixer_grab: Option<MixerGrab>,
     /// The strip whose colour palette is open, if any.
     mixer_palette: Option<usize>,
+    /// A decibel figure being typed into a strip, and which.
+    mixer_typing: Option<(usize, String)>,
     /// Where the mixer was last drawn, so a press can be tested against it.
     mixer_rect: Option<Rect>,
     /// The OS's own file panel is on screen right now.
@@ -715,6 +717,7 @@ impl IvoryApp {
             mixer_open: false,
             mixer_grab: None,
             mixer_palette: None,
+            mixer_typing: None,
             mixer_rect: None,
             native_panel_up: false,
             factory_cartridge: false,
@@ -1304,6 +1307,63 @@ impl IvoryApp {
     /// One builder for all of it. The arguments were identical at seven call
     /// sites, which is seven places to forget a new one — and the one being
     /// forgotten silently is a band that draws from stale state.
+    /// Collect a decibel figure being typed into a strip.
+    ///
+    /// Accepts digits, a minus and one point, which is every dB anybody types.
+    /// A figure that will not parse is discarded rather than applied: the
+    /// alternative is a fader that jumps to zero because somebody typed "-" and
+    /// pressed Enter.
+    fn type_into_mixer(&mut self, ctx: &egui::Context) {
+        let Some((at, mut buf)) = self.mixer_typing.take() else {
+            return;
+        };
+        let (commit, cancel) = ctx.input(|i| {
+            for e in &i.events {
+                match e {
+                    egui::Event::Text(t) => {
+                        for c in t.chars() {
+                            if c.is_ascii_digit()
+                                || (c == '-' && buf.is_empty())
+                                || (c == '.' && !buf.contains('.'))
+                            {
+                                buf.push(c);
+                            }
+                        }
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        pressed: true,
+                        ..
+                    } => {
+                        buf.pop();
+                    }
+                    _ => {}
+                }
+            }
+            (
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if cancel {
+            return;
+        }
+        if commit {
+            if let Ok(db) = buf.trim().parse::<f32>() {
+                // Through the same door a drag uses, so one path decides what a
+                // fader position means and there is no second conversion to
+                // disagree with it.
+                let gain = 10f32.powf(db.clamp(-80.0, 12.0) / 20.0);
+                self.apply_mixer_hit(
+                    crate::mixer_panel::Hit::Fader(at),
+                    recorder::gain_to_fader(gain),
+                );
+            }
+            return;
+        }
+        self.mixer_typing = Some((at, buf));
+    }
+
     /// What a mixer control reads now, 0..=1, for a drag to start from.
     fn mixer_value(&self, hit: crate::mixer_panel::Hit) -> f32 {
         use crate::mixer_panel::Hit as H;
@@ -1315,7 +1375,7 @@ impl IvoryApp {
                 .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
             H::Send(i) => view.strips.get(i).map_or(0.0, |s| s.send),
             H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(_) | H::Paint(..)
-            | H::Palette(_) => 0.0,
+            | H::Palette(_) | H::Db(_) => 0.0,
         }
     }
 
@@ -1369,6 +1429,13 @@ impl IvoryApp {
             }
             H::Palette(i) => {
                 self.mixer_palette = Some(i);
+                return;
+            }
+            // Click the number and say it. Seeded EMPTY rather than with what
+            // is there: somebody who clicked it wants to type a figure, not to
+            // edit one character of the old one.
+            H::Db(i) => {
+                self.mixer_typing = Some((i, String::new()));
                 return;
             }
             // `usize::MAX` is "anywhere but a swatch", which closes it without
@@ -1453,6 +1520,19 @@ impl IvoryApp {
                 name,
                 detail,
                 color: self.settings.strip_colors.get(i).copied().unwrap_or(0) as usize,
+                // **What the SOURCE is, not what the samples happen to be.**
+                // A mono microphone whose two bars are identical is a meter
+                // claiming a stereo signal; the input knows its own width and
+                // an instrument's is on its `Loaded`.
+                stereo: match s {
+                    Strip::Input => self
+                        .audio_status
+                        .input
+                        .as_ref()
+                        .is_none_or(|(_, st)| st.channels != 1),
+                    _ => true,
+                },
+                gr_db: 0.0,
                 insert: if s == Strip::Fx {
                     self.settings.bus_effect.as_deref().map_or("", plugin_display_name)
                 } else {
@@ -1484,18 +1564,24 @@ impl IvoryApp {
                     empty: false,
                     gain: g.master,
                     send: 0.0,
-                    peak: self
-                        .recorder
-                        .meters
-                        .left
-                        .peak
-                        .max(self.recorder.meters.right.peak),
+                    // The master's own meter, which the band already has: the
+                    // OUTPUT, left and right, and what the limiter took off.
+                    peak: [
+                        self.recorder.master.left.peak,
+                        self.recorder.master.right.peak,
+                    ],
+                    stereo: true,
+                    gr_db: self.recorder.gr_db,
                     muted: false,
                     soloed: false,
                 },
             }),
             any_solo: desk.any_solo(),
             palette_open: self.mixer_palette,
+            typing: self
+                .mixer_typing
+                .as_ref()
+                .map(|(at, buf)| (*at, buf.as_str())),
             dark_mode: self.settings.dark_mode,
             wood: {
                 let c = self.settings.recorder_bg_color;
@@ -6405,6 +6491,17 @@ impl IvoryApp {
         // and go on pulling, and a press never makes a cap jump to meet it.
         // A switch is not dragged at all and acts on the way down.
         if let Some(rect) = self.mixer_rect {
+            // **What is being typed into a decibel field.**
+            //
+            // Read from raw events rather than through an egui widget, for the
+            // reason the take-name field is: the mixer is a pure painter and
+            // cannot own a `TextEdit`. Enter commits, Escape abandons, and a
+            // press anywhere else commits too — the same bargain the band's
+            // number fields already make, because a half-typed figure that
+            // vanishes when you look away is a field people learn not to trust.
+            if self.mixer_typing.is_some() {
+                self.type_into_mixer(&ctx);
+            }
             // **A right-click paints.** Anywhere on a channel opens its palette,
             // which is the only gesture in the mixer that is not a control —
             // so it needs no target of its own and cannot collide with one.
@@ -6418,6 +6515,19 @@ impl IvoryApp {
             let released = ctx.input(|i| i.pointer.any_released());
             let pos = ctx.pointer_interact_pos();
             if pressed {
+                // A press anywhere else finishes the figure being typed.
+                if self.mixer_typing.is_some() {
+                    let done = std::mem::take(&mut self.mixer_typing);
+                    if let Some((at, buf)) = done {
+                        if let Ok(db) = buf.trim().parse::<f32>() {
+                            let gain = 10f32.powf(db.clamp(-80.0, 12.0) / 20.0);
+                            self.apply_mixer_hit(
+                                crate::mixer_panel::Hit::Fader(at),
+                                recorder::gain_to_fader(gain),
+                            );
+                        }
+                    }
+                }
                 if let Some(pos) = pos.filter(|p| rect.contains(*p)) {
                     let view = self.mixer_view();
                     match crate::mixer_panel::hit_test(rect, &view, pos) {
@@ -6426,7 +6536,8 @@ impl IvoryApp {
                         | crate::mixer_panel::Hit::Add(_)
                         | crate::mixer_panel::Hit::Insert(_)
                         | crate::mixer_panel::Hit::Paint(..)
-                        | crate::mixer_panel::Hit::Palette(_))) => {
+                        | crate::mixer_panel::Hit::Palette(_)
+                        | crate::mixer_panel::Hit::Db(_))) => {
                             self.apply_mixer_hit(hit, 0.0);
                         }
                         Some(hit) => {

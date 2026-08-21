@@ -550,7 +550,7 @@ pub struct RecorderState {
     pub elapsed_s: f64,
     /// The loudest thing each strip made since the last frame, in
     /// [`Strip::ALL`] order. Pushed by the host, read by the mixer.
-    pub strip_peaks: [f32; STRIPS],
+    pub strip_peaks: [[f32; 2]; STRIPS],
     pub meters: Meters,
     /// The output's levels and the limiter's reduction. See the same two
     /// fields on [`RecorderView`].

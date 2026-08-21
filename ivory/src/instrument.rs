@@ -537,15 +537,15 @@ fn fold_strip(
     target: f32,
     send: f32,
     coeff: f32,
-) -> f32 {
-    let mut peak = 0.0f32;
+) -> [f32; 2] {
+    let mut peak = [0.0f32; 2];
     for f in 0..frames {
         *gain += (target - *gain) * coeff;
         let at = f * TAP_CHANNELS;
         for c in 0..TAP_CHANNELS {
             let Some(v) = mix.get_mut(at + c) else { return peak };
             *v *= *gain;
-            peak = peak.max(v.abs());
+            peak[c.min(1)] = peak[c.min(1)].max(v.abs());
             if let Some(a) = aux.get_mut(at + c) {
                 *a += *v * send;
             }
@@ -562,8 +562,8 @@ fn add_return(
     gain: &mut f32,
     target: f32,
     coeff: f32,
-) -> f32 {
-    let mut peak = 0.0f32;
+) -> [f32; 2] {
+    let mut peak = [0.0f32; 2];
     for f in 0..frames {
         *gain += (target - *gain) * coeff;
         let at = f * TAP_CHANNELS;
@@ -572,7 +572,7 @@ fn add_return(
                 return peak;
             };
             let wet = *a * *gain;
-            peak = peak.max(wet.abs());
+            peak[c.min(1)] = peak[c.min(1)].max(wet.abs());
             *v += wet;
         }
     }
@@ -585,9 +585,12 @@ impl Shared {
     /// `fetch_max` on the BITS, which is only correct for non-negative floats
     /// — and these are magnitudes, so they are. The same trick the limiter's
     /// gain reduction uses two fields up.
-    fn note_strip_peak(&self, strip: Strip, peak: f32) {
-        if peak > 0.0 {
-            self.strip_peak[strip.index()].fetch_max(peak.to_bits(), Ordering::Relaxed);
+    fn note_strip_peak(&self, strip: Strip, peak: [f32; 2]) {
+        let at = &self.strip_peak[strip.index()];
+        for (slot, v) in at.iter().zip(peak) {
+            if v > 0.0 {
+                slot.fetch_max(v.to_bits(), Ordering::Relaxed);
+            }
         }
     }
 }
@@ -678,7 +681,7 @@ fn mix_in(
     target: f32,
     send: f32,
     coeff: f32,
-) -> f32 {
+) -> [f32; 2] {
     let frames = mix.len() / TAP_CHANNELS;
     if left.len() < frames || right.len() < frames {
         // **The gain still travels.** A slot with nothing in it this block is
@@ -688,9 +691,9 @@ fn mix_in(
         for _ in 0..frames {
             *gain += (target - *gain) * coeff;
         }
-        return 0.0;
+        return [0.0; 2];
     }
-    let mut peak = 0.0f32;
+    let mut peak = [0.0f32; 2];
     for i in 0..frames {
         *gain += (target - *gain) * coeff;
         let g = *gain;
@@ -700,7 +703,8 @@ fn mix_in(
         // there, and an assignment here would make the last slot the only one
         // anybody hears.
         let (l, r) = (left[i] * g, right[i] * g);
-        peak = peak.max(l.abs()).max(r.abs());
+        peak[0] = peak[0].max(l.abs());
+        peak[1] = peak[1].max(r.abs());
         mix[i * TAP_CHANNELS] += l;
         mix[i * TAP_CHANNELS + 1] += r;
         // Post-fader, like every send on this desk.
@@ -1094,7 +1098,7 @@ struct Shared {
     /// f32 bits. Read and RESET, like the limiter's gain reduction beside it:
     /// a peak is a transient and an average would read as almost nothing on
     /// exactly the material a meter is there for.
-    strip_peak: [AtomicU32; STRIPS],
+    strip_peak: [[AtomicU32; 2]; STRIPS],
     /// One bit per strip. See [`Strip`].
     ///
     /// **Two masks rather than a flag each**, because solo is a question about
@@ -1216,7 +1220,7 @@ impl Shared {
                 AtomicU32::new(if i < SLOTS { 1.0f32 } else { 0.0f32 }.to_bits())
             }),
             fx_return: AtomicU32::new(1.0f32.to_bits()),
-            strip_peak: std::array::from_fn(|_| AtomicU32::new(0)),
+            strip_peak: std::array::from_fn(|_| [AtomicU32::new(0), AtomicU32::new(0)]),
             muted: AtomicU32::new(0),
             soloed: AtomicU32::new(0),
             gr_db: AtomicU32::new(0),
@@ -2029,7 +2033,8 @@ impl Renderer {
                     }
                 }
             }
-            self.shared.note_strip_peak(Strip::Click, click_peak);
+            // The click is one voice on both sides.
+            self.shared.note_strip_peak(Strip::Click, [click_peak; 2]);
 
             // ── the bus, and then the master ───────────────────────────────
             let sends = crate::effects::Sends {
@@ -2236,7 +2241,7 @@ impl Renderer {
             return;
         }
         let frames_got = got / ch_in;
-        let mut peak = 0.0f32;
+        let mut peak = [0.0f32; 2];
         for i in 0..frames.min(frames_got) {
             self.monitor_gain += (target - self.monitor_gain) * self.gain_coeff;
             let at = i * TAP_CHANNELS;
@@ -2246,7 +2251,7 @@ impl Renderer {
                 // which is what a monitor is for — hearing that something is
                 // arriving, not auditioning a surround mix.
                 let src = scratch[i * ch_in + c.min(ch_in - 1)] * self.monitor_gain;
-                peak = peak.max(src.abs());
+                peak[c.min(1)] = peak[c.min(1)].max(src.abs());
                 if let Some(v) = self.mix.get_mut(at + c) {
                     *v += src;
                 }
@@ -2311,7 +2316,7 @@ impl Renderer {
         ) else {
             return;
         };
-        let mut peak = 0.0f32;
+        let mut peak = [0.0f32; 2];
         for f in 0..frames {
             self.track_gain += (target - self.track_gain) * coeff;
             if self.track_pos >= out {
@@ -2323,7 +2328,8 @@ impl Renderer {
             // the audio thread if that ever stopped being true.
             if let (Some(l), Some(r)) = (clip.samples.get(at), clip.samples.get(at + 1)) {
                 let (l, r) = (l * self.track_gain, r * self.track_gain);
-                peak = peak.max(l.abs()).max(r.abs());
+                peak[0] = peak[0].max(l.abs());
+                peak[1] = peak[1].max(r.abs());
                 mix[f * TAP_CHANNELS] += l;
                 mix[f * TAP_CHANNELS + 1] += r;
                 // Post-fader, like every other send here. A backing track
@@ -2414,13 +2420,14 @@ impl Renderer {
         self.builtin.render(scratch, frames, TAP_CHANNELS);
         let send =
             f32::from_bits(self.shared.send[slot].load(Ordering::Relaxed)).clamp(0.0, 1.0);
-        let mut peak = 0.0f32;
+        let mut peak = [0.0f32; 2];
         for i in 0..frames {
             self.builtin_gain += (target - self.builtin_gain) * coeff;
             let g = self.builtin_gain;
             let l = scratch[i * TAP_CHANNELS] * g;
             let r = scratch[i * TAP_CHANNELS + 1] * g;
-            peak = peak.max(l.abs()).max(r.abs());
+            peak[0] = peak[0].max(l.abs());
+            peak[1] = peak[1].max(r.abs());
             mix[i * TAP_CHANNELS] += l;
             mix[i * TAP_CHANNELS + 1] += r;
             aux[i * TAP_CHANNELS] += l * send;
@@ -2502,7 +2509,7 @@ impl Renderer {
         };
         mix.fill(0.0);
         let coeff = self.gain_coeff;
-        let mut peaks = [0.0f32; SLOTS];
+        let mut peaks = [[0.0f32; 2]; SLOTS];
         for (i, ((slot, width), target)) in
             self.slots.iter_mut().zip(widths).zip(targets).enumerate()
         {
@@ -3866,9 +3873,11 @@ impl Engine {
 
     /// The loudest thing each strip has made since this was last called, and
     /// it CLEARS as it reads. Zero for a strip that has been silent.
-    pub fn strip_peaks(&self) -> [f32; STRIPS] {
+    pub fn strip_peaks(&self) -> [[f32; 2]; STRIPS] {
         std::array::from_fn(|i| {
-            f32::from_bits(self.shared.strip_peak[i].swap(0, Ordering::Relaxed))
+            std::array::from_fn(|c| {
+                f32::from_bits(self.shared.strip_peak[i][c].swap(0, Ordering::Relaxed))
+            })
         })
     }
 

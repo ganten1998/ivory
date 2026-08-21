@@ -43,8 +43,13 @@ pub struct StripView<'a> {
     pub gain: f32,
     /// 0..=1, how much of it reaches the effects bus.
     pub send: f32,
-    /// The loudest thing it made since the last frame, as a magnitude.
-    pub peak: f32,
+    /// The loudest thing it made since the last frame, left and right.
+    pub peak: [f32; 2],
+    /// Whether it is a stereo source. A mono one draws ONE bar, because two
+    /// identical bars is a lie about the signal.
+    pub stereo: bool,
+    /// Decibels the limiter took off, for the master alone. Zero for none.
+    pub gr_db: f32,
     pub muted: bool,
     pub soloed: bool,
 }
@@ -76,6 +81,12 @@ pub struct MixerView<'a> {
     pub wood: (u8, u8, u8),
     /// The strip whose colour palette is open, if any.
     pub palette_open: Option<usize>,
+    /// A decibel figure being typed, and into which strip.
+    ///
+    /// **A fader is a bad way to ask for exactly -6.0.** Its whole range is
+    /// eighty decibels; the drag was slowed until it was usable, and this is
+    /// the other half of that — click the number and say it.
+    pub typing: Option<(usize, &'a str)>,
 }
 
 impl MixerView<'_> {
@@ -111,6 +122,8 @@ pub enum Hit {
     Paint(usize, usize),
     /// A right-click anywhere on a strip: open its palette.
     Palette(usize),
+    /// The decibel readout: type a number into it.
+    Db(usize),
 }
 
 impl Hit {
@@ -124,7 +137,7 @@ impl Hit {
             Hit::Fader(_) => Some(DragAxis::Vertical),
             Hit::Send(_) => Some(DragAxis::Vertical),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(_) | Hit::Paint(..)
-            | Hit::Palette(_) => None,
+            | Hit::Palette(_) | Hit::Db(_) => None,
         }
     }
 
@@ -134,7 +147,7 @@ impl Hit {
             Hit::Fader(_) => Some(FADER_TRAVEL),
             Hit::Send(_) => Some(SEND_TRAVEL),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(_) | Hit::Paint(..)
-            | Hit::Palette(_) => None,
+            | Hit::Palette(_) | Hit::Db(_) => None,
         }
     }
 }
@@ -319,7 +332,7 @@ impl Layout {
         } else {
             Rect::NOTHING
         };
-        let switches = if switchable { cut(0.90, 0.975) } else { Rect::NOTHING };
+        let switches = if switchable { cut(0.902, 0.975) } else { Rect::NOTHING };
         let (mute, solo) = if switchable {
             let mid = switches.center().x;
             (
@@ -366,7 +379,7 @@ impl Layout {
             meter: Rect::from_min_max(travel.min, Pos2::new(split, travel.max.y)),
             send,
             fader: Rect::from_min_max(Pos2::new(split, travel.min.y), travel.max),
-            db: cut(0.83, 0.90),
+            db: cut(0.83, 0.888),
             mute,
             solo,
             insert,
@@ -389,6 +402,7 @@ impl Layout {
                 (s.solo, Hit::Solo(i)),
                 (s.add, Hit::Add(i)),
                 (s.insert, Hit::Insert(i)),
+                (s.db, Hit::Db(i)),
             ] {
                 if r.is_positive() {
                     out.push((r, hit));
@@ -450,6 +464,7 @@ struct Ink {
     mute: Color32,
     solo: Color32,
     meter_lo: Color32,
+    gr: Color32,
     meter_hi: Color32,
 }
 
@@ -476,6 +491,7 @@ fn ink(view: &MixerView<'_>) -> Ink {
         mute: Color32::from_rgb(0xE0, 0xA8, 0x22),
         solo: Color32::from_rgb(0xE8, 0x3A, 0x4E),
         meter_lo: Color32::from_rgb(0x3D, 0xC0, 0x5A),
+        gr: Color32::from_rgb(0xE8, 0x8C, 0x2A),
         meter_hi: Color32::from_rgb(0xE0, 0xA8, 0x22),
     }
 }
@@ -492,7 +508,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
             continue;
         }
         let heard = view.heard(i);
-        strip(painter, s, v, &p, heard);
+        let typed = view.typing.filter(|(at, _)| *at == i).map(|(_, b)| b);
+        strip(painter, s, v, &p, heard, typed);
     }
     // The palette last, over whatever it belongs to.
     if let Some(at) = view.palette_open {
@@ -517,7 +534,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
     }
 }
 
-fn strip(painter: &Painter, l: &StripStrip, v: &StripView<'_>, p: &Ink, heard: bool) {
+fn strip(
+    painter: &Painter,
+    l: &StripStrip,
+    v: &StripView<'_>,
+    p: &Ink,
+    heard: bool,
+    typed: Option<&str>,
+) {
     if v.empty {
         empty_slot(painter, l, p);
         return;
@@ -592,7 +616,7 @@ fn strip(painter: &Painter, l: &StripStrip, v: &StripView<'_>, p: &Ink, heard: b
         painter.rect_filled(l.panel, 3.0, Color32::from_black_alpha(90));
     }
 
-    meter(painter, l.meter, v.peak, heard, p);
+    meter(painter, l.meter, v.peak, v.stereo, v.gr_db, heard, p);
 
     if l.send.is_positive() {
         send_knob(painter, l.send, v.send, p);
@@ -613,13 +637,20 @@ fn strip(painter: &Painter, l: &StripStrip, v: &StripView<'_>, p: &Ink, heard: b
     }
 
     fader(painter, l.fader, v.gain, p);
-    centred(
-        painter,
-        l.db,
-        &gain_text(v.gain),
-        plain((h * 0.026).clamp(8.0, 12.0)),
-        p.engrave,
-    );
+    let db_font = plain((h * 0.026).clamp(8.0, 12.0));
+    match typed {
+        Some(buf) => {
+            painter.rect_filled(l.db, 2.0, p.face);
+            painter.rect_stroke(
+                l.db,
+                2.0,
+                Stroke::new(1.0, p.lit),
+                egui::StrokeKind::Inside,
+            );
+            centred(painter, l.db, &format!("{buf}_"), db_font, p.engrave);
+        }
+        None => centred(painter, l.db, &gain_text(v.gain), db_font, p.engrave),
+    }
 
     if l.mute.is_positive() {
         switch(painter, l.mute, "M", v.muted, p.mute, p);
@@ -690,24 +721,86 @@ fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink) {
 /// width of the strip is not a meter, it is a panel with a colour in it: at
 /// rest it is the largest thing on the channel and it reads as something that
 /// failed to load rather than as a level of nothing.
-fn meter(painter: &Painter, r: Rect, peak: f32, heard: bool, p: &Ink) {
+/// The marks down the side of a meter, in decibels.
+///
+/// **The band's own set, shortened.** A strip is a fifth of the width the
+/// master column has, so seven labels would be a grey smear; these four are
+/// the ones anybody actually reads a level against.
+const METER_TICKS: [f32; 4] = [0.0, -12.0, -24.0, -48.0];
+
+fn meter(
+    painter: &Painter,
+    r: Rect,
+    peak: [f32; 2],
+    stereo: bool,
+    gr_db: f32,
+    heard: bool,
+    p: &Ink,
+) {
     if !r.is_positive() {
         return;
     }
-    let w = (r.width() * 0.52).clamp(6.0, 18.0);
-    let r = Rect::from_center_size(r.center(), Vec2::new(w, r.height()));
-    painter.rect_filled(r, 2.0, p.track);
-    if !heard || peak <= 0.0 {
-        return;
+    // **Tall and thin, with the ticks to its left.** A meter you read a number
+    // off wants a scale beside it, and the scale is what decides how much of
+    // the cell the bars can have.
+    let scale_w = (r.width() * 0.42).clamp(12.0, 26.0);
+    let bars = Rect::from_min_max(Pos2::new(r.left() + scale_w, r.top()), r.max);
+    let font = FontId::new((r.width() * 0.16).clamp(5.5, 8.0), crate::fonts::courier());
+    for db in METER_TICKS {
+        let t = gain_to_fader(10f32.powf(db / 20.0)).clamp(0.0, 1.0);
+        let y = bars.bottom() - bars.height() * t;
+        painter.text(
+            Pos2::new(r.left() + scale_w - 3.0, y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{db:.0}"),
+            font.clone(),
+            p.face.gamma_multiply(0.55),
+        );
+        painter.line_segment(
+            [Pos2::new(bars.left(), y), Pos2::new(bars.right(), y)],
+            Stroke::new(0.5, p.face.gamma_multiply(0.18)),
+        );
     }
-    // The same curve the faders use, so a strip at unity reads at the same
-    // height on both — a meter on a different scale from the fader beside it
-    // is two rulers on one wall.
-    let t = gain_to_fader(peak).clamp(0.0, 1.0);
-    let top = r.bottom() - r.height() * t;
-    let filled = Rect::from_min_max(Pos2::new(r.left(), top), r.max);
-    let colour = if peak >= 0.9 { p.meter_hi } else { p.meter_lo };
-    painter.rect_filled(filled, 2.0, colour);
+
+    // One bar or two, and that is a claim about the SOURCE rather than about
+    // the samples: a mono microphone drawn as two identical bars says it is
+    // stereo, which is the one thing a meter must not do.
+    let lanes = if stereo { 2 } else { 1 };
+    let gap = 2.0;
+    let w = ((bars.width() - gap * (lanes as f32 - 1.0)) / lanes as f32).max(2.0);
+    for lane in 0..lanes {
+        let x = bars.left() + lane as f32 * (w + gap);
+        let cell = Rect::from_min_max(
+            Pos2::new(x, bars.top()),
+            Pos2::new(x + w, bars.bottom()),
+        );
+        painter.rect_filled(cell, 2.0, p.track);
+        let v = if stereo { peak[lane.min(1)] } else { peak[0].max(peak[1]) };
+        if !heard || v <= 0.0 {
+            continue;
+        }
+        // The same curve the faders use, so a strip at unity reads at the same
+        // height on both — a meter on a different scale from the fader beside
+        // it is two rulers on one wall.
+        let t = gain_to_fader(v).clamp(0.0, 1.0);
+        let top = cell.bottom() - cell.height() * t;
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(cell.left(), top), cell.max),
+            2.0,
+            if v >= 0.9 { p.meter_hi } else { p.meter_lo },
+        );
+    }
+
+    // **Gain reduction hangs from the top**, the way it does on the band's own
+    // master, because that is the direction it means: the ceiling coming down.
+    if gr_db > 0.01 {
+        let t = (gr_db / 24.0).clamp(0.0, 1.0);
+        let strip = Rect::from_min_max(
+            Pos2::new(bars.right() - 3.0, bars.top()),
+            Pos2::new(bars.right(), bars.top() + bars.height() * t),
+        );
+        painter.rect_filled(strip, 1.0, p.gr);
+    }
 }
 
 /// A knob, drawn as an arc rather than a dial: it is a percentage, and an arc
@@ -807,10 +900,12 @@ mod tests {
             detail: "",
             insert: "",
             color: 0,
+            stereo: true,
+            gr_db: 0.0,
             empty,
             gain: 1.0,
             send: 0.0,
-            peak: 0.0,
+            peak: [0.0; 2],
             muted: false,
             soloed: false,
         }
@@ -825,6 +920,7 @@ mod tests {
             }),
             any_solo: false,
             palette_open: None,
+            typing: None,
             dark_mode: true,
             wood: (0x4A, 0x3B, 0x2C),
         }
@@ -982,6 +1078,43 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), n, "two channels share an index");
+    }
+
+    /// **The decibel readout is a target, and the palette swallows the strip.**
+    ///
+    /// Both are things the first version had no room for and both are now the
+    /// difference between a fader you fight and one you tell.
+    #[test]
+    fn a_number_can_be_typed_and_a_palette_covers_what_is_under_it() {
+        let v = a_view();
+        let r = rect();
+        let l = Layout::new(r, &v);
+        assert_eq!(
+            hit_test(r, &v, l.strips[0].db.center()),
+            Some(Hit::Db(0)),
+            "the number could not be clicked"
+        );
+
+        // With a palette open, everything under it is a swatch or a dismissal
+        // — a swatch over a fader that also moved the fader would be a colour
+        // you cannot pick without changing a level.
+        let mut open = a_view();
+        open.palette_open = Some(0);
+        let swatches = palette_over(&l.strips[0]);
+        assert_eq!(swatches.len(), STRIP_COLORS.len());
+        for (c, s) in swatches.iter().enumerate() {
+            assert_eq!(hit_test(r, &open, s.center()), Some(Hit::Paint(0, c)));
+        }
+        // The fader is under it and cannot be reached.
+        assert!(matches!(
+            hit_test(r, &open, l.strips[0].fader.center()),
+            Some(Hit::Paint(0, _))
+        ));
+        // And a strip that is NOT the open one is untouched.
+        assert_eq!(
+            hit_test(r, &open, l.strips[1].fader.center()),
+            Some(Hit::Fader(1))
+        );
     }
 
     /// Everything that travels does so vertically, and knows how far.
