@@ -486,6 +486,12 @@ pub struct Settings {
     pub master_gain: f64,
     /// The backing track's level, linear.
     pub track_gain: f64,
+    /// What colour each mixer channel is painted, and the master last.
+    ///
+    /// Indexes [`crate::mixer_panel::STRIP_COLORS`]; zero is the desk's own
+    /// wood, which is what an unpainted channel is. The master defaults to RED
+    /// because it is the one channel you look for.
+    pub strip_colors: [i64; crate::recorder::STRIPS + 1],
     /// A user effect plugin across the effects bus, as a bundle path.
     ///
     /// **On the bus, not on every channel.** A reverb is a send effect: one
@@ -725,6 +731,18 @@ impl Default for Settings {
             input_gain: 1.0,
             master_gain: 1.0,
             track_gain: 1.0,
+            strip_colors: {
+                // **The two that are not instruments come coloured.** Five
+                // slots and two sources in one rack read as seven of the same
+                // thing; the microphone and the backing track are neither
+                // instruments nor each other, and a colour each says so before
+                // the labels are read.
+                let mut c = [0; crate::recorder::STRIPS + 1];
+                c[crate::recorder::Strip::Input.index()] = 4; // teal
+                c[crate::recorder::Strip::Track.index()] = 6; // violet
+                c[crate::recorder::STRIPS] = crate::mixer_panel::MASTER_COLOR as i64;
+                c
+            },
             bus_effect: None,
             guitar_intervals: true,
             fx_return_gain: 1.0,
@@ -1214,6 +1232,13 @@ impl Settings {
         take_opt_str(&mut map, "record_camera_uid", &mut s.record_camera_uid);
         take_opt_str(&mut map, "record_audio_device", &mut s.record_audio_device);
         take_opt_str(&mut map, "bus_effect", &mut s.bus_effect);
+        if let Some(Value::Array(v)) = map.shift_remove("strip_colors") {
+            for (i, x) in v.iter().take(crate::recorder::STRIPS + 1).enumerate() {
+                if let Some(n) = x.as_i64() {
+                    s.strip_colors[i] = n.rem_euclid(crate::mixer_panel::STRIP_COLORS.len() as i64);
+                }
+            }
+        }
         if let Some(Value::Array(v)) = map.shift_remove("strip_sends") {
             for (i, x) in v.iter().take(crate::recorder::STRIPS).enumerate() {
                 if let Some(n) = x.as_f64() {
@@ -1740,6 +1765,10 @@ impl Settings {
             Value::Array(self.strip_sends.iter().map(|v| Value::from(*v)).collect()),
         );
         map.insert("strip_muted".into(), Value::from(self.strip_muted));
+        map.insert(
+            "strip_colors".into(),
+            Value::Array(self.strip_colors.iter().map(|c| Value::from(*c)).collect()),
+        );
         map.insert("strip_soloed".into(), Value::from(self.strip_soloed));
         map.insert(
             "record_input_channels".into(),

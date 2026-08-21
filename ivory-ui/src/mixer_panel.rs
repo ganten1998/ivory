@@ -10,7 +10,7 @@
 //! [`Layout::targets`] is the single source of truth both are derived from. No
 //! state, no `egui::Ui`, and nothing here can open a device or read a file.
 
-use crate::recorder::{gain_text, gain_to_fader, Strip, STRIPS};
+use crate::recorder::{gain_text, gain_to_fader, Strip, SLOTS};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 /// One channel, as the painter sees it.
@@ -29,6 +29,8 @@ pub struct StripView<'a> {
     pub detail: &'a str,
     /// A user effect across this strip, by name. Empty for none.
     pub insert: &'a str,
+    /// Index into [`STRIP_COLORS`]. Zero is the desk's own wood.
+    pub color: usize,
     /// An instrument slot with nothing in it.
     ///
     /// **Drawn, not hidden.** Five slots that appear one at a time as they are
@@ -72,6 +74,8 @@ pub struct MixerView<'a> {
     pub dark_mode: bool,
     /// The band's own wood, so the two surfaces are one instrument.
     pub wood: (u8, u8, u8),
+    /// The strip whose colour palette is open, if any.
+    pub palette_open: Option<usize>,
 }
 
 impl MixerView<'_> {
@@ -103,6 +107,10 @@ pub enum Hit {
     Add(usize),
     /// The insert chip: put an effect across this strip.
     Insert(usize),
+    /// A swatch in the open palette: paint strip `n` colour `c`.
+    Paint(usize, usize),
+    /// A right-click anywhere on a strip: open its palette.
+    Palette(usize),
 }
 
 impl Hit {
@@ -115,7 +123,8 @@ impl Hit {
         match self {
             Hit::Fader(_) => Some(DragAxis::Vertical),
             Hit::Send(_) => Some(DragAxis::Vertical),
-            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(_) => None,
+            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(_) | Hit::Paint(..)
+            | Hit::Palette(_) => None,
         }
     }
 
@@ -124,10 +133,32 @@ impl Hit {
         match self {
             Hit::Fader(_) => Some(FADER_TRAVEL),
             Hit::Send(_) => Some(SEND_TRAVEL),
-            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(_) => None,
+            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(_) | Hit::Paint(..)
+            | Hit::Palette(_) => None,
         }
     }
 }
+
+/// What a channel can be painted.
+///
+/// **Eight, and the first is "the desk".** A palette long enough to tell seven
+/// channels apart and short enough to pick from without reading; index 0 is the
+/// band's own wood, so a channel nobody has coloured is not a colour choice at
+/// all.
+pub const STRIP_COLORS: [(u8, u8, u8); 8] = [
+    (0x00, 0x00, 0x00), // the desk's own wood — replaced at draw time
+    (0x8E, 0x2C, 0x2C), // red
+    (0x8A, 0x55, 0x1E), // amber
+    (0x4E, 0x6B, 0x2C), // green
+    (0x25, 0x5A, 0x74), // teal
+    (0x2E, 0x46, 0x86), // blue
+    (0x5A, 0x36, 0x77), // violet
+    (0x4A, 0x46, 0x42), // slate
+];
+
+/// The master's colour on a fresh install. Red, because it is the one channel
+/// you look for.
+pub const MASTER_COLOR: usize = 1;
 
 /// Which way a control travels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,22 +166,27 @@ pub enum DragAxis {
     Vertical,
 }
 
-/// **Up is louder.** A vertical fader dragged downward turning up would be
-/// wrong in a way nobody would report as a bug and everybody would feel.
-const FADER_TRAVEL: f32 = 160.0;
+/// How far the hand moves to sweep a fader end to end, in points.
+///
+/// **Long, and longer than it looks.** The first pair were a fader's own
+/// height, on the reasoning that a fader should feel one-to-one under the
+/// pointer — but the range is eighty decibels and the track is a hundred
+/// points, so every point was most of a decibel and nobody could land on a
+/// number. A sweep wider than the screen is not a problem: the drag is
+/// RELATIVE, so the hand leaves the fader and goes on pulling.
+const FADER_TRAVEL: f32 = 420.0;
 
-/// Wider than the knob by a lot, for the reason the band's knobs are: a knob's
-/// cell is a few tens of points and mapping that to the whole range is a
-/// control nobody can land on a number with.
-const SEND_TRAVEL: f32 = 200.0;
+/// The same, for a send. A percentage is read to the nearest few, so it wants
+/// the same room a fader does.
+const SEND_TRAVEL: f32 = 420.0;
 
 /// Where everything on one strip is, and where the strips are.
 ///
 /// Fractions of the rect rather than points, so the same layout holds at every
 /// window size the app offers — and so the hit test and the painter cannot
 /// drift, because they read the same struct.
-/// Channels plus the master.
-pub const COLUMNS: usize = STRIPS + 1;
+/// The drawn channels, plus the master.
+pub const COLUMNS: usize = SLOTS + 3;
 
 pub struct Layout {
     pub strips: [StripStrip; COLUMNS],
@@ -160,6 +196,7 @@ pub struct Layout {
 #[derive(Debug, Clone, Copy)]
 pub struct StripStrip {
     pub panel: Rect,
+    pub icon: Rect,
     pub name: Rect,
     pub detail: Rect,
     pub meter: Rect,
@@ -181,6 +218,7 @@ impl StripStrip {
     /// INSIDE small windows — a target you can press by accident.
     const NONE: Self = Self {
         panel: Rect::NOTHING,
+        icon: Rect::NOTHING,
         name: Rect::NOTHING,
         detail: Rect::NOTHING,
         meter: Rect::NOTHING,
@@ -312,10 +350,19 @@ impl Layout {
         // The meter takes the left third and the fader the rest, so the fader
         // still sits near the middle of the strip where a hand expects it.
         let split = travel.left() + travel.width() * 0.34;
+        // The two sources that carry an icon get a band for it and push their
+        // name down; an instrument slot has none and keeps the room.
+        let has_icon = matches!(view.strip, Some(Strip::Input | Strip::Track));
         StripStrip {
             panel,
-            name: cut(0.02, 0.10),
-            detail: cut(0.10, 0.16),
+            icon: if has_icon {
+                let r = cut(0.015, 0.075);
+                Rect::from_center_size(r.center(), Vec2::splat(r.height().min(r.width())))
+            } else {
+                Rect::NOTHING
+            },
+            name: if has_icon { cut(0.08, 0.15) } else { cut(0.02, 0.10) },
+            detail: if has_icon { cut(0.15, 0.20) } else { cut(0.10, 0.16) },
             meter: Rect::from_min_max(travel.min, Pos2::new(split, travel.max.y)),
             send,
             fader: Rect::from_min_max(Pos2::new(split, travel.min.y), travel.max),
@@ -354,11 +401,35 @@ impl Layout {
 
 /// What a press at `pos` means, or nothing.
 pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
-    Layout::new(rect, view)
-        .targets()
+    let l = Layout::new(rect, view);
+    // **The palette first, and it swallows the strip under it.** A swatch over
+    // a fader that also moved the fader would be a colour you cannot pick
+    // without changing a level.
+    if let Some(at) = view.palette_open {
+        if let Some(s) = l.strips.get(at) {
+            for (c, r) in palette_over(s).into_iter().enumerate() {
+                if r.contains(pos) {
+                    return Some(Hit::Paint(at, c));
+                }
+            }
+            if s.panel.contains(pos) {
+                // Anywhere else on the strip closes it without painting.
+                return Some(Hit::Paint(at, usize::MAX));
+            }
+        }
+    }
+    l.targets()
         .into_iter()
         .find(|(r, _)| r.contains(pos))
         .map(|(_, h)| h)
+}
+
+/// Which strip a point is on, for a right-click. `None` off the rack.
+pub fn strip_at(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<usize> {
+    Layout::new(rect, view)
+        .strips
+        .iter()
+        .position(|s| s.panel.contains(pos))
 }
 
 /// How far a control travels, for the caller that is dragging it.
@@ -423,6 +494,27 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
         let heard = view.heard(i);
         strip(painter, s, v, &p, heard);
     }
+    // The palette last, over whatever it belongs to.
+    if let Some(at) = view.palette_open {
+        if let Some(s) = l.strips.get(at) {
+            painter.rect_filled(s.panel, 3.0, Color32::from_black_alpha(180));
+            for (c, r) in palette_over(s).into_iter().enumerate() {
+                let (cr, cg, cb) = STRIP_COLORS[c];
+                let fill = if c == 0 {
+                    p.wood
+                } else {
+                    Color32::from_rgb(cr, cg, cb)
+                };
+                painter.rect_filled(r, 2.0, fill);
+                painter.rect_stroke(
+                    r,
+                    2.0,
+                    Stroke::new(1.0, p.face.gamma_multiply(0.5)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+    }
 }
 
 fn strip(painter: &Painter, l: &StripStrip, v: &StripView<'_>, p: &Ink, heard: bool) {
@@ -430,7 +522,16 @@ fn strip(painter: &Painter, l: &StripStrip, v: &StripView<'_>, p: &Ink, heard: b
         empty_slot(painter, l, p);
         return;
     }
-    let face = if heard {
+    // **A painted channel keeps its own face for the labels.** The whole panel
+    // takes the colour, and the name and what it is carrying sit on a plate of
+    // the ordinary face — so a channel can be any colour at all and its label
+    // is still dark text on bone, which is the one thing that must not depend
+    // on a choice somebody made for fun.
+    let painted = v.color != 0;
+    let face = if painted {
+        let (r, g, b) = STRIP_COLORS[v.color.min(STRIP_COLORS.len() - 1)];
+        Color32::from_rgb(r, g, b)
+    } else if heard {
         p.face
     } else {
         // **Not merely unlit: silent.** A strip that solo has taken out of the
@@ -450,6 +551,31 @@ fn strip(painter: &Painter, l: &StripStrip, v: &StripView<'_>, p: &Ink, heard: b
     let plain = |size: f32| FontId::new(size, crate::fonts::courier());
     let h = l.panel.height();
 
+    // The plate the label sits on, so it reads on any colour.
+    let plate = Rect::from_min_max(
+        Pos2::new(l.panel.left() + 3.0, l.name.top() - 2.0),
+        Pos2::new(l.panel.right() - 3.0, l.detail.bottom() + 2.0),
+    );
+    if painted && plate.is_positive() {
+        painter.rect_filled(plate, 2.0, p.face);
+    }
+    // **The band's own icons, above the names.** The microphone and the
+    // waveform are how the input and the backing track are already labelled
+    // one band up; drawing them again here is what makes the two channels that
+    // are not instruments read as the same two things rather than as two more
+    // rows of text.
+    let named = match v.strip {
+        Some(Strip::Input) => {
+            crate::recorder_panel::draw_microphone(painter, l.icon, p.engrave);
+            true
+        }
+        Some(Strip::Track) => {
+            crate::recorder_panel::draw_waveform_icon(painter, l.icon, p.engrave);
+            true
+        }
+        _ => false,
+    };
+    let _ = named;
     centred(painter, l.name, v.name, cap((h * 0.032).clamp(7.5, 12.0)), p.engrave);
     if !v.detail.is_empty() {
         centred(
@@ -459,6 +585,11 @@ fn strip(painter: &Painter, l: &StripStrip, v: &StripView<'_>, p: &Ink, heard: b
             plain((h * 0.024).clamp(7.0, 11.0)),
             p.faint,
         );
+    }
+    // A dimmed channel is dimmed by a veil rather than by a paler face, so
+    // painting one does not cost it its "not heard" state.
+    if !heard {
+        painter.rect_filled(l.panel, 3.0, Color32::from_black_alpha(90));
     }
 
     meter(painter, l.meter, v.peak, heard, p);
@@ -494,6 +625,32 @@ fn strip(painter: &Painter, l: &StripStrip, v: &StripView<'_>, p: &Ink, heard: b
         switch(painter, l.mute, "M", v.muted, p.mute, p);
         switch(painter, l.solo, "S", v.soloed, p.solo, p);
     }
+}
+
+/// The swatches, over the strip whose colour is being chosen.
+///
+/// Drawn last and hit-tested first, like every other transient thing in this
+/// app: while it is up it is the only thing on that strip that can be pressed.
+fn palette_over(l: &StripStrip) -> Vec<Rect> {
+    if !l.panel.is_positive() {
+        return Vec::new();
+    }
+    let n = STRIP_COLORS.len();
+    let side = (l.panel.width() - 8.0) / 2.0;
+    let rows = n.div_ceil(2);
+    let h = (side * rows as f32).min(l.panel.height() - 8.0);
+    let side = (h / rows as f32).min(side);
+    let top = l.panel.center().y - h * 0.5;
+    let left = l.panel.center().x - side;
+    (0..n)
+        .map(|i| {
+            Rect::from_min_size(
+                Pos2::new(left + (i % 2) as f32 * side, top + (i / 2) as f32 * side),
+                Vec2::splat(side),
+            )
+            .shrink(1.5)
+        })
+        .collect()
 }
 
 /// Somewhere to put an instrument: an outline and a plus.
@@ -649,6 +806,7 @@ mod tests {
             name: "CHANNEL",
             detail: "",
             insert: "",
+            color: 0,
             empty,
             gain: 1.0,
             send: 0.0,
@@ -660,12 +818,13 @@ mod tests {
 
     /// Every slot filled, so the ordinary strip is what is being measured.
     fn a_view() -> MixerView<'static> {
-        let channels = Strip::all();
+        let channels = Strip::shown();
         MixerView {
             strips: std::array::from_fn(|i| {
                 a_strip(channels.get(i).copied(), false)
             }),
             any_solo: false,
+            palette_open: None,
             dark_mode: true,
             wood: (0x4A, 0x3B, 0x2C),
         }
@@ -738,9 +897,10 @@ mod tests {
         assert!(!master.solo.is_positive(), "the master was given a solo");
         assert!(master.fader.is_positive(), "the master has no fader");
 
-        let fx = &l.strips[FX];
-        assert!(!fx.send.is_positive(), "the effects bus can feed itself");
-        assert!(fx.mute.is_positive(), "the effects return cannot be muted");
+        // The channel before the master is the backing track now, and it is an
+        // ordinary one: a fader, a send and both switches.
+        let last = &l.strips[FX];
+        assert!(last.send.is_positive() && last.mute.is_positive());
     }
 
     /// A strip with no send gives that room to its meter rather than leaving a
@@ -803,14 +963,21 @@ mod tests {
     #[test]
     fn the_desk_has_a_strip_for_every_slot() {
         use crate::recorder::SLOTS;
-        let channels = Strip::all();
+        let channels = Strip::shown();
         for n in 0..SLOTS {
             assert_eq!(channels[n], Strip::Slot(n), "slot {n} is not a channel");
         }
-        assert_eq!(COLUMNS, SLOTS + 5, "a channel went missing");
+        // **Drawn, not all of them.** The click and the effects return keep
+        // their place on the desk and have controls of their own elsewhere;
+        // the mixer shows the slots, the input, the backing track and the
+        // master.
+        assert_eq!(COLUMNS, SLOTS + 3, "a drawn channel went missing");
+        assert_eq!(channels.len(), SLOTS + 2);
+        assert!(!channels.contains(&Strip::Click), "the click is drawn twice");
+        assert!(!channels.contains(&Strip::Fx), "the bus is drawn twice");
         // Every strip owns a distinct place in the arrays, or two of them
         // would share a send and mute together.
-        let mut seen: Vec<usize> = channels.iter().map(|s| s.index()).collect();
+        let mut seen: Vec<usize> = Strip::all().iter().map(|s| s.index()).collect();
         let n = seen.len();
         seen.sort_unstable();
         seen.dedup();

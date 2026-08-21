@@ -416,6 +416,24 @@ pub enum Strip {
 pub const STRIPS: usize = SLOTS + 4;
 
 impl Strip {
+    /// The channels the MIXER draws, in order.
+    ///
+    /// **Not all of them.** The click and the effects return have controls of
+    /// their own everywhere else — the click's fader is in the band and the
+    /// bus's three knobs are the band's — so a column each in the mixer was
+    /// two columns of duplication and a narrower strip for everything that had
+    /// nowhere else to be. They keep their place on the desk: the sends and
+    /// the mute masks are unchanged, they are simply not drawn.
+    pub fn shown() -> [Strip; SLOTS + 2] {
+        std::array::from_fn(|i| {
+            if i < SLOTS {
+                Strip::Slot(i)
+            } else {
+                [Strip::Input, Strip::Track][i - SLOTS]
+            }
+        })
+    }
+
     /// Every strip, in the order they are drawn.
     pub fn all() -> [Strip; STRIPS] {
         std::array::from_fn(|i| {

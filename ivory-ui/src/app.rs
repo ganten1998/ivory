@@ -269,6 +269,8 @@ pub struct IvoryApp {
     mixer_open: bool,
     /// The mixer control being dragged, and where the hand started.
     mixer_grab: Option<MixerGrab>,
+    /// The strip whose colour palette is open, if any.
+    mixer_palette: Option<usize>,
     /// Where the mixer was last drawn, so a press can be tested against it.
     mixer_rect: Option<Rect>,
     /// The OS's own file panel is on screen right now.
@@ -712,6 +714,7 @@ impl IvoryApp {
             dir_request: None,
             mixer_open: false,
             mixer_grab: None,
+            mixer_palette: None,
             mixer_rect: None,
             native_panel_up: false,
             factory_cartridge: false,
@@ -1311,7 +1314,8 @@ impl IvoryApp {
                 .get(i)
                 .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
             H::Send(i) => view.strips.get(i).map_or(0.0, |s| s.send),
-            H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(_) => 0.0,
+            H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(_) | H::Paint(..)
+            | H::Palette(_) => 0.0,
         }
     }
 
@@ -1361,6 +1365,23 @@ impl IvoryApp {
             // The bus's own effect. One picker, aimed somewhere else.
             H::Insert(_) => {
                 self.open_bus_effect_picker();
+                return;
+            }
+            H::Palette(i) => {
+                self.mixer_palette = Some(i);
+                return;
+            }
+            // `usize::MAX` is "anywhere but a swatch", which closes it without
+            // painting — the same sentinel the patch picker uses for its own
+            // "none of these" row.
+            H::Paint(i, c) => {
+                self.mixer_palette = None;
+                if c != usize::MAX {
+                    if let Some(slot) = self.settings.strip_colors.get_mut(i) {
+                        *slot = c as i64;
+                        self.save_settings();
+                    }
+                }
                 return;
             }
         }
@@ -1431,6 +1452,7 @@ impl IvoryApp {
                 strip: Some(s),
                 name,
                 detail,
+                color: self.settings.strip_colors.get(i).copied().unwrap_or(0) as usize,
                 insert: if s == Strip::Fx {
                     self.settings.bus_effect.as_deref().map_or("", plugin_display_name)
                 } else {
@@ -1444,7 +1466,7 @@ impl IvoryApp {
                 soloed: desk.soloed[i],
             }
         };
-        let channels = Strip::all();
+        let channels = Strip::shown();
         crate::mixer_panel::MixerView {
             strips: std::array::from_fn(|i| match channels.get(i) {
                 Some(s) => strip(*s),
@@ -1452,6 +1474,12 @@ impl IvoryApp {
                     strip: None,
                     name: "MASTER",
                     detail: "",
+                    color: self
+                        .settings
+                        .strip_colors
+                        .last()
+                        .copied()
+                        .unwrap_or(0) as usize,
                     insert: "",
                     empty: false,
                     gain: g.master,
@@ -1467,6 +1495,7 @@ impl IvoryApp {
                 },
             }),
             any_solo: desk.any_solo(),
+            palette_open: self.mixer_palette,
             dark_mode: self.settings.dark_mode,
             wood: {
                 let c = self.settings.recorder_bg_color;
@@ -6376,6 +6405,15 @@ impl IvoryApp {
         // and go on pulling, and a press never makes a cap jump to meet it.
         // A switch is not dragged at all and acts on the way down.
         if let Some(rect) = self.mixer_rect {
+            // **A right-click paints.** Anywhere on a channel opens its palette,
+            // which is the only gesture in the mixer that is not a control —
+            // so it needs no target of its own and cannot collide with one.
+            if ctx.input(|i| i.pointer.secondary_pressed()) {
+                if let Some(pos) = ctx.pointer_interact_pos().filter(|p| rect.contains(*p)) {
+                    let view = self.mixer_view();
+                    self.mixer_palette = crate::mixer_panel::strip_at(rect, &view, pos);
+                }
+            }
             let pressed = ctx.input(|i| i.pointer.primary_pressed());
             let released = ctx.input(|i| i.pointer.any_released());
             let pos = ctx.pointer_interact_pos();
@@ -6386,7 +6424,9 @@ impl IvoryApp {
                         Some(hit @ (crate::mixer_panel::Hit::Mute(_)
                         | crate::mixer_panel::Hit::Solo(_)
                         | crate::mixer_panel::Hit::Add(_)
-                        | crate::mixer_panel::Hit::Insert(_))) => {
+                        | crate::mixer_panel::Hit::Insert(_)
+                        | crate::mixer_panel::Hit::Paint(..)
+                        | crate::mixer_panel::Hit::Palette(_))) => {
                             self.apply_mixer_hit(hit, 0.0);
                         }
                         Some(hit) => {

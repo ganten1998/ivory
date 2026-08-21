@@ -2695,7 +2695,7 @@ fn draw_fader_icon(painter: &Painter, r: Rect, icon: FaderIcon, ink: Color32, p:
 /// **Bars and not a drawn curve.** At twelve points across, a curve is a
 /// wobble; the bars survive being small, and they are what the row below the
 /// microphone is a picture of.
-fn draw_waveform_icon(painter: &Painter, b: Rect, ink: Color32) {
+pub(crate) fn draw_waveform_icon(painter: &Painter, b: Rect, ink: Color32) {
     let n = 5;
     let w = b.width() / (n as f32 * 2.0 - 1.0);
     // Tallest in the middle, so it reads as a sound and not as a bar chart.
@@ -2762,7 +2762,7 @@ fn draw_metronome(painter: &Painter, b: Rect, ink: Color32, p: &Palette) {
 /// The cradle is what makes it a microphone rather than a pill — a capsule on
 /// its own reads as a battery — so it is an arc of eleven points rather than
 /// the three-segment bracket that would have been cheaper.
-fn draw_microphone(painter: &Painter, b: Rect, ink: Color32) {
+pub(crate) fn draw_microphone(painter: &Painter, b: Rect, ink: Color32) {
     let s = b.width();
     let cx = b.center().x;
     let top = b.top() + s * 0.04;
