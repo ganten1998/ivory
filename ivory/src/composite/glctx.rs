@@ -337,6 +337,62 @@ impl Gl {
     /// The same, skipping the first `skip` candidates, and reporting which one
     /// it used.
     ///
+/// The EGL display for a context that renders offscreen and owns itself.
+///
+/// **`eglGetDisplay(EGL_DEFAULT_DISPLAY)` asks mesa to GUESS**, from the
+/// environment, which window system to attach to. Under X11 it sees `DISPLAY`
+/// and guesses right. Under Wayland, with no `DISPLAY` set, it guesses wrong
+/// and hands back nothing — and the compositor then falls all the way back to
+/// wgpu's own adapter, which on this hardware is llvmpipe.
+///
+/// Measured on the 2013 Air, 60 frames at 1280x720, same binary minutes apart:
+///
+/// | session | platform          | path              | CPU/frame | at 15 fps |
+/// |---------|-------------------|-------------------|-----------|-----------|
+/// | X11     | guessed           | owned hardware GL |   8.17 ms |       12% |
+/// | Wayland | guessed           | llvmpipe          | 205-337ms |  308-506% |
+/// | Wayland | surfaceless       | owned hardware GL |   9.17 ms |       14% |
+/// | X11     | surfaceless       | owned hardware GL |   6.33 ms |       10% |
+///
+/// So this was never a Wayland limitation: hardware GL is available there and
+/// is if anything cheaper. It was one guess, made silently, costing every
+/// Wayland user a factor of twenty-five.
+///
+/// **Surfaceless is what this context actually wants.** It renders to a texture
+/// and has no business connecting to a compositor at all, so asking for a
+/// platform with no window system is not a workaround — it is the honest
+/// request, and it happens to be the fastest on both. The guess is kept as the
+/// last resort, for a libEGL too old to offer the platform extension.
+fn open_display(egl: &Egl) -> EGLDisplay {
+    // EGL_MESA_platform_surfaceless. Also accepted by the EGL 1.5 core entry
+    // point, which is why the EXT one is enough to ask for.
+    const EGL_PLATFORM_SURFACELESS_MESA: EGLenum = 0x31DD;
+    type GetPlatformDisplayExt =
+        unsafe extern "C" fn(EGLenum, *mut c_void, *const EGLint) -> EGLDisplay;
+
+    // A CLIENT extension: queried with no display, which is the one thing
+    // `eglGetProcAddress` is allowed to do before `eglInitialize`.
+    let p = unsafe { (egl.GetProcAddress)(c"eglGetPlatformDisplayEXT".as_ptr()) };
+    if !p.is_null() {
+        // SAFETY: the EGL spec fixes this signature for this name, and the
+        // pointer came from `eglGetProcAddress` asked for exactly that name.
+        let f: GetPlatformDisplayExt = unsafe { std::mem::transmute(p) };
+        let d = unsafe {
+            f(
+                EGL_PLATFORM_SURFACELESS_MESA,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        if d != EGL_NO_DISPLAY {
+            log::debug!("compositor GL: surfaceless EGL display");
+            return d;
+        }
+        log::debug!("compositor GL: no surfaceless platform, falling back to the default");
+    }
+    unsafe { (egl.GetDisplay)(EGL_DEFAULT_DISPLAY) }
+}
+
     /// **Creating a context is not the last thing that can fail.** wgpu opens a
     /// device on it afterwards, and that can be refused for reasons only
     /// visible then — a desktop GL 3.3 context is fine until wgpu tries to
@@ -350,7 +406,7 @@ impl Gl {
         let egl = Egl::load()?;
         let glx = Glx::load();
 
-        let display = unsafe { (egl.GetDisplay)(EGL_DEFAULT_DISPLAY) };
+        let display = Self::open_display(&egl);
         if display == EGL_NO_DISPLAY {
             log::debug!("compositor GL: no EGL display");
             return None;
