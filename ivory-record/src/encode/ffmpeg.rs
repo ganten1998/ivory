@@ -64,13 +64,27 @@ const MAX_PAD: u32 = 60;
 
 /// How many frame intervals a frame may wait before it is given up on.
 ///
-/// **Not zero, and that is the whole of it.** The first version dropped the
-/// instant the queue was full, which is the same mistake `macos.rs` made and
-/// documents: an encoder is briefly busy all the time, so an instant drop
-/// threw away eleven frames in twenty and turned a two-second clip into a
-/// quarter of a second. Two frame intervals is long enough for every ordinary
-/// hiccup and far too short to be a queue in disguise.
+/// **Not zero.** An encoder is briefly busy all the time, so a push that gave
+/// up the instant the queue was full threw away eleven frames in twenty.
 const WAIT_FRAMES: u32 = 2;
+
+/// And the ceiling on that, in wall time, whatever the frame rate is.
+///
+/// **Because this blocks the UI thread**, and the UI thread is what composites
+/// the next frame. Two intervals is 66 ms at 30 fps and 133 at 15 — a stall
+/// that slows the window, which slows the compositor, which fills the queue
+/// again: a machine that falls behind once used to stay behind, and the owner
+/// measured the result at about half the camera's frames lost on every take.
+///
+/// It could be this long before because a dropped frame SHORTENED the video:
+/// the pipe was stamped in arrival order, so a frame given up on was a slot
+/// that vanished, and "a two-second clip became a quarter of a second". That
+/// is fixed — a gap is filled from the frame's own timestamp now, see
+/// `Frame::pad` — so the trade is finally an honest one. Waiting costs the
+/// window; dropping costs one repeated picture. Four milliseconds is a quarter
+/// of a 60 fps frame: long enough for the ordinary hiccup the wait exists for,
+/// short enough that nobody can feel it.
+const MAX_WAIT: Duration = Duration::from_millis(4);
 
 /// Where `ffmpeg` is, or why it is not.
 ///
@@ -278,7 +292,8 @@ impl Encoder {
             tmp,
             out: path.to_path_buf(),
             frame_bytes: spec.width as usize * spec.height as usize * 4,
-            wait: Duration::from_secs_f64(f64::from(WAIT_FRAMES) / f64::from(spec.fps.max(1))),
+            wait: Duration::from_secs_f64(f64::from(WAIT_FRAMES) / f64::from(spec.fps.max(1)))
+                .min(MAX_WAIT),
             last_pts: None,
             first_pts: None,
             slots: 0,

@@ -724,7 +724,19 @@ impl DesktopApp {
             // Kept for the compositor, which ticks on the take's clock rather
             // than this one and will want a frame on a window frame that has
             // none of its own.
-            self.recorder.camera_rgba = Some((frame.pixels.clone(), frame.width, frame.height));
+            //
+            // **Moved, not cloned.** This was `frame.pixels.clone()`: a full
+            // 3.7 MB copy per frame at 720p, on the UI thread, of pixels that
+            // were about to be dropped anyway. And the buffer it displaces
+            // goes BACK to the capture thread, which is what makes the
+            // steady state allocation-free — see `FrameSlot::recycle`.
+            let spent = self
+                .recorder
+                .camera_rgba
+                .replace((frame.pixels, frame.width, frame.height));
+            if let Some((pixels, ..)) = spent {
+                self.recorder.session.recycle_frame(pixels);
+            }
             self.recorder.preview_px = egui::Vec2::new(frame.width as f32, frame.height as f32);
             match self.recorder.preview.as_mut() {
                 // `set` reuses the GPU allocation; `load_texture` makes a new
@@ -2924,6 +2936,15 @@ struct TakeVideo {
     /// not composite in real time. The video stays on the wall clock; this is
     /// the honest count of how much of it is a freeze-frame.
     padded: u64,
+    /// Ticks the take's own clock has passed, whether or not one was produced.
+    ///
+    /// **Not `next`.** `next` is the timeline position and it can fall behind:
+    /// the burst that fills a gap is capped at a second of video, so on a
+    /// machine that cannot keep up the deficit carries — and reporting `next`
+    /// as "frames expected" quietly shortened the expectation to match what
+    /// was delivered. The take then said it had lost nothing while losing
+    /// half. This is the honest denominator.
+    due: u64,
     /// Compose only every Nth tick, and pad the rest. 1 is every frame.
     ///
     /// Raised when a pump overruns its budget, so a machine that cannot keep
@@ -3020,6 +3041,7 @@ impl DesktopApp {
             path,
             failed: 0,
             padded: 0,
+            due: 0,
             stride: 1,
             has_audio,
             cam_frames_at_start: self.recorder.session.camera_frames_delivered(),
@@ -3058,6 +3080,7 @@ impl DesktopApp {
         // timestamp, and a machine compositing at half speed used to squeeze
         // a whole performance into half its real duration.
         let due = (elapsed * f64::from(v.fps)) as u64;
+        v.due = v.due.max(due);
 
         // Fresh frames first — capped by COUNT for the window-is-slow case (a
         // plugin drag at 8 fps still needs ~4 video frames per pump, and they
@@ -3234,7 +3257,7 @@ impl DesktopApp {
                         fps: f64::from(v.fps),
                         // Ticks scheduled over the take. The pump holds these
                         // to the wall clock, so this IS duration x rate.
-                        frames_expected: v.next,
+                        frames_expected: v.due.max(v.next),
                         frames_received: self
                             .recorder
                             .session

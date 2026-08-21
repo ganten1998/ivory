@@ -1409,6 +1409,16 @@ impl Session {
         self.camera.as_ref()?.latest()
     }
 
+    /// Give a finished frame's buffer back to the capture thread.
+    ///
+    /// See `camera::FrameSlot::recycle`: without this the zero-allocation
+    /// steady state only held while the preview was LOSING frames.
+    pub fn recycle_frame(&self, pixels: Vec<u8>) {
+        if let Some(c) = self.camera.as_ref() {
+            c.recycle(pixels);
+        }
+    }
+
     /// Camera frames delivered since the camera OPENED — a counter, not a
     /// per-take figure. The camera outlives the take (it opens with the band),
     /// so a per-take number is this read at Stop minus the same read at start;

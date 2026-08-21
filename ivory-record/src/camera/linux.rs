@@ -340,6 +340,10 @@ fn capture_loop(
         }
     };
 
+    // The compressed frame, copied out of the driver's buffer so the decode
+    // does not hold it. Reused for the life of the take: one allocation, not
+    // one per frame.
+    let mut staged: Vec<u8> = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         match stream.will_block() {
             Ok(true) => {
@@ -352,6 +356,22 @@ fn capture_loop(
                 return;
             }
         }
+        // **Copy the frame out, then let go of the buffer.**
+        //
+        // The decode used to run INSIDE this closure, and the closure is what
+        // holds the mmap'd buffer: the driver has only two, so a decode that
+        // takes a third of a core left it exactly one to fill while the other
+        // was busy. Anything arriving in that window overwrites a frame nobody
+        // has read, which on Linux is invisible — V4L2 gives no sequence
+        // number through `linuxvideo` 0.3 and there is nothing to compare.
+        //
+        // Copying a JPEG bitstream is tens of kilobytes; decoding one is
+        // milliseconds. The buffer goes back to the driver as soon as the
+        // memcpy is done.
+        //
+        // (Two is the crate's `DEFAULT_BUFFER_COUNT` and `ReadStream::new` is
+        // `pub(crate)`, so asking for more would mean vendoring it.)
+        let mut arrived: Option<crate::clock::Nanos> = None;
         let r = stream.dequeue(|view| {
             // First statement, per the module's timebase contract.
             let host_ns = timebase.now();
@@ -359,7 +379,7 @@ fn capture_loop(
                 stats.note_unreadable();
                 return Ok(());
             }
-            // **Before the decode, after the dequeue.** The queue has to keep
+            // **Before the copy, after the dequeue.** The queue has to keep
             // moving whatever the answer is, or the driver backs up and starts
             // reporting errors; the decode is the part worth skipping, and on
             // this class of machine it is a third of a core.
@@ -367,44 +387,49 @@ fn capture_loop(
                 stats.note_skipped();
                 return Ok(());
             }
-            // **Timed, because the preview's rate is decided from it.** This is
-            // the JPEG decode the budget exists for; see `FrameSlot::want`.
-            let began = std::time::Instant::now();
-            let bytes: &[u8] = &view;
-            let mut dst = slot.take_spare();
-            let ok = match pixel {
-                PixelFormat::YUYV => {
-                    let stride = if stride_in >= width as usize * 2 {
-                        stride_in
-                    } else {
-                        width as usize * 2
-                    };
-                    yuyv_to_rgba(bytes, width, height, stride, &mut dst)
-                }
-                _ => decode_mjpg(bytes, width, height, &mut dst),
-            };
-            if !ok {
-                stats.note_unreadable();
-                return Ok(());
-            }
-            slot.note_convert_cost(began.elapsed().as_nanos() as u64);
-            slot.publish(super::Frame {
-                width,
-                height,
-                stride: width as usize * BYTES_PER_PIXEL,
-                pixels: dst,
-                host_ns,
-                // V4L2 stamps `v4l2_buffer.timestamp`, but linuxvideo 0.3 does
-                // not expose it; when it does, this is where it goes.
-                pts_ns: None,
-            });
-            stats.note_delivered();
+            staged.clear();
+            staged.extend_from_slice(&view);
+            arrived = Some(host_ns);
             Ok::<(), io::Error>(())
         });
         if let Err(e) = r {
             state.store(state_as_u8(lost_or_errored(&e)), Ordering::Relaxed);
             return;
         }
+        let Some(host_ns) = arrived else {
+            continue;
+        };
+        // **Timed, because the preview's rate is decided from it.** This is
+        // the JPEG decode the budget exists for; see `FrameSlot::want`.
+        let began = std::time::Instant::now();
+        let mut dst = slot.take_spare();
+        let ok = match pixel {
+            PixelFormat::YUYV => {
+                let stride = if stride_in >= width as usize * 2 {
+                    stride_in
+                } else {
+                    width as usize * 2
+                };
+                yuyv_to_rgba(&staged, width, height, stride, &mut dst)
+            }
+            _ => decode_mjpg(&staged, width, height, &mut dst),
+        };
+        if !ok {
+            stats.note_unreadable();
+            continue;
+        }
+        slot.note_convert_cost(began.elapsed().as_nanos() as u64);
+        slot.publish(super::Frame {
+            width,
+            height,
+            stride: width as usize * BYTES_PER_PIXEL,
+            pixels: dst,
+            host_ns,
+            // V4L2 stamps `v4l2_buffer.timestamp`, but linuxvideo 0.3 does
+            // not expose it; when it does, this is where it goes.
+            pts_ns: None,
+        });
+        stats.note_delivered();
     }
 }
 

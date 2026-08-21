@@ -829,6 +829,29 @@ impl FrameSlot {
         }
     }
 
+    /// Hand a finished frame's buffer back to be filled again.
+    ///
+    /// **The steady state used to be the losing one.** `spare` was refilled
+    /// only when `publish` DISPLACED a frame — that is, only while the preview
+    /// was dropping frames — so a camera keeping up allocated a fresh
+    /// full-size buffer for every single frame, and one falling behind did
+    /// not. That is exactly the wrong way round.
+    ///
+    /// The consumer owns the pixels once it has taken them, so the consumer is
+    /// what gives them back. Whichever buffer is larger is kept: the capture
+    /// resizes what it is handed, and starting from the bigger one is one
+    /// fewer growth.
+    pub fn recycle(&self, pixels: Vec<u8>) {
+        if pixels.capacity() == 0 {
+            return;
+        }
+        if let Ok(mut g) = self.inner.lock() {
+            if pixels.capacity() > g.spare.capacity() {
+                g.spare = pixels;
+            }
+        }
+    }
+
     /// Install a frame, displacing whatever was there.
     ///
     /// The displaced frame's buffer becomes the next [`take_spare`](Self::take_spare).
@@ -874,6 +897,11 @@ impl FrameReader {
     /// Newest-wins, exactly as [`FrameSlot::latest`].
     pub fn latest(&self) -> Option<Frame> {
         self.slot.latest()
+    }
+
+    /// See [`FrameSlot::recycle`].
+    pub fn recycle(&self, pixels: Vec<u8>) {
+        self.slot.recycle(pixels);
     }
 
     pub fn has_frame(&self) -> bool {
@@ -1145,6 +1173,11 @@ impl CameraStream {
     /// [`CameraStats::frames_superseded`].
     pub fn latest(&self) -> Option<Frame> {
         self.slot.latest()
+    }
+
+    /// See [`FrameSlot::recycle`].
+    pub fn recycle(&self, pixels: Vec<u8>) {
+        self.slot.recycle(pixels);
     }
 
     /// Tell the capture thread who is looking. See [`FrameWant`].
@@ -2004,6 +2037,48 @@ mod tests {
             "at most one camera can be the system default"
         );
     }
+    /// **The steady state was the losing one.**
+    ///
+    /// `spare` was refilled only when a frame was DISPLACED — only while the
+    /// preview was dropping frames — so a camera that was keeping up
+    /// allocated a fresh full-size buffer for every single frame and one that
+    /// was falling behind did not. The consumer owns the pixels once it has
+    /// taken them, so the consumer gives them back.
+    #[test]
+    fn a_consumed_frame_gives_its_buffer_back() {
+        let slot = FrameSlot::new(Arc::new(CameraStats::default()));
+        // Nothing to recycle yet, so the first frame has to allocate.
+        assert_eq!(slot.take_spare().capacity(), 0);
+
+        let mut px = Vec::with_capacity(4096);
+        px.extend(std::iter::repeat_n(7u8, 4096));
+        slot.publish(Frame {
+            width: 32,
+            height: 32,
+            stride: 128,
+            pixels: px,
+            host_ns: 1,
+            pts_ns: None,
+        });
+        // The consumer takes it, uses it, and hands the buffer back.
+        let got = slot.latest().expect("a frame was published");
+        assert_eq!(slot.take_spare().capacity(), 0, "nothing was displaced");
+        slot.recycle(got.pixels);
+        assert!(
+            slot.take_spare().capacity() >= 4096,
+            "the buffer was not kept, so every frame allocates while the \
+             camera is keeping up"
+        );
+
+        // An empty one is not worth keeping, and a smaller one does not
+        // replace a bigger one: the capture resizes what it is handed.
+        slot.recycle(Vec::new());
+        assert_eq!(slot.take_spare().capacity(), 0);
+        slot.recycle(Vec::with_capacity(8192));
+        slot.recycle(Vec::with_capacity(16));
+        assert!(slot.take_spare().capacity() >= 8192, "the bigger one lost");
+    }
+
 
     /// Ignored: opens a real camera.
     ///
