@@ -38,7 +38,10 @@ use std::collections::HashSet;
 use std::ffi::{c_void, CString, OsStr};
 use std::path::{Path, PathBuf};
 
-use vst3::Steinberg::{IPluginFactory, IPluginFactoryTrait, PClassInfo, PFactoryInfo};
+use vst3::Steinberg::{
+    IPluginFactory, IPluginFactory2, IPluginFactory2Trait, IPluginFactoryTrait, PClassInfo,
+    PClassInfo2, PFactoryInfo,
+};
 use vst3::ComPtr;
 
 /// Where a VST3 bundle's loadable binary lives inside it, per platform.
@@ -206,8 +209,33 @@ pub struct ClassInfo {
     pub name: String,
     /// `"Audio Module Class"` for a processor, `"Component Controller Class"`
     /// for its editor half. An instrument is the former.
+    ///
+    /// **It does not say what KIND of processor.** A synth and a reverb are
+    /// both "Audio Module Class"; see [`sub_categories`](Self::sub_categories).
     pub category: String,
+    /// The `|`-separated list a plugin uses to say what it is —
+    /// `"Instrument|Synth"`, `"Fx|Reverb"`, `"Fx|Instrument"` for the rare
+    /// thing that is both.
+    ///
+    /// **Empty when the factory is too old to be asked.** `subCategories` is a
+    /// `PClassInfo2` field, reachable only through `IPluginFactory2`, and a
+    /// factory that does not implement it tells us nothing — which must read as
+    /// "unknown" rather than as "not an instrument". See [`kind`](Self::kind).
+    pub sub_categories: String,
     pub cid: [u8; 16],
+}
+
+/// What a plugin is for, as far as it will say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// It makes sound from notes. This is what a slot can play.
+    Instrument,
+    /// It changes sound it is given. A slot feeds it nothing, so it would sit
+    /// there silent — which is exactly the complaint this enum exists to answer.
+    Effect,
+    /// It did not say, and nothing may be assumed. Treated as an instrument,
+    /// because that is what every build before this one did with everything.
+    Unknown,
 }
 
 impl ClassInfo {
@@ -215,6 +243,26 @@ impl ClassInfo {
     /// something else the factory happens to export.
     pub fn is_audio_module(&self) -> bool {
         self.category == "Audio Module Class"
+    }
+
+    /// What the plugin says it is for.
+    ///
+    /// **Instrument wins a tie.** A handful of plugins declare `Fx|Instrument`
+    /// — samplers with an audio input, mostly — and those genuinely do play
+    /// notes, so refusing them would be a regression dressed as a fix.
+    pub fn kind(&self) -> Kind {
+        let has = |needle: &str| {
+            self.sub_categories
+                .split('|')
+                .any(|part| part.trim().eq_ignore_ascii_case(needle))
+        };
+        if has("Instrument") {
+            Kind::Instrument
+        } else if has("Fx") {
+            Kind::Effect
+        } else {
+            Kind::Unknown
+        }
     }
 }
 
@@ -321,9 +369,21 @@ impl Module {
     }
 
     /// Every class the factory exports.
+    ///
+    /// **Asked twice, and the second question is optional.** `getClassInfo`
+    /// answers on every factory ever shipped and does not say whether a class
+    /// is a synth or a reverb; `getClassInfo2` says, and exists only on
+    /// `IPluginFactory2`. So the cheap one is authoritative for identity and
+    /// the richer one is consulted for kind when it is there — a factory that
+    /// is too old simply leaves `sub_categories` empty, which reads as
+    /// "unknown" and behaves exactly as this app did before.
     pub fn classes(&self) -> Vec<ClassInfo> {
         // SAFETY: the factory is a live COM pointer for the module's lifetime.
         let count = unsafe { self.factory.countClasses() };
+        // Queried once for the whole enumeration rather than per class: it is a
+        // `QueryInterface` and the answer cannot change between two classes of
+        // one factory.
+        let richer = self.factory.cast::<IPluginFactory2>();
         let mut out = Vec::with_capacity(count.max(0) as usize);
         for i in 0..count {
             let mut info = PClassInfo {
@@ -337,9 +397,32 @@ impl Module {
             if result != vst3::Steinberg::kResultOk {
                 continue;
             }
+            let sub_categories = richer
+                .as_ref()
+                .and_then(|f| {
+                    let mut two = PClassInfo2 {
+                        cid: [0; 16],
+                        cardinality: 0,
+                        category: [0; 32],
+                        name: [0; 64],
+                        classFlags: 0,
+                        subCategories: [0; 128],
+                        vendor: [0; 64],
+                        version: [0; 64],
+                        sdkVersion: [0; 64],
+                    };
+                    // SAFETY: same index, and `two` is a valid out-parameter.
+                    // A factory that implements the interface but refuses the
+                    // call is treated as one that never had it.
+                    let ok = unsafe { f.getClassInfo2(i, &mut two) };
+                    (ok == vst3::Steinberg::kResultOk)
+                        .then(|| c_array_to_string(&two.subCategories))
+                })
+                .unwrap_or_default();
             out.push(ClassInfo {
                 name: c_array_to_string(&info.name),
                 category: c_array_to_string(&info.category),
+                sub_categories,
                 // A plain reinterpretation of sixteen bytes whose only
                 // difference is signedness — and `c_char` rather than `i8`
                 // because that signedness is the thing that varies by target.
@@ -713,15 +796,61 @@ mod tests {
         let processor = ClassInfo {
             name: "Pianoteq".into(),
             category: "Audio Module Class".into(),
+            sub_categories: "Instrument|Piano".into(),
             cid: [0; 16],
         };
         let controller = ClassInfo {
             name: "Pianoteq Controller".into(),
             category: "Component Controller Class".into(),
+            sub_categories: String::new(),
             cid: [0; 16],
         };
         assert!(processor.is_audio_module());
         assert!(!controller.is_audio_module());
+    }
+
+    fn class_of(sub: &str) -> ClassInfo {
+        ClassInfo {
+            name: "Something".into(),
+            category: "Audio Module Class".into(),
+            sub_categories: sub.into(),
+            cid: [0; 16],
+        }
+    }
+
+    /// **A synth and a reverb are both "Audio Module Class".**
+    ///
+    /// Which is why loading Pro-R into an instrument slot produced silence and
+    /// no explanation: nothing the app could see said the two were different.
+    /// `subCategories` says, and this is the reading of it.
+    #[test]
+    fn a_plugin_says_whether_it_plays_notes_or_changes_them() {
+        use Kind::*;
+        for (sub, want) in [
+            ("Instrument|Synth", Instrument),
+            ("Instrument", Instrument),
+            ("Fx|Reverb", Effect),
+            ("Fx|Delay|Stereo", Effect),
+            // **Instrument wins a tie.** Samplers with an audio input declare
+            // both, and they genuinely do play notes: refusing one would be a
+            // regression wearing a fix's clothes.
+            ("Fx|Instrument", Instrument),
+            ("Instrument|Fx", Instrument),
+            // Case and spacing are a plugin's own business.
+            ("fx|reverb", Effect),
+            (" Fx | Reverb ", Effect),
+            // **Silence is not a no.** A factory too old to be asked tells us
+            // nothing, and nothing must not read as "not an instrument" — that
+            // would refuse to load working plugins that have always worked.
+            ("", Unknown),
+            ("Spatial|Ambisonics", Unknown),
+        ] {
+            assert_eq!(
+                class_of(sub).kind(),
+                want,
+                "{sub:?} was read as the wrong kind"
+            );
+        }
     }
 
     /// **The scan finds what is actually installed, not what is at the top.**

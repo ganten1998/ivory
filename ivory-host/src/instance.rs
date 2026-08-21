@@ -873,6 +873,27 @@ impl Instance {
                 class.name, class.category
             ));
         }
+        // **An effect refused HERE, with a reason.**
+        //
+        // A slot is fed MIDI and mixed into the instrument bus; an effect has
+        // no notes to play and nothing plugged into it, so loading one used to
+        // succeed, take a second, and produce silence for ever. Nothing warned
+        // anybody. The owner's report was that a Pro-R or a VintageVerb owner
+        // "will be irked that they load their vst and nothing happens", and
+        // they were right — it is a broken promise rather than a missing
+        // feature.
+        //
+        // Refused at instantiation rather than filtered out of the picker,
+        // because the picker is a filesystem walk that never opens a bundle:
+        // reading `subCategories` for every VST3 on the machine is a scan with
+        // a cache and a crash boundary, which is a subsystem, not a check. Here
+        // the bundle is open anyway and the answer is free.
+        if class.kind() == crate::scan::Kind::Effect {
+            // Short on purpose: the caller wraps this in the bundle's name and
+            // a pointer at the built-in, and the three together have to fit on
+            // one line in the band.
+            return Err(format!("{} is an effect, not an instrument", class.name));
+        }
 
         let host = ComWrapper::new(HostApp::new());
         let host_unknown = host
