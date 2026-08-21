@@ -1041,6 +1041,16 @@ pub struct VideoReport {
     /// there was no point. Not a loss; it is here so the three numbers above
     /// add up against what the camera sent.
     pub frames_skipped: u64,
+    /// Frames the DRIVER overwrote before anyone read them, counted from gaps
+    /// in V4L2's own `sequence`.
+    ///
+    /// **A different fault from every number above it**, and until the queue
+    /// could be deepened it was not even observable on Linux: the driver had
+    /// two buffers, `dequeue` held one, and a frame arriving in that window
+    /// replaced one nobody had read — invisibly, because the sequence field
+    /// was never surfaced. Zero here with a non-zero `frames_received` is the
+    /// capture path keeping up.
+    pub frames_dropped_late: u64,
 }
 
 impl VideoReport {
@@ -1057,6 +1067,7 @@ impl VideoReport {
             ("frames_superseded", Json::Int(self.frames_superseded as i64)),
             ("frames_unreadable", Json::Int(self.frames_unreadable as i64)),
             ("frames_skipped", Json::Int(self.frames_skipped as i64)),
+            ("frames_dropped_late", Json::Int(self.frames_dropped_late as i64)),
         ])
     }
 }
@@ -1861,6 +1872,7 @@ mod tests {
             frames_superseded: 0,
             frames_unreadable: 0,
             frames_skipped: 0,
+            frames_dropped_late: 0,
             ..VideoReport::default()
         });
         m.plugin = Some(PluginReport {

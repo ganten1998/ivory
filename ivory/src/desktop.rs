@@ -3031,6 +3031,7 @@ struct TakeVideo {
     cam_superseded_at_start: u64,
     cam_unreadable_at_start: u64,
     cam_skipped_at_start: u64,
+    cam_dropped_late_at_start: u64,
 }
 
 #[cfg(feature = "recorder")]
@@ -3122,6 +3123,7 @@ impl DesktopApp {
             cam_superseded_at_start: self.recorder.session.camera_frames_superseded(),
             cam_unreadable_at_start: self.recorder.session.camera_frames_unreadable(),
             cam_skipped_at_start: self.recorder.session.camera_frames_skipped(),
+            cam_dropped_late_at_start: self.recorder.session.camera_frames_dropped_late(),
         });
     }
 
@@ -3391,6 +3393,16 @@ impl DesktopApp {
                             .session
                             .camera_frames_skipped()
                             .saturating_sub(v.cam_skipped_at_start),
+                        // **The one the Linux side could never count.** V4L2
+                        // reports every frame it produced in `sequence`, and
+                        // the crate never surfaced the field — so a frame the
+                        // driver overwrote while the app held its only other
+                        // buffer was invisible. See `frames_dropped_late`.
+                        frames_dropped_late: self
+                            .recorder
+                            .session
+                            .camera_frames_dropped_late()
+                            .saturating_sub(v.cam_dropped_late_at_start),
                     },
                     &file_name,
                 );

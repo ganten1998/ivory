@@ -420,6 +420,20 @@ pub struct IvoryApp {
     /// The note under a mouse button that is still down, with keytoggle off.
     /// One at a time: a press replaces whatever the last one was.
     clicked: std::collections::BTreeSet<u8>,
+    /// Where a fret was clicked while keytoggle is OFF: `(note, string, fret)`.
+    ///
+    /// **The neck is an instrument in both modes, and in one of them it was
+    /// lying about where you touched it.** With keytoggle on, a fret click
+    /// pins the note to the string and fret it was clicked on, so it lights up
+    /// under the finger. With keytoggle off nothing was pinned at all — the
+    /// note reached the neck only as a pitch, through `sounding`, and the
+    /// solver put it wherever it liked. Click the fifth fret of the A string
+    /// and watch the right note light up on the low E at the tenth.
+    ///
+    /// Transient, unlike `manual_positions`: there is no latch in this mode, so
+    /// it lives exactly as long as the mouse button does and is cleared beside
+    /// `clicked`.
+    clicked_position: Option<(u8, usize, u8)>,
     /// Set on the frame Space goes down: sound everything afresh.
     ///
     /// **Space is a STRIKE, not a request for the note to exist.** Without
@@ -770,6 +784,7 @@ impl IvoryApp {
             fx_defaults: crate::ports::EffectDefaults::default(),
             sounding: std::collections::BTreeSet::new(),
             clicked: std::collections::BTreeSet::new(),
+            clicked_position: None,
             restrike: false,
             audition_held: false,
             audio_status: recorder::AudioStatus::default(),
@@ -1149,12 +1164,21 @@ impl IvoryApp {
     }
 
     fn sync_pins(&mut self) {
-        let pins: Vec<(u8, usize, u8)> = self
+        let mut pins: Vec<(u8, usize, u8)> = self
             .manual_positions
             .iter()
             .filter(|(p, _)| self.manual_notes.contains(p))
             .map(|(&p, &(st, f))| (p, st, f))
             .collect();
+        // **And the fret under the hand right now**, which is how the neck
+        // answers a click with keytoggle off. See `clicked_position`.
+        if let Some((note, st, fret)) = self.clicked_position {
+            // One finger per string, as everywhere else here: a live gesture
+            // displaces whatever was pinned on that string rather than asking
+            // for a hand with two fingers on it.
+            pins.retain(|(_, s, _)| *s != st);
+            pins.push((note, st, fret));
+        }
         self.voicing.set_pins(pins);
     }
 
@@ -1183,6 +1207,18 @@ impl IvoryApp {
         // already in display pitches, and transposing it a second time lit
         // phantom keys a whole interval above the ones being played.
         set.extend(self.sounding.iter().copied());
+        // **And what a gesture is asking for RIGHT NOW.**
+        //
+        // `sounding` is one step behind by construction: `reconcile_sound`
+        // runs at the END of the frame, after `voicing_tick`, so a note the
+        // hand is on does not reach the picture until the next tick — and that
+        // tick is on a 100 ms cadence. A neck that answers a press a tenth of a
+        // second later is a neck that feels broken.
+        //
+        // Safe because `wanted_sound` takes `clicked` unconditionally: these
+        // two sets converge on the very next reconcile, so this is the same
+        // answer arriving sooner rather than a different one.
+        set.extend(self.clicked.iter().copied());
         set
     }
 
@@ -1324,6 +1360,12 @@ impl IvoryApp {
     /// here, and a chord placed from the lattice arrives as a chord.
     fn sound_while_held(&mut self, notes: impl IntoIterator<Item = u8>) {
         self.clicked.clear();
+        // A new gesture, so the last one's place on the neck is gone. The
+        // fretboard's own path sets this again immediately afterwards; every
+        // other caller — a piano key, a lattice vertex — says WHICH note and
+        // not where on the neck to draw it, so for those it stays cleared and
+        // the solver chooses, which is right.
+        self.clicked_position = None;
         self.clicked.extend(notes);
     }
 
@@ -1766,11 +1808,24 @@ impl IvoryApp {
 
     /// What the neck's interval column should say, or nothing when it is off.
     ///
-    /// **From the MIDI, not from the fingering.** The question is "what am I
-    /// playing, in intervals", and that has the same answer whether the notes
-    /// came from a guitar the solver fingered or from a keyboard — so it is
-    /// built from the same `theory_panel::Input` the circle and the triangles
-    /// use, which is every sounding note and the detected root.
+    /// **The root is the LOWEST NOTE BEING PLAYED, always.**
+    ///
+    /// It used to be `Input::tonic()` — the detected chord's root, falling back
+    /// to the bass — which is right for the circle and the triangles and wrong
+    /// here. Those diagrams answer "what key am I in"; this column answers
+    /// "what is this shape under my hand", and a guitarist reads a shape from
+    /// the bottom string up. A first-inversion C over E labelled from C puts
+    /// "3" on the lowest note you are fretting, which is a true statement about
+    /// a chord and a useless one about a hand.
+    ///
+    /// It also means the labels never disagree with the detector being unsure:
+    /// two notes have a lowest one, and the column says something honest about
+    /// them before anything has a name.
+    ///
+    /// **And from what is ON THE NECK**, not through `theory_input`, which
+    /// substitutes the pinned notes when `theory_follow_midi` is off. The neck
+    /// draws `display`; measuring the labels against a different set would put
+    /// them beside strings holding other notes.
     fn guitar_intervals(
         &self,
         display: &HashSet<u8>,
@@ -1778,10 +1833,9 @@ impl IvoryApp {
         if !self.settings.guitar_intervals {
             return None;
         }
-        let input = self.theory_input(display);
         Some(fretboard_panel::Intervals {
-            tonic: input.tonic(),
-            any: input.pcs != 0,
+            tonic: display.iter().min().map_or(0, |n| n % 12),
+            any: !display.is_empty(),
         })
     }
 
@@ -2182,6 +2236,11 @@ impl IvoryApp {
         let ended = ctx.input(|i| i.pointer.any_released() || !i.focused);
         if ended && !self.clicked.is_empty() {
             self.clicked.clear();
+            // And the place it was clicked, which only lasts as long as the
+            // gesture does. `sync_pins` is what the solver reads, so telling it
+            // is part of letting go rather than something to remember later.
+            self.clicked_position = None;
+            self.sync_pins();
         }
         if self.dialog.is_some() {
             // **Dropped, but not silently.** A press here is somebody trying
@@ -2575,6 +2634,26 @@ impl IvoryApp {
                     };
                     if let Some(note) = hit {
                         self.sound_while_held([note]);
+                        // **Where, not just what.** A click on the NECK says
+                        // both, and saying only the pitch is what made the note
+                        // light up somewhere else entirely. A click on the
+                        // piano says only the pitch, so it leaves the pin
+                        // cleared and the solver chooses — which is right,
+                        // because a piano key has no opinion about strings.
+                        if let Some(r) = fret_rect.filter(|r| r.contains(pos)) {
+                            if let Some((st, fret)) = fretboard_panel::position_at(
+                                r,
+                                &self.settings.fretboard_spec(),
+                                pos,
+                            ) {
+                                self.clicked_position = Some((note, st, fret));
+                            }
+                        }
+                        // The solver has to be told now rather than on the next
+                        // tick: a neck that answers a press a fifth of a second
+                        // later is a neck that feels broken.
+                        self.sync_pins();
+                        self.voicing_tick(true);
                         return;
                     }
                 }
@@ -8137,6 +8216,120 @@ mod tests {
         // The other two bays are untouched, because they are other bays.
         assert!(app.insert(at, 0).is_none());
         assert!(app.insert(at, 2).is_none());
+    }
+
+    /// **A fret you click lights up under your finger, with keytoggle OFF.**
+    ///
+    /// The neck is an instrument in both modes and in one of them it was lying
+    /// about where you touched it. With keytoggle ON a fret click pins the note
+    /// to the string and fret it was clicked on. With it OFF nothing was pinned
+    /// at all: the note reached the neck as a PITCH, through `sounding`, and
+    /// the solver put it wherever it liked — click the fifth fret of the A
+    /// string and the right note lights up on the low E at the tenth.
+    ///
+    /// Swept over the whole neck rather than tested on one fret, because that
+    /// is how the fault presented: the owner's report was that "only the
+    /// majority of fretboard notes have this behavior" — the ones the solver
+    /// happened to agree with looked fine.
+    #[test]
+    fn a_clicked_fret_lights_where_it_was_clicked_with_keytoggle_off() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        app.settings.show_fretboard = true;
+        let spec = app.settings.fretboard_spec();
+        let strings = spec.tuning.strings();
+        let mut checked = 0;
+        for st in 0..strings {
+            for fret in [0u8, 2, 3, 5, 7, 9, 12] {
+                let Some(note) = spec.pitch_at(st, fret) else {
+                    continue;
+                };
+                // Exactly what the click path does, minus the pointer maths
+                // that `position_at` is separately tested for.
+                app.sound_while_held([note]);
+                app.clicked_position = Some((note, st, fret));
+                app.sync_pins();
+                app.voicing_tick(true);
+
+                let at = app.voicing.current().position_of(note);
+                assert_eq!(
+                    at.map(|p| (p.string, p.fret)),
+                    Some((st, fret)),
+                    "clicked string {st} fret {fret} ({note}) and it was drawn at {at:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "only {checked} positions were reachable to test");
+    }
+
+    /// And letting go gives the neck back to the solver.
+    ///
+    /// The pin is the GESTURE, not a latch — that is the whole difference
+    /// between the two modes — so it must not outlive the button.
+    #[test]
+    fn the_clicked_fret_pin_does_not_outlive_the_gesture() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        let spec = app.settings.fretboard_spec();
+        let note = spec.pitch_at(1, 5).expect("a real position");
+        app.sound_while_held([note]);
+        app.clicked_position = Some((note, 1, 5));
+        app.sync_pins();
+        app.voicing_tick(true);
+        assert!(app.clicked_position.is_some());
+
+        // A click somewhere that is not the neck — a piano key says WHICH note
+        // and has no opinion about strings.
+        app.sound_while_held([note]);
+        assert!(
+            app.clicked_position.is_none(),
+            "a piano click kept the neck's pin, so the note is stuck on a string"
+        );
+    }
+
+    /// **The neck's interval column measures from the LOWEST note.**
+    ///
+    /// It used to measure from the detected chord's root, falling back to the
+    /// bass. That is right for the circle and the triangles, which answer "what
+    /// key am I in"; this column answers "what is this shape under my hand",
+    /// and a guitarist reads a shape from the bottom string up. A first
+    /// inversion labelled from the chord's root puts "3" on the lowest note you
+    /// are fretting — a true statement about a chord and a useless one about a
+    /// hand.
+    #[test]
+    fn the_interval_column_measures_from_the_lowest_note_played() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.guitar_intervals = true;
+
+        // C major in root position: the lowest note is C, so the root is C.
+        let root_position: HashSet<u8> = [60, 64, 67].into_iter().collect();
+        let i = app.guitar_intervals(&root_position).expect("the column is on");
+        assert_eq!(i.tonic, 0, "root position did not measure from C");
+        assert!(i.any);
+
+        // The SAME chord in first inversion. The detector still calls it C, and
+        // the column must now say E — because that is the note under the
+        // lowest string.
+        app.current_chord = Some("C".to_owned());
+        let first_inversion: HashSet<u8> = [64, 67, 72].into_iter().collect();
+        let i = app
+            .guitar_intervals(&first_inversion)
+            .expect("the column is on");
+        assert_eq!(
+            i.tonic, 4,
+            "first inversion measured from the chord's root, not from the \
+             lowest note being played"
+        );
+
+        // Two notes with no name at all still have a lowest one, so the column
+        // says something honest before the detector has an opinion.
+        app.current_chord = None;
+        let bare: HashSet<u8> = [55, 62].into_iter().collect();
+        assert_eq!(app.guitar_intervals(&bare).expect("on").tonic, 7);
+
+        // And nothing playing is an empty column, not the last chord's labels.
+        assert!(!app.guitar_intervals(&HashSet::new()).expect("on").any);
     }
 
     // ── the built-in's patch picker ─────────────────────────────────────────

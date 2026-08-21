@@ -1483,6 +1483,17 @@ impl Session {
             .map_or(0, |c| c.stats().frames_skipped())
     }
 
+    /// Frames the driver overwrote before anyone read them.
+    ///
+    /// Counted from gaps in V4L2's own `sequence` on Linux and from the
+    /// backend's own report on macOS. Zero beside a non-zero
+    /// `camera_frames_delivered` is the capture path keeping up.
+    pub fn camera_frames_dropped_late(&self) -> u64 {
+        self.camera
+            .as_ref()
+            .map_or(0, |c| c.stats().frames_dropped_late())
+    }
+
     /// Fold the finished video into the last take's manifest.
     ///
     /// `stop` wrote `take.json` without a video section, because the encoder
@@ -2871,6 +2882,7 @@ mod tests {
                 frames_superseded: 0,
                 frames_unreadable: 0,
                 frames_skipped: 0,
+                frames_dropped_late: 0,
             },
             "take.mp4",
         );
@@ -2916,6 +2928,7 @@ mod tests {
                 frames_superseded: 0,
                 frames_unreadable: 0,
                 frames_skipped: 0,
+                frames_dropped_late: 0,
             },
             "take.mp4",
         );
