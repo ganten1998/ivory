@@ -44,6 +44,12 @@
 //! The video is not delayed by this: the frame carries its own `pts`, which is
 //! computed from the take's clock and travels with it through the pipeline.
 
+// An OpenGL context of our own, for machines whose only Vulkan is a software
+// rasteriser. Linux-only because the problem is: macOS composites on the
+// window's Metal device and Windows has a Vulkan driver worth the name.
+#[cfg(target_os = "linux")]
+mod glctx;
+
 use ivory_ui::app::IvoryApp;
 use ivory_ui::recorder::{DisplayShows, Layout};
 
@@ -83,6 +89,28 @@ pub struct Compositor {
     /// and handing that out as [`last_frame`](Self::last_frame) would pad a
     /// slow take's opening with black frames that were never composited.
     has_frame: bool,
+    /// A GL context of our own, when the compositor is running on one.
+    ///
+    /// **Declared last on purpose.** Fields drop in declaration order, and
+    /// every wgpu object above needs this context current while it releases
+    /// its GPU resources — so this has to be the last thing to go. See
+    /// [`Drop for Compositor`].
+    #[cfg(target_os = "linux")]
+    gl: Option<glctx::Gl>,
+}
+
+impl Drop for Compositor {
+    fn drop(&mut self) {
+        // A `Drop` impl runs BEFORE the struct's fields are dropped, so a
+        // guard taken here would be gone by the time the wgpu objects release
+        // their GPU resources — and those calls need our context current. The
+        // sticky form makes it current and leaves it; `Gl`'s own `Drop`, which
+        // runs last of all, puts the window's context back.
+        #[cfg(target_os = "linux")]
+        if let Some(gl) = &self.gl {
+            gl.make_current_sticky();
+        }
+    }
 }
 
 struct CameraTexture {
@@ -142,6 +170,14 @@ fn software_adapter(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
 /// and the encoder. A 1080p30 take there delivered 44% of its frames and made
 /// the app unplayable while it did.
 pub fn renders_on_the_cpu() -> bool {
+    // **Ask the owned-GL path first, because it is what will actually run.**
+    // Without this the app drops itself to 720p/15 on a machine that is about
+    // to composite on its GPU — apologising for hardware that is doing the
+    // work. `standalone` tries the same path in the same order.
+    #[cfg(target_os = "linux")]
+    if owned_gl_is_hardware() {
+        return false;
+    }
     static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ANSWER.get_or_init(|| {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
@@ -165,6 +201,76 @@ pub fn renders_on_the_cpu() -> bool {
             );
             info.device_type == wgpu::DeviceType::Cpu
         })
+    })
+}
+
+/// Open a wgpu device on an adapter exposed from a context we own.
+///
+/// Split out so that [`renders_on_the_cpu`] can ask the same question the
+/// compositor will later ask, rather than a cheaper one that might disagree —
+/// a machine told it has hardware and then given lavapipe would film at
+/// defaults it cannot hold.
+#[cfg(target_os = "linux")]
+fn owned_gl_device(
+    exposed: wgpu::hal::ExposedAdapter<wgpu::hal::api::Gles>,
+) -> Result<(wgpu::Device, wgpu::Queue), String> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::GL,
+        ..Default::default()
+    });
+    // SAFETY: `exposed` is a GLES adapter and `Gles` is the matching api type.
+    let adapter = unsafe { instance.create_adapter_from_hal::<wgpu::hal::api::Gles>(exposed) };
+
+    // **Downlevel limits, and not as a formality.** wgpu's defaults require
+    // compute shaders; the parts this whole path exists for top out at GLES
+    // 3.0 and have none, so the default descriptor is refused outright with
+    // `max_compute_workgroups_per_dimension ... allowed 0`.
+    let limits = wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
+    block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_limits: limits,
+        ..Default::default()
+    }))
+    .map_err(|e| format!("the GL adapter would not open a device: {e:?}"))
+}
+
+/// Whether a context of our own would composite on real hardware here.
+///
+/// **Deliberately does not build a wgpu device.** The obvious implementation
+/// asks the same question the compositor will ask — context, adapter, device —
+/// and that is what the first version did. It turned the app's window black.
+///
+/// Creating and binding the bare EGL context is harmless against a live GLX
+/// window; that was checked directly, with a C probe that draws and swaps a
+/// real mapped GLX window around every EGL call and finds no damage. Standing a
+/// wgpu device up on that context at startup and immediately tearing it down
+/// again is what does it — glow's entry points are resolved against our
+/// context, and wgpu's teardown does not keep it current, so the deletes land
+/// on whatever context the thread has, which is the window's.
+///
+/// The renderer string answers the only question this needs, and costs nothing
+/// beyond the context itself. If the device later declines, the compositor
+/// falls back and the defaults were merely optimistic — a far better failure
+/// than a black window.
+#[cfg(target_os = "linux")]
+fn owned_gl_is_hardware() -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        let Some(gl) = glctx::Gl::create() else {
+            return false;
+        };
+        let Some(_guard) = gl.enter() else {
+            return false;
+        };
+        let Some(name) = gl.renderer() else {
+            return false;
+        };
+        let lower = name.to_lowercase();
+        let software = lower.contains("llvmpipe")
+            || lower.contains("softpipe")
+            || lower.contains("swrast")
+            || lower.contains("lavapipe");
+        log::debug!("video adapter: {name} via a GL context of our own");
+        !software
     })
 }
 
@@ -202,6 +308,16 @@ impl Compositor {
     /// anyway. Bringing an executor into this crate to await two futures at
     /// startup would be a dependency bought for one line.
     pub fn standalone(width: u32, height: u32) -> Result<Self, String> {
+        // **A GL context of our own, first.** On a machine whose only Vulkan
+        // is lavapipe this is the difference between 217 ms of CPU per
+        // composited frame and 13.8 ms. It is an accelerator and nothing more:
+        // any failure falls through to exactly the wgpu path that ran before.
+        #[cfg(target_os = "linux")]
+        match Self::on_owned_gl(width, height) {
+            Ok(c) => return Ok(c),
+            Err(why) => log::debug!("compositor: no hardware GL of our own ({why})"),
+        }
+
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -226,12 +342,18 @@ impl Compositor {
                 }
             )
         })?;
-        // A GL adapter is REFUSED, not tried. This runs on the window's own
-        // thread and the window is drawn with OpenGL on this platform; EGL
-        // allows one current context per thread, so wgpu's first make-current
-        // against the window's is EGL_BAD_ACCESS — which wgpu-hal unwraps,
-        // taking the whole app down mid-take. Observed, not theorised. Vulkan
-        // has no notion of "current" and coexists fine.
+        // **A GL adapter that wgpu found for ITSELF is still refused**, and the
+        // reason is unchanged: wgpu-hal brackets its GL work with
+        // `eglMakeCurrent(ctx)` ... `eglMakeCurrent(NONE)`, which UNBINDS
+        // rather than restores. This runs on the window's thread, EGL allows
+        // one current context per thread, and so the window's context ends up
+        // current nowhere and the next `swapBuffers` fails — inside an
+        // `unwrap`, taking the app down mid-take. Observed, not theorised.
+        //
+        // `owned_gl` above is the way round it, and the difference is
+        // ownership: there the context is ours, wgpu does no currency
+        // management at all (`Adapter::new_external` carries `egl: None`), and
+        // the guard puts the window's context back. See `composite/glctx.rs`.
         if adapter.get_info().backend == wgpu::Backend::Gl {
             return Err(
                 "compositing cannot share a thread with the window's OpenGL - \
@@ -243,6 +365,94 @@ impl Compositor {
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
             .map_err(|e| format!("the graphics adapter would not open a device: {e}"))?;
         Self::on(device, queue, width, height)
+    }
+
+    /// A compositor on a hardware OpenGL context this code creates and owns.
+    ///
+    /// This exists because the two reasons the GL backend was unusable are
+    /// both about wgpu *managing* the context rather than about GL: wgpu
+    /// cannot open a context on some drivers at all (a robustness-negotiation
+    /// bug), and where it can, it unbinds the window's context afterwards.
+    /// Owning the context answers both. `composite/glctx.rs` has the detail.
+    ///
+    /// Returns `Err` on any machine this does not suit, and the caller carries
+    /// on to the wgpu path unchanged.
+    #[cfg(target_os = "linux")]
+    fn on_owned_gl(width: u32, height: u32) -> Result<Self, String> {
+        // Walk the context candidates. Creating one is not the last thing that
+        // can fail — wgpu opens a device on it afterwards, and refuses some
+        // perfectly good contexts then (a desktop GL 3.3 context is fine until
+        // wgpu's indirect-validation shader wants GLSL 430). One refusal is not
+        // the end of it on a machine that has another API to offer.
+        let mut skip = 0;
+        let mut last = String::from("no EGL context available");
+        loop {
+            let Some((gl, used)) = glctx::Gl::create_from(skip) else {
+                return Err(last);
+            };
+            skip = used + 1;
+            match Self::on_this_gl(gl, width, height) {
+                Ok(c) => return Ok(c),
+                Err(e) => {
+                    log::debug!("compositor GL: candidate {used} unusable ({e})");
+                    last = e;
+                }
+            }
+        }
+    }
+
+    /// Build the compositor on one specific context we have already created.
+    #[cfg(target_os = "linux")]
+    fn on_this_gl(gl: glctx::Gl, width: u32, height: u32) -> Result<Self, String> {
+
+        // Everything from here to the end of this scope touches GL, including
+        // the resources `Self::on` allocates, so the context stays current for
+        // all of it.
+        let mut me = {
+            let _guard = gl.enter().ok_or("the GL context would not bind")?;
+
+            // SAFETY: the context is current on this thread for the whole of
+            // this scope, which is `new_external`'s requirement, and `gl`
+            // outlives every object derived from it — it is moved into the
+            // compositor below and dropped last.
+            let exposed = unsafe {
+                wgpu::hal::gles::Adapter::new_external(
+                    |name| gl.proc_address(name),
+                    wgpu::GlBackendOptions::default(),
+                )
+            }
+            .ok_or("wgpu could not expose an adapter for this GL context")?;
+
+            // A software GL driver is not worth the complexity: lavapipe
+            // through wgpu's own path is the same thing with less to go wrong.
+            let name = exposed.info.name.clone();
+            if exposed.info.device_type == wgpu::DeviceType::Cpu
+                || name.contains("llvmpipe")
+                || name.contains("softpipe")
+                || name.contains("swrast")
+            {
+                return Err(format!("{name} is a software GL driver"));
+            }
+
+            let (device, queue) = owned_gl_device(exposed)?;
+            log::info!("compositor: hardware GL ({name}, {:?})", gl.api);
+            Self::on(device, queue, width, height)?
+        };
+        me.gl = Some(gl);
+        Ok(me)
+    }
+
+    /// Whether this compositor is running on a GL context of its own.
+    #[cfg(test)]
+    pub(crate) fn is_owned_gl(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.gl.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
     }
 
     /// The same, from a device this code was handed rather than one it found.
@@ -311,6 +521,8 @@ impl Compositor {
             camera: None,
             frame: vec![0; (width as usize) * (height as usize) * 4],
             has_frame: false,
+            #[cfg(target_os = "linux")]
+            gl: None,
         })
     }
 
@@ -379,6 +591,11 @@ impl Compositor {
         pts_ns: i64,
         paint: Option<&dyn Fn(&egui::Painter, egui::Rect)>,
     ) -> Result<Option<i64>, String> {
+        // Held for the whole body, and released at the end of it — which puts
+        // the window's GL context back. Nothing between here and the return
+        // may touch the GPU without it.
+        #[cfg(target_os = "linux")]
+        let _gl = self.gl.as_ref().and_then(|g| g.enter());
         if let Some((pixels, w, h)) = camera {
             self.upload_camera(pixels, w, h)?;
         }
@@ -532,6 +749,8 @@ impl Compositor {
     /// That is the cost of pipelining, made explicit and given a name rather
     /// than avoided by making every frame wait.
     pub fn flush(&mut self) -> Result<Option<i64>, String> {
+        #[cfg(target_os = "linux")]
+        let _gl = self.gl.as_ref().and_then(|g| g.enter());
         let Some((which, pts)) = self.in_flight.take() else {
             return Ok(None);
         };
@@ -764,6 +983,131 @@ mod tests {
 
     /// The smallest possible executor. `pollster` is not a dependency of this
     /// crate and adding one for two `await`s in a test would be a poor trade.
+    /// **The compositor must not leave the window's GL context unbound.**
+    ///
+    /// This is the failure the `Backend::Gl` refusal in `standalone` exists to
+    /// prevent, and the reason it can now be bypassed. wgpu's own GL path ends
+    /// every locked section with `eglMakeCurrent(NONE)`, which on the UI thread
+    /// leaves the window's context current nowhere — and eframe's next
+    /// `swapBuffers` fails inside an unwrap, mid-take.
+    ///
+    /// So: bind a context, stand it in for the window, run whole frames
+    /// through the compositor, and prove the same context is still current and
+    /// still answering afterwards.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn compositing_leaves_the_windows_gl_context_current() {
+        let Some(window) = glctx::Gl::create() else {
+            eprintln!("no EGL here - nothing to protect");
+            return;
+        };
+        let _window_current = window.enter().expect("bind the stand-in window context");
+        assert_eq!(
+            window.current_raw(),
+            window.raw(),
+            "the stand-in window context did not become current"
+        );
+
+        // SAFETY: single-threaded test setup, before any app exists.
+        unsafe {
+            std::env::set_var(
+                "IVORY_SETTINGS_PATH",
+                std::env::temp_dir().join("tangent-glguard-settings.json"),
+            );
+        }
+        let (w, h) = (320u32, 240u32);
+        let mut c = match Compositor::standalone(w, h) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("no compositor here: {e}");
+                return;
+            }
+        };
+        // **Otherwise this test quietly stops testing.** A compositor that fell
+        // back to Vulkan never touches EGL currency, so every assertion below
+        // would pass without exercising the thing they are about.
+        if !c.is_owned_gl() {
+            eprintln!("compositor did not take the owned-GL path - nothing to protect here");
+            return;
+        }
+        let app = IvoryApp::new(
+            c.context(),
+            ivory_ui::settings::Settings::default(),
+            ivory_ui::host::Caps::MINIMAL,
+        );
+        for i in 0..4_i64 {
+            c.frame(
+                &app,
+                Layout::default(),
+                DisplayShows::default(),
+                true,
+                true,
+                None,
+                i * 1_000,
+            )
+            .expect("composite");
+            assert_eq!(
+                window.current_raw(),
+                window.raw(),
+                "frame {i} left a different context current - the window would stop drawing"
+            );
+        }
+        let _ = c.flush().expect("flush");
+        assert_eq!(
+            window.current_raw(),
+            window.raw(),
+            "flush left a different context current"
+        );
+
+        // And the context is not merely current, it still answers.
+        assert!(
+            !window.proc_address("glGetString").is_null(),
+            "the window context stopped resolving GL entry points"
+        );
+
+        // Dropping the compositor must put it back too: that tear-down runs
+        // its own context current so the wgpu objects can be released.
+        drop(c);
+        assert_eq!(
+            window.current_raw(),
+            window.raw(),
+            "dropping the compositor left the window's context unbound"
+        );
+    }
+
+    /// **What the app is told must match what it gets.**
+    ///
+    /// `renders_on_the_cpu` is what sets `video_defaults_lowered`, the flag
+    /// that quietly drops a machine to 720p/15. If the compositor is about to
+    /// run on the GPU, saying otherwise makes the app apologise for hardware
+    /// that is doing the work — and film at defaults it did not need to take.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn the_defaults_probe_agrees_with_what_the_compositor_gets() {
+        // SAFETY: single-threaded test setup, before any app exists.
+        unsafe {
+            std::env::set_var(
+                "IVORY_SETTINGS_PATH",
+                std::env::temp_dir().join("tangent-defaults-settings.json"),
+            );
+        }
+        let Ok(c) = Compositor::standalone(320, 240) else {
+            eprintln!("no compositor here - nothing to agree about");
+            return;
+        };
+        if !c.is_owned_gl() {
+            eprintln!("not on the owned-GL path - nothing to agree about");
+            return;
+        }
+        assert!(
+            !renders_on_the_cpu(),
+            "the compositor is on hardware GL but the app is being told it \
+             renders on the CPU, so it will lower its own defaults"
+        );
+    }
+
     /// **The camera survives the round trip with its colours intact.**
     ///
     /// Upload BGRA, composite, read back BGRA, and check the middle pixel is
@@ -1046,6 +1390,249 @@ mod tests {
         let twice = compose_one(&mut c, &app, None)
             .expect("composite");
         assert_eq!(once, twice, "two frames of an unchanged app differ");
+    }
+}
+
+/// What a composited frame costs, on whichever adapter you point it at.
+///
+/// The compositor is the last thing on this machine still running on the CPU,
+/// and "~8 composites per second" was measured by watching a take rather than
+/// by timing the thing itself. This times the thing itself, and lets the
+/// adapter be chosen so hardware and software are the same binary on the same
+/// frames:
+///
+///   TANGENT_COST_BACKEND=gl     cargo test -p ivory --bins cost::composite \
+///     -- --ignored --nocapture
+///   TANGENT_COST_BACKEND=vulkan cargo test -p ivory --bins cost::composite \
+///     -- --ignored --nocapture
+///
+/// On a machine with no hardware Vulkan the second is lavapipe, which is what
+/// the app falls back to today.
+#[cfg(test)]
+mod cost {
+    use super::*;
+
+    /// A logger in a dozen lines rather than a dev-dependency, so wgpu's own
+    /// account of what it did is visible when something refuses.
+    struct Stderr;
+    impl log::Log for Stderr {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, r: &log::Record<'_>) {
+            eprintln!("  [{:<5} {}] {}", r.level(), r.target(), r.args());
+        }
+        fn flush(&self) {}
+    }
+
+    fn logging() {
+        if std::env::var_os("TANGENT_COST_LOG").is_some() {
+            let _ = log::set_boxed_logger(Box::new(Stderr));
+            log::set_max_level(log::LevelFilter::Debug);
+        }
+    }
+
+    /// Process CPU seconds, from /proc, so this needs no new dependency.
+    fn cpu_seconds() -> f64 {
+        let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let Some(rest) = s.rsplit_once(')').map(|(_, r)| r) else {
+            return 0.0;
+        };
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let g = |i: usize| -> f64 { f.get(i).and_then(|v| v.parse().ok()).unwrap_or(0.0) };
+        (g(11) + g(12)) / 100.0
+    }
+
+    #[test]
+    #[ignore = "measures a machine, and needs a GPU"]
+    fn composite() {
+        logging();
+        let want = std::env::var("TANGENT_COST_BACKEND").unwrap_or_else(|_| "all".to_owned());
+        // "standalone" measures what the APP actually gets, rather than an
+        // adapter this test picked — which is the only number that settles
+        // whether the hardware path is really in use.
+        if want == "standalone" {
+            // SAFETY: single-threaded test setup, before any app exists.
+            unsafe {
+                std::env::set_var(
+                    "IVORY_SETTINGS_PATH",
+                    std::env::temp_dir().join("tangent-cost-settings.json"),
+                );
+            }
+            let (w, h) = (1280u32, 720u32);
+            #[cfg(target_os = "linux")]
+            match Compositor::on_owned_gl(w, h) {
+                Ok(_) => println!("owned GL: available"),
+                Err(e) => println!("owned GL: UNAVAILABLE -- {e}"),
+            }
+            let mut c = match Compositor::standalone(w, h) {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("standalone refused: {e}");
+                    return;
+                }
+            };
+            println!(
+                "path    : {}",
+                if c.is_owned_gl() { "** OWNED HARDWARE GL **" } else { "wgpu's own adapter" }
+            );
+            let mut settings = ivory_ui::settings::Settings::default();
+            settings.show_recorder = true;
+            let app = IvoryApp::new(c.context(), settings, ivory_ui::host::Caps::DESKTOP);
+            let mut cam = vec![0u8; (w * h * 4) as usize];
+            for (i, px) in cam.chunks_exact_mut(4).enumerate() {
+                px[0] = (i % 251) as u8;
+                px[1] = (i / 7 % 253) as u8;
+                px[2] = (i / 13 % 249) as u8;
+                px[3] = 255;
+            }
+            let go = |c: &mut Compositor, n: i64| {
+                for i in 0..n {
+                    c.frame(
+                        &app,
+                        Layout::default(),
+                        DisplayShows::default(),
+                        true,
+                        true,
+                        Some((&cam, w, h)),
+                        i * 66_666_667,
+                    )
+                    .expect("composite");
+                }
+                let _ = c.flush().expect("flush");
+            };
+            go(&mut c, 10);
+            let frames = 60_i64;
+            let c0 = cpu_seconds();
+            let t0 = std::time::Instant::now();
+            go(&mut c, frames);
+            let wall = t0.elapsed().as_secs_f64();
+            let cpu = cpu_seconds() - c0;
+            assert!(c.last_frame().is_some(), "no frame ever came back");
+            println!("frames  : {frames} at {w}x{h}");
+            println!("CPU     : {:.3} s  ->  {:.2} ms/frame", cpu, cpu * 1000.0 / frames as f64);
+            println!(
+                "wall    : {:.3} s  ->  {:.2} ms/frame  ({:.1} composites/sec)",
+                wall,
+                wall * 1000.0 / frames as f64,
+                frames as f64 / wall
+            );
+            println!(
+                "          {:.0}% of one core to hold 15 fps",
+                (cpu / frames as f64) * 15.0 * 100.0
+            );
+            return;
+        }
+        let backends = match want.as_str() {
+            "gl" => wgpu::Backends::GL,
+            "vulkan" => wgpu::Backends::VULKAN,
+            _ => wgpu::Backends::all(),
+        };
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends,
+            ..Default::default()
+        });
+        let Ok(adapter) = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        })) else {
+            eprintln!("no adapter for backend {want}");
+            return;
+        };
+        let info = adapter.get_info();
+        println!("adapter : {} ({:?}/{:?})", info.name, info.backend, info.device_type);
+        let (device, queue) = match block_on(
+            adapter.request_device(&wgpu::DeviceDescriptor::default()),
+        ) {
+            Ok(dq) => dq,
+            Err(e) => {
+                println!("   default limits refused: {e}");
+                // GLES 3.0 cannot meet wgpu's default limits; downlevel is the
+                // set wgpu itself defines for exactly this case.
+                let desc = wgpu::DeviceDescriptor {
+                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                        .using_resolution(adapter.limits()),
+                    ..Default::default()
+                };
+                match block_on(adapter.request_device(&desc)) {
+                    Ok(dq) => {
+                        println!("   downlevel_webgl2 limits: accepted");
+                        dq
+                    }
+                    Err(e2) => {
+                        println!("   downlevel limits refused too: {e2}");
+                        return;
+                    }
+                }
+            }
+        };
+
+        // 720p15 is where the app pins itself on the machine this is about.
+        let (w, h) = (1280u32, 720u32);
+        let mut c = Compositor::on(device, queue, w, h).expect("compositor");
+        // SAFETY: single-threaded test setup, before any app exists. A frame
+        // can save, and `ivory-ui`'s own test guard is not in force here.
+        unsafe {
+            std::env::set_var(
+                "IVORY_SETTINGS_PATH",
+                std::env::temp_dir().join("tangent-cost-settings.json"),
+            );
+        }
+        let mut settings = ivory_ui::settings::Settings::default();
+        settings.show_recorder = true;
+        let app = IvoryApp::new(c.context(), settings, ivory_ui::host::Caps::DESKTOP);
+
+        // A camera frame that is not flat, so nothing can shortcut the upload.
+        let mut cam = vec![0u8; (w * h * 4) as usize];
+        for (i, px) in cam.chunks_exact_mut(4).enumerate() {
+            px[0] = (i % 251) as u8;
+            px[1] = (i / 7 % 253) as u8;
+            px[2] = (i / 13 % 249) as u8;
+            px[3] = 255;
+        }
+
+        let run = |c: &mut Compositor, n: i64| {
+            for i in 0..n {
+                let _ = c
+                    .frame(
+                        &app,
+                        Layout::default(),
+                        DisplayShows::default(),
+                        true,
+                        true,
+                        Some((&cam, w, h)),
+                        i * 66_666_667,
+                    )
+                    .expect("composite");
+            }
+            let _ = c.flush().expect("flush");
+        };
+
+        run(&mut c, 10); // warm: shaders, atlases, the first allocation of everything
+
+        let frames = 60_i64;
+        let c0 = cpu_seconds();
+        let t0 = std::time::Instant::now();
+        run(&mut c, frames);
+        let wall = t0.elapsed().as_secs_f64();
+        let cpu = cpu_seconds() - c0;
+
+        let soft = info.device_type == wgpu::DeviceType::Cpu;
+        println!();
+        println!("          {}", if soft { "SOFTWARE RASTERIZER" } else { "** HARDWARE **" });
+        println!("frames  : {frames} at {w}x{h}");
+        println!("CPU     : {:.3} s  ->  {:.2} ms/frame", cpu, cpu * 1000.0 / frames as f64);
+        println!(
+            "wall    : {:.3} s  ->  {:.2} ms/frame  ({:.1} composites/sec)",
+            wall,
+            wall * 1000.0 / frames as f64,
+            frames as f64 / wall
+        );
+        println!(
+            "          {:.0}% of one core to hold 15 fps",
+            (cpu / frames as f64) * 15.0 * 100.0
+        );
     }
 }
 

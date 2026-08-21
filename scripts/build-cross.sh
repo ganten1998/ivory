@@ -56,6 +56,15 @@ Libs: -L${libdir} -lasound
 Cflags: -I${includedir}
 PC
   echo "==> type-checking $target (stub alsa.pc, no sysroot)"
+  # **The library targets only.** `--all-targets` was tried and cannot work
+  # from here: it drags `alsa-sys`'s build script into a HOST build, where
+  # there is no ALSA and the stub .pc above does not apply. The Linux-only
+  # tests are checked on the Linux box instead.
+  #
+  # Nothing may go between the backslashes below. A comment there ends the
+  # continuation, the environment never reaches `cargo`, and the failure is
+  # alsa-sys panicking about pkg-config — which reads as a broken toolchain
+  # rather than as a broken line.
   PKG_CONFIG_ALLOW_CROSS=1 \
   PKG_CONFIG_PATH="$pcdir" \
   PKG_CONFIG_SYSROOT_DIR=/ \
