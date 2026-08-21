@@ -25,7 +25,6 @@
 
 use ivory_record::audio::ChannelPick;
 use ivory_ui::ports::{CaptureDevices, DeviceInfo};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// What the picker chose and what the reconciler managed to do about it.

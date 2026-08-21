@@ -596,7 +596,7 @@ mod tests {
             .collect();
         // A gated binding must be a LISTED one, or the gate hides a shortcut
         // the card was never going to mention in the first place.
-        for &(_, label, action, is_shown) in BINDINGS {
+        for &(_, label, action, _) in BINDINGS {
             if !available(action, Gates { recorder_shown: true, recorder_available: true, window_sizing: true }) {
                 panic!("{label} is dead even with every gate open");
             }

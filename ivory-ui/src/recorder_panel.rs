@@ -90,7 +90,7 @@
 use crate::fonts;
 use crate::recorder::{
     DEFAULT_BPM,
-    disk_text, gain_text, gain_to_fader, timecode, DeviceLabel, ExportSpec, Level, Meters,
+    gain_text, gain_to_fader, timecode, DeviceLabel, ExportSpec, Level, Meters,
     NumField, Preview, RecordState, RecorderView, SlotView, COUNT_IN_CHOICES, MAX_BPM, MIN_BPM,
     SLOTS,
 };
