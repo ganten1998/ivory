@@ -1,5 +1,11 @@
 [workspace]
 members = ["ivory-core", "ivory-ui", "ivory", "ivory-record", "ivory-host"]
+# `ivory-record/vendor/linuxvideo` is a patched copy of a crates.io crate, not
+# a crate of ours. A path dependency living inside the workspace directory has
+# to be either a member or excluded, and excluded is what it should be: it must
+# stay byte-comparable to upstream 0.3.5, which means no workspace lints and no
+# `cargo test --workspace` opinions about someone else's code.
+exclude = ["ivory-record/vendor/linuxvideo"]
 resolver = "2"
 
 [workspace.package]

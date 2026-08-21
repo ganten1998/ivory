@@ -1,0 +1,86 @@
+--- linuxvideo-0.3.5/src/lib.rs	2006-07-23 20:21:28.000000000 -0500
++++ vendor/src/lib.rs	2026-08-21 13:59:19.326815553 -0500
+@@ -405,11 +405,25 @@
+ 
+     /// Initializes streaming I/O mode.
+     pub fn into_stream(self) -> io::Result<ReadStream> {
++        self.into_stream_with(DEFAULT_BUFFER_COUNT)
++    }
++
++    /// Initializes streaming I/O mode with a specific number of buffers.
++    ///
++    /// [`ReadStream::dequeue`] holds a buffer for as long as its callback runs, so the
++    /// default of two leaves the driver exactly one to fill while the application looks
++    /// at a frame. A frame arriving in that window has nowhere to go and overwrites one
++    /// the application has not read yet. More buffers convert that loss into latency,
++    /// at the cost of one frame's memory each.
++    ///
++    /// The driver may allocate fewer than requested; [`ReadStream::buffer_count`]
++    /// reports how many it actually got.
++    pub fn into_stream_with(self, buffer_count: u32) -> io::Result<ReadStream> {
+         Ok(ReadStream::new(
+             self.file,
+             BufType::VIDEO_CAPTURE,
+             Memory::MMAP,
+-            DEFAULT_BUFFER_COUNT,
++            buffer_count,
+         )?)
+     }
+ }
+--- linuxvideo-0.3.5/src/stream.rs	2006-07-23 20:21:28.000000000 -0500
++++ vendor/src/stream.rs	2026-08-21 13:59:19.303815956 -0500
+@@ -231,6 +231,7 @@
+             flags: buf.flags,
+             data,
+             bytesused: buf.bytesused as usize,
++            sequence: buf.sequence,
+         };
+ 
+         let res = cb(view);
+@@ -241,6 +242,17 @@
+         res
+     }
+ 
++    /// Returns the number of buffers the driver actually allocated.
++    ///
++    /// `VIDIOC_REQBUFS` is a request, not a demand: a driver is free to grant fewer
++    /// buffers than were asked for, and it reports how many in the same call. Anything
++    /// reasoning about queue depth has to read it back rather than assume it got what
++    /// it asked for.
++    #[inline]
++    pub fn buffer_count(&self) -> usize {
++        self.buffers.buffers.len()
++    }
++
+     /// Tests whether the next call to [`ReadStream::dequeue`] will block.
+     ///
+     /// If this returns `false`, a filled buffer is already available and the next call to
+@@ -297,6 +309,7 @@
+     flags: BufFlag,
+     data: &'a [u8],
+     bytesused: usize,
++    sequence: u32,
+ }
+ 
+ impl<'a> ReadBufferView<'a> {
+@@ -321,6 +334,20 @@
+     pub fn raw_buffer(&self) -> &'a [u8] {
+         self.data
+     }
++
++    /// Returns the driver's sequence number for this frame.
++    ///
++    /// V4L2 increments this once per frame the hardware produced, whether or not the
++    /// application managed to dequeue it. A gap between the sequence numbers of two
++    /// consecutively dequeued buffers is therefore the number of frames the driver
++    /// filled and overwrote while every buffer was held elsewhere — the only way to
++    /// observe that loss, since it is otherwise entirely silent.
++    ///
++    /// Not every driver maintains this field; some leave it at zero.
++    #[inline]
++    pub fn sequence(&self) -> u32 {
++        self.sequence
++    }
+ }
+ 
+ impl Deref for ReadBufferView<'_> {

@@ -58,6 +58,51 @@ use super::{
 };
 use crate::audio::{DeviceState, Timebase};
 
+/// How many buffers to ask the driver for.
+///
+/// `linuxvideo`'s own default is two, and two is the number that makes loss
+/// invisible: [`ReadStream::dequeue`] holds one for as long as its callback
+/// runs, leaving the driver exactly one to fill. A frame arriving while both
+/// are spoken for overwrites one nobody read.
+///
+/// Six trades that for latency, which is the direction we want — a late frame
+/// is a frame we still have — and six is where the measurement puts the knee.
+/// With the capture thread stalled 300 ms every 15 frames at 720p, `seqprobe`
+/// loses 10 frames at two buffers, 5 at four, and none at six or eight. At the
+/// real workload it is insurance and nothing more: the steady state loses
+/// nothing at any depth, including two.
+///
+/// **Memory is charged at the uncompressed rate even for MJPEG.** uvcvideo
+/// sets `sizeimage` to the YUYV worst case — 1,843,200 bytes at 720p, measured,
+/// not the ~250 KB an actual JPEG occupies — so this queue costs 10.5 MB
+/// rather than the 1.5 MB a compressed-size estimate predicts.
+///
+/// Override with `IVORY_V4L2_BUFFERS` to measure the difference; the driver
+/// may grant fewer, and [`CameraStats::buffers_allocated`] reports what it
+/// actually gave.
+const DEFAULT_BUFFER_COUNT: u32 = 6;
+
+/// How many frames the driver filled and overwrote between two dequeues.
+///
+/// V4L2's `sequence` counts every frame the hardware produced, so consecutive
+/// dequeues differing by one mean nothing was missed and a difference of `n`
+/// means `n - 1` frames went by unseen.
+///
+/// `checked_sub`, not `wrapping_sub`: a driver that restarts its count
+/// mid-stream would otherwise turn one backwards step into four billion
+/// phantom drops. Backwards or unchanged both read as no loss, which for a
+/// counter feeding a take report is the right way to be wrong.
+fn frames_lost_between(prev: u32, seq: u32) -> u64 {
+    u64::from(seq.checked_sub(prev).unwrap_or(0).saturating_sub(1))
+}
+
+fn requested_buffer_count() -> u32 {
+    match std::env::var("IVORY_V4L2_BUFFERS") {
+        Ok(v) => v.trim().parse::<u32>().ok().filter(|n| *n > 0).unwrap_or(DEFAULT_BUFFER_COUNT),
+        Err(_) => DEFAULT_BUFFER_COUNT,
+    }
+}
+
 /// No TCC on Linux: whether a camera can be opened is decided by file
 /// permissions on the device node, and that failure is reported by `open`,
 /// where it happens, with the fix in the message.
@@ -332,13 +377,29 @@ fn capture_loop(
     // `ReadStream` holds mmap'd pointers and is not `Send`, so it is built on
     // the thread that will use it — which is also why `open` cannot surface
     // this particular failure synchronously.
-    let mut stream = match cap.into_stream() {
+    let mut stream = match cap.into_stream_with(requested_buffer_count()) {
         Ok(s) => s,
         Err(_) => {
             state.store(state_as_u8(DeviceState::Errored), Ordering::Relaxed);
             return;
         }
     };
+    stats.set_buffers_allocated(stream.buffer_count() as u32);
+
+    // **The driver's frame counter, which is the only witness to loss here.**
+    //
+    // V4L2 increments `sequence` once per frame the hardware produced, whether
+    // or not we dequeued it, so a gap between one dequeue and the next is a
+    // count of frames the driver filled and overwrote while we held every
+    // buffer. Nothing else on this platform can see them: there is no
+    // late-frame callback the way AVFoundation has one, and a buffer that was
+    // recycled under us arrives looking exactly like a buffer that was not.
+    //
+    // `None` until the first frame, because the first sequence number is a
+    // starting point and not a gap. Drivers that never maintain the field
+    // leave it at zero, which reads as no gaps — an undercount, never a false
+    // alarm.
+    let mut last_seq: Option<u32> = None;
 
     // **Built on the first compressed frame, not up front.** Choosing between
     // hardware and software means probing with a real frame, and a camera that
@@ -381,6 +442,14 @@ fn capture_loop(
         let r = stream.dequeue(|view| {
             // First statement, per the module's timebase contract.
             let host_ns = timebase.now();
+            // **Before the error check**, because an errored buffer still
+            // consumed a sequence number: skipping it here would report the
+            // next good frame as a drop.
+            let seq = view.sequence();
+            if let Some(prev) = last_seq {
+                stats.note_dropped_late_n(frames_lost_between(prev, seq));
+            }
+            last_seq = Some(seq);
             if view.is_error() {
                 stats.note_unreadable();
                 return Ok(());
@@ -575,5 +644,42 @@ impl Drop for LinuxCamera {
             // open and make an immediate reopen fail with EBUSY.
             let _ = join.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ordinary case, and the one that must never miscount: a camera
+    /// keeping up reports no loss at all.
+    #[test]
+    fn consecutive_frames_lose_nothing() {
+        assert_eq!(frames_lost_between(0, 1), 0);
+        assert_eq!(frames_lost_between(41, 42), 0);
+    }
+
+    #[test]
+    fn a_gap_is_the_frames_that_fell_in_it() {
+        assert_eq!(frames_lost_between(10, 12), 1);
+        assert_eq!(frames_lost_between(10, 20), 9);
+    }
+
+    /// Some drivers never touch the field. Reading zero forever has to mean
+    /// "nothing observed", not "every frame lost".
+    #[test]
+    fn a_driver_that_never_counts_reports_no_loss() {
+        assert_eq!(frames_lost_between(0, 0), 0);
+    }
+
+    /// **The one that would poison a take report.** A sequence that goes
+    /// backwards — a driver restarting its count on a format change, a device
+    /// that reuses numbers — must read as no loss rather than as `u32::MAX`
+    /// frames of it.
+    #[test]
+    fn a_backwards_sequence_is_not_four_billion_drops() {
+        assert_eq!(frames_lost_between(9_000, 3), 0);
+        assert_eq!(frames_lost_between(u32::MAX, 0), 0);
+        assert_eq!(frames_lost_between(42, 42), 0);
     }
 }

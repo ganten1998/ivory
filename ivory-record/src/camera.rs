@@ -83,7 +83,7 @@
 
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::audio::{DeviceState, Timebase};
@@ -932,6 +932,11 @@ pub struct CameraStats {
     /// Frames the capture thread deliberately did not convert. See
     /// [`FrameSlot::want`].
     frames_skipped: AtomicU64,
+    /// How many capture buffers the driver granted, or 0 before a stream is
+    /// running. Linux only: V4L2 lets the queue depth be asked for and then
+    /// reports what it actually gave, and that number is what
+    /// `frames_dropped_late` has to be read against.
+    buffers_allocated: AtomicU32,
     device_state: AtomicU8,
     /// Monotonic nanoseconds at the first and most recent delivery, for
     /// [`delivered_fps`](Self::delivered_fps). Zero until a frame arrives.
@@ -1064,6 +1069,18 @@ impl CameraStats {
         self.frames_dropped_late.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Several at once.
+    ///
+    /// macOS learns about a dropped frame one at a time, as the callback that
+    /// would have carried it does not arrive. V4L2 reports loss after the fact
+    /// and in bulk: a gap in the driver's sequence numbers says how many frames
+    /// it filled while every buffer was held, which can be more than one.
+    pub fn note_dropped_late_n(&self, n: u64) {
+        if n != 0 {
+            self.frames_dropped_late.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
     pub fn note_unreadable(&self) {
         self.frames_unreadable.fetch_add(1, Ordering::Relaxed);
     }
@@ -1079,6 +1096,15 @@ impl CameraStats {
 
     pub fn frames_skipped(&self) -> u64 {
         self.frames_skipped.load(Ordering::Relaxed)
+    }
+
+    pub fn set_buffers_allocated(&self, n: u32) {
+        self.buffers_allocated.store(n, Ordering::Relaxed);
+    }
+
+    /// 0 on platforms that do not have a say in the matter.
+    pub fn buffers_allocated(&self) -> u32 {
+        self.buffers_allocated.load(Ordering::Relaxed)
     }
 
     /// Clear the counters for a new take. Never during one.
