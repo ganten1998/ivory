@@ -1732,7 +1732,6 @@ mod shot {
                 },
                 what == "open",
             );
-            app.set_track_trim(9.5, 196.0);
         }
         // **The desk, with things on it.** The mixer is the one panel whose
         // faults are all proportional — a rack too narrow to read, a tick too

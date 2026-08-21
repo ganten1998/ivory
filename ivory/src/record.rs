@@ -1008,6 +1008,12 @@ pub struct Session {
     pending_note: Option<String>,
     /// A T0 supplied from outside; see [`arm_at`](Session::arm_at).
     arm_override: Option<Nanos>,
+    /// The next take's placement facts, pushed by the host every frame:
+    /// (timeline start s, head s, muted mask, soloed mask). Read once, at
+    /// `begin`, which is the only moment they are true OF anything.
+    take_facts: (f64, f64, u32, u32),
+    /// The same four, latched at `begin` for the manifest `stop` writes.
+    manifest_facts: (f64, f64, u32, u32),
     last: Option<Summary>,
     /// Latched across the take, because the meter's own latch is reset when the
     /// next one is armed and the user may not have looked yet.
@@ -1081,6 +1087,8 @@ impl Session {
             spec: ExportSpec::default(),
             pending_note: None,
             arm_override: None,
+            take_facts: (0.0, 0.0, 0, 0),
+            manifest_facts: (0.0, 0.0, 0, 0),
             last: None,
             clipped: false,
             finished: None,
@@ -1339,6 +1347,14 @@ impl Session {
     /// matching neither answer.
     /// The take's time signature. Ignored mid-take, like the source: a `.mid`
     /// whose bar lines changed halfway through is a file nobody can edit.
+    /// The next take's placement facts, pushed each frame so `begin` can
+    /// latch them at the one moment they are true of anything: where on the
+    /// timeline it starts, how much count-in its head will carry, and the
+    /// desk masks it is cut under.
+    pub fn set_take_facts(&mut self, timeline_start_s: f64, head_s: f64, muted: u32, soloed: u32) {
+        self.take_facts = (timeline_start_s, head_s, muted, soloed);
+    }
+
     pub fn set_meter(&mut self, meter: ivory_ui::recorder::TimeSignature) {
         if !self.state.is_active() {
             self.meter = meter;
@@ -1726,6 +1742,12 @@ impl Session {
     fn begin(&mut self, root: &std::path::Path, name: Option<&str>) {
         self.clipped = false;
         self.last = None;
+        // **The three facts only THIS moment can capture.** Where on the
+        // timeline the take begins, how much count-in the file's head will
+        // carry, and what desk it is being cut from — all latched into the
+        // manifest here, because a take placed on a lane afterwards has
+        // nothing else to ask. See `Manifest::timeline_start_seconds`.
+        let (timeline_start, head, muted, soloed) = self.take_facts;
         // The previous take's manifest must not be amendable once a new take
         // exists, or a slow encoder could write take N's video into take N+1.
         self.finished = None;
@@ -1749,6 +1771,7 @@ impl Session {
         // delay at the head of the file as silence the MIDI does not know about.
         self.t0 = self.arm_override.take().unwrap_or_else(|| self.timebase.now());
         self.started_at = at;
+        self.manifest_facts = (timeline_start, head, muted, soloed);
         self.started_instant = Some(Instant::now());
         // Keep the minute BEFORE T0: that is where the pedal-down and the
         // program change the .mid has to restate at tick 0 live.
@@ -2001,6 +2024,13 @@ impl Session {
         // the crystal actually measured. A manifest of defaults looks exactly
         // like a perfect take.
         let mut manifest = Manifest::starting(take.name(), self.started_at, t0);
+        // The placement facts latched at `begin` — see `Manifest`'s own docs
+        // for why each is irrecoverable after the fact.
+        let (timeline_start, head, muted, soloed) = self.manifest_facts;
+        manifest.timeline_start_seconds = timeline_start;
+        manifest.head_seconds = head;
+        manifest.heard_muted = muted;
+        manifest.heard_soloed = soloed;
         manifest.apply_timeline(&timeline);
         let frames = report.as_ref().map_or(0, |r| r.frames);
         if let Some(r) = &report {

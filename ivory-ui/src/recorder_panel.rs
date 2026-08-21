@@ -299,6 +299,10 @@ struct Layout {
     preview: Rect,
 
     // ── transport ──
+    /// The green button. Idle and audition only — during a take the slot is
+    /// EMPTY, because record owns the transport and a dead control is worse
+    /// than no control.
+    play: Rect,
     record: Rect,
     /// The steady red dot, which takes the record button's place while rolling.
     /// An indicator and not a control, so it is not a hit.
@@ -643,6 +647,7 @@ impl Layout {
             rolling,
             preview: Rect::NOTHING,
             heart: Rect::NOTHING,
+            play: Rect::NOTHING,
             record: Rect::NOTHING,
             dot: Rect::NOTHING,
             stop: Rect::NOTHING,
@@ -999,8 +1004,11 @@ impl Layout {
         let side = from_knob
             .map_or(buttons.height() * TRANSPORT_SIDE, |d| d * TRANSPORT_SIDE)
             .min(buttons.width() * 0.26);
+        // Four slots now that PLAY exists. Eighths rather than sixths, and
+        // BOTH layouts use them, so stop stands exactly where it stood when
+        // the take starts — the rule this row has always kept.
         let icon = |i: usize| {
-            let cx = buttons.left() + buttons.width() * (i as f32 * 2.0 + 1.0) / 6.0;
+            let cx = buttons.left() + buttons.width() * (i as f32 * 2.0 + 1.0) / 8.0;
             Rect::from_center_size(Pos2::new(cx, line), Vec2::splat(side))
         };
         // The typing box, under the knob and only ever drawn while somebody is
@@ -1012,16 +1020,18 @@ impl Layout {
             Vec2::new(self.tempo.width() * 0.88, self.tempo.height() * 0.42),
         );
         if rolling {
-            // No record button while rolling — pressing it would mean nothing,
-            // and a dead control is worse than no control. The steady dot
-            // stands exactly where it stood. No cog either: none of what it
-            // opens can be changed with an encoder running.
-            self.dot = icon(0);
-            self.stop = icon(1);
+            // No play and no record while rolling — pressing either would
+            // mean nothing, and a dead control is worse than no control. The
+            // steady dot stands where the record button stood, the stop where
+            // it always stands. No cog either: none of what it opens can be
+            // changed with an encoder running.
+            self.dot = icon(1);
+            self.stop = icon(2);
         } else {
-            self.record = icon(0);
-            self.stop = icon(1);
-            self.setup = icon(2);
+            self.play = icon(0);
+            self.record = icon(1);
+            self.stop = icon(2);
+            self.setup = icon(3);
         }
     }
 
@@ -1215,7 +1225,7 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 62] {
+    fn targets(&self) -> [(Rect, Produces); 63] {
         use Produces::{Along, AlongV, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
         // The dB at the end of a fader row, which is the box you type into.
@@ -1289,6 +1299,7 @@ impl Layout {
             // fact is one of them being wrong.
             (self.meter, Fixed(Hit::DismissClip)),
             (self.status_close, Fixed(Hit::DismissMessage)),
+            (self.play, Fixed(Hit::Play)),
             (self.record, Fixed(Hit::Record)),
             (self.stop, Fixed(Hit::Stop)),
             (self.setup, Fixed(Hit::OpenSetup)),
@@ -1421,6 +1432,8 @@ pub enum Hit {
     ShowAudioStatus,
     ToggleCountInInTake,
     ToggleHideElapsed,
+    /// The green button: audition from the playhead without making a take.
+    Play,
     Record,
     Stop,
     ChooseFolder,
@@ -1541,7 +1554,8 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 48] = [
+    pub const ALL: [Hit; 49] = [
+        Hit::Play,
         Hit::Record,
         Hit::Stop,
         Hit::OpenSetup,
@@ -1636,6 +1650,7 @@ impl Hit {
             Hit::ShowAudioStatus => "Setup: the audio system, devices, rate and buffer",
             Hit::ToggleCountInInTake => "Record the count-in into the take",
             Hit::ToggleHideElapsed => "Hide the elapsed time",
+            Hit::Play => "Play from the playhead, without recording",
             Hit::Stop => "Stop",
             Hit::ChooseFolder => "Choose folder",
             Hit::RevealFolder => "Show the folder",
@@ -1779,8 +1794,6 @@ fn num_field_key(f: NumField) -> usize {
         NumField::Track => 103,
         NumField::Tempo => 104,
         NumField::Meter => 105,
-        NumField::TrackIn => 106,
-        NumField::TrackOut => 107,
         NumField::Fx(fx) => 200 + fx.index(),
     }
 }
@@ -2114,7 +2127,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &RecorderView<'_>, s: &Settings
     let l = Layout::new(rect, view);
 
     draw_preview(painter, &l, view, &p);
-    draw_transport(painter, &l, &p);
+    draw_transport(painter, &l, view.playing, &p);
     draw_meter(painter, l.meter, view.meters, &p);
     draw_readout(painter, &l, view, &p);
     draw_monitor(painter, &l, view, &p);
@@ -2316,7 +2329,28 @@ fn draw_camera(
     painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
 }
 
-fn draw_transport(painter: &Painter, l: &Layout, p: &Palette) {
+fn draw_transport(painter: &Painter, l: &Layout, playing: bool, p: &Palette) {
+    if l.play.is_positive() {
+        // **The same kind of thing as record and stop**: a filled shape with a
+        // hairline, at the transport's own size — not a labelled row. A
+        // triangle of the record button's visual weight: an equilateral
+        // triangle of side D is 43% of the circle's ink, so it is drawn on the
+        // full rect where the square is inset.
+        let r = l.play;
+        let c = r.center();
+        let h = r.height() * 0.5;
+        let w = r.width() * 0.44;
+        let ink = if playing { PLAY_GREEN } else { toward(PLAY_GREEN, p.bg, 0.35) };
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(c.x - w * 0.7, c.y - h),
+                Pos2::new(c.x - w * 0.7, c.y + h),
+                Pos2::new(c.x + w * 1.1, c.y),
+            ],
+            ink,
+            Stroke::new(1.5_f32, p.line),
+        ));
+    }
     if l.record.is_positive() {
         let c = l.record.center();
         let rad = l.record.width() * 0.5;
@@ -3172,6 +3206,11 @@ fn draw_track(painter: &Painter, track: Rect, gain: f32, p: &Palette) {
 /// first take instead of after it.
 const CLIP_ZONE: f32 = 0.501; // -6 dBFS
 
+/// The play button's green: the meter's own healthy colour, because "the
+/// transport is moving" and "signal is flowing" are the same kind of good
+/// news.
+const PLAY_GREEN: Color32 = Color32::from_rgb(0x3D, 0xC0, 0x5A);
+
 /// The VU face, and the ink printed on it.
 ///
 /// Fixed, like [`CAP_BONE`] and for the same reason: a meter is an instrument
@@ -3470,7 +3509,7 @@ fn draw_vu(painter: &Painter, face: Rect, lv: Level, clipped: bool, p: &Palette)
 /// instruction and the number the player needs is the one the click is playing.
 /// A countdown in seconds against a click in beats is two clocks disagreeing in
 /// front of the person trying to come in on time.
-fn readout_text(state: RecordState, elapsed_s: f64) -> String {
+fn readout_text(state: RecordState, position_s: f64) -> String {
     match state {
         // Just the number. It said "3 OF 12" when the count was a running
         // total, and "3 OF 6" once it became a beat within the bar — at which
@@ -3480,7 +3519,11 @@ fn readout_text(state: RecordState, elapsed_s: f64) -> String {
         // saying out loud, as large as the box will draw it.
         RecordState::CountIn { beat, .. } => beat.to_string(),
         RecordState::Finishing => "FINISHING".to_owned(),
-        RecordState::Rolling | RecordState::Idle => timecode(elapsed_s),
+        // **The PLAYHEAD, not a stopwatch.** Click the waveform at 1:24 and
+        // this reads 1:24 before anything is pressed; press play or record
+        // and it counts up from there. Idle at zero it reads 0:00.0, which is
+        // also where stop puts it — one number, one meaning, every state.
+        RecordState::Rolling | RecordState::Idle => timecode(position_s),
     }
 }
 
@@ -3489,7 +3532,7 @@ fn draw_readout(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
     if !r.is_positive() {
         return;
     }
-    let text = readout_text(view.state, view.elapsed_s);
+    let text = readout_text(view.state, view.position_s);
     let colour = match view.state {
         RecordState::CountIn { .. } => p.rec,
         RecordState::Rolling | RecordState::Finishing => p.ink,
@@ -4692,9 +4735,8 @@ mod tests {
             // The nominal sizes `draw_track_panel` asks for, in the same order
             // the reader meets them.
             let title = l.title.height() * 0.42;
-            let field = l.field_in.height() * 0.34;
-            let reset = l.reset.height() * 0.30;
-            for (what, pt) in [("title", title), ("trim field", field), ("reset", reset)] {
+            let clock = l.clock.height() * 0.48;
+            for (what, pt) in [("title", title), ("clock", clock)] {
                 assert!(
                     pt <= 20.0,
                     "the {what} asks for {pt:.0} points at a {w:.0}-point window"
@@ -4704,9 +4746,10 @@ mod tests {
                     "the {what} shrank to {pt:.0} points and will not draw"
                 );
             }
-            // The numbers being typed into are the largest thing in the panel,
-            // which is the one piece of hierarchy it has.
-            assert!(field > title, "the trim readouts are not the subject");
+            // The position readout is the largest thing in the panel, which
+            // is the one piece of hierarchy it has: the panel exists to say
+            // where the playhead is.
+            assert!(clock > title, "the transport readout is not the subject");
         }
     }
 
@@ -5069,30 +5112,11 @@ mod tests {
         }
     }
 
-    /// **The trim reads as a fraction of the file, and zero means the end.**
-    #[test]
-    fn the_trim_spans_what_it_says() {
-        // Untrimmed: the whole file.
-        assert_eq!(trim_fractions(200.0, 0.0, 0.0), (0.0, 1.0));
-        // An out-point of zero is the END, everywhere — it is what the engine
-        // reads and what the settings hold.
-        assert_eq!(trim_fractions(200.0, 50.0, 0.0), (0.25, 1.0));
-        assert_eq!(trim_fractions(200.0, 50.0, 150.0), (0.25, 0.75));
-        // Past the ends it pins rather than drawing off the edge.
-        assert_eq!(trim_fractions(200.0, -9.0, 900.0), (0.0, 1.0));
-        // A file of no length has no fractions to give and must not divide.
-        assert_eq!(trim_fractions(0.0, 1.0, 2.0), (0.0, 1.0));
-        // Crossed points come back in order rather than as a negative span.
-        let (a, b) = trim_fractions(200.0, 150.0, 50.0);
-        assert!(a <= b, "{a} {b}");
-    }
-
     /// **Each part of the panel answers for itself, and the waveform's middle
     /// answers for nothing.**
     ///
-    /// A press in the body of a waveform is a press on a picture. Treating it
-    /// as "move whichever handle is nearest" would move half the track from
-    /// under a hand that was only pointing at something.
+    /// A press on the waveform is a locate to that second; a press beside it
+    /// is nothing; the X still closes.
     #[test]
     fn the_track_panel_hits_what_is_under_the_pointer() {
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
@@ -5104,34 +5128,25 @@ mod tests {
             "the panel hangs off the window"
         );
 
-        let at = |p: Pos2| track_hit_test(screen, anchor, 200.0, 50.0, 150.0, p);
+        let at = |p: Pos2| track_hit_test(screen, anchor, 200.0, p);
         assert_eq!(at(l.close.center()), Some(TrackHit::Close));
-        assert_eq!(at(l.reset.center()), Some(TrackHit::ClearTrim));
-        assert_eq!(at(l.field_in.center()), Some(TrackHit::TypeIn));
-        assert_eq!(at(l.field_out.center()), Some(TrackHit::TypeOut));
         // Outside the panel entirely: not ours, which is what dismisses it.
         assert_eq!(at(Pos2::new(5.0, 5.0)), None);
 
-        // The handles: 50/200 and 150/200 along the waveform.
+        // Anywhere along the waveform is that second of the file — the exact
+        // fraction, because the playhead drawn back is the same maths.
         let x = |t: f32| l.wave.left() + t * l.wave.width();
         let y = l.wave.center().y;
-        assert!(matches!(
-            at(Pos2::new(x(0.25), y)),
-            Some(TrackHit::DragIn(_))
-        ));
-        assert!(matches!(
-            at(Pos2::new(x(0.75), y)),
-            Some(TrackHit::DragOut(_))
-        ));
-        // And the middle of the kept part is neither.
-        assert_eq!(at(Pos2::new(x(0.5), y)), None, "the body moved a handle");
-
-        // The fraction a drag reports is where the pointer is, not where the
-        // handle was.
-        let Some(TrackHit::DragIn(t)) = at(Pos2::new(x(0.25) + 2.0, y)) else {
-            panic!("not the in handle")
-        };
-        assert!((t - 0.25).abs() < 0.02, "it reported {t}");
+        for (t, want) in [(0.0f32, 0.0f64), (0.25, 50.0), (0.5, 100.0), (0.75, 150.0)] {
+            match at(Pos2::new(x(t), y)) {
+                Some(TrackHit::Seek(s)) => {
+                    assert!((s - want).abs() < 1.0, "{t} of the wave asked for {s}")
+                }
+                other => panic!("{t} of the wave answered {other:?}"),
+            }
+        }
+        // The clock is a readout, not a control.
+        assert_eq!(at(l.clock.center()), None);
     }
 
     /// The panel stays on screen however near an edge its icon is.
@@ -5174,9 +5189,8 @@ mod tests {
                                 screen,
                                 anchor,
                                 track: &track,
-                                from: 9.5,
-                                to: 196.0,
-                                typing: (None, Some("1:12")),
+                                position_s: 72.5,
+                                playing: true,
                             },
                             &Settings::default(),
                         );
@@ -5592,6 +5606,8 @@ mod tests {
             for state in STATES {
                 for preview in [None, Some(pv)] {
                     let v = RecorderView {
+                            position_s: 0.0,
+                            playing: false,
                         input_monitor: false,
                         preview,
                         ..with_rack(state, racks()[1])
@@ -5782,6 +5798,8 @@ mod tests {
         for w in [320.0_f32, 640.0, 1300.0, 2600.0] {
             let r = band(w);
             let v = RecorderView {
+                position_s: 0.0,
+                playing: false,
                 input_monitor: false,
                 state: RecordState::Rolling,
                 ..idle()
@@ -5841,6 +5859,8 @@ mod tests {
                     for hide in [false, true] {
                         for rack in racks() {
                             let v = RecorderView {
+                position_s: 0.0,
+                playing: false,
                                 input_monitor: false,
                                 hide_elapsed: hide,
                                 ..with_rack(state, rack)
@@ -6139,6 +6159,8 @@ mod tests {
         ] {
             for hide in [false, true] {
                 let v = RecorderView {
+                position_s: 0.0,
+                playing: false,
                     input_monitor: false,
                     hide_elapsed: hide,
                     ..with_rack(state, racks()[1])
@@ -6450,6 +6472,8 @@ mod tests {
         let r = band(1300.0);
         for hide in [false, true] {
             let v = RecorderView {
+                position_s: 0.0,
+                playing: false,
                 input_monitor: false,
                 state: RecordState::CountIn { beat: 1, of: 4 },
                 hide_elapsed: hide,
@@ -6935,6 +6959,8 @@ mod tests {
                         for edit in typing_states() {
                             for rack in racks() {
                             let v = RecorderView {
+                position_s: 0.0,
+                playing: false,
                                 input_monitor: false,
                                 state,
                                 elapsed_s: 3725.0,
@@ -7992,31 +8018,16 @@ pub fn draw_setup(
 const TRACK_W: (f32, f32, f32) = (0.46, 320.0, 720.0);
 const TRACK_ASPECT: f32 = 0.44;
 
-/// How wide a trim handle's grab zone is, in points.
-///
-/// **Fatter than the line it draws.** The line is one point because a fat line
-/// hides the waveform under it; a one-point grab target is a control nobody
-/// can catch. Fourteen is a comfortable thumb at any window size.
-const TRIM_GRAB: f32 = 14.0;
-
-/// The shortest a trimmed track may be, in seconds.
-///
-/// **Not zero.** Two handles that can meet are two handles that can cross, and
-/// what that produces is a track which plays nothing — discovered by pressing
-/// Record and hearing silence.
-pub const MIN_TRIM: f64 = 0.05;
-
 /// Where everything in the track panel goes.
 pub struct TrackLayout {
     pub panel: Rect,
     pub title: Rect,
     pub close: Rect,
-    /// The waveform itself. Trim positions are fractions ALONG this.
+    /// The waveform — the timeline's first face. The playhead is a fraction
+    /// ALONG this, and a click anywhere on it is a locate.
     pub wave: Rect,
-    /// The two typed fields, and the button that clears the trim.
-    pub field_in: Rect,
-    pub field_out: Rect,
-    pub reset: Rect,
+    /// The transport timestamp, under the waveform: where the playhead is.
+    pub clock: Rect,
 }
 
 impl TrackLayout {
@@ -8025,9 +8036,7 @@ impl TrackLayout {
         title: Rect::NOTHING,
         close: Rect::NOTHING,
         wave: Rect::NOTHING,
-        field_in: Rect::NOTHING,
-        field_out: Rect::NOTHING,
-        reset: Rect::NOTHING,
+        clock: Rect::NOTHING,
     };
 
     pub fn new(screen: Rect, anchor: Rect) -> Self {
@@ -8057,16 +8066,16 @@ impl TrackLayout {
         // The rows carry two numbers and two buttons; they do not need a fifth
         // of the panel each.
         let title = slice_v(body, 0.00, 0.13);
-        let wave = slice_v(body, 0.20, 0.72);
-        let row = slice_v(body, 0.80, 1.00);
+        // Taller than the trim editor's was: the two typed fields and their
+        // button are gone, and the waveform is the control now.
+        let wave = slice_v(body, 0.20, 0.82);
+        let clock = slice_v(body, 0.86, 1.00);
         Self {
             panel,
             title: slice_h(title, 0.0, 0.86),
             close: slice_h(title, 0.88, 1.0),
             wave,
-            field_in: slice_h(row, 0.00, 0.30),
-            field_out: slice_h(row, 0.34, 0.64),
-            reset: slice_h(row, 0.74, 1.00),
+            clock,
         }
     }
 }
@@ -8074,44 +8083,42 @@ impl TrackLayout {
 /// What a press in the track panel means.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrackHit {
-    /// Drag the in-point to this fraction of the file.
-    DragIn(f32),
-    /// Drag the out-point to this fraction of the file.
-    DragOut(f32),
-    /// Type the in- or out-point instead.
-    TypeIn,
-    TypeOut,
-    /// Play the whole file again.
-    ClearTrim,
+    /// Put the playhead HERE, in seconds from 0:00. A click on the waveform
+    /// is a locate — where you point is where play auditions from and where
+    /// record starts writing.
+    Seek(f64),
     Close,
 }
 
-/// Where a trim point sits along the waveform, 0..=1.
+/// The click's half of the waveform's time axis: an x position on `wave` as
+/// seconds into a file `seconds` long.
 ///
-/// `out` of zero means the end of the file, everywhere: it is what the engine
-/// reads and what the settings hold, so the drawing has to agree.
-pub fn trim_fractions(seconds: f64, from: f64, to: f64) -> (f32, f32) {
-    if seconds <= 0.0 {
-        return (0.0, 1.0);
+/// `None` off the rect or for an empty file. The exact inverse of
+/// [`fraction_of`], and the pair is guard-tested as a round trip — the click
+/// and the playhead it produces may never disagree, because the playhead the
+/// user sees IS the answer to where they clicked.
+pub fn seconds_at(wave: Rect, seconds: f64, x: f32) -> Option<f64> {
+    if !wave.is_positive() || seconds <= 0.0 || !(wave.left()..=wave.right()).contains(&x) {
+        return None;
     }
-    let a = (from / seconds).clamp(0.0, 1.0) as f32;
-    let b = if to <= 0.0 {
-        1.0
-    } else {
-        (to / seconds).clamp(0.0, 1.0) as f32
-    };
-    (a.min(b), b.max(a))
+    let t = f64::from((x - wave.left()) / wave.width());
+    Some((t * seconds).clamp(0.0, seconds))
+}
+
+/// The playhead's half: a position in seconds as a fraction along the file.
+///
+/// `None` for an empty file or a position past its end — a playhead beyond
+/// the clip is drawn nowhere rather than pinned to the edge lying about where
+/// the transport is.
+pub fn fraction_of(seconds: f64, position_s: f64) -> Option<f32> {
+    if seconds <= 0.0 || position_s < 0.0 || position_s > seconds {
+        return None;
+    }
+    Some((position_s / seconds) as f32)
 }
 
 /// What a press at `pos` in the track panel means, if anything.
-pub fn track_hit_test(
-    screen: Rect,
-    anchor: Rect,
-    seconds: f64,
-    from: f64,
-    to: f64,
-    pos: Pos2,
-) -> Option<TrackHit> {
+pub fn track_hit_test(screen: Rect, anchor: Rect, seconds: f64, pos: Pos2) -> Option<TrackHit> {
     let l = TrackLayout::new(screen, anchor);
     if !l.panel.contains(pos) {
         return None;
@@ -8119,33 +8126,9 @@ pub fn track_hit_test(
     if l.close.contains(pos) {
         return Some(TrackHit::Close);
     }
-    if l.reset.contains(pos) {
-        return Some(TrackHit::ClearTrim);
-    }
-    if l.field_in.contains(pos) {
-        return Some(TrackHit::TypeIn);
-    }
-    if l.field_out.contains(pos) {
-        return Some(TrackHit::TypeOut);
-    }
-    if l.wave.is_positive() && l.wave.expand(TRIM_GRAB).contains(pos) {
-        let t = ((pos.x - l.wave.left()) / l.wave.width()).clamp(0.0, 1.0);
-        let (a, b) = trim_fractions(seconds, from, to);
-        let (xa, xb) = (
-            l.wave.left() + a * l.wave.width(),
-            l.wave.left() + b * l.wave.width(),
-        );
-        // **Whichever handle is nearer, and only if the press is near one.**
-        // A press in the middle of the waveform is not a request to move the
-        // end that happens to be closest — it is a press on the picture, and
-        // moving half the track under it would be the worst kind of surprise.
-        let (da, db) = ((pos.x - xa).abs(), (pos.x - xb).abs());
-        if da.min(db) <= TRIM_GRAB {
-            return Some(if da <= db {
-                TrackHit::DragIn(t)
-            } else {
-                TrackHit::DragOut(t)
-            });
+    if l.wave.contains(pos) {
+        if let Some(s) = seconds_at(l.wave, seconds, pos.x) {
+            return Some(TrackHit::Seek(s));
         }
     }
     None
@@ -8156,8 +8139,8 @@ pub fn track_popup_rect(screen: Rect, anchor: Rect) -> Rect {
     TrackLayout::new(screen, anchor).panel
 }
 
-/// A time in seconds as `m:ss.t`, which is how somebody reads a trim point.
-pub fn trim_text(seconds: f64) -> String {
+/// A time in seconds as `m:ss.t`, which is how somebody reads a position.
+pub fn time_text(seconds: f64) -> String {
     let s = seconds.max(0.0);
     format!("{}:{:04.1}", (s / 60.0) as u64, s % 60.0)
 }
@@ -8172,22 +8155,22 @@ pub struct TrackPanel<'a> {
     pub screen: Rect,
     pub anchor: Rect,
     pub track: &'a crate::ports::TrackInfo,
-    /// The trim, in seconds. `to` of zero is the end of the file.
-    pub from: f64,
-    pub to: f64,
-    /// What is being typed into the IN and OUT fields, if either is open.
-    pub typing: (Option<&'a str>, Option<&'a str>),
+    /// The playhead, in seconds from 0:00 — a measurement the host made, never
+    /// a clock this painter advances.
+    pub position_s: f64,
+    /// Whether the transport is moving, take or audition alike, so the
+    /// playhead can say so by colour.
+    pub playing: bool,
 }
 
-/// Draw the waveform, the trim, and the two numbers.
+/// Draw the waveform, the playhead, and where it is.
 pub fn draw_track_panel(painter: &Painter, at: TrackPanel<'_>, s: &Settings) {
     let TrackPanel {
         screen,
         anchor,
         track,
-        from,
-        to,
-        typing,
+        position_s,
+        playing,
     } = at;
     let l = TrackLayout::new(screen, anchor);
     if !l.panel.is_positive() {
@@ -8202,7 +8185,7 @@ pub fn draw_track_panel(painter: &Painter, at: TrackPanel<'_>, s: &Settings) {
         let name = if track.is_empty() {
             "no backing track loaded".to_owned()
         } else {
-            format!("{}   {}", track.name, trim_text(track.seconds))
+            format!("{}   {}", track.name, time_text(track.seconds))
         };
         // 0.42, the same fraction the effect panels' titles use, so the two
         // read as the same size of thing on screen rather than the same
@@ -8223,8 +8206,6 @@ pub fn draw_track_panel(painter: &Painter, at: TrackPanel<'_>, s: &Settings) {
     // The waveform, in the same recess the meters use.
     if l.wave.is_positive() {
         painter.rect_filled(l.wave, 2.0, METER_FACE);
-        let (a, b) = trim_fractions(track.seconds, from, to);
-        let x_at = |t: f32| l.wave.left() + t * l.wave.width();
         let mid = l.wave.center().y;
         let half = l.wave.height() * 0.46;
         if track.wave.is_empty() {
@@ -8236,21 +8217,20 @@ pub fn draw_track_panel(painter: &Painter, at: TrackPanel<'_>, s: &Settings) {
         } else {
             // One column per point, sampled from the envelope — the envelope
             // is a thousand buckets and the panel is a few hundred points
-            // wide, so this is a decimation and not a stretch.
+            // wide, so this is a decimation and not a stretch. **Played is
+            // lit, unplayed is dimmed**: the boundary between the two IS the
+            // playhead, so the picture carries the position even before the
+            // line over it is found.
+            let played = fraction_of(track.seconds, position_s).unwrap_or(0.0);
             let cols = l.wave.width().max(1.0) as usize;
             for i in 0..cols {
                 let t = i as f32 / cols as f32;
                 let v = track.wave[(t * track.wave.len() as f32) as usize % track.wave.len()];
                 let x = l.wave.left() + i as f32;
-                // **Outside the trim is drawn and dimmed, not hidden.** What
-                // was cut is how somebody knows they cut the right thing, and
-                // a waveform that jumped to only the kept part every time a
-                // handle moved would be impossible to aim.
-                let lit = t >= a && t <= b;
-                let ink = if lit {
+                let ink = if t <= played {
                     Color32::from_rgb(0x5f, 0xc9, 0x8a)
                 } else {
-                    Color32::from_rgba_unmultiplied(0x5f, 0xc9, 0x8a, 52)
+                    Color32::from_rgba_unmultiplied(0x5f, 0xc9, 0x8a, 96)
                 };
                 let h = (v * half).max(0.5);
                 painter.rect_filled(
@@ -8259,34 +8239,47 @@ pub fn draw_track_panel(painter: &Painter, at: TrackPanel<'_>, s: &Settings) {
                     ink,
                 );
             }
-            // The handles, over the top.
-            for x in [x_at(a), x_at(b)] {
+            // The playhead, over the top: ivory at rest, the record button's
+            // own red while the transport moves, with a small cap so it reads
+            // as a marker rather than a scratch on the picture.
+            if let Some(t) = fraction_of(track.seconds, position_s) {
+                let x = l.wave.left() + t * l.wave.width();
+                let ink = if playing {
+                    Color32::from_rgb(0xE8, 0x3A, 0x4E)
+                } else {
+                    Color32::from_rgb(0xff, 0xf4, 0xe0)
+                };
                 painter.line_segment(
                     [Pos2::new(x, l.wave.top()), Pos2::new(x, l.wave.bottom())],
-                    Stroke::new(1.5_f32, Color32::from_rgb(0xff, 0xf4, 0xe0)),
+                    Stroke::new(1.5_f32, ink),
                 );
+                let cap = 4.0_f32.min(l.wave.height() * 0.08);
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        Pos2::new(x - cap, l.wave.top()),
+                        Pos2::new(x + cap, l.wave.top()),
+                        Pos2::new(x, l.wave.top() + cap * 1.6),
+                    ],
+                    ink,
+                    Stroke::NONE,
+                ));
             }
         }
     }
 
-    // The two numbers and the way back.
-    let (kept_from, kept_to) = (from, if to <= 0.0 { track.seconds } else { to });
-    for (r, label, value, typed) in [
-        (l.field_in, "IN", kept_from, typing.0),
-        (l.field_out, "OUT", kept_to, typing.1),
-    ] {
-        if !r.is_positive() {
-            continue;
-        }
-        painter.rect_filled(r, 2.0, p.field);
-        let text = typed.map_or_else(|| trim_text(value), |t| format!("{t}_"));
-        let shown = format!("{label} {text}");
-        // A little larger than the title: these are the numbers being read and
-        // typed into, which is what the panel is for.
-        let size = fit_text(r.shrink(r.width() * 0.06), &shown, r.height() * 0.34);
+    // The transport timestamp: where the playhead is, against how long the
+    // file runs. The one number this panel exists to show.
+    if l.clock.is_positive() {
+        let shown = format!("{}  /  {}", time_text(position_s), time_text(track.seconds));
+        let size = fit_text(l.clock, &shown, l.clock.height() * 0.48);
         if size >= MIN_TEXT {
-            painter.text(r.center(), Align2::CENTER_CENTER, &shown, font(size), p.ink);
+            painter.text(
+                l.clock.center(),
+                Align2::CENTER_CENTER,
+                &shown,
+                font(size),
+                p.ink,
+            );
         }
     }
-    draw_word_button_sized(painter, l.reset, &["WHOLE FILE", "WHOLE"], 0.30, &p);
 }

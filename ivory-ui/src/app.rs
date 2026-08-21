@@ -391,7 +391,7 @@ pub struct IvoryApp {
     fx_open: Option<recorder_panel::Fx>,
     /// The backing track's waveform panel, and which handle a hand is on.
     track_open: bool,
-    track_drag: Option<bool>,
+
     /// The row of that panel a drag is on, once one has started. `&'static
     /// str` because it is the settings KEY — the same thing the panel reports
     /// and the host reads back, so a drag cannot end up writing to a row it
@@ -779,7 +779,7 @@ impl IvoryApp {
             input_monitor: false,
             fx_open: None,
             track_open: false,
-            track_drag: None,
+
             fx_drag: None,
             fx_defaults: crate::ports::EffectDefaults::default(),
             sounding: std::collections::BTreeSet::new(),
@@ -2331,7 +2331,6 @@ impl IvoryApp {
                     // fifteen points tall.
                     if recorder_panel::track_icon(r, &view).is_some_and(|i| i.contains(pos)) {
                         self.track_open = true;
-                        self.track_drag = None;
                         return;
                     }
                     if recorder_panel::hit_test(r, &view, pos)
@@ -2425,14 +2424,11 @@ impl IvoryApp {
 
         // The backing track's panel, on the same terms as the effect panels.
         if self.track_open {
-            if primary_pressed || (pointer_down && self.track_drag.is_some()) {
+            if primary_pressed {
                 if let Some(pos) = pointer {
                     self.press_in_track_panel(ui.max_rect(), pos, primary_pressed);
                 }
                 return;
-            }
-            if pointer_released {
-                self.track_drag = None;
             }
         }
 
@@ -3063,95 +3059,39 @@ impl IvoryApp {
         recorder_panel::track_icon(self.last_band, &view).unwrap_or(Rect::NOTHING)
     }
 
-    /// A press or a drag inside the backing track's panel.
+    /// A press inside the backing track's panel.
     ///
-    /// **A drag stays on the handle it started on**, the same rule the effect
-    /// panels' rows follow: the two handles meet when a track is trimmed to
-    /// nothing, and a hand that crossed over would start dragging the other
-    /// one from under itself.
+    /// **A click on the waveform is a LOCATE.** The panel stopped being a trim
+    /// editor — trim is gone — and became the timeline's first face: press
+    /// where you want the playhead and the transport goes there, rolling or
+    /// not. The maths goes through `seconds_at`, whose inverse draws the
+    /// playhead, so a click and the line it produces cannot disagree.
     fn press_in_track_panel(&mut self, screen: Rect, pos: Pos2, pressed: bool) {
         let anchor = self.track_anchor();
-        let seconds = self.track.seconds;
-        if let Some(is_in) = self.track_drag.filter(|_| !pressed) {
-            let l = recorder_panel::TrackLayout::new(screen, anchor);
-            if l.wave.is_positive() {
-                let t = ((pos.x - l.wave.left()) / l.wave.width()).clamp(0.0, 1.0);
-                self.set_trim(is_in, f64::from(t) * seconds);
-            }
-            return;
-        }
+        self.press_in_track_panel_at(screen, anchor, pos, pressed);
+    }
+
+    /// The same, with the anchor handed in — the testable half, because the
+    /// anchor comes from the band's live layout and a headless test has none.
+    fn press_in_track_panel_at(&mut self, screen: Rect, anchor: Rect, pos: Pos2, pressed: bool) {
         if !pressed {
             return;
         }
-        let hit = recorder_panel::track_hit_test(
-            screen,
-            anchor,
-            seconds,
-            self.settings.track_in,
-            self.settings.track_out,
-            pos,
-        );
-        match hit {
+        let seconds = self.track.seconds;
+        match recorder_panel::track_hit_test(screen, anchor, seconds, pos) {
             Some(recorder_panel::TrackHit::Close) => {
                 self.track_open = false;
-                self.track_drag = None;
             }
-            Some(recorder_panel::TrackHit::ClearTrim) => {
-                self.settings.track_in = 0.0;
-                self.settings.track_out = 0.0;
-                self.save_settings();
-            }
-            Some(recorder_panel::TrackHit::TypeIn) => {
-                self.num_edit = Some(recorder::NumEdit::new(recorder::NumField::TrackIn));
-            }
-            Some(recorder_panel::TrackHit::TypeOut) => {
-                self.num_edit = Some(recorder::NumEdit::new(recorder::NumField::TrackOut));
-            }
-            Some(recorder_panel::TrackHit::DragIn(t)) => {
-                self.track_drag = Some(true);
-                self.set_trim(true, f64::from(t) * seconds);
-            }
-            Some(recorder_panel::TrackHit::DragOut(t)) => {
-                self.track_drag = Some(false);
-                self.set_trim(false, f64::from(t) * seconds);
+            Some(recorder_panel::TrackHit::Seek(seconds)) => {
+                self.request_recorder(recorder::RecorderRequest::Locate(seconds));
             }
             // Inside the panel and on nothing: swallowed. Outside: dismissed.
             None => {
                 if !recorder_panel::track_popup_rect(screen, anchor).contains(pos) {
                     self.track_open = false;
-                    self.track_drag = None;
                 }
             }
         }
-    }
-
-    /// Move one trim point, keeping the two in order.
-    ///
-    /// **They may not cross.** An out-point before the in-point is a track
-    /// that plays nothing, and the way a person discovers it is by pressing
-    /// Record and hearing silence.
-    fn set_trim(&mut self, is_in: bool, seconds: f64) {
-        let len = self.track.seconds;
-        let want = seconds.clamp(0.0, len);
-        if is_in {
-            let end = if self.settings.track_out <= 0.0 {
-                len
-            } else {
-                self.settings.track_out
-            };
-            self.settings.track_in = want.min((end - recorder_panel::MIN_TRIM).max(0.0));
-        } else {
-            // Landing on the very end means "to the end", which is the zero
-            // the engine and the settings both read as "no out-point" — so a
-            // track dragged back to full length stops carrying an out-point
-            // that would have to be updated if the file were ever replaced.
-            self.settings.track_out = if want >= len - recorder_panel::MIN_TRIM {
-                0.0
-            } else {
-                want.max(self.settings.track_in + recorder_panel::MIN_TRIM)
-            };
-        }
-        self.save_settings_soon();
     }
 
     /// A press or a drag inside the open effect panel.
@@ -3376,31 +3316,15 @@ impl IvoryApp {
     /// Remember which file the track came from, so it loads again next launch.
     pub fn set_track_path(&mut self, path: String) {
         self.settings.track_path = path;
-        // A fresh file starts untrimmed: the in and out points belonged to the
-        // one before it, and a track that opens already cut to somebody else's
-        // length is a track that looks broken.
-        self.settings.track_in = 0.0;
-        self.settings.track_out = 0.0;
         self.save_settings();
     }
 
-    /// The backing track's file and trim, for the host to reload it at launch.
-    pub fn track_settings(&self) -> (String, f64, f64) {
-        (
-            self.settings.track_path.clone(),
-            self.settings.track_in,
-            self.settings.track_out,
-        )
+    /// The backing track's file, for the host to reload it at launch.
+    pub fn track_settings(&self) -> String {
+        self.settings.track_path.clone()
     }
 
-    /// Put the trim back after a reload. See `load_track_at_launch`.
-    pub fn set_track_trim(&mut self, from: f64, to: f64) {
-        self.settings.track_in = from.max(0.0);
-        self.settings.track_out = to.max(0.0);
-    }
-
-    /// The backing track's level, trim and length, for the host to push at the
-    /// engine. Seconds, because that is what the settings hold.
+    /// The backing track's level, for the host to push at the engine.
     pub fn track_playback(&self) -> f32 {
         self.settings.track_gain as f32
     }
@@ -3853,6 +3777,10 @@ impl IvoryApp {
         use recorder::RecorderRequest as R;
         match hit {
             Hit::Record => self.request_recorder(R::Toggle),
+            // The audition. The host ignores it while a take is writing;
+            // pressed mid-audition it stops and the playhead goes home to
+            // 0:00, which is `Transport::toggle_play`'s half of the rule.
+            Hit::Play => self.request_recorder(R::Play),
             Hit::Stop => self.request_recorder(R::Stop),
             Hit::DismissClip => self.request_recorder(R::DismissClip),
             // Opens the menu, led by the Recorder's own categories, at the
@@ -4440,18 +4368,8 @@ impl IvoryApp {
             }
             return;
         }
-        // The trim points are not `Hit`s either: they belong to a panel rather
-        // than to a control in the band, and they are the only two numbers
-        // here measured in time.
-        if matches!(edit.field, F::TrackIn | F::TrackOut) {
-            if let Some(t) = recorder::parse_time(&edit.text) {
-                self.set_trim(edit.field == F::TrackIn, t);
-                self.save_settings();
-            }
-            return;
-        }
         let hit = match edit.field {
-            F::Meter | F::TrackIn | F::TrackOut => None,
+            F::Meter => None,
             F::Tempo => recorder::parse_bpm(&edit.text).map(Hit::SetTempo),
             // The setters take a FADER POSITION, not a gain, so a typed dB has
             // to go back through the same curve the drag uses. Doing it here
@@ -6948,24 +6866,15 @@ impl IvoryApp {
         if self.track_open {
             let anchor = self.track_anchor();
             if anchor.is_positive() {
-                let typing = |f: recorder::NumField| {
-                    self.num_edit
-                        .as_ref()
-                        .filter(|e| e.field == f)
-                        .map(|e| e.text.as_str())
-                };
                 recorder_panel::draw_track_panel(
                     ui.painter(),
                     recorder_panel::TrackPanel {
                         screen: ui.max_rect(),
                         anchor,
                         track: &self.track,
-                        from: self.settings.track_in,
-                        to: self.settings.track_out,
-                        typing: (
-                            typing(recorder::NumField::TrackIn),
-                            typing(recorder::NumField::TrackOut),
-                        ),
+                        position_s: self.recorder.position_s,
+                        playing: self.recorder.playing
+                            || matches!(self.recorder.state, recorder::RecordState::Rolling),
                     },
                     &self.settings,
                 );
@@ -9367,12 +9276,14 @@ mod tests {
         );
     }
 
-    /// **The two trim handles may not cross.**
+    /// **A click on the waveform is a locate, and the maths is the drawn
+    /// playhead's exact inverse.**
     ///
-    /// An out-point before the in-point is a track that plays nothing, and the
-    /// way somebody finds out is by pressing Record and hearing silence.
+    /// This replaced the trim tests — trim is gone; the panel's one gesture is
+    /// "put the playhead where I pressed", and the host answers it with
+    /// `RecorderRequest::Locate` in seconds.
     #[test]
-    fn the_trim_handles_stay_in_order() {
+    fn a_click_on_the_waveform_asks_for_that_second_of_the_file() {
         let (_, mut app) = headless_with_fx(Caps::DESKTOP);
         app.set_track_for_shot(
             crate::ports::TrackInfo {
@@ -9381,42 +9292,58 @@ mod tests {
                 wave: vec![0.5; 100],
                 error: String::new(),
             },
-            false,
+            true,
         );
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let anchor = Rect::from_min_size(Pos2::new(600.0, 40.0), Vec2::new(20.0, 15.0));
+        let l = recorder_panel::TrackLayout::new(screen, anchor);
+        assert!(l.wave.is_positive(), "the panel has no waveform");
 
-        app.set_trim(true, 50.0);
-        app.set_trim(false, 150.0);
-        assert!((app.settings.track_in - 50.0).abs() < 1.0e-6);
-        assert!((app.settings.track_out - 150.0).abs() < 1.0e-6);
+        // The middle of the waveform is the middle of the file.
+        let mid = Pos2::new(l.wave.center().x, l.wave.center().y);
+        match recorder_panel::track_hit_test(screen, anchor, 200.0, mid) {
+            Some(recorder_panel::TrackHit::Seek(s)) => {
+                assert!((s - 100.0).abs() < 1.5, "the middle asked for {s} of 200");
+            }
+            other => panic!("a click on the waveform answered {other:?}"),
+        }
 
-        // Dragging the in-point past the out-point stops at it.
-        app.set_trim(true, 180.0);
-        assert!(
-            app.settings.track_in < app.settings.track_out,
-            "in {} is not before out {}",
-            app.settings.track_in,
-            app.settings.track_out
-        );
-        // And the other way.
-        app.set_trim(false, 1.0);
-        assert!(app.settings.track_out > app.settings.track_in);
-
-        // Dragged back to the very end, the out-point becomes "no out-point",
-        // which is the zero the engine and the settings both read as the end.
-        app.set_trim(true, 0.0);
-        app.set_trim(false, 200.0);
-        assert_eq!(app.settings.track_out, 0.0);
-
-        // Past either end it pins inside the file.
-        app.set_trim(true, 9_000.0);
-        assert!(app.settings.track_in <= 200.0);
-        app.set_trim(true, -5.0);
-        assert_eq!(app.settings.track_in, 0.0);
+        // And the app turns it into a Locate request, in those seconds.
+        app.press_in_track_panel_at(screen, anchor, mid, true);
+        match app.take_recorder_request() {
+            Some(recorder::RecorderRequest::Locate(s)) => {
+                assert!((s - 100.0).abs() < 1.5, "the locate asked for {s}");
+            }
+            other => panic!("the press produced {other:?}"),
+        }
     }
 
-    /// A trim typed as a time lands where a player's display would say.
+    /// The waveform's two mappings are exact inverses, at every position and
+    /// at a non-zero start of nothing — the playhead the user sees IS the
+    /// answer to where they clicked, so the pair may never disagree.
     #[test]
-    fn a_typed_trim_reads_both_ways_of_writing_a_time() {
+    fn the_waveform_time_axis_round_trips() {
+        let wave = Rect::from_min_size(Pos2::new(37.0, 10.0), Vec2::new(613.0, 80.0));
+        let seconds = 214.0;
+        for x in [wave.left(), wave.left() + 100.0, wave.center().x, wave.right()] {
+            let s = recorder_panel::seconds_at(wave, seconds, x)
+                .expect("on the waveform is on the axis");
+            let t = recorder_panel::fraction_of(seconds, s).expect("inside the file");
+            let back = wave.left() + t * wave.width();
+            assert!(
+                (back - x).abs() < 0.5,
+                "x {x} became {s}s became x {back}"
+            );
+        }
+        // Off the rect and past the end are both nowhere, not clamped lies.
+        assert_eq!(recorder_panel::seconds_at(wave, seconds, wave.left() - 5.0), None);
+        assert_eq!(recorder_panel::fraction_of(seconds, 300.0), None);
+        assert_eq!(recorder_panel::fraction_of(0.0, 0.0), None);
+    }
+
+    /// A position typed or printed reads both ways of writing a time.
+    #[test]
+    fn a_printed_time_is_accepted_back() {
         assert_eq!(recorder::parse_time("12.5"), Some(12.5));
         assert_eq!(recorder::parse_time("1:12.5"), Some(72.5));
         assert_eq!(recorder::parse_time(" 2:00 "), Some(120.0));
@@ -9426,10 +9353,9 @@ mod tests {
         assert_eq!(recorder::parse_time("soon"), None);
         assert_eq!(recorder::parse_time("-4"), None);
         assert_eq!(recorder::parse_time("1:-4"), None);
-        // What the panel PRINTS is what the field ACCEPTS, which is the whole
-        // reason the minutes form is parsed at all.
+        // What the panel PRINTS is what a field would ACCEPT.
         for t in [0.0_f64, 9.5, 72.5, 196.0] {
-            let shown = recorder_panel::trim_text(t);
+            let shown = recorder_panel::time_text(t);
             let back = recorder::parse_time(&shown)
                 .unwrap_or_else(|| panic!("{shown} is printed and not accepted"));
             assert!((back - t).abs() < 0.06, "{shown} came back as {back}");

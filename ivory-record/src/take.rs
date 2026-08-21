@@ -1121,6 +1121,30 @@ pub struct Manifest {
     /// `T0` in the recorder's monotonic timebase, so a log line can be lined up
     /// against the manifest without going through the wall clock.
     pub t0_monotonic_ns: Nanos,
+    /// Where on the PROJECT timeline this take's frame 0 sits, in seconds.
+    ///
+    /// **Irrecoverable if not written now**: a take recorded at a playhead of
+    /// 1:24 can only be placed on a lane afterwards if somebody wrote down
+    /// where the playhead was, and nothing else did. Zero for every take made
+    /// before locate existed, which is also where those takes belong.
+    pub timeline_start_seconds: f64,
+    /// How long the head of the FILE runs before the musical downbeat, in
+    /// seconds. Zero unless the count-in was recorded into the take.
+    ///
+    /// The other irrecoverable: with count-in-in-take on, writing starts at
+    /// the press while the click counts on into the file, so frame 0 is one
+    /// or two bars before the music. A take dropped onto a lane at
+    /// `timeline_start_seconds` without this lands that many bars late — a
+    /// bar-scale error, not a millisecond one — and the setting it derives
+    /// from can be flipped tomorrow, so it cannot be reconstructed.
+    pub head_seconds: f64,
+    /// The desk's mute and solo masks as the take began, by desk index.
+    ///
+    /// What the take was CUT FROM. The take is the desk output, so a muted
+    /// channel is genuinely absent from the file — and afterwards nothing
+    /// could say whether the piano was silent or switched off.
+    pub heard_muted: u32,
+    pub heard_soloed: u32,
     pub duration_seconds: f64,
     pub clock: ClockKind,
     pub audio: AudioReport,
@@ -1142,6 +1166,10 @@ impl Manifest {
             aborted_reason: None,
             started,
             t0_monotonic_ns: t0,
+            timeline_start_seconds: 0.0,
+            head_seconds: 0.0,
+            heard_muted: 0,
+            heard_soloed: 0,
             duration_seconds: 0.0,
             clock: ClockKind::Synthetic,
             audio: AudioReport::default(),
@@ -1214,6 +1242,10 @@ impl Manifest {
                         Json::Int(i64::from(self.started.utc_offset_seconds)),
                     ),
                     ("monotonic_ns", Json::Int(self.t0_monotonic_ns)),
+                    ("timeline_start_seconds", Json::Num(self.timeline_start_seconds)),
+                    ("head_seconds", Json::Num(self.head_seconds)),
+                    ("heard_muted", Json::Int(i64::from(self.heard_muted))),
+                    ("heard_soloed", Json::Int(i64::from(self.heard_soloed))),
                 ]),
             ),
             ("duration_seconds", Json::Num(self.duration_seconds)),

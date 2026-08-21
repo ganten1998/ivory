@@ -233,6 +233,12 @@ pub struct RecorderView<'a> {
     /// Seconds since the take started writing. Zero in `Idle` and during
     /// pre-roll.
     pub elapsed_s: f64,
+    /// The playhead, in seconds from 0:00. What the readout shows in every
+    /// state but the count-in: click the waveform at 1:24 and this reads 1:24
+    /// before anything is pressed, then counts up from there.
+    pub position_s: f64,
+    /// The green button's audition is running.
+    pub playing: bool,
     pub meters: Meters,
     /// The OUTPUT's levels — after the effects, after the limiter, after the
     /// master, click included. Not the same signal as `meters`, which is what
@@ -329,6 +335,8 @@ impl RecorderView<'_> {
             input_monitor: false,
             state: RecordState::Idle,
             elapsed_s: 0.0,
+            position_s: 0.0,
+            playing: false,
             meters: Meters::SILENT,
             master: Meters::SILENT,
             gr_db: 0.0,
@@ -794,6 +802,8 @@ impl RecorderState {
             input_monitor: false,
             state: self.state,
             elapsed_s: self.elapsed_s,
+            position_s: self.position_s,
+            playing: self.playing,
             meters: self.meters,
             master: self.master,
             gr_db: self.gr_db,
@@ -1873,9 +1883,6 @@ pub enum NumField {
     Master,
     /// The backing track's level, in decibels like the faders beside it.
     Track,
-    /// The backing track's trim points, typed as `m:ss.t` or as seconds.
-    TrackIn,
-    TrackOut,
     /// One of the six effect knobs, typed as a PERCENT. Every other field
     /// here is typed in the unit it is displayed in, and "40" for four tenths
     /// wet is the only reading of a send anybody has ever wanted to write.

@@ -1558,7 +1558,16 @@ impl DesktopApp {
                     let wait = if in_take { 0 } else { beats };
                     self.recorder.session.toggle(&root, name.as_deref(), wait, spec);
                 }
-                R::Stop => self.recorder.session.stop(),
+                // **One stop for both machines.** The square ends whichever
+                // is running: the take by the session's own stop, the audition
+                // by the transport's toggle — and either way the falling edge
+                // in `Transport::push` is what returns the playhead to 0:00.
+                R::Stop => {
+                    self.recorder.session.stop();
+                    if self.recorder.transport.playing() {
+                        self.recorder.transport.toggle_play();
+                    }
+                }
                 // **Every latch, or the light does not go out.** The warning
                 // is an OR across the input tracker, the take summary and the
                 // instrument bus's own — and the VU paints itself red from the
@@ -1928,7 +1937,7 @@ impl DesktopApp {
     /// nobody has asked for yet is not.
     #[cfg(feature = "recorder")]
     fn load_track_at_launch(&mut self) {
-        let (path, from, to) = self.app.track_settings();
+        let path = self.app.track_settings();
         if path.is_empty() {
             return;
         }
@@ -1937,11 +1946,6 @@ impl DesktopApp {
             return;
         }
         self.load_track(&path);
-        // The trim is put BACK, because it belongs to this file — which is the
-        // one being reloaded. `set_track_path` clears it, on the reasoning
-        // that a NEW file should not open already cut to the last one's
-        // length, and that reasoning does not apply here.
-        self.app.set_track_trim(from, to);
     }
 
     /// What to do with a chosen folder, whichever picker chose it.
@@ -2442,6 +2446,35 @@ impl DesktopApp {
         // machine with no monitor (or one another app holds) would have kept
         // counting and writing 4/4 while the band showed 6/8.
         self.recorder.session.set_meter(self.app.time_signature());
+        // The placement facts, fresh each frame so `begin` latches this
+        // frame's truth: the playhead (where the take will start on the
+        // timeline), the head the count-in will leave in the file, and the
+        // desk masks the take is cut under.
+        {
+            let engine = self.recorder.engine.as_ref();
+            let rate = engine.map_or(0.0, |e| f64::from(e.output().sample_rate));
+            let timeline_start = self.recorder.transport.position_s(engine, rate);
+            let head = if self.app.count_in_in_take() {
+                let beats = f64::from(self.app.count_in_beats());
+                let bpm = self.app.tempo_bpm().max(1.0);
+                beats * 60.0 / bpm
+            } else {
+                // A pre-roll count-in delays the file, it is not IN it.
+                0.0
+            };
+            let desk = self.app.desk();
+            let mask = |bits: &[bool]| {
+                bits.iter()
+                    .enumerate()
+                    .fold(0u32, |m, (i, b)| if *b && i < 32 { m | 1 << i } else { m })
+            };
+            self.recorder.session.set_take_facts(
+                timeline_start,
+                head,
+                mask(&desk.muted),
+                mask(&desk.soloed),
+            );
+        }
         let Some(e) = self.recorder.engine.as_ref() else {
             return;
         };
