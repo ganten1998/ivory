@@ -768,7 +768,7 @@ impl DesktopApp {
         if self.recorder.engine.is_none() && self.app.recorder_band_open() {
             if let Some((at, _)) = self.recorder.engine_retry {
                 if std::time::Instant::now() >= at {
-                    self.start_engine(ctx);
+                    self.open_audio_path(ctx);
                 }
             }
         }
@@ -799,14 +799,13 @@ impl DesktopApp {
             // no monitor and no instrument until the band was closed and
             // reopened — which is not a thing anybody would think to try.
             //
-            // Both in the same call: the old stream's `Drop` releases the
-            // device before the new one asks for it, which is the ordering
-            // CoreAudio needs. The five-second instrument load still happens
-            // over the following frames, announced as usual.
+            // The old stream's `Drop` releases the device before the new one
+            // asks for it, which is the ordering CoreAudio needs. The
+            // five-second instrument load still happens over the following
+            // frames, announced as usual.
             self.recorder.engine = None;
             self.recorder.plugin_loaded = std::array::from_fn(|_| None);
-            self.start_engine(ctx);
-            self.reconcile_audio(true);
+            self.open_audio_path(ctx);
         }
 
         let audio_uid = self.app.chosen_audio_uid().map(str::to_owned);
@@ -1100,8 +1099,7 @@ impl DesktopApp {
         if open != self.recorder.band_was_open {
             self.recorder.band_was_open = open;
             if open {
-                self.start_engine(ctx);
-                self.reconcile_audio(true);
+                self.open_audio_path(ctx);
                 self.reconcile_camera(true, ctx);
             } else {
                 self.recorder.session.close_input();
@@ -2019,6 +2017,49 @@ impl DesktopApp {
     /// device, or one another app holds exclusively, still has a perfectly good
     /// chord display and a perfectly good recorder. The band says what happened
     /// and everything else carries on.
+    /// Bring the whole audio path up: the OUTPUT first, with no input
+    /// callback running, and the input after it.
+    ///
+    /// **The order is the whole of this function, and it is a deadlock fix.**
+    ///
+    /// Changing the buffer size from 64 to 128 hung the app on macOS with a
+    /// spinning cursor and no way out but a force quit. The sample is
+    /// unambiguous:
+    ///
+    /// ```text
+    /// main thread  AudioOutputUnitStart -> StartIOProc
+    ///              -> HALB_Mutex::Lock                    [blocked]
+    /// IO thread    our input proc -> AudioUnitGetProperty
+    ///              -> recursive_mutex::lock               [blocked]
+    /// ```
+    ///
+    /// The input stream was still RUNNING while the output was rebuilt. Both
+    /// are the same interface on the ordinary rig, so starting the output sets
+    /// that device's buffer frame size — and the input's next callback then
+    /// arrives with a frame count that does not match the one `coreaudio-rs`
+    /// cached when the stream was built. Its input proc handles that by asking
+    /// CoreAudio for the stream format FROM THE AUDIO CALLBACK, and
+    /// reallocating there, which is its own sin. So the IO thread holds the
+    /// HAL's lock and blocks on the unit's, while the main thread holds the
+    /// unit's and blocks on the HAL's. Neither half of that is ours to fix.
+    ///
+    /// Closing the input first removes the window rather than racing it: no IO
+    /// proc is running while the device is reconfigured. Rebuilding the input
+    /// LAST matters just as much — the frame size it caches is then the size
+    /// the device already has, so the branch cannot fire on the way back up
+    /// either.
+    ///
+    /// The output has no equivalent hazard: its render callback is handed a
+    /// buffer and never asks CoreAudio for anything.
+    ///
+    /// Every path that starts the engine goes through here, because a rule
+    /// about ordering that only two of three callers follow is not a rule.
+    fn open_audio_path(&mut self, ctx: &egui::Context) {
+        self.recorder.session.close_input();
+        self.start_engine(ctx);
+        self.reconcile_audio(true);
+    }
+
     fn start_engine(&mut self, ctx: &egui::Context) {
         if self.recorder.engine.is_some() {
             return;

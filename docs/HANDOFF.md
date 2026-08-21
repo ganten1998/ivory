@@ -1,6 +1,9 @@
 # Ivory 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-21. **The app is now called TANGENT.** Newest work is
+§2y: what you hear is what you get — the take is the desk, and mute is the only
+thing that decides what is in it. Before it,
+§2x: the buffer-size change that deadlocked against CoreAudio. Before it,
 §2w: the effects as a bus with a user VST3 across it, and the desk finished to
 the owner's second pass. Before it,
 §2v: a strip per instrument slot, the mixer as a real surface, and the neck's
@@ -2120,6 +2123,71 @@ channel".
 Several inputs from one interface. §2u's stage list still describes it: fan the
 callback into N rings, and decide what `TakeSource::Input` means when there is
 more than one.
+
+---
+
+## 2x. 2026-08-21 — the buffer-size change that hung the app
+
+**Reproduced by the owner: switch the buffer from 64 to 128 on macOS, get a
+spinning cursor and a force quit.** Diagnosed live off `sample 42448`, which is
+worth doing before anything else — the process sat at 0.1% CPU, so it was a
+deadlock and not a spin, and the stacks named every participant.
+
+```text
+main thread  AudioOutputUnitStart -> HALC_ProxyIOContext::StartIOProc
+             -> HALB_Mutex::Lock                          [blocked]
+IO thread    <our input proc> -> AudioUnitGetProperty
+             -> std::recursive_mutex::lock                [blocked]
+listener q   HALObject::PropertiesChanged
+             -> caulk::pooled_semaphore_mutex::lock_impl  [blocked]
+```
+
+### What it is
+
+`coreaudio-rs`'s input proc has this, on the audio thread:
+
+```rust
+if buffer_frame_size != in_number_frames {
+    let asbd = super::get_property(audio_unit, kAudioUnitProperty_StreamFormat, ..)?;
+    ...
+    vec.resize(data_byte_size, 0u8);   // and an allocation, while we are here
+}
+```
+
+So a frame count that does not match the one cached when the stream was built
+makes the input callback call into CoreAudio and allocate. The IO thread is
+holding the HAL's lock at that point and blocks on the unit's; the main thread,
+inside `AudioOutputUnitStart`, holds the unit's and blocks on the HAL's.
+
+The frame count changes because **the input was still running while the output
+was rebuilt**. On the ordinary one-box rig they are the same interface, and
+starting the output sets that device's `kAudioDevicePropertyBufferFrameSize`.
+
+Neither half of the upstream code is ours. The OUTPUT has no equivalent hazard:
+its render callback is handed a buffer and never asks CoreAudio for anything.
+
+### The fix
+
+`DesktopApp::open_audio_path` — close the input, start the engine, rebuild the
+input:
+
+- **Closing first** removes the window rather than racing it: no IO proc is
+  running while the device is reconfigured.
+- **Rebuilding LAST** matters just as much. The frame size `coreaudio-rs`
+  caches is then the size the device already has, so the branch cannot fire on
+  the way back up either.
+
+Every path that starts the engine goes through it — the buffer/rate/system
+change, the retry after a failed open, and the band opening — because a rule
+about ordering that only two of three callers follow is not a rule.
+
+### If it happens again
+
+`sample <pid>` FIRST, while it is still hung; the stacks are the whole
+diagnosis and they are gone the moment it is killed. Then force quit — the main
+thread is in a mutex wait and will not process a Quit — and expect to need
+`sudo killall coreaudiod` afterwards, because force-killing an audio client can
+leave the HAL wedged for every other app on the machine.
 
 ---
 
