@@ -724,8 +724,8 @@ impl Default for Settings {
                 // instruments nor each other, and a colour each says so before
                 // the labels are read.
                 let mut c = [0; crate::recorder::STRIPS + 1];
-                c[crate::recorder::Strip::Input.index()] = 4; // teal
-                c[crate::recorder::Strip::Track.index()] = 6; // violet
+                c[crate::recorder::Strip::Input.index()] = 16; // teal
+                c[crate::recorder::Strip::Track.index()] = 23; // violet
                 c[crate::recorder::STRIPS] = crate::mixer_panel::MASTER_COLOR as i64;
                 c
             },
@@ -1218,11 +1218,28 @@ impl Settings {
         take_opt_str(&mut map, "record_camera_uid", &mut s.record_camera_uid);
         take_opt_str(&mut map, "record_audio_device", &mut s.record_audio_device);
         take_opt_str(&mut map, "bus_effect", &mut s.bus_effect);
-        if let Some(Value::Array(v)) = map.shift_remove("strip_colors") {
+        // **A NEW key, because the old one's numbers mean something else
+        // now.** The palette went from eight colours to twenty-seven, which
+        // renumbered every index anybody had already saved: a desk with a teal
+        // microphone and a violet backing track came back dark red and brown.
+        //
+        // So `strip_colors` is read through the map that says where each of
+        // the eight went, and `strip_colors_v2` is written. A file with both
+        // is a downgrade and back, and the newer key wins — which is the same
+        // bargain every other renamed key here makes.
+        for (key, migrate) in [("strip_colors", true), ("strip_colors_v2", false)] {
+            let Some(Value::Array(v)) = map.shift_remove(key) else {
+                continue;
+            };
             for (i, x) in v.iter().take(crate::recorder::STRIPS + 1).enumerate() {
-                if let Some(n) = x.as_i64() {
-                    s.strip_colors[i] = n.rem_euclid(crate::mixer_panel::STRIP_COLORS.len() as i64);
-                }
+                let Some(n) = x.as_i64() else { continue };
+                let n = if migrate {
+                    let old = n.rem_euclid(crate::mixer_panel::PALETTE_V1_TO_V2.len() as i64);
+                    crate::mixer_panel::PALETTE_V1_TO_V2[old as usize] as i64
+                } else {
+                    n
+                };
+                s.strip_colors[i] = n.rem_euclid(crate::mixer_panel::STRIP_COLORS.len() as i64);
             }
         }
         if let Some(Value::Array(v)) = map.shift_remove("strip_sends") {
@@ -1753,7 +1770,7 @@ impl Settings {
         );
         map.insert("strip_muted".into(), Value::from(self.strip_muted));
         map.insert(
-            "strip_colors".into(),
+            "strip_colors_v2".into(),
             Value::Array(self.strip_colors.iter().map(|c| Value::from(*c)).collect()),
         );
         map.insert("strip_soloed".into(), Value::from(self.strip_soloed));
@@ -2358,7 +2375,48 @@ mod tests {
     /// default and the only thing that had ever turned it on was choosing a
     /// camera. New installs get it from the default; existing files need the
     /// migration, and only the one time.
+     /// **A palette is a set of indices somebody has already saved.**
+    ///
+    /// Growing the table from eight colours to twenty-seven renumbered every
+    /// one of them. Without the map, a desk with a teal microphone and a
+    /// violet backing track comes back dark red and brown — colours the user
+    /// never chose, on a build where the old ones were on screen a minute
+    /// earlier.
     #[test]
+    fn the_old_palette_numbers_still_mean_their_own_colours() {
+        use crate::mixer_panel::{PALETTE_V1_TO_V2, STRIP_COLORS};
+        use crate::recorder::Strip;
+        // The old defaults: 4 was teal and 6 was violet.
+        let old = Settings::from_json(r#"{"strip_colors": [0, 0, 0, 0, 0, 4, 6, 0, 0, 1]}"#);
+        let teal = old.strip_colors[Strip::Input.index()] as usize;
+        let violet = old.strip_colors[Strip::Track.index()] as usize;
+        assert_eq!(teal, PALETTE_V1_TO_V2[4], "the microphone changed colour");
+        assert_eq!(violet, PALETTE_V1_TO_V2[6], "the backing track changed colour");
+        // And they are still a teal and a violet, not merely different numbers.
+        let (r, g, b) = STRIP_COLORS[teal];
+        assert!(b > r && g > r, "index {teal} is not a teal: {r:02X}{g:02X}{b:02X}");
+        let (r, g, b) = STRIP_COLORS[violet];
+        assert!(b > g && r > g, "index {violet} is not a violet: {r:02X}{g:02X}{b:02X}");
+
+        // A file already written by this build is taken at face value.
+        let new = Settings::from_json(r#"{"strip_colors_v2": [0, 0, 0, 0, 0, 26, 0, 0, 0, 5]}"#);
+        assert_eq!(new.strip_colors[Strip::Input.index()], 26);
+
+        // And what is written back is the NEW key, or the next launch would
+        // migrate the already-migrated numbers a second time.
+        let text = new.to_json();
+        assert!(text.contains("strip_colors_v2"), "the new key is not written");
+        assert!(
+            !text.contains(r#""strip_colors":"#),
+            "the old key is still written, so every launch would remap again"
+        );
+        // Every index the map produces has to exist in the table it indexes.
+        for (i, to) in PALETTE_V1_TO_V2.iter().enumerate() {
+            assert!(*to < STRIP_COLORS.len(), "old colour {i} maps off the end");
+        }
+    }
+
+   #[test]
     fn an_older_file_is_moved_onto_video() {
         use crate::recorder::VideoMode;
         let older = r#"{"settings_version": 7, "record_export": {"video": "none"}}"#;

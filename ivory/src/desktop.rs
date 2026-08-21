@@ -999,6 +999,29 @@ impl DesktopApp {
             state.master = ivory_ui::recorder::Meters::SILENT;
             state.gr_db = 0.0;
         }
+        // **Levels with nothing plugged in, for looking at the desk.**
+        //
+        // Every meter here comes from the engine, so a machine with no
+        // interface and no instrument shows twelve strips of silence — and a
+        // meter, a scale and a gain-reduction bar are exactly the things that
+        // have to be LOOKED at rather than reasoned about. Pushed after the
+        // engine's own numbers, because it is overriding them.
+        //   IVORY_DEMO_LEVELS=1 /Applications/Tangent.app/Contents/MacOS/tangent
+        if std::env::var("IVORY_DEMO_LEVELS").is_ok() {
+            for (i, peaks) in state.strip_peaks.iter_mut().enumerate() {
+                // Different on every channel and different on the two sides of
+                // each, so a bar drawn from the wrong lane is visible.
+                let l = 0.12 + 0.13 * (i % 6) as f32;
+                *peaks = [l, l * 0.55];
+            }
+            state.gr_db = 7.5;
+            state.master = ivory_ui::recorder::Meters {
+                left: ivory_ui::recorder::Level { peak: 0.79, rms: 0.5, hold: 0.9 },
+                right: ivory_ui::recorder::Level { peak: 0.44, rms: 0.3, hold: 0.55 },
+                mono: false,
+                clipped: false,
+            };
+        }
         state.dest = shorten_home(&root);
         state.folder_preview = take::folder_name(
             &take::WallTime::now_utc(),

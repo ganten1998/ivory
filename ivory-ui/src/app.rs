@@ -1827,6 +1827,21 @@ impl IvoryApp {
 
         // Right-click (or ctrl-click on macOS, Qt default) opens the menu.
         if resp.secondary_clicked() || (resp.clicked() && ctrl_as_context) {
+            // **Not over the mixer, which is its own surface.**
+            //
+            // A right-click there means "paint this channel" and opens the
+            // palette — so the band's menu opened UNDER it as well, on the
+            // same press, and the two argued about which one you had asked
+            // for. The mixer covers the piano for the same reason: while it is
+            // up it is the only thing taking presses.
+            //
+            // Checked before the pointer is even unwrapped, because there is
+            // nothing below this that a press on the mixer should reach.
+            if let Some(rect) = self.mixer_rect {
+                if pointer.is_some_and(|p| rect.contains(p)) {
+                    return;
+                }
+            }
             if let Some(pos) = pointer {
                 let global = self.main_inner_origin + pos.to_vec2();
                 // A right-click ON the Recorder band opens the menu with the
@@ -5825,9 +5840,23 @@ impl IvoryApp {
         // keypress — which on a shared desktop is a keypress that might land
         // somewhere else.
         //   IVORY_INLINE=mixer /Applications/Tangent.app/Contents/MacOS/tangent
-        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("mixer") {
+        //
+        // **And `palette` opens the swatches on a channel**, which cannot be
+        // photographed any other way: it is dismissed by a press anywhere
+        // outside it, and taking a screenshot with the mouse is a press
+        // somewhere outside it. Twenty-seven colours in a strip a hundred
+        // points wide is exactly the kind of thing that has to be LOOKED at.
+        if !self.demo_menu_done
+            && matches!(
+                std::env::var("IVORY_INLINE").as_deref(),
+                Ok("mixer" | "palette")
+            )
+        {
             self.demo_menu_done = true;
             self.mixer_open = true;
+            if std::env::var("IVORY_INLINE").as_deref() == Ok("palette") {
+                self.mixer_palette = Some(1);
+            }
         }
         // And the input chooser, which needs hardware nobody developing this
         // has: it only offers itself on an interface with more than two

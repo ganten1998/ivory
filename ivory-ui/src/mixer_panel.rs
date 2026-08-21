@@ -154,24 +154,54 @@ impl Hit {
 
 /// What a channel can be painted.
 ///
-/// **Eight, and the first is "the desk".** A palette long enough to tell seven
-/// channels apart and short enough to pick from without reading; index 0 is the
-/// band's own wood, so a channel nobody has coloured is not a colour choice at
-/// all.
-pub const STRIP_COLORS: [(u8, u8, u8); 8] = [
+/// **A row per hue, three tones across.** Eight colours were enough to tell
+/// eight channels apart and not enough to tell them apart the way somebody
+/// wants to — two quiet blues for two microphones, a loud red for the one
+/// thing that must not be missed. So: nine rows of three.
+///
+/// The first row is the neutrals, and index 0 is the band's own wood — a
+/// channel nobody has coloured is not a colour choice at all. Every value is
+/// dark enough to carry the face's text, because this paints the whole strip
+/// and not a dot on it; the labels sit on plates of their own for the same
+/// reason.
+///
+/// [`PALETTE_COLUMNS`] is what makes the grid read as hues rather than as
+/// twenty-seven swatches: reading down a column is one tone, across a row is
+/// one colour.
+pub const STRIP_COLORS: [(u8, u8, u8); 27] = [
     (0x00, 0x00, 0x00), // the desk's own wood — replaced at draw time
-    (0x8E, 0x2C, 0x2C), // red
-    (0x8A, 0x55, 0x1E), // amber
-    (0x4E, 0x6B, 0x2C), // green
-    (0x25, 0x5A, 0x74), // teal
-    (0x2E, 0x46, 0x86), // blue
-    (0x5A, 0x36, 0x77), // violet
-    (0x4A, 0x46, 0x42), // slate
+    (0x36, 0x33, 0x30), // slate
+    (0x56, 0x51, 0x4D), // stone
+    (0x3F, 0x12, 0x15), (0x63, 0x17, 0x1C), (0x86, 0x27, 0x2D), // red
+    (0x3F, 0x27, 0x12), (0x63, 0x39, 0x17), (0x86, 0x52, 0x27), // amber
+    (0x3F, 0x3B, 0x12), (0x63, 0x5C, 0x17), (0x86, 0x7D, 0x27), // olive
+    (0x21, 0x3F, 0x12), (0x30, 0x63, 0x17), (0x46, 0x86, 0x27), // green
+    (0x12, 0x3A, 0x3F), (0x17, 0x5A, 0x63), (0x27, 0x7B, 0x86), // teal
+    (0x12, 0x24, 0x3F), (0x17, 0x36, 0x63), (0x27, 0x4D, 0x86), // blue
+    (0x29, 0x12, 0x3F), (0x3D, 0x17, 0x63), (0x57, 0x27, 0x86), // violet
+    (0x3F, 0x12, 0x33), (0x63, 0x17, 0x4E), (0x86, 0x27, 0x6C), // magenta
 ];
 
+/// Three, because the table is hues down and tones across.
+pub const PALETTE_COLUMNS: usize = 3;
+
 /// The master's colour on a fresh install. Red, because it is the one channel
-/// you look for.
-pub const MASTER_COLOR: usize = 1;
+/// you look for — the top tone of it, which is the one that reads as RED
+/// rather than as maroon.
+pub const MASTER_COLOR: usize = 5;
+
+/// Where the eight-colour table's indices moved to when it became this one.
+///
+/// **A palette is a set of indices somebody has already saved.** Growing the
+/// table from eight to twenty-seven renumbered every one of them, so a desk
+/// with a teal microphone and a violet backing track came back dark red and
+/// brown — colours the user never chose, on a build where the old ones were
+/// still on screen a minute earlier.
+///
+/// Each entry is the nearest tone of the same hue. `slate` becomes `stone`,
+/// which is the only one that is not an exact match and is the closest the new
+/// neutrals get.
+pub const PALETTE_V1_TO_V2: [usize; 8] = [0, 5, 8, 14, 16, 20, 23, 2];
 
 /// Which way a control travels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -616,7 +646,14 @@ fn strip(
         painter.rect_filled(l.panel, 3.0, Color32::from_black_alpha(90));
     }
 
-    meter(painter, l.meter, v.peak, v.stereo, v.gr_db, heard, p);
+    // The master gets the full scale; a channel gets the four marks its width
+    // has room for. `strip: None` IS the master — see `StripView`.
+    let ticks: &[f32] = if v.strip.is_none() {
+        &MASTER_TICKS
+    } else {
+        &METER_TICKS
+    };
+    meter(painter, l.meter, v.peak, v.stereo, v.gr_db, heard, ticks, p);
 
     if l.send.is_positive() {
         send_knob(painter, l.send, v.send, p);
@@ -667,16 +704,27 @@ fn palette_over(l: &StripStrip) -> Vec<Rect> {
         return Vec::new();
     }
     let n = STRIP_COLORS.len();
-    let side = (l.panel.width() - 8.0) / 2.0;
-    let rows = n.div_ceil(2);
-    let h = (side * rows as f32).min(l.panel.height() - 8.0);
-    let side = (h / rows as f32).min(side);
+    let cols = PALETTE_COLUMNS;
+    let rows = n.div_ceil(cols);
+    // **Square, and inside the strip.** It could be wider than the channel it
+    // belongs to and the swatches would be bigger — but then a press in the
+    // overhang would fall through to the NEIGHBOUR's fader, and a colour
+    // picker that sometimes moves the channel beside it is worse than a small
+    // one. Whichever of the two axes runs out first decides the size.
+    let side = ((l.panel.width() - 8.0) / cols as f32)
+        .min((l.panel.height() - 8.0) / rows as f32)
+        .max(1.0);
+    let w = side * cols as f32;
+    let h = side * rows as f32;
+    let left = l.panel.center().x - w * 0.5;
     let top = l.panel.center().y - h * 0.5;
-    let left = l.panel.center().x - side;
     (0..n)
         .map(|i| {
             Rect::from_min_size(
-                Pos2::new(left + (i % 2) as f32 * side, top + (i / 2) as f32 * side),
+                Pos2::new(
+                    left + (i % cols) as f32 * side,
+                    top + (i / cols) as f32 * side,
+                ),
                 Vec2::splat(side),
             )
             .shrink(1.5)
@@ -721,12 +769,24 @@ fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink) {
 /// width of the strip is not a meter, it is a panel with a colour in it: at
 /// rest it is the largest thing on the channel and it reads as something that
 /// failed to load rather than as a level of nothing.
-/// The marks down the side of a meter, in decibels.
+/// The marks down the side of a CHANNEL's meter, in decibels.
 ///
-/// **The band's own set, shortened.** A strip is a fifth of the width the
-/// master column has, so seven labels would be a grey smear; these four are
-/// the ones anybody actually reads a level against.
+/// **Four, because a strip is a fifth of the width the master has.** More
+/// labels in a column that narrow is a grey smear, and these are the ones
+/// anybody actually reads a level against.
 const METER_TICKS: [f32; 4] = [0.0, -12.0, -24.0, -48.0];
+
+/// And the MASTER's, which has the room for a scale you can read a number off.
+///
+/// The standard set, thinned where the fader's own curve crowds it: the marks
+/// near unity are worth having one every three decibels and the ones at the
+/// bottom are not.
+///
+/// **Neither END of the travel gets one.** +12 and -60 are where the fader
+/// stops, so a label there sits half off the meter and reads against nothing.
+/// `every_meter_tick_lands_where_the_fader_would_put_it` caught +12 the first
+/// time this was written.
+const MASTER_TICKS: [f32; 9] = [6.0, 0.0, -3.0, -6.0, -12.0, -18.0, -24.0, -36.0, -48.0];
 
 fn meter(
     painter: &Painter,
@@ -735,6 +795,7 @@ fn meter(
     stereo: bool,
     gr_db: f32,
     heard: bool,
+    ticks: &[f32],
     p: &Ink,
 ) {
     if !r.is_positive() {
@@ -746,7 +807,7 @@ fn meter(
     let scale_w = (r.width() * 0.42).clamp(12.0, 26.0);
     let bars = Rect::from_min_max(Pos2::new(r.left() + scale_w, r.top()), r.max);
     let font = FontId::new((r.width() * 0.16).clamp(5.5, 8.0), crate::fonts::courier());
-    for db in METER_TICKS {
+    for &db in ticks {
         let t = gain_to_fader(10f32.powf(db / 20.0)).clamp(0.0, 1.0);
         let y = bars.bottom() - bars.height() * t;
         painter.text(
@@ -775,6 +836,29 @@ fn meter(
             Pos2::new(x + w, bars.bottom()),
         );
         painter.rect_filled(cell, 2.0, p.track);
+        // **Gain reduction hangs from the top of EVERY lane**, the way it does
+        // on the band's own master, because that is the direction it means:
+        // the ceiling coming down. One strip down the right-hand edge of the
+        // pair was the first version and it read as the right channel being
+        // limited on its own — the limiter is stereo-linked and takes the same
+        // decibels off both sides, so showing it on one is a picture of
+        // something that does not happen.
+        //
+        // Before the bar and outside the `heard` test: a limiter working on a
+        // channel you have muted is still worth seeing, and a limiter working
+        // on silence is not possible.
+        if gr_db > 0.01 {
+            let t = (gr_db / 24.0).clamp(0.0, 1.0);
+            let w = (cell.width() * 0.3).clamp(2.0, 5.0);
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(cell.right() - w, cell.top()),
+                    Pos2::new(cell.right(), cell.top() + cell.height() * t),
+                ),
+                1.0,
+                p.gr,
+            );
+        }
         let v = if stereo { peak[lane.min(1)] } else { peak[0].max(peak[1]) };
         if !heard || v <= 0.0 {
             continue;
@@ -791,16 +875,6 @@ fn meter(
         );
     }
 
-    // **Gain reduction hangs from the top**, the way it does on the band's own
-    // master, because that is the direction it means: the ceiling coming down.
-    if gr_db > 0.01 {
-        let t = (gr_db / 24.0).clamp(0.0, 1.0);
-        let strip = Rect::from_min_max(
-            Pos2::new(bars.right() - 3.0, bars.top()),
-            Pos2::new(bars.right(), bars.top() + bars.height() * t),
-        );
-        painter.rect_filled(strip, 1.0, p.gr);
-    }
 }
 
 /// A knob, drawn as an arc rather than a dial: it is a percentage, and an arc
@@ -1078,6 +1152,89 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), n, "two channels share an index");
+    }
+
+    /// **Every mark has to land on the scale it is drawn against.**
+    ///
+    /// The fader's travel is +12 down to -60. A tick outside that is clamped to
+    /// an end and sits on top of its neighbour, which is a scale that says two
+    /// different levels are the same height — the exact thing a scale exists
+    /// to stop.
+    #[test]
+    fn every_meter_tick_lands_where_the_fader_would_put_it() {
+        for (which, ticks) in [
+            ("channel", &METER_TICKS[..]),
+            ("master", &MASTER_TICKS[..]),
+        ] {
+            let mut seen: Vec<f32> = Vec::new();
+            for &db in ticks {
+                let t = gain_to_fader(10f32.powf(db / 20.0));
+                assert!(
+                    t > 0.0 && t < 1.0,
+                    "{which}'s {db} dB mark sits at {t}, which is off the end of \
+                     the travel and on top of whatever is there"
+                );
+                for other in &seen {
+                    assert!(
+                        (other - t).abs() > 0.01,
+                        "{which} has two marks at {t}, so one of them is a label \
+                         nobody can read"
+                    );
+                }
+                seen.push(t);
+            }
+        }
+        // The master column is the one you read a number off, and it is wider
+        // — so it carries the scale a channel has no room for.
+        assert!(
+            MASTER_TICKS.len() > METER_TICKS.len(),
+            "the master's scale is no fuller than a channel's"
+        );
+    }
+
+    /// **A colour you cannot pick without moving the channel beside it.**
+    ///
+    /// The palette could be wider than the strip it belongs to and the
+    /// swatches would be easier to hit — but a press in the overhang falls
+    /// through to the NEIGHBOUR's fader, which is a colour picker that
+    /// sometimes changes a level. So every swatch stays inside its own
+    /// channel, and every one of them is reachable.
+    #[test]
+    fn every_swatch_is_inside_its_own_channel_and_can_be_pressed() {
+        let mut v = a_view();
+        v.palette_open = Some(0);
+        let r = rect();
+        let l = Layout::new(r, &v);
+        let panel = l.strips[0].panel;
+        let swatches = palette_over(&l.strips[0]);
+        assert_eq!(swatches.len(), STRIP_COLORS.len(), "a colour is unreachable");
+        for (i, sw) in swatches.iter().enumerate() {
+            assert!(
+                panel.contains(sw.min) && panel.contains(sw.max),
+                "swatch {i} hangs outside the channel it belongs to"
+            );
+            assert!(sw.is_positive(), "swatch {i} has no area");
+            assert_eq!(
+                hit_test(r, &v, sw.center()),
+                Some(Hit::Paint(0, i)),
+                "swatch {i} cannot be pressed"
+            );
+            for (j, other) in swatches.iter().enumerate().take(i) {
+                assert!(
+                    !other.intersects(*sw),
+                    "swatches {j} and {i} overlap, so one of them wins twice"
+                );
+            }
+        }
+        // Hues down, tones across: the grid is what makes twenty-seven
+        // swatches pickable without reading every one of them.
+        assert_eq!(
+            (STRIP_COLORS.len() - PALETTE_COLUMNS) % PALETTE_COLUMNS,
+            0,
+            "the neutrals and the hues do not line up into rows"
+        );
+        // The master's default has to BE in the table it indexes.
+        assert!(MASTER_COLOR < STRIP_COLORS.len());
     }
 
     /// **The decibel readout is a target, and the palette swallows the strip.**
