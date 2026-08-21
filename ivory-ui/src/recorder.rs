@@ -450,6 +450,46 @@ pub const INPUTS: usize = 4;
 /// How many channels the desk has, master aside.
 pub const STRIPS: usize = SLOTS + INPUTS + 3;
 
+/// A mixer COLUMN, which is not a desk index and may never be used as one.
+///
+/// **This exact aliasing has shipped three times.** Columns and desk indices
+/// agree on every channel that has a column and disagree past the last one —
+/// so a handler that read `Strip::all()`, `strip_names`, `strip_sends` or a
+/// mute mask with a raw column index passed every manual test and was wrong on
+/// exactly the master: the master's fader moved the metronome, its inserts
+/// landed on the click, and its typed name went to a channel with no column to
+/// show it. Each time the fix was one missed call site.
+///
+/// So the two spaces get two types. A `Column` comes from geometry — a press,
+/// a drawn strip — and the ONLY ways out of it are [`Column::strip`], which
+/// answers what the column is, and [`Column::desk_index`], which answers where
+/// its settings live. Indexing anything desk-shaped with `.0` is greppable,
+/// deliberate, and almost always the bug being reintroduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Column(pub usize);
+
+impl Column {
+    /// Which strip this column shows, or `None` for the master.
+    ///
+    /// The one place a column becomes a strip. `shown()` and `all()` are not
+    /// the same list — the click and the effects bus are strips with no column
+    /// of their own — and everything that turns a press into a change goes
+    /// through here.
+    pub fn strip(self) -> Option<Strip> {
+        Strip::shown().get(self.0).copied()
+    }
+
+    /// Where this column's settings live in every desk array.
+    ///
+    /// The master's are last, past every channel — it is not in `shown()` and
+    /// has no `Strip` of its own, so `STRIPS` is its slot by convention and
+    /// this is where that convention is written down.
+    pub fn desk_index(self) -> usize {
+        self.strip().map_or(STRIPS, Strip::index)
+    }
+}
+
+
 /// How many COLUMNS the desk draws: every strip that has one, then the master.
 ///
 /// Re-exported from `mixer_panel::COLUMNS` would be the other direction and
@@ -491,27 +531,10 @@ impl Strip {
         })
     }
 
-    /// Which strip the mixer's `n`th COLUMN is, or `None` for the master.
-    ///
-    /// **The one place a column becomes a strip.** `shown()` and `all()` are
-    /// not the same list — the click and the effects bus are strips with no
-    /// column of their own — so `all()[n]` for a column index is off by
-    /// however many of those come before it. It was, and the symptom was the
-    /// master fader silently moving the metronome: column `SLOTS + INPUTS + 1`
-    /// is the master, and `all()` at that index is `Strip::Click`.
-    ///
-    /// Everything that turns a press into a change goes through this.
-    pub fn column(n: usize) -> Option<Strip> {
-        Self::shown().get(n).copied()
-    }
-
-    /// Where the `n`th COLUMN's settings live. See [`Strip::column`].
-    ///
-    /// The master's are last, past every channel — it is not in `shown()` and
-    /// has no `Strip` of its own, so `STRIPS` is its slot by convention and
-    /// this is where that convention is written down.
-    pub fn column_index(n: usize) -> usize {
-        Self::column(n).map_or(STRIPS, Strip::index)
+    /// The column this strip is drawn in, or `None` for the click and the
+    /// bus, which have none. The inverse of [`Column::strip`].
+    pub fn column_of(self) -> Option<Column> {
+        Self::shown().iter().position(|s| *s == self).map(Column)
     }
 
     /// Its place in `Desk`'s arrays.

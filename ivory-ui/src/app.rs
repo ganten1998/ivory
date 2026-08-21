@@ -270,15 +270,15 @@ pub struct IvoryApp {
     /// The mixer control being dragged, and where the hand started.
     mixer_grab: Option<MixerGrab>,
     /// The strip whose colour palette is open, if any.
-    mixer_palette: Option<usize>,
+    mixer_palette: Option<crate::recorder::Column>,
     /// A decibel figure being typed into a strip, and which.
-    mixer_typing: Option<(usize, String)>,
+    mixer_typing: Option<(crate::recorder::Column, String)>,
     /// The channel whose NAME is being typed, and what is in the field.
     ///
     /// Its own field rather than a mode on `mixer_typing`: the two accept
     /// different characters, commit to different places and are drawn in
     /// different rows, and a shared one would need a tag at every use.
-    mixer_naming: Option<(usize, String)>,
+    mixer_naming: Option<(crate::recorder::Column, String)>,
     /// Where the mixer was last drawn, so a press can be tested against it.
     mixer_rect: Option<Rect>,
     /// The OS's own file panel is on screen right now.
@@ -1592,13 +1592,13 @@ impl IvoryApp {
     ///
     /// So the alias makes the DEFAULT name — "x - 3" — and typing here
     /// replaces it, which is what a default is for.
-    fn commit_mixer_name(&mut self, at: usize, name: String) {
+    fn commit_mixer_name(&mut self, at: crate::recorder::Column, name: String) {
         // **A COLUMN, converted.** `at` is where the field was drawn and
         // `strip_names` is a desk array, and the two agree on every column but
         // the last — so the master's name was being written into the CLICK's
         // slot while `mixer_view` read it back from `STRIPS`. Third time this
-        // aliasing has shipped; `Strip::column_index` exists for it.
-        let at = crate::recorder::Strip::column_index(at);
+        // aliasing shipped — and the reason `Column` is now a TYPE.
+        let at = at.desk_index();
         let name = name.trim().to_owned();
         if self.settings.strip_names.len() <= crate::recorder::STRIPS {
             self.settings
@@ -1618,9 +1618,9 @@ impl IvoryApp {
         match hit {
             H::Fader(i) => view
                 .strips
-                .get(i)
+                .get(i.0)
                 .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
-            H::Send(i) => view.strips.get(i).map_or(0.0, |s| s.send),
+            H::Send(i) => view.strips.get(i.0).map_or(0.0, |s| s.send),
             H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..) | H::Paint(..)
             | H::Palette(_) | H::Db(_) | H::Name(_) => 0.0,
         }
@@ -1642,7 +1642,7 @@ impl IvoryApp {
         let d = Settings::default();
         match hit {
             H::Fader(i) => {
-                let to = match Strip::column(i) {
+                let to = match i.strip() {
                     Some(Strip::Slot(n)) => d.plugin_gains.get(n).copied().unwrap_or(1.0),
                     Some(Strip::Input(n)) => d.input_gains.get(n).copied().unwrap_or(1.0),
                     Some(Strip::Track) => d.track_gain,
@@ -1653,7 +1653,7 @@ impl IvoryApp {
                 self.apply_mixer_hit(hit, recorder::gain_to_fader(to as f32));
             }
             H::Send(i) => {
-                let at = Strip::column_index(i);
+                let at = i.desk_index();
                 let to = d.strip_sends.get(at).copied().unwrap_or(0.0);
                 if let Some(slot) = self.settings.strip_sends.get_mut(at) {
                     *slot = to;
@@ -1680,7 +1680,7 @@ impl IvoryApp {
             // two lists differ by the click and the bus, so the master column
             // used to land on the metronome — a fader that did not move and
             // moved another one instead.
-            H::Fader(i) => match Strip::column(i) {
+            H::Fader(i) => match i.strip() {
                 Some(Strip::Slot(n)) => {
                     if let Some(g) = self.settings.plugin_gains.get_mut(n) {
                         *g = gain;
@@ -1700,19 +1700,19 @@ impl IvoryApp {
                 None => self.settings.master_gain = gain,
             },
             H::Send(i) => {
-                let i = Strip::column_index(i);
+                let i = i.desk_index();
                 if let Some(slot) = self.settings.strip_sends.get_mut(i) {
                     *slot = f64::from(v);
                 }
             }
             // **A press, not a drag**, so it acts on the way down and the
             // value is ignored.
-            H::Mute(i) => self.settings.strip_muted ^= 1 << Strip::column_index(i),
-            H::Solo(i) => self.settings.strip_soloed ^= 1 << Strip::column_index(i),
+            H::Mute(i) => self.settings.strip_muted ^= 1 << i.desk_index(),
+            H::Solo(i) => self.settings.strip_soloed ^= 1 << i.desk_index(),
             // The plus on an empty slot: the same picker the rack opens, so
             // there is one way to choose an instrument and two ways to reach it.
             H::Add(i) => {
-                match Strip::column(i) {
+                match i.strip() {
                     Some(Strip::Slot(n)) => self.open_plugin_picker(n),
                     // **The first input is the band's own picker**, because it
                     // is the same choice: the row in the band and the first
@@ -1738,7 +1738,7 @@ impl IvoryApp {
             // control lives inside a window nothing opens is an effect you
             // cannot use — which is what a rack was until now.
             H::Insert(i, n) => {
-                let at = Strip::column_index(i);
+                let at = i.desk_index();
                 if self.insert(at, n).is_some() {
                     self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(at, n));
                 } else {
@@ -1750,7 +1750,7 @@ impl IvoryApp {
             // that means something on sight: red is where the output is, and a
             // master somebody painted teal is a desk with no landmark on it.
             H::Palette(i) => {
-                if Strip::column(i).is_some() {
+                if i.strip().is_some() {
                     self.mixer_palette = Some(i);
                 }
                 return;
@@ -1772,7 +1772,7 @@ impl IvoryApp {
                 let seed = match self
                     .settings
                     .strip_names
-                    .get(Strip::column_index(i))
+                    .get(i.desk_index())
                 {
                     Some(n) if !n.is_empty() => n.clone(),
                     // Nothing typed yet, so the field starts from the DEFAULT —
@@ -1782,7 +1782,7 @@ impl IvoryApp {
                     _ => self
                         .mixer_view()
                         .strips
-                        .get(i)
+                        .get(i.0)
                         .map_or(String::new(), |v| v.name.to_owned()),
                 };
                 self.mixer_naming = Some((i, seed));
@@ -1794,7 +1794,7 @@ impl IvoryApp {
             H::Paint(i, c) => {
                 self.mixer_palette = None;
                 if c != usize::MAX {
-                    let i = Strip::column_index(i);
+                    let i = i.desk_index();
                     if let Some(slot) = self.settings.strip_colors.get_mut(i) {
                         *slot = c as i64;
                         self.save_settings();
@@ -4137,11 +4137,16 @@ impl IvoryApp {
         self.mixer_open = true;
         let strips = crate::recorder::STRIPS;
         for (at, name) in [
-            (crate::recorder::Strip::Slot(0).index(), "Rhodes"),
-            (crate::recorder::Strip::Input(0).index(), "x - 3"),
-            (crate::recorder::Strip::Input(1).index(), "x - 4 vox"),
+            (crate::recorder::Strip::Slot(0), "Rhodes"),
+            (crate::recorder::Strip::Input(0), "x - 3"),
+            (crate::recorder::Strip::Input(1), "x - 4 vox"),
         ] {
-            self.commit_mixer_name(at, name.to_owned());
+            // Through the strip's own column, because `commit_mixer_name`
+            // takes a COLUMN — the type exists so a desk index cannot be
+            // passed here by accident.
+            if let Some(col) = at.column_of() {
+                self.commit_mixer_name(col, name.to_owned());
+            }
         }
         // A long name and a short one, in the first bay and the last, so the
         // picture shows both what fits and what has to be cut.
@@ -6461,7 +6466,7 @@ impl IvoryApp {
             self.demo_menu_done = true;
             self.mixer_open = true;
             if std::env::var("IVORY_INLINE").as_deref() == Ok("palette") {
-                self.mixer_palette = Some(1);
+                self.mixer_palette = Some(crate::recorder::Column(1));
             }
         }
         // And the input chooser, which needs hardware nobody developing this
@@ -7151,8 +7156,7 @@ impl IvoryApp {
                         // other button, which is one gesture each way and no
                         // second control to draw in a bay this size.
                         Some(crate::mixer_panel::Hit::Insert(i, n)) => {
-                            let at = crate::recorder::Strip::column_index(i);
-                            self.set_insert(at, n, None);
+                            self.set_insert(i.desk_index(), n, None);
                         }
                         // A control, and not one that answers this button.
                         Some(_) => {}
@@ -7161,7 +7165,7 @@ impl IvoryApp {
                         None => {
                             self.mixer_palette =
                                 crate::mixer_panel::strip_at(rect, &view, pos)
-                                    .filter(|i| crate::recorder::Strip::column(*i).is_some());
+                                    .filter(|i| i.strip().is_some());
                         }
                     }
                 }
@@ -7650,7 +7654,7 @@ mod tests {
 
         // And back, with no trace left of a drag that was in progress.
         app.mixer_grab = Some(MixerGrab {
-            hit: crate::mixer_panel::Hit::Fader(0),
+            hit: crate::mixer_panel::Hit::Fader(crate::recorder::Column(0)),
             from: Pos2::ZERO,
             moved: true,
             from_value: 0.5,
@@ -7685,6 +7689,7 @@ mod tests {
             Strip::shown()
                 .iter()
                 .position(|c| *c == s)
+                .map(crate::recorder::Column)
                 .expect("that strip has no column")
         };
         app.apply_mixer_hit(Hit::Fader(column(Strip::Track)), 0.25);
@@ -7702,17 +7707,23 @@ mod tests {
         );
 
         // A send is a percentage and lands where the host reads it.
-        app.apply_mixer_hit(Hit::Send(Strip::Input(0).index()), 0.4);
+        app.apply_mixer_hit(
+            Hit::Send(Strip::Input(0).column_of().expect("an input has a column")),
+            0.4,
+        );
         assert!(
             (app.desk().send[Strip::Input(0).index()] - 0.4).abs() < 1.0e-6,
             "the input's send did not stick"
         );
 
-        // Mute and solo toggle, and they are separate switches.
-        app.apply_mixer_hit(Hit::Mute(Strip::Track.index()), 0.0);
+        // Mute and solo toggle, and they are separate switches. Pressed by
+        // COLUMN, read back by desk index — which is the whole conversion
+        // under test.
+        let track = Strip::Track.column_of().expect("the track has a column");
+        app.apply_mixer_hit(Hit::Mute(track), 0.0);
         assert!(app.desk().muted[Strip::Track.index()]);
         assert!(!app.desk().soloed[Strip::Track.index()]);
-        app.apply_mixer_hit(Hit::Mute(Strip::Track.index()), 0.0);
+        app.apply_mixer_hit(Hit::Mute(track), 0.0);
         assert!(!app.desk().muted[Strip::Track.index()], "mute did not toggle back");
     }
 
@@ -8071,7 +8082,7 @@ mod tests {
             v.push(s.master_gain);
             v
         };
-        for col in 0..COLUMNS_FOR_TEST {
+        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             let before = snapshot(&app.settings);
             // A position nothing defaults to, so "it changed" is unambiguous.
@@ -8081,7 +8092,7 @@ mod tests {
                 .filter(|i| (before[*i] - after[*i]).abs() > 1e-9)
                 .collect();
             // Which slot in the snapshot this column owns.
-            let want = match Strip::column(col) {
+            let want = match col.strip() {
                 Some(Strip::Slot(n)) => n,
                 Some(Strip::Input(n)) => crate::recorder::SLOTS + n,
                 Some(s) => crate::recorder::SLOTS + crate::recorder::INPUTS
@@ -8095,8 +8106,9 @@ mod tests {
             assert_eq!(
                 moved,
                 vec![want],
-                "column {col} ({:?}) moved {moved:?}, not just {want}",
-                Strip::column(col)
+                "column {} ({:?}) moved {moved:?}, not just {want}",
+                col.0,
+                col.strip()
             );
         }
     }
@@ -8109,7 +8121,7 @@ mod tests {
         use crate::mixer_panel::Hit;
         use crate::recorder::COLUMNS_FOR_TEST;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
-        app.apply_mixer_hit(Hit::Fader(COLUMNS_FOR_TEST - 1), 0.42);
+        app.apply_mixer_hit(Hit::Fader(crate::recorder::Column(COLUMNS_FOR_TEST - 1)), 0.42);
         let desk = app.settings.master_gain;
         assert!(
             (desk - f64::from(recorder::fader_to_gain(0.42))).abs() < 1e-9,
@@ -8133,14 +8145,14 @@ mod tests {
         use crate::recorder::COLUMNS_FOR_TEST;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         let fresh = Settings::default();
-        for col in 0..COLUMNS_FOR_TEST {
+        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
             app.apply_mixer_hit(Hit::Fader(col), 0.13);
         }
         assert_ne!(
             app.settings.master_gain, fresh.master_gain,
             "nothing moved, so resetting proves nothing"
         );
-        for col in 0..COLUMNS_FOR_TEST {
+        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
             app.reset_mixer_hit(Hit::Fader(col));
         }
         for (what, got, want) in [
@@ -8167,9 +8179,9 @@ mod tests {
     #[test]
     fn every_column_writes_its_own_name_and_no_others() {
         use crate::recorder::{Strip, COLUMNS_FOR_TEST, STRIPS};
-        for col in 0..COLUMNS_FOR_TEST {
+        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
-            app.commit_mixer_name(col, format!("col{col}"));
+            app.commit_mixer_name(col, format!("col{}", col.0));
             let named: Vec<usize> = (0..=STRIPS)
                 .filter(|i| {
                     app.settings.strip_names.get(*i).is_some_and(|n| !n.is_empty())
@@ -8177,9 +8189,10 @@ mod tests {
                 .collect();
             assert_eq!(
                 named,
-                vec![Strip::column_index(col)],
-                "column {col} ({:?}) named {named:?}",
-                Strip::column(col)
+                vec![col.desk_index()],
+                "column {} ({:?}) named {named:?}",
+                col.0,
+                col.strip()
             );
         }
     }
@@ -8188,13 +8201,14 @@ mod tests {
     #[test]
     fn a_typed_name_is_the_one_the_desk_shows() {
         use crate::recorder::COLUMNS_FOR_TEST;
-        for col in 0..COLUMNS_FOR_TEST {
+        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             app.commit_mixer_name(col, "Rhodes".to_owned());
             assert_eq!(
-                app.mixer_view().strips[col].name,
+                app.mixer_view().strips[col.0].name,
                 "Rhodes",
-                "column {col} does not show the name it was given"
+                "column {} does not show the name it was given",
+                col.0
             );
         }
     }

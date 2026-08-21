@@ -10,7 +10,7 @@
 //! [`Layout::targets`] is the single source of truth both are derived from. No
 //! state, no `egui::Ui`, and nothing here can open a device or read a file.
 
-use crate::recorder::{gain_text, gain_to_fader, Strip, INSERTS, SLOTS};
+use crate::recorder::{gain_text, gain_to_fader, Column, Strip, INSERTS, SLOTS};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 /// One channel, as the painter sees it.
@@ -82,15 +82,15 @@ pub struct MixerView<'a> {
     /// The band's own wood, so the two surfaces are one instrument.
     pub wood: (u8, u8, u8),
     /// The strip whose colour palette is open, if any.
-    pub palette_open: Option<usize>,
+    pub palette_open: Option<Column>,
     /// A decibel figure being typed, and into which strip.
     ///
     /// **A fader is a bad way to ask for exactly -6.0.** Its whole range is
     /// eighty decibels; the drag was slowed until it was usable, and this is
     /// the other half of that — click the number and say it.
-    pub typing: Option<(usize, &'a str)>,
+    pub typing: Option<(Column, &'a str)>,
     /// The channel whose NAME is being typed, and what is in the field.
-    pub naming: Option<(usize, &'a str)>,
+    pub naming: Option<(Column, &'a str)>,
 }
 
 impl MixerView<'_> {
@@ -112,25 +112,26 @@ impl MixerView<'_> {
 /// What a press on the mixer means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
-    /// The fader of strip `n`, where `n` indexes [`MixerView::strips`].
-    Fader(usize),
-    /// The send knob of strip `n`.
-    Send(usize),
-    Mute(usize),
-    Solo(usize),
+    /// The fader of the strip drawn in this column.
+    Fader(Column),
+    /// The send knob of the strip drawn in this column.
+    Send(Column),
+    Mute(Column),
+    Solo(Column),
     /// **What is on this channel**: the plus on an empty slot, and the icon
     /// above the name on a filled one. Both open the same picker — the
     /// interface for an input, the instrument for a slot, the file for the
     /// backing track — because both ask the same question.
-    Add(usize),
+    Add(Column),
     /// One of the three insert chips: put an effect in it, or take one out.
-    Insert(usize, usize),
-    /// A swatch in the open palette: paint strip `n` colour `c`.
-    Paint(usize, usize),
+    /// The second field is the BAY, which is not a channel of anything.
+    Insert(Column, usize),
+    /// A swatch in the open palette: paint this column's strip colour `c`.
+    Paint(Column, usize),
     /// A right-click anywhere on a strip: open its palette.
-    Palette(usize),
+    Palette(Column),
     /// The decibel readout: type a number into it.
-    Db(usize),
+    Db(Column),
     /// The channel's name: type a new one.
     ///
     /// **On an INPUT this renames the interface, not the channel.** Every
@@ -138,12 +139,12 @@ pub enum Hit {
     /// typing "x" over "Scarlett 18i20 USB - 3" makes all of them "x - N" at
     /// once — which is the only rename that fits and the only one anybody
     /// wants to type more than once.
-    Name(usize),
+    Name(Column),
 }
 
 impl Hit {
-    /// Which channel it is on. Every one of them is on exactly one.
-    pub fn strip(self) -> usize {
+    /// Which column it is on. Every one of them is on exactly one.
+    pub fn column(self) -> Column {
         match self {
             Hit::Fader(i)
             | Hit::Send(i)
@@ -521,6 +522,7 @@ impl Layout {
     pub fn targets(&self) -> Vec<(Rect, Hit)> {
         let mut out = Vec::with_capacity(6 * 4);
         for (i, s) in self.strips.iter().enumerate() {
+            let i = Column(i);
             for (r, hit) in [
                 (s.fader, Hit::Fader(i)),
                 (s.send, Hit::Send(i)),
@@ -549,7 +551,7 @@ pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
     // a fader that also moved the fader would be a colour you cannot pick
     // without changing a level.
     if let Some(at) = view.palette_open {
-        if let Some(s) = l.strips.get(at) {
+        if let Some(s) = l.strips.get(at.0) {
             for (c, r) in palette_over(s).into_iter().enumerate() {
                 if r.contains(pos) {
                     return Some(Hit::Paint(at, c));
@@ -567,12 +569,13 @@ pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
         .map(|(_, h)| h)
 }
 
-/// Which strip a point is on, for a right-click. `None` off the rack.
-pub fn strip_at(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<usize> {
+/// Which column a point is on, for a right-click. `None` off the rack.
+pub fn strip_at(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Column> {
     Layout::new(rect, view)
         .strips
         .iter()
         .position(|s| s.panel.contains(pos))
+        .map(Column)
 }
 
 /// How far a control travels, for the caller that is dragging it.
@@ -648,13 +651,13 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
             continue;
         }
         let heard = view.heard(i);
-        let typed = view.typing.filter(|(at, _)| *at == i).map(|(_, b)| b);
-        let naming = view.naming.filter(|(at, _)| *at == i).map(|(_, b)| b);
+        let typed = view.typing.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
+        let naming = view.naming.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
         strip(painter, s, v, &p, heard, typed, naming);
     }
     // The palette last, over whatever it belongs to.
     if let Some(at) = view.palette_open {
-        if let Some(s) = l.strips.get(at) {
+        if let Some(s) = l.strips.get(at.0) {
             painter.rect_filled(s.panel, 3.0, Color32::from_black_alpha(180));
             for (c, r) in palette_over(s).into_iter().enumerate() {
                 let (cr, cg, cb) = STRIP_COLORS[c];
@@ -1540,7 +1543,7 @@ mod tests {
         }
         assert_eq!(
             hit_test(rect(), &v, s.add.center()),
-            Some(Hit::Add(0)),
+            Some(Hit::Add(Column(0))),
             "the plus does not open anything"
         );
         // And a filled one has no plus in the MIDDLE of it, where the fader
@@ -1559,7 +1562,7 @@ mod tests {
         );
         assert_eq!(
             hit_test(rect(), &a_view(), filled.strips[0].icon.center()),
-            Some(Hit::Add(0)),
+            Some(Hit::Add(Column(0))),
             "the icon does not open the picker"
         );
     }
@@ -1584,7 +1587,7 @@ mod tests {
         ] {
             assert_eq!(
                 hit_test(r, &v, at),
-                Some(Hit::Add(0)),
+                Some(Hit::Add(Column(0))),
                 "{what} of an empty channel does nothing"
             );
         }
@@ -1714,7 +1717,7 @@ mod tests {
                 );
                 assert_eq!(
                     hit_test(r, &v, s.inserts[n].center()),
-                    Some(Hit::Insert(i, n)),
+                    Some(Hit::Insert(Column(i), n)),
                     "channel {i}'s insert {n} cannot be pressed"
                 );
             }
@@ -1769,7 +1772,7 @@ mod tests {
             assert!(s.name.is_positive(), "channel {i} has nowhere to put a name");
             assert_eq!(
                 hit_test(r, &v, s.name.center()),
-                Some(Hit::Name(i)),
+                Some(Hit::Name(Column(i))),
                 "channel {i}'s name cannot be pressed"
             );
         }
@@ -1780,7 +1783,7 @@ mod tests {
         empty.strips[0] = a_strip(Some(Strip::Slot(0)), true);
         let l = Layout::new(r, &empty);
         assert!(!l.strips[0].name.is_positive(), "an empty slot got a name field");
-        assert_eq!(hit_test(r, &empty, l.strips[0].panel.center()), Some(Hit::Add(0)));
+        assert_eq!(hit_test(r, &empty, l.strips[0].panel.center()), Some(Hit::Add(Column(0))));
     }
 
     /// **Every mark has to land on the scale it is drawn against.**
@@ -1831,7 +1834,7 @@ mod tests {
     #[test]
     fn every_swatch_is_inside_its_own_channel_and_can_be_pressed() {
         let mut v = a_view();
-        v.palette_open = Some(0);
+        v.palette_open = Some(Column(0));
         let r = rect();
         let l = Layout::new(r, &v);
         let panel = l.strips[0].panel;
@@ -1845,7 +1848,7 @@ mod tests {
             assert!(sw.is_positive(), "swatch {i} has no area");
             assert_eq!(
                 hit_test(r, &v, sw.center()),
-                Some(Hit::Paint(0, i)),
+                Some(Hit::Paint(Column(0), i)),
                 "swatch {i} cannot be pressed"
             );
             for (j, other) in swatches.iter().enumerate().take(i) {
@@ -1877,7 +1880,7 @@ mod tests {
         let l = Layout::new(r, &v);
         assert_eq!(
             hit_test(r, &v, l.strips[0].db.center()),
-            Some(Hit::Db(0)),
+            Some(Hit::Db(Column(0))),
             "the number could not be clicked"
         );
 
@@ -1885,32 +1888,32 @@ mod tests {
         // — a swatch over a fader that also moved the fader would be a colour
         // you cannot pick without changing a level.
         let mut open = a_view();
-        open.palette_open = Some(0);
+        open.palette_open = Some(Column(0));
         let swatches = palette_over(&l.strips[0]);
         assert_eq!(swatches.len(), STRIP_COLORS.len());
         for (c, s) in swatches.iter().enumerate() {
-            assert_eq!(hit_test(r, &open, s.center()), Some(Hit::Paint(0, c)));
+            assert_eq!(hit_test(r, &open, s.center()), Some(Hit::Paint(Column(0), c)));
         }
         // The fader is under it and cannot be reached.
         assert!(matches!(
             hit_test(r, &open, l.strips[0].fader.center()),
-            Some(Hit::Paint(0, _))
+            Some(Hit::Paint(Column(0), _))
         ));
         // And a strip that is NOT the open one is untouched.
         assert_eq!(
             hit_test(r, &open, l.strips[1].fader.center()),
-            Some(Hit::Fader(1))
+            Some(Hit::Fader(Column(1)))
         );
     }
 
     /// Everything that travels does so vertically, and knows how far.
     #[test]
     fn every_travelling_control_has_an_axis_and_a_distance() {
-        for hit in [Hit::Fader(0), Hit::Send(1)] {
+        for hit in [Hit::Fader(Column(0)), Hit::Send(Column(1))] {
             assert_eq!(hit.axis(), Some(DragAxis::Vertical), "{hit:?}");
             assert!(hit.travel().is_some_and(|t| t > 0.0), "{hit:?}");
         }
-        for hit in [Hit::Mute(0), Hit::Solo(0)] {
+        for hit in [Hit::Mute(Column(0)), Hit::Solo(Column(0))] {
             assert_eq!(hit.axis(), None, "{hit:?} is not a thing you drag");
             assert_eq!(hit.travel(), None, "{hit:?}");
         }
