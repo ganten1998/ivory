@@ -1,6 +1,8 @@
 # Ivory 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-21. **The app is now called TANGENT.** Newest work is
+§2z: the video that was half its own length on every take, and the message
+about it that could not be read, cleared or pressed. Before it,
 §2y: what you hear is what you get — the take is the desk, and mute is the only
 thing that decides what is in it. Before it,
 §2x: the buffer-size change that deadlocked against CoreAudio. Before it,
@@ -2308,6 +2310,117 @@ Several inputs of one interface, one strip each.
 `strip_colors`, `strip_sends` and the mute/solo masks past the new columns.
 Without it a violet backing track comes back on input 2. See
 `desk_channel_moved`.
+
+---
+
+## 2z. 2026-08-21 — the video was half length, and had been for weeks
+
+Shipped as **4.29.0**, from the owner's own measured handoff on `dresden` (a
+2013 MacBook Air running Linux). Read that document before this section if it
+is still around: `~/tangent-handoff/`, plus an artifact titled "Tangent Camera
+Hardening". The numbers below are theirs.
+
+### A. The take was 0.50 of its own length, on every take, on every platform
+
+Six takes in a row: video duration over audio duration, 0.50, 0.51, 0.52. The
+camera played about twice too fast and stopped halfway through.
+
+`Encoder::push` took a timestamp per frame, compared it against the last one,
+and **threw it away**. Frames go down a rawvideo pipe with `-framerate N`, so
+ffmpeg stamps them by ARRIVAL ORDER: the Nth frame to arrive is second N/fps
+whenever it actually turned up. On a machine that cannot composite and encode
+in real time — the case this path exists to survive — about half the pushes
+were dropped for want of queue room, and a dropped frame is invisible to an
+arrival-order timeline. The take simply got shorter.
+
+Every frame is now placed at the slot its own timestamp names, and the gap is
+filled with the PREVIOUS picture — what was on screen while the compositor was
+busy. Padding with the NEW picture would pull each stall's worth of motion
+earlier, which is the same error in miniature.
+
+- The padding rides with the frame it precedes (`Frame::pad`) and is WRITTEN,
+  not queued: a twenty-slot stall is twenty writes of one buffer rather than
+  twenty frames of backpressure.
+- Capped at two seconds (`MAX_PAD`). A compositor stopped for longer than that
+  has not stalled, it has stopped, and painting the last picture across the
+  whole of it would be inventing a recording.
+- **macOS was never affected.** AVFoundation is handed the real presentation
+  time, so `frames_repeated` is zero there by construction.
+
+### B. The wait that made it worse
+
+`push` blocked the UI thread for two frame intervals before giving up — 66 ms
+at 30 fps — and the UI thread is what composites the next frame. A machine that
+fell behind once stayed behind. It was that long because a dropped frame used
+to shorten the video; with A fixed the trade is honest, so it is capped at 4 ms
+(`MAX_WAIT`).
+
+### C. The message about it could not be read, cleared or pressed
+
+Every one of these was true at once:
+
+- It lived in `engine_error`, the AUDIO engine's slot, which nothing in the
+  video path ever cleared. One sat on screen for eight minutes across several
+  takes. It has its own field now (`take_note`), cleared when a take starts.
+- It could not be dismissed: painted with a bare `Painter::text`, so no rect in
+  `targets()` and a press returned `None`. There is an × on the status row now
+  (`Hit::DismissMessage`), and it is in `SURVIVORS` because a warning that
+  appears mid-take is exactly when somebody reads it.
+- **It could vanish entirely.** `fit_text` shrinks to fit and returns a size
+  below `MIN_TEXT` when it cannot, and `text_line` read that as "draw nothing"
+  — so at 155 characters the one line with the answer in it was silently absent
+  on a narrower window. `fit_or_cut` truncates instead.
+- It named Take Settings, where the video resolution is not. That is Export.
+
+### D. The modal that looked like a hang
+
+`Summary::is_problem` was `problem.is_some() || silent`, so **"the audio is
+silent" opened a MODAL dialog** — and `handle_main_interaction` drops every
+event while one is open. On Linux it opened behind the main window and
+swallowed ten minutes of clicks and keypresses. The app looked frozen and was
+not.
+
+A silent take is a line in the status row now. And because a window manager can
+ignore `AlwaysOnTop`, a press on the main window while a modal is up RAISES the
+modal (`SurfaceSpec::raise`) instead of going nowhere: a press that disappears
+is how an app looks frozen.
+
+### E. Camera pipeline
+
+- The JPEG decode was INSIDE `stream.dequeue`'s closure, which holds the mmap'd
+  buffer. The driver has two (`linuxvideo`'s `DEFAULT_BUFFER_COUNT`, and
+  `ReadStream::new` is `pub(crate)`, so more means vendoring), so a decode
+  costing a third of a core left it exactly one. The bitstream is copied out —
+  tens of kilobytes — and the buffer goes straight back.
+- `FrameSlot::recycle`: the consumer hands the buffer back. `spare` used to be
+  refilled only when a frame was DISPLACED, so the allocation-free steady state
+  held only while the preview was losing frames.
+- One 3.7 MB `clone()` per frame is gone from the UI thread.
+- `frames_expected` is `due`, not `next`: the gap-filling burst is capped at a
+  second, so reporting the timeline position shortened the expectation to match
+  what was delivered, and the take reported no loss while losing half.
+
+### What is NOT done, and why
+
+**Hardware encode and hardware compositing.** The owner measured `h264_vaapi`
+at **0.70 s against libx264's 25.54 s** for ten seconds of 720p — 36× less CPU
+at equal SSIM — and VA-API JPEG decode at 5.3× against ffmpeg's SIMD decoder.
+Their machine has JPEG VLD, VPP, H.264 EncSlice and both DMA-BUF extensions,
+and no hardware Vulkan driver at all (Gen7 predates ANV; `wgpu` sees only
+lavapipe).
+
+It is not in the source because none of it can be exercised on the build
+machine, and an untested encoder path can silently ruin every take on the one
+platform that needs it. **They have it working as a shim** at
+`~/.local/bin/tangent-ffmpeg`, which intercepts the `libx264` invocation. With
+A fixed, the shim's timing half (`-use_wallclock_as_timestamps`) can be
+dropped and only the hardware half remains — see their §07.
+
+Their probes are in `~/tangent-handoff/bench/`, including the one that finds
+why `wgpu`'s GL backend fails on crocus: wgpu-hal 27 asks for
+`EGL_CONTEXT_OPENGL_ROBUST_ACCESS` and gets `EGL_BAD_ATTRIBUTE`, then never
+reaches a working configuration. That looks like a genuine upstream bug
+affecting every driver without robust access.
 
 ---
 
