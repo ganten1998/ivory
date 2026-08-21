@@ -65,6 +65,33 @@ fn desk_channel_moved(old: usize) -> usize {
     }
 }
 
+/// The desk arrays exactly as the FILE had them, before anything clamps.
+///
+/// **Because the desk is about to SHRINK, and truncation happens first.**
+/// `from_map` read these with `.take(STRIPS + 1)` against the LIVE constant and
+/// `shift_remove`d the key on the way past — so nothing over the new length was
+/// read, and nothing was left in `extra` either. That is harmless while a desk
+/// only ever grows and silently destructive the first time it does not:
+/// twelve strips becoming eleven drops the master's colour, its name and its
+/// three insert plugins, and hands the master whatever was at the old index 11,
+/// which is the effects bus. On the first launch, for every existing user, with
+/// the only copy being the file the next save overwrites.
+///
+/// So the file's own lengths are kept here, the migration renumbers against
+/// them, and the clamp into the fixed arrays happens LAST. The caps are a
+/// defence against a hand-edited file, not a description of any desk: they are
+/// deliberately far larger than any shape this app has had or is planning.
+#[derive(Debug, Default)]
+struct LegacyDesk {
+    colors: Vec<i64>,
+    sends: Vec<f64>,
+    inserts: Vec<String>,
+    names: Vec<String>,
+}
+
+/// As many channels as a hand-edited file may claim before we stop reading.
+const LEGACY_MAX_STRIPS: usize = 64;
+
 /// The desk's shape at settings_version 10, frozen.
 ///
 /// Every constant a migration needs is written down here as a literal rather
@@ -87,22 +114,31 @@ const V11_INSERTS: usize = 3;
 const V11_FX_INDEX: usize = 11;
 
 /// Move every desk array from the one-input layout to this one.
-fn migrate_desk_channels(s: &mut Settings) {
-    // Frozen, like everything else a migration reads — see `V10_SLOTS`. The
-    // upper bound is the only live one, and it is a BOUNDS CHECK against the
-    // arrays as they are today rather than a description of the old shape.
-    let today = crate::recorder::STRIPS;
+fn migrate_desk_channels(s: &mut Settings, desk: &mut LegacyDesk) {
+    // **On the staging arrays**, which are at the file's own length — see
+    // `LegacyDesk`. Grown rather than bounds-checked against today's constant:
+    // this move pushes rows UP, and a destination past the end of what the file
+    // held is a row that has to exist before it can be written.
+    let was = V10_SLOTS + 4; // the old `STRIPS`, before the input strips
+    let need = desk_channel_moved(was) + 1;
+    if desk.colors.len() < need {
+        desk.colors.resize(need, 0);
+    }
+    if desk.sends.len() < need {
+        desk.sends.resize(need, 0.0);
+    }
     // Highest first, because every channel moves UP: writing low to high would
     // overwrite entries that have not been read yet.
-    let was = V10_SLOTS + 4; // the old `STRIPS`, before the input strips
     for old in (V10_SLOTS + 1..=was).rev() {
         let new = desk_channel_moved(old);
-        if new == old || new > today {
+        if new == old {
             continue;
         }
-        s.strip_colors[new] = std::mem::replace(&mut s.strip_colors[old], 0);
-        if old < s.strip_sends.len() && new < s.strip_sends.len() {
-            s.strip_sends[new] = std::mem::replace(&mut s.strip_sends[old], 0.0);
+        if old < desk.colors.len() && new < desk.colors.len() {
+            desk.colors[new] = std::mem::replace(&mut desk.colors[old], 0);
+        }
+        if old < desk.sends.len() && new < desk.sends.len() {
+            desk.sends[new] = std::mem::replace(&mut desk.sends[old], 0.0);
         }
     }
     let move_mask = |mask: u32| {
@@ -1354,40 +1390,48 @@ impl Settings {
         // the eight went, and `strip_colors_v2` is written. A file with both
         // is a downgrade and back, and the newer key wins — which is the same
         // bargain every other renamed key here makes.
+        // **At the FILE's length, not at today's.** See `LegacyDesk`: the
+        // clamp has to happen after the migration, or a desk that shrinks
+        // destroys the rows past the new end before anything can move them.
+        let mut desk = LegacyDesk::default();
         for (key, migrate) in [("strip_colors", true), ("strip_colors_v2", false)] {
             let Some(Value::Array(v)) = map.shift_remove(key) else {
                 continue;
             };
-            for (i, x) in v.iter().take(crate::recorder::STRIPS + 1).enumerate() {
-                let Some(n) = x.as_i64() else { continue };
-                let n = if migrate {
-                    let old = n.rem_euclid(crate::mixer_panel::PALETTE_V1_TO_V2.len() as i64);
-                    crate::mixer_panel::PALETTE_V1_TO_V2[old as usize] as i64
-                } else {
-                    n
-                };
-                s.strip_colors[i] = n.rem_euclid(crate::mixer_panel::STRIP_COLORS.len() as i64);
-            }
+            desk.colors = v
+                .iter()
+                .take(LEGACY_MAX_STRIPS + 1)
+                .map(|x| {
+                    let n = x.as_i64().unwrap_or(0);
+                    let n = if migrate {
+                        let old = n.rem_euclid(crate::mixer_panel::PALETTE_V1_TO_V2.len() as i64);
+                        crate::mixer_panel::PALETTE_V1_TO_V2[old as usize] as i64
+                    } else {
+                        n
+                    };
+                    n.rem_euclid(crate::mixer_panel::STRIP_COLORS.len() as i64)
+                })
+                .collect();
         }
         if let Some(Value::Array(v)) = map.shift_remove("strip_sends") {
-            for (i, x) in v.iter().take(crate::recorder::STRIPS).enumerate() {
-                if let Some(n) = x.as_f64() {
-                    s.strip_sends[i] = n.clamp(0.0, 1.0);
-                }
-            }
+            desk.sends = v
+                .iter()
+                .take(LEGACY_MAX_STRIPS)
+                .map(|x| x.as_f64().unwrap_or(0.0).clamp(0.0, 1.0))
+                .collect();
         }
         if let Some(Value::Array(v)) = map.shift_remove("strip_inserts") {
-            s.strip_inserts = v
+            desk.inserts = v
                 .into_iter()
                 .map(|x| x.as_str().unwrap_or_default().to_owned())
-                .take((crate::recorder::STRIPS + 1) * crate::recorder::INSERTS)
+                .take((LEGACY_MAX_STRIPS + 1) * crate::recorder::INSERTS)
                 .collect();
         }
         if let Some(Value::Array(v)) = map.shift_remove("strip_names") {
-            s.strip_names = v
+            desk.names = v
                 .into_iter()
                 .map(|x| x.as_str().unwrap_or_default().to_owned())
-                .take(crate::recorder::STRIPS + 1)
+                .take(LEGACY_MAX_STRIPS + 1)
                 .collect();
         }
         if let Some(Value::String(v)) = map.shift_remove("input_alias") {
@@ -1587,8 +1631,36 @@ impl Settings {
         if !saw_bars {
             s.convert_count_in_to_bars();
         }
-        s.migrate_from(was, legacy, legacy_staff, saw_order);
+        s.migrate_from(was, legacy, legacy_staff, saw_order, &mut desk);
+        // **The clamp, LAST.** Everything above this line worked at the shape
+        // the file had; from here on the desk is this build's shape. See
+        // `LegacyDesk`.
+        s.adopt_desk(desk);
         s
+    }
+
+    /// Fold the file's desk arrays into this build's fixed ones.
+    ///
+    /// Rows past the end are dropped HERE, after the migration has had its
+    /// chance to move anything worth keeping — which is the whole point of
+    /// [`LegacyDesk`]. A row that reaches this function and does not fit is a
+    /// row the migration decided not to carry.
+    fn adopt_desk(&mut self, desk: LegacyDesk) {
+        for (i, n) in desk.colors.iter().take(crate::recorder::STRIPS + 1).enumerate() {
+            self.strip_colors[i] = *n;
+        }
+        for (i, n) in desk.sends.iter().take(crate::recorder::STRIPS).enumerate() {
+            self.strip_sends[i] = *n;
+        }
+        if !desk.inserts.is_empty() {
+            self.strip_inserts = desk.inserts;
+            self.strip_inserts
+                .truncate((crate::recorder::STRIPS + 1) * crate::recorder::INSERTS);
+        }
+        if !desk.names.is_empty() {
+            self.strip_names = desk.names;
+            self.strip_names.truncate(crate::recorder::STRIPS + 1);
+        }
     }
 
     /// Move a file written before [`SETTINGS_VERSION`] onto the defaults it
@@ -1607,6 +1679,9 @@ impl Settings {
         legacy_theory: [bool; 3],
         legacy_staff: bool,
         saw_order: bool,
+        // **The desk at the FILE's shape**, not this build's. Every renumbering
+        // below works on this and the clamp happens after — see `LegacyDesk`.
+        desk: &mut LegacyDesk,
     ) {
         if was < 11 {
             // **The one insert this app had becomes the first of the bus's
@@ -1617,12 +1692,16 @@ impl Settings {
                 // `Strip::Fx.index() * INSERTS`, so the next time `Strip` gains
                 // or loses a variant every upgrade from version 10 would have
                 // put the bus reverb on some other channel.
+                //
+                // On `desk`, not on `self`: this writes an index in the OLD
+                // layout, and it has to resolve there before anything renumbers
+                // it. See `LegacyDesk`.
                 let at = V11_FX_INDEX * V11_INSERTS;
                 let need = (V11_STRIPS + 1) * V11_INSERTS;
-                if self.strip_inserts.len() < need {
-                    self.strip_inserts.resize(need, String::new());
+                if desk.inserts.len() < need {
+                    desk.inserts.resize(need, String::new());
                 }
-                if let Some(slot) = self.strip_inserts.get_mut(at) {
+                if let Some(slot) = desk.inserts.get_mut(at) {
                     if slot.is_empty() {
                         *slot = path;
                     }
@@ -1633,7 +1712,7 @@ impl Settings {
             // **The desk grew four input columns where there had been one**,
             // and everything indexed by a channel moved with it. See
             // `desk_channel_moved`.
-            migrate_desk_channels(self);
+            migrate_desk_channels(self, desk);
         }
         if was < 9 {
             // **The limiter's dial turned round.** It used to be off at zero
@@ -3453,6 +3532,102 @@ mod tests {
                  beside `V10_SLOTS` instead"
             );
         }
+    }
+
+    /// **A desk that SHRINKS must not eat the rows past its new end before the
+    /// migration has seen them.**
+    ///
+    /// This is the trap the whole `LegacyDesk` staging exists for, and it is
+    /// about to be sprung: the rework replaces five instrument slots and four
+    /// inputs with eight general channels, so `STRIPS` goes from 12 to 11 and
+    /// every desk array loses its last row.
+    ///
+    /// `from_map` read those arrays with `.take(STRIPS + 1)` against the LIVE
+    /// constant and `shift_remove`d the key on the way past — so the rows over
+    /// the new length were never read, and were not left in `extra` either. On
+    /// the first launch of the new build, for every existing user, the master's
+    /// colour, its name and its three insert plugins would have been dropped
+    /// and the master handed whatever sat at the old index 11, which is the
+    /// effects bus. The only copy is the file the next save overwrites.
+    ///
+    /// Written against a SYNTHETIC shrink rather than against today's numbers:
+    /// the fault cannot be reproduced until `STRIPS` actually changes, and a
+    /// test that waits for that is a test that fails on the commit that needed
+    /// it. So this checks the property directly — everything the file held is
+    /// visible to the migration, and the clamp happens after.
+    #[test]
+    fn a_shrinking_desk_reaches_the_migration_before_it_is_clamped() {
+        use crate::recorder::{INSERTS, STRIPS};
+
+        // A file from a desk WIDER than this build's, by two channels — which
+        // is the shape a v11 file has the moment `STRIPS` drops.
+        let wide = STRIPS + 2;
+        let colors: Vec<String> = (0..=wide).map(|i| (i % 27).to_string()).collect();
+        let names: Vec<String> = (0..=wide).map(|i| format!("\"ch{i}\"")).collect();
+        let inserts: Vec<String> = (0..(wide + 1) * INSERTS)
+            .map(|i| format!("\"/x/p{i}.vst3\""))
+            .collect();
+        let json = format!(
+            r#"{{"settings_version": {SETTINGS_VERSION},
+                 "strip_colors_v2": [{}],
+                 "strip_names": [{}],
+                 "strip_inserts": [{}]}}"#,
+            colors.join(","),
+            names.join(","),
+            inserts.join(",")
+        );
+
+        let s = Settings::from_json(&json);
+
+        // What survives is this build's shape, taken from the FRONT — not a
+        // window that slid because something was dropped early.
+        assert_eq!(
+            s.strip_names.len(),
+            STRIPS + 1,
+            "the names were not clamped to this build's desk"
+        );
+        for i in 0..=STRIPS {
+            assert_eq!(s.strip_names[i], format!("ch{i}"), "channel {i} moved");
+            assert_eq!(
+                s.strip_colors[i],
+                (i % 27) as i64,
+                "channel {i}'s colour moved"
+            );
+        }
+        assert_eq!(s.strip_inserts.len(), (STRIPS + 1) * INSERTS);
+        for i in 0..(STRIPS + 1) * INSERTS {
+            assert_eq!(s.strip_inserts[i], format!("/x/p{i}.vst3"), "bay {i} moved");
+        }
+    }
+
+    /// And the staging never truncates BEFORE a migration that needs the rows.
+    ///
+    /// Reading the source, because the property is about an ordering that no
+    /// value can witness once it has been lost: `from_map` must not clamp, and
+    /// the clamp must be the last thing that happens.
+    #[test]
+    fn the_desk_is_clamped_after_the_migration_and_not_during_the_read() {
+        let src = include_str!("settings.rs");
+        let from_map = &src[src.find("fn from_map").expect("from_map")
+            ..src.find("fn adopt_desk").expect("adopt_desk")];
+        for banned in [
+            "take(crate::recorder::STRIPS",
+            "take((crate::recorder::STRIPS",
+        ] {
+            assert!(
+                !from_map.contains(banned),
+                "the read path clamps to today's desk with `{banned}`; stage it \
+                 in `LegacyDesk` and clamp in `adopt_desk` instead"
+            );
+        }
+        let order = from_map
+            .find("migrate_from")
+            .zip(from_map.find("adopt_desk"))
+            .expect("both are called");
+        assert!(
+            order.0 < order.1,
+            "the desk is clamped before the migration can move anything"
+        );
     }
 
 }
