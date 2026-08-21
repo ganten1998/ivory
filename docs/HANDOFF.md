@@ -1,6 +1,8 @@
 # Ivory 2.0 — Handoff / Resume Document
 
-**Last updated:** 2026-08-20. **The app is now called TANGENT.** Newest work is
+**Last updated:** 2026-08-21. **The app is now called TANGENT.** Newest work is
+§2w: the effects as a bus with a user VST3 across it, and the desk finished to
+the owner's second pass. Before it,
 §2v: a strip per instrument slot, the mixer as a real surface, and the neck's
 interval margin. Before it,
 §2u: the DESK — the effects as a bus, the limiter on the master, and a mixer
@@ -2040,6 +2042,84 @@ The neck stretches rather than losing frets: the strip is taken out of the rect
 BEFORE `Geom` is built. Sized from the panel's HEIGHT so it stays proportional
 to the string spacing, clamped, and with no heading — the first version took
 two frets' width under a word that was the widest thing in it.
+
+---
+
+## 2w. 2026-08-21 — the effects become a bus with a plugin on it, and the desk finishes
+
+Shipped as **4.26.0**. Stage 3 of the mixer plan plus the owner's second pass
+over the panel. Read §2u for why any of this exists.
+
+### A user effect across the bus
+
+The rack lists every VST3 on the machine, so somebody loads Pro-R into a slot
+and hears nothing — an instrument slot sends a plugin MIDI and takes audio
+back, and a reverb has nothing to say to that. The fix is a place where an
+effect is the right thing to load: one insert across the send bus, reached
+from the bus strip's own row.
+
+`ivory-host` could only ever drive an instrument. `Instance::process_effect`
+joins `process` on one path (`process_through`), because two paths would drift:
+the difference between them is entirely in `bind_inputs` — an instrument gets a
+null bus and a zero count, an effect gets its channels bound to the scratch
+buffers. **Channel counts do not have to match and usually don't**: a mono aux
+into a stereo reverb repeats the last channel rather than silencing the right
+side, and only the first input bus is bound (sidechains stay unfed, which is
+the correct default for one).
+
+Scanning learned the difference too. `IPluginFactory2::getClassInfo2` carries
+`subCategories`, which is where "Fx" and "Instrument" live; `ClassInfo` now
+carries a `Kind` and the rack filters on it. This has to happen at
+`Instance::create` and NOT in `discover_in` — that is a filesystem walk that
+never opens a bundle, and making it open one would turn a rack refresh into a
+few hundred dlopens.
+
+**The send bus subtracts its own dry signal.** `effects.rs` is additive by
+construction (`out = dry + wet * knob`) because it was written for an insert on
+the master. Feeding it a copy of the aux and adding the result back is +6 dB
+and comb filtering, so a send instance sets `wet_only` and takes the dry back
+out at the end. The quiet path and the fewer-than-two-channels path zero the
+buffer rather than passing it, for the same reason.
+
+**And clear the aux BEFORE the slots write to it, not after.** The knob did
+nothing for anybody except the click track for one build, because the summing
+order was backwards and every slot's send was being erased a moment after it
+landed.
+
+### The desk, second pass
+
+- **Two columns retired.** The FX bus and the click had strips because the
+  strip was cheap, not because anybody needed a fader there — both are reachable
+  where they already were.
+- **The input and the backing track are visually separate**, in their own
+  colours, with the same icons the recorder band uses above their labels. They
+  are not slots and should not read as slots.
+- **Right-click any channel for a palette.** The colour lands on the whole
+  strip background, which is why every label now sits on its own plate: text
+  and background inside the label keep their own contrast no matter what the
+  strip is painted. The master is red by default.
+- **The faders were slowed.** Eighty decibels across a few hundred pixels is
+  not a control, it is a guess — and the other half of the fix is that the
+  decibel readout is a field. Click it, type `-6`, press Enter. It converts
+  through `gain_to_fader` into the same `Hit::Fader` a drag produces, so one
+  path decides what a fader position means.
+- **The meters are stereo end to end.** `note_strip_peak` takes a pair now and
+  every fold measures both sides; a meter that showed the louder of two was a
+  mono meter with a stereo signal in it. Each carries a scale (0, -12, -24,
+  -48) on the fader's own curve, so unity reads at the same height on both.
+  One bar or two is a claim about the SOURCE — a mono microphone drawn as two
+  identical bars is a lie about the rig — so the input strip asks its stream
+  how wide it is. The master adds the gain reduction the band's master shows.
+
+`no_two_controls_are_in_the_same_place` caught `Fader(8)/Insert(8)` and then
+`Mute(0)/Db(0)` before either could ship as "the number field mutes the
+channel".
+
+### Still not done: stage 4
+
+Several inputs from one interface. §2u's stage list still describes it: fan the
+callback into N rings, and decide what `TakeSource::Input` means when there is
+more than one.
 
 ---
 
