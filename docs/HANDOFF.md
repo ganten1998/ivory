@@ -1,6 +1,8 @@
 # Ivory 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-21. **The app is now called TANGENT.** Newest work is
+§2aa: hardware JPEG decode on Linux, and the camera's 15 fps ceiling turning
+out to be auto-exposure rather than anything this app did. Before it,
 §2z: the video that was half its own length on every take, and the message
 about it that could not be read, cleared or pressed. Before it,
 §2y: what you hear is what you get — the take is the desk, and mute is the only
@@ -2350,10 +2352,25 @@ earlier, which is the same error in miniature.
 ### B. The wait that made it worse
 
 `push` blocked the UI thread for two frame intervals before giving up — 66 ms
-at 30 fps — and the UI thread is what composites the next frame. A machine that
-fell behind once stayed behind. It was that long because a dropped frame used
-to shorten the video; with A fixed the trade is honest, so it is capped at 4 ms
-(`MAX_WAIT`).
+at 30 fps — and the UI thread is what composites the next frame. It was that
+long because a dropped frame used to SHORTEN the video; with A fixed a drop is
+a repeat, so the trade is finally an honest one and the ceiling is `MAX_WAIT`.
+
+**Corrected.** This section first said the wait cost "about half the camera's
+frames on every take", citing the `cam delivered` column of the take table.
+That was wrong, and the Linux box found out why — see §2aa: the camera was
+delivering 15 fps because of AUTO-EXPOSURE, against takes that expected 30.
+Half the frames were never sent, not lost. The wait is still worth capping,
+for the reason above and not for that one.
+
+**And four milliseconds was too few.** Three encoder tests on that box lost a
+fifth to a half of a burst. The cause was not throughput — the frames are
+64x48 — it was that ffmpeg takes a moment to START and had not read a byte.
+Two different problems were wearing one number: a steady-state hiccup is
+milliseconds and blocking through it is right; a process launch is hundreds and
+blocking through THAT is what the ceiling exists to stop. So the allowance is
+generous exactly while it is a launch (`WARMUP`), and the queue is ten frames
+deep rather than four.
 
 ### C. The message about it could not be read, cleared or pressed
 
@@ -2421,6 +2438,89 @@ why `wgpu`'s GL backend fails on crocus: wgpu-hal 27 asks for
 `EGL_CONTEXT_OPENGL_ROBUST_ACCESS` and gets `EGL_BAD_ATTRIBUTE`, then never
 reaches a working configuration. That looks like a genuine upstream bug
 affecting every driver without robust access.
+
+---
+
+## 2aa. 2026-08-21 — hardware JPEG decode, and the 15 fps that was never ours
+
+Written on the Linux box by a second agent working on the hardware it needed,
+and forward-ported here from a 4.4.1 tree. `ivory-record/src/camera/vaapi.rs`
+is theirs, verbatim; `camera/linux.rs` is their capture-loop rework merged onto
+this tree's version of it. **Measured in THIS tree on that machine**: 150
+frames in 10 s at 4.0 ms of CPU per frame, 6.0% of one core, against 25 ms
+before.
+
+### The camera's 15 fps ceiling is auto-exposure, not this app
+
+The most useful thing in the whole exercise, and it corrects a claim §2z was
+repeating. `v4l2-ctl` writing to `/dev/null` — zero processing — measures 14.96
+fps at every size and format, including 640x480 MJPEG at about 1.5 MB/s, which
+rules out USB bandwidth. Exposure reads back as 66.6 ms, exactly two frame
+periods, and the relationship is `fps = min(30, 1/exposure)`: 66.6 ms gives
+15.6, 40 gives 25.3, 30 and below give 30.
+
+The camera does a sustained 30 fps at 720p. It is trading frame rate for
+exposure in a dark room, correctly, and nothing tells the user. **Gotcha:
+setting the control BEFORE streaming is silently overridden — only a mid-stream
+write sticks.**
+
+So the take reports that said the camera delivered half of what was expected
+were describing a camera doing what it was asked to, not a pipeline losing
+frames. §2z's B has been corrected in place.
+
+### What the module does, and the three findings that shaped it
+
+- **The readback dominates, not the decode.** GPU decode is 0.22 ms of CPU;
+  getting the pixels back is 35.5 ms with an ordinary `memcpy`, because a
+  derived VA image is WRITE-COMBINED memory and reads at about 104 MB/s. The
+  naive hardware path is therefore SLOWER than software. `MOVNTDQA` (`copy_wc`)
+  brings it to about 1.5 ms.
+  **That readback exists only because the compositor lives in system memory.**
+  With a GL compositor the surface is exported as a DMA-BUF and never moves —
+  which turns the "get compositing off the CPU" argument into a number.
+- **i965's VPP cannot be told JPEG is full range.** Letting the GPU do
+  YUV→RGBA comes back visibly dark — mean 3.5 against a reference 19.0, and
+  `(19.0−16)×255/219 = 3.48` matches exactly. All five colour configurations
+  produce byte-identical output. Correcting afterwards fails because the wrong
+  conversion CLAMPS and clamping is not invertible. So the module skips VPP and
+  converts the decoder's own YCbCr with full-range coefficients: 20–29 dB
+  becomes 49–54.
+- **The conversion has to be SIMD**: 9.7 ms scalar against 2.3 SSE2, in 7-bit
+  fixed point because `359 × 127` overflows an `i16` lane.
+
+Hand-written FFI over `dlopen` — no bindgen, no libclang, no link-time
+dependency, honouring `ivory-record`'s "no C toolchain requirement". Every
+`#[repr(C)]` struct is pinned by a `const` size assertion. Absent VA-API,
+`Decoder::new` returns `None` and `zune-jpeg` runs unchanged; a frame the
+hardware declines costs a software decode rather than the frame.
+
+### What the port had to keep
+
+Their rework was against 4.4.1 and dropped two things this tree has since
+grown. Both are back:
+
+- `slot.should_convert(host_ns)` / `stats.note_skipped()` — the preview's frame
+  budget (§2s). Without it the camera decodes every frame whether or not
+  anything wants one.
+- `slot.note_convert_cost(...)` — what `affordable_interval` reads. It matters
+  MORE with hardware decode, not less: 2.3 ms a frame instead of 32 is what
+  buys the preview its rate back.
+
+Their refinement kept: **YUYV stays inside the dequeue closure.** It is a byte
+reshuffle, and moving it out would mean copying the whole uncompressed frame —
+1.8 MB at 720p — to save less than the copy costs. MJPEG is the opposite case.
+
+### Still open
+
+- **The V4L2 buffer count is still two.** `linuxvideo` 0.3.5 hardcodes
+  `DEFAULT_BUFFER_COUNT` and `ReadStream::new` is `pub(crate)`. Both of us hit
+  it independently; it needs an upstream change or a vendored copy.
+- **The compositor is still on lavapipe**, and the readback finding above is
+  the strongest argument yet for the raw-EGL/GL route. `~/tangent-handoff/bench`
+  on that box has the probe that shows wgpu-hal 27 asking crocus for
+  `EGL_CONTEXT_OPENGL_ROBUST_ACCESS` and getting `EGL_BAD_ATTRIBUTE`.
+- **Hardware ENCODE is not ported.** The owner's `~/.local/bin/tangent-ffmpeg`
+  shim still does it, and with A fixed its timing half can be dropped.
 
 ---
 

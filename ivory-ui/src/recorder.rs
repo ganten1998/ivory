@@ -426,6 +426,20 @@ pub enum Strip {
     Fx,
 }
 
+/// How many effect inserts a channel has room for.
+///
+/// **Three, on every channel, and the number never changes.** A desk where one
+/// channel can hold nine and another two is a desk you have to remember the
+/// rules of; three everywhere is a shape you can see. It is also artistically
+/// limiting on purpose — this started as a MIDI monitor, and a rack that grows
+/// until the machine gives out is a different program.
+///
+/// Thirty-six across the desk if every one is filled. That is deliberately
+/// reachable: anybody who fills thirty-six will find out what their hardware
+/// can do, which is a thing worth learning from the app rather than from a
+/// number this app made up.
+pub const INSERTS: usize = 3;
+
 /// How many inputs of one interface the desk has room for.
 ///
 /// **Must equal `ivory_record::audio::MAX_PICKS`**, which is the same number

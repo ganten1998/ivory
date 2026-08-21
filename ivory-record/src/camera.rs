@@ -99,6 +99,11 @@ use macos as backend;
 mod linux;
 #[cfg(target_os = "linux")]
 use linux as backend;
+/// Hardware MJPEG decode, when the machine has it. See the module's own docs:
+/// it is strictly an accelerator, absent it `zune-jpeg` runs unchanged, and
+/// nothing links against `libva` — the library is opened at runtime.
+#[cfg(target_os = "linux")]
+pub mod vaapi;
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod stub;

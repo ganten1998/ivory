@@ -340,10 +340,14 @@ fn capture_loop(
         }
     };
 
+    // **Built on the first compressed frame, not up front.** Choosing between
+    // hardware and software means probing with a real frame, and a camera that
+    // never delivers one should not pay for the attempt.
+    let mut mjpeg: Option<MjpegDecoder> = None;
     // The compressed frame, copied out of the driver's buffer so the decode
     // does not hold it. Reused for the life of the take: one allocation, not
     // one per frame.
-    let mut staged: Vec<u8> = Vec::new();
+    let mut compressed: Vec<u8> = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         match stream.will_block() {
             Ok(true) => {
@@ -365,13 +369,15 @@ fn capture_loop(
         // has read, which on Linux is invisible — V4L2 gives no sequence
         // number through `linuxvideo` 0.3 and there is nothing to compare.
         //
-        // Copying a JPEG bitstream is tens of kilobytes; decoding one is
-        // milliseconds. The buffer goes back to the driver as soon as the
-        // memcpy is done.
-        //
         // (Two is the crate's `DEFAULT_BUFFER_COUNT` and `ReadStream::new` is
         // `pub(crate)`, so asking for more would mean vendoring it.)
-        let mut arrived: Option<crate::clock::Nanos> = None;
+        //
+        // **YUYV stays inside, and that is not an oversight.** It is a byte
+        // reshuffle, not a decode: moving it out would mean copying the whole
+        // UNCOMPRESSED frame first — 1.8 MB at 720p — to save less time than
+        // the copy costs. MJPEG is the opposite case: a quarter of a megabyte
+        // in, and a decode that dwarfs it.
+        let mut pending: Option<crate::clock::Nanos> = None;
         let r = stream.dequeue(|view| {
             // First statement, per the module's timebase contract.
             let host_ns = timebase.now();
@@ -379,42 +385,65 @@ fn capture_loop(
                 stats.note_unreadable();
                 return Ok(());
             }
-            // **Before the copy, after the dequeue.** The queue has to keep
-            // moving whatever the answer is, or the driver backs up and starts
-            // reporting errors; the decode is the part worth skipping, and on
-            // this class of machine it is a third of a core.
+            // **Before any work at all, after the dequeue.** The queue has to
+            // keep moving whatever the answer is, or the driver backs up and
+            // starts reporting errors; the conversion is the part worth
+            // skipping when nobody is looking. See `FrameSlot::want`.
             if !slot.should_convert(host_ns) {
                 stats.note_skipped();
                 return Ok(());
             }
-            staged.clear();
-            staged.extend_from_slice(&view);
-            arrived = Some(host_ns);
+            let bytes: &[u8] = &view;
+            match pixel {
+                PixelFormat::YUYV => {
+                    let began = std::time::Instant::now();
+                    let stride = if stride_in >= width as usize * 2 {
+                        stride_in
+                    } else {
+                        width as usize * 2
+                    };
+                    let mut dst = slot.take_spare();
+                    if yuyv_to_rgba(bytes, width, height, stride, &mut dst) {
+                        slot.note_convert_cost(began.elapsed().as_nanos() as u64);
+                        slot.publish(super::Frame {
+                            width,
+                            height,
+                            stride: width as usize * BYTES_PER_PIXEL,
+                            pixels: dst,
+                            host_ns,
+                            pts_ns: None,
+                        });
+                        stats.note_delivered();
+                    } else {
+                        stats.note_unreadable();
+                    }
+                }
+                _ => {
+                    compressed.clear();
+                    compressed.extend_from_slice(bytes);
+                    pending = Some(host_ns);
+                }
+            }
             Ok::<(), io::Error>(())
         });
         if let Err(e) = r {
             state.store(state_as_u8(lost_or_errored(&e)), Ordering::Relaxed);
             return;
         }
-        let Some(host_ns) = arrived else {
+        // Outside the checkout: the driver has its buffer back before the
+        // expensive part starts.
+        let Some(host_ns) = pending else {
             continue;
         };
         // **Timed, because the preview's rate is decided from it.** This is
-        // the JPEG decode the budget exists for; see `FrameSlot::want`.
+        // the JPEG decode the budget exists for — and it is why hardware
+        // decode raises the preview's rate rather than merely lowering the
+        // load: 2.3 ms a frame instead of 32 buys back most of the interval.
         let began = std::time::Instant::now();
+        let decoder =
+            mjpeg.get_or_insert_with(|| MjpegDecoder::new(width, height, &compressed));
         let mut dst = slot.take_spare();
-        let ok = match pixel {
-            PixelFormat::YUYV => {
-                let stride = if stride_in >= width as usize * 2 {
-                    stride_in
-                } else {
-                    width as usize * 2
-                };
-                yuyv_to_rgba(&staged, width, height, stride, &mut dst)
-            }
-            _ => decode_mjpg(&staged, width, height, &mut dst),
-        };
-        if !ok {
+        if !decoder.decode(&compressed, width, height, &mut dst) {
             stats.note_unreadable();
             continue;
         }
@@ -430,6 +459,41 @@ fn capture_loop(
             pts_ns: None,
         });
         stats.note_delivered();
+    }
+}
+
+/// Whichever MJPEG decoder this machine turned out to have.
+///
+/// Hardware decode is thirteen times cheaper on the CPU at 720p — 2.3 ms a
+/// frame against 32.1, measured — which on a two-core laptop that is also
+/// running a synth is the difference between the camera being affordable and
+/// not. But it depends on a VA-API driver with a JPEG entrypoint, which most
+/// machines have and some do not, so it is strictly an ACCELERATOR: when it is
+/// missing, or when it declines a particular frame, `zune-jpeg` runs and the
+/// only difference is the cost.
+enum MjpegDecoder {
+    Hardware(super::vaapi::Decoder),
+    Software,
+}
+
+impl MjpegDecoder {
+    fn new(width: u32, height: u32, sample: &[u8]) -> Self {
+        match super::vaapi::Decoder::new(width, height, sample) {
+            Some(d) => MjpegDecoder::Hardware(d),
+            None => MjpegDecoder::Software,
+        }
+    }
+
+    fn decode(&mut self, bytes: &[u8], width: u32, height: u32, dst: &mut Vec<u8>) -> bool {
+        match self {
+            // A frame the hardware declines — a sampling it cannot express, a
+            // truncated frame, a transient driver error — costs a software
+            // decode rather than the frame itself.
+            MjpegDecoder::Hardware(d) => {
+                d.decode(bytes, width, height, dst) || decode_mjpg(bytes, width, height, dst)
+            }
+            MjpegDecoder::Software => decode_mjpg(bytes, width, height, dst),
+        }
     }
 }
 

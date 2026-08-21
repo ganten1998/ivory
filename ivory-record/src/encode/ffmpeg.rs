@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 /// between a bounded 33 MB of slack and an unbounded queue that ends a long
 /// take with the machine out of memory. Four is enough to ride out the
 /// ordinary hiccup and far too few to be a queue in disguise.
-const QUEUE: usize = 4;
+const QUEUE: usize = 10;
 
 /// The longest gap one picture may be held across, in frames.
 ///
@@ -84,7 +84,33 @@ const WAIT_FRAMES: u32 = 2;
 /// window; dropping costs one repeated picture. Four milliseconds is a quarter
 /// of a 60 fps frame: long enough for the ordinary hiccup the wait exists for,
 /// short enough that nobody can feel it.
-const MAX_WAIT: Duration = Duration::from_millis(4);
+///
+/// **Four milliseconds was too few, and the Linux box said so**: three
+/// encoder tests that push a burst and expect every frame to arrive lost
+/// between a fifth and a half of them. The cause is not steady-state
+/// throughput — the frames in those tests are 64x48 — it is that ffmpeg takes
+/// a moment to START, and the first frames arrive while it is still doing so.
+/// That is what the QUEUE is for, so the queue got deeper rather than the wait
+/// longer: ten frames of headroom absorbs a process launch, where waiting for
+/// one would have meant blocking the window through it.
+const MAX_WAIT: Duration = Duration::from_millis(12);
+
+/// How long a frame may wait while the encoder is still STARTING, and for how
+/// long that allowance lasts.
+///
+/// **Two different problems wearing one number.** A steady-state hiccup is a
+/// few milliseconds and blocking the window through it is the right trade. A
+/// process launch is hundreds, and blocking the window through THAT is what
+/// the four-millisecond ceiling was written to stop — but ffmpeg has not read
+/// a byte yet, so the queue fills and every frame of the opening is dropped
+/// instead. Three encoder tests on the Linux box lost between a fifth and a
+/// half of a burst that way.
+///
+/// So the allowance is generous exactly while it is a launch. The first
+/// seconds of a take are the count-in; a window that hitches there and keeps
+/// the opening is the better bargain, and after that responsiveness wins.
+const WARMUP: Duration = Duration::from_millis(2500);
+const WARMUP_WAIT: Duration = Duration::from_millis(250);
 
 /// Where `ffmpeg` is, or why it is not.
 ///
@@ -182,6 +208,8 @@ pub struct Encoder {
     frame_bytes: usize,
     /// How long `push` will wait for room before it gives the frame up.
     wait: Duration,
+    /// When the encoder was created, for the warm-up allowance. See [`WARMUP`].
+    started: Instant,
     last_pts: Option<Nanos>,
     /// When the first frame of the take happened, which is where the video's
     /// own timeline starts.
@@ -294,6 +322,7 @@ impl Encoder {
             frame_bytes: spec.width as usize * spec.height as usize * 4,
             wait: Duration::from_secs_f64(f64::from(WAIT_FRAMES) / f64::from(spec.fps.max(1)))
                 .min(MAX_WAIT),
+            started: Instant::now(),
             last_pts: None,
             first_pts: None,
             slots: 0,
@@ -381,7 +410,15 @@ impl Encoder {
         // and if there is no room, wait a millisecond and try again until the
         // deadline. `try_send` hands the frame back on a full channel, so the
         // retry costs no second copy of eight megabytes.
-        let deadline = Instant::now() + self.wait;
+        // Generous while the encoder is still coming up, short once it is
+        // running. See `WARMUP`.
+        let now = Instant::now();
+        let wait = if now.duration_since(self.started) < WARMUP {
+            WARMUP_WAIT
+        } else {
+            self.wait
+        };
+        let deadline = now + wait;
         // **The padding rides with the picture it precedes**, not with the one
         // it repeats. The writer holds no state, and a gap can therefore never
         // be written for a frame that was then dropped for want of room.
