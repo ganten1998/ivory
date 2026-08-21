@@ -173,6 +173,18 @@ struct AudioReport {
     clipped_samples: u64,
     take_peak: f32,
     channels: u16,
+    /// **The rate the file was actually WRITTEN at.**
+    ///
+    /// Reported rather than re-derived, because it was re-derived and the two
+    /// answers disagreed. `take.json`'s `nominal_rate_hz` read the CAPTURE
+    /// device's rate and fell back to a hard-coded 48000 when no microphone
+    /// was chosen — while the take itself is the desk OUTPUT and is written at
+    /// the tap's rate. On a machine whose output came up at 44100 with no input
+    /// selected, which is a fresh install, the manifest claimed 48000 over a
+    /// 44100 file: `duration_seconds` came out 8% short and the clock fitter
+    /// dutifully reported the difference as -81894 ppm of drift. Measured on
+    /// Zorin OS 18.1; the files were all correct and only the manifest lied.
+    sample_rate: u32,
     /// When file sample 0 happened, in the timebase. The take's real T0.
     first_frame_ns: Option<Nanos>,
     /// Whether the device was still running when the take stopped.
@@ -212,8 +224,32 @@ struct AudioReport {
 /// dropped; its marks drive the timeline. See `Writer::pump`.
 
 /// The writer thread's own state.
+/// The rate `take.json` should call the take's, given what wrote it.
+///
+/// **The writer's rate wins, because the writer wrote the file.** This was an
+/// inline expression that read the CAPTURE device and fell back to a
+/// hard-coded 48000 — a different fact from the one in the file, since a take
+/// is the desk OUTPUT and is written at the tap's rate. With no microphone
+/// chosen, which is a fresh install, `take.json` claimed 48000 over a 44100
+/// file: `duration_seconds` came out 8% short and the clock fitter reported the
+/// gap as -81894 ppm of drift. Measured on Zorin OS 18.1, where every file was
+/// correct and only the manifest disagreed with them.
+///
+/// The capture device stays the fallback for a take with no writer, and 48000
+/// behind that, because a number has to be chosen — and a guess should be
+/// recognisable as one rather than dressed as a measurement.
+fn nominal_rate(wrote_at: Option<u32>, capture: Option<u32>) -> f64 {
+    wrote_at
+        .filter(|r| *r > 0)
+        .or(capture.filter(|r| *r > 0))
+        .map_or(48_000.0, f64::from)
+}
+
 struct Writer {
     sink: audio::CaptureSink,
+    /// The rate this writer's file is written at. See
+    /// `AudioReport::sample_rate` for why the manifest may not re-derive it.
+    sample_rate: u32,
     tracker: LevelTracker,
     clock: ClockTap,
     cursor: FrameCursor,
@@ -514,6 +550,7 @@ impl Writer {
         self.tracker.publish(&mut m);
         AudioReport {
             frames,
+            sample_rate: self.sample_rate,
             fit: self.clock.fit().clone(),
             // Per-take, by subtracting the reading taken at arm. The fit itself
             // is deliberately NOT reset: the stream is continuous and the
@@ -668,6 +705,7 @@ impl Audio {
         tracker.warm_up(audio::CLIP_WARMUP_MS);
         let mut writer = Writer {
             sink,
+            sample_rate: config.sample_rate,
             tracker,
             clock: ClockTap::new(2_000_000_000),
             cursor: FrameCursor::new(),
@@ -1879,10 +1917,21 @@ impl Session {
         // when there was not. The distinction is the whole reason `synthetic`
         // exists: 0 ppm measured and 0 ppm assumed must not look alike in
         // `take.json`.
-        let nominal = self
-            .audio
-            .as_ref()
-            .map_or(48_000.0, |a| f64::from(a.sample_rate));
+        // **The rate the file was WRITTEN at**, taken from the writer that
+        // wrote it — see `AudioReport::sample_rate`. This read the CAPTURE
+        // device and fell back to a hard-coded 48000, which is a different fact
+        // from the one in the file: a take is the desk output and is written at
+        // the tap's rate. With no microphone chosen — a fresh install — the
+        // manifest said 48000 over a 44100 file, `duration_seconds` came out 8%
+        // short, and the fitter reported the gap as -81894 ppm of drift.
+        //
+        // The capture device is still the fallback for a take with no writer at
+        // all, and 48000 behind that, because a number has to be chosen and
+        // this file's own rule is that a guess must be recognisable as one.
+        let nominal = nominal_rate(
+            report.as_ref().map(|r| r.sample_rate),
+            self.audio.as_ref().map(|a| a.sample_rate),
+        );
         // **T0 is where the audio actually starts, not where the button was
         // pressed.** RECORDER-PLAN §3: `T0 = max(T_audio_sample_0, T_arm)`.
         //
@@ -2263,6 +2312,39 @@ pub fn record_test(seconds: Option<String>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The manifest reports the rate the file was WRITTEN at.**
+    ///
+    /// It re-derived it instead, from the CAPTURE device, falling back to a
+    /// hard-coded 48000 when no microphone was chosen. A take is the desk
+    /// OUTPUT and is written at the tap's rate, so on a machine whose output
+    /// came up at 44100 with no input selected — a fresh install — `take.json`
+    /// claimed 48000 over a 44100 file. `duration_seconds` came out 8% short
+    /// (6.597 s against a real 7.189) and the clock fitter dutifully reported
+    /// the difference as -81894 ppm of drift, which reads as a catastrophically
+    /// broken crystal when the crystal is fine and the label is wrong.
+    ///
+    /// Found on Zorin OS 18.1, where every file was correct and only the
+    /// manifest disagreed with them.
+    #[test]
+    fn the_manifest_reports_the_rate_the_writer_used() {
+        // A writer that ran at 44100 while no capture device was open at all —
+        // the exact shape of the Zorin take.
+        assert_eq!(
+            nominal_rate(Some(44_100), None),
+            44_100.0,
+            "the manifest ignored the rate its own writer reported"
+        );
+        // With a capture device open the writer still wins: it wrote the file.
+        assert_eq!(nominal_rate(Some(44_100), Some(48_000)), 44_100.0);
+        // No writer falls back to the capture device, then to 48000 — and a
+        // guess stays recognisable as one.
+        assert_eq!(nominal_rate(None, Some(96_000)), 96_000.0);
+        assert_eq!(nominal_rate(None, None), 48_000.0);
+        // A zero from either side is not a rate.
+        assert_eq!(nominal_rate(Some(0), Some(44_100)), 44_100.0);
+        assert_eq!(nominal_rate(Some(0), Some(0)), 48_000.0);
+    }
     use super::*;
 
     /// A `Writer` wired to a synthetic ring, with no device anywhere.
@@ -2434,6 +2516,7 @@ mod tests {
         let take = crate::instrument::TAP_CHANNELS;
         let writer = Writer {
             sink,
+            sample_rate: 48_000,
             tracker: LevelTracker::new(take, 48_000.0),
             clock: ClockTap::new(2_000_000_000),
             cursor: FrameCursor::new(),
@@ -2674,6 +2757,7 @@ mod tests {
         let stats = Arc::new(audio::CaptureStats::new());
         let (mut source, sink) = audio::capture_channel(CH, 1024, 64, Arc::clone(&stats));
         let mut writer = Writer {
+            sample_rate: 48_000,
             sink,
             tracker: LevelTracker::new(CH, 48_000.0),
             clock: ClockTap::new(2_000_000_000),
@@ -3596,6 +3680,7 @@ impl PluginWriter {
         };
         AudioReport {
             frames: self.frames,
+            sample_rate: self.sample_rate,
             fit: std::mem::replace(&mut self.fit, RateFit::new()),
             // There is no such thing here: every frame carries its position by
             // construction, because this thread counts them as it writes them.
@@ -3625,4 +3710,5 @@ impl PluginWriter {
             error: self.error.take(),
         }
     }
+
 }
