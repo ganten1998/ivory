@@ -28,13 +28,33 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# ffmpeg 7.0.2, static, x86_64 glibc — johnvansickle.com, the long-standing
-# static-build source the ffmpeg project itself links to. When this release
-# rotates out, the same file appears under /ffmpeg/old-releases/.
-LINUX_FILE="ffmpeg-7.0.2-amd64-static.tar.xz"
-LINUX_URLS="https://johnvansickle.com/ffmpeg/releases/$LINUX_FILE
-https://johnvansickle.com/ffmpeg/old-releases/$LINUX_FILE"
-LINUX_SHA="abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67"
+# ffmpeg 8.1.2, linux64, BtbN's autobuilds — THE SAME BUILD AS WINDOWS, from
+# the same immutable dated tag.
+#
+# **This was johnvansickle's static build, and that build has no VA-API in it.**
+# Not a missing encoder: no `--enable-vaapi` in its configure line at all, and
+# no `h264_vaapi` in the binary. Those builds are made for maximum portability
+# and deliberately leave out anything that needs a runtime library.
+#
+# The consequence was invisible and expensive. Tangent resolves its encoder as
+# `$IVORY_FFMPEG` -> `tangent-ffmpeg` beside its own binary -> `ffmpeg` on PATH,
+# so the bundled one WINS — and every Linux install has therefore been encoding
+# takes on the CPU whether or not the machine had a perfectly good hardware
+# encoder and a system ffmpeg that could reach it. Measured on a 2012 Intel
+# GPU: 25.54 s of CPU per 10 s of 720p against VA-API's 0.70, which is 36x, on
+# a two-core machine that also has to run a synth.
+#
+# BtbN's build carries `--enable-vaapi --enable-libdrm --enable-vulkan`,
+# `h264_vaapi`, `scale_vaapi` and `hwupload`, and it dlopens `libva.so.2` — so
+# a machine without libva degrades to software instead of refusing to start.
+# Its glibc floor is 2.28, which clears the 2.32 target `build-cross.sh` builds
+# against and every distribution this app claims to support.
+#
+# The cost is size: 138 MB against 76. That is the whole trade, and hardware
+# encode being IMPOSSIBLE out of the box is worth 62 MB.
+LINUX_FILE="ffmpeg-n8.1.2-44-g7c533d0f86-linux64-gpl-8.1.tar.xz"
+LINUX_URLS="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-17-13-05/$LINUX_FILE"
+LINUX_SHA="802a6ad62d310814a42c4aea4a95354f4a5e04bd3e792c4ca55970d25577808b"
 
 # ffmpeg 8.1.2, win64, BtbN's autobuilds — an IMMUTABLE dated tag, never the
 # rolling `latest` release, whose assets are rebuilt in place.
@@ -100,11 +120,16 @@ linux)
     fetch "$LINUX_FILE" "$LINUX_SHA" $LINUX_URLS
     OUT="dist/vendor/linux"
     rm -rf "$OUT"; mkdir -p "$OUT/ffmpeg-licenses"
+    # `bin/ffmpeg` and a top-level `LICENSE.txt`, the same layout as the
+    # Windows zip — two components deep for the binary, one for the licence,
+    # so they are extracted separately.
+    tar -xJf "dist/vendor/$LINUX_FILE" -C "$OUT" --strip-components=2 \
+        "${LINUX_FILE%.tar.xz}/bin/ffmpeg"
     tar -xJf "dist/vendor/$LINUX_FILE" -C "$OUT" --strip-components=1 \
-        "${LINUX_FILE%.tar.xz}/ffmpeg" "${LINUX_FILE%.tar.xz}/GPLv3.txt"
+        "${LINUX_FILE%.tar.xz}/LICENSE.txt"
     mv "$OUT/ffmpeg" "$OUT/tangent-ffmpeg"
     chmod 755 "$OUT/tangent-ffmpeg"
-    mv "$OUT/GPLv3.txt" "$OUT/ffmpeg-licenses/GPLv3.txt"
+    mv "$OUT/LICENSE.txt" "$OUT/ffmpeg-licenses/LICENSE.txt"
     provenance "$OUT/ffmpeg-licenses" "${LINUX_URLS%%$'\n'*}" "$LINUX_SHA"
     echo "==> $OUT/tangent-ffmpeg"
     ;;
