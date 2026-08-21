@@ -310,6 +310,14 @@ pub struct CartridgeInfo {
     /// Why the last attempt failed, if it did. Empty on success, and on
     /// failure everything above is left as it was.
     pub error: String,
+    /// This IS the bank that ships in the binary.
+    ///
+    /// A flag rather than comparing `bank` to a known string: the shipped bank
+    /// has a name like any other, so an empty name does not mean "the factory
+    /// one" and never did. The picker uses it to decide whether there is
+    /// anything to go back FROM — and `ivory-ui` may not name the constant,
+    /// which lives on the other side of the firewall.
+    pub factory: bool,
 }
 
 /// Why a file is being asked for.

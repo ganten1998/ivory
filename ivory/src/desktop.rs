@@ -273,6 +273,9 @@ pub struct DesktopApp {
     refullscreen: bool,
     /// A picker deferred by one frame for that reason.
     #[cfg(feature = "recorder")]
+    /// A request held back for one frame so the dialogs above it can stand
+    /// down first. See `IvoryApp::native_panel_up`.
+    panel_armed: bool,
     deferred_file: Option<ivory_ui::ports::FileRequest>,
     #[cfg(feature = "recorder")]
     deferred_dir: Option<ivory_ui::ports::DirRequest>,
@@ -610,18 +613,22 @@ fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate
 
 /// A parsed cartridge as the picker wants it: names and a bank, no voices.
 #[cfg(feature = "recorder")]
-fn cartridge_info(cart: &crate::dx7::Cartridge, error: &str) -> ivory_ui::ports::CartridgeInfo {
+fn cartridge_info(
+    cart: &crate::dx7::Cartridge,
+    error: &str,
+    factory: bool,
+) -> ivory_ui::ports::CartridgeInfo {
     ivory_ui::ports::CartridgeInfo {
         bank: cart.name.clone(),
         bad_checksum: !cart.checksum_ok,
         voices: cart.names(),
         error: error.to_owned(),
+        factory,
     }
 }
 
+/// How often free space is measured again while the band is open.
 #[cfg(feature = "recorder")]
-/// How often a preview needs a fresh camera frame, in nanoseconds.
-///
 const DISK_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long to wait before trying the monitor output again, and how many times.
@@ -1157,6 +1164,15 @@ impl DesktopApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                 return;
             }
+            // One frame for the dialogs to stop floating, as for files.
+            if self.panel_armed {
+                self.panel_armed = false;
+            } else if self.app.native_panel_up() {
+                self.panel_armed = true;
+                self.deferred_dir = Some(request);
+                ctx.request_repaint();
+                return;
+            }
             // No portal and no zenity: our own browser, as for files.
             if !Self::native_dialogs_work() {
                 let at = request
@@ -1166,6 +1182,7 @@ impl DesktopApp {
                     .unwrap_or_else(|| std::path::PathBuf::from("/"));
                 self.browse_extensions = Vec::new();
                 let (entries, _) = Self::list_dir(&at, &[]);
+                self.app.native_panel_closed();
                 self.app.open_browser(
                     request.title.clone(),
                     ivory_ui::dialogs::BrowseFor::Folder(request.purpose),
@@ -1182,7 +1199,9 @@ impl DesktopApp {
             if let Some(start) = request.start_at.filter(|p| p.exists()) {
                 dialog = dialog.set_directory(start);
             }
-            if let Some(dir) = dialog.pick_folder() {
+            let picked = dialog.pick_folder();
+            self.app.native_panel_closed();
+            if let Some(dir) = picked {
                 self.finish_dir_choice(request.purpose, dir);
             }
             self.restore_fullscreen(ctx);
@@ -1195,6 +1214,23 @@ impl DesktopApp {
         if self.app.take_plugin_rescan() {
             let extra = self.app.plugin_folders();
             self.app.set_plugin_list(ivory_host::discover_in(&extra));
+        }
+        // **The shipped bank, put back.** The same call a first launch makes,
+        // which is the point: there is one definition of "the cartridge that
+        // ships" and both paths read it.
+        if self.app.take_factory_cartridge() {
+            let cart = crate::dx7::factory();
+            self.app.set_cartridge(cartridge_info(&cart, "", true));
+            // **And the sound changes now.** Refilling the list without
+            // changing what is playing is a button that appears to do nothing,
+            // which is the complaint this answers. Patch 0, because the
+            // setting was reset to it.
+            if let Some(v) = cart.voices.first().copied() {
+                if let Some(e) = self.recorder.engine.as_mut() {
+                    e.set_builtin_voice(v);
+                }
+            }
+            self.cartridge = Some(cart);
         }
 
         // The take's video, on the EDGES of the session's own state. Placed
@@ -1513,6 +1549,7 @@ impl DesktopApp {
         // a single patch. Sixteen electric pianos and sixteen jazz guitars are
         // in the binary; a fresh install has them all without opening a file
         // dialog, and "Load .syx..." is for somebody who wants somebody else's.
+        let mut is_factory = path.is_empty();
         let cart = if path.is_empty() {
             crate::dx7::factory()
         } else {
@@ -1520,10 +1557,15 @@ impl DesktopApp {
             // to nothing: cartridges live in sample folders that get
             // reorganised, and an app that goes silent because a file moved is
             // an app that looks broken.
-            crate::dx7::Cartridge::load(std::path::Path::new(&path))
-                .unwrap_or_else(|_| crate::dx7::factory())
+            crate::dx7::Cartridge::load(std::path::Path::new(&path)).unwrap_or_else(|_| {
+                // The remembered file has gone. What is playing IS the shipped
+                // bank now, and the picker must say so rather than offering to
+                // go back to the bank it is already on.
+                is_factory = true;
+                crate::dx7::factory()
+            })
         };
-        self.app.set_cartridge(cartridge_info(&cart, ""));
+        self.app.set_cartridge(cartridge_info(&cart, "", is_factory));
         if let Some(v) = cart.voices.get(patch).copied() {
             if let Some(e) = self.recorder.engine.as_mut() {
                 e.set_builtin_voice(v);
@@ -1554,6 +1596,19 @@ impl DesktopApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             return;
         }
+        // **And one frame for the dialogs to stop floating.**
+        //
+        // A dialog is always-on-top so that a modal one cannot end up buried
+        // behind the main window, which is an app that has silently frozen.
+        // The OS's file panel is parented to the MAIN window, so it opens
+        // UNDERNEATH any such dialog — which is what "load sysex opens behind
+        // the instrument window" is. `native_panel_up` takes the dialogs down
+        // to a normal level, but a window level is a property of the surface
+        // and therefore changes on the NEXT frame; opening the panel in the
+        // same frame that asked for it would race that change and lose.
+        if self.arm_panel(ctx, &request) {
+            return;
+        }
         let purpose = request.purpose;
         // **No portal, no zenity: our own browser.** Otherwise this opens a
         // dialog that never appears and returns the same `None` a cancel does.
@@ -1565,6 +1620,8 @@ impl DesktopApp {
                 .unwrap_or_else(|| std::path::PathBuf::from("/"));
             let (entries, _) = Self::list_dir(&at, &request.extensions);
             self.browse_extensions = request.extensions.clone();
+            // Our own browser is a dialog like any other, and wants to float.
+            self.app.native_panel_closed();
             self.app.open_browser(
                 request.title.clone(),
                 ivory_ui::dialogs::BrowseFor::File(request.purpose),
@@ -1597,8 +1654,11 @@ impl DesktopApp {
             dialog = dialog.add_filter("All files", &["*"]);
         }
         let file = dialog.pick_file();
-        // Back to fullscreen whether or not anything was chosen: a cancel must
-        // not leave the window in a shape the user did not ask for.
+        // **Whether or not anything was chosen**, on both counts: back to
+        // fullscreen, because a cancel must not leave the window in a shape
+        // the user did not ask for, and dialogs may float again, because a
+        // cancelled panel is a panel that has gone.
+        self.app.native_panel_closed();
         self.restore_fullscreen(ctx);
         let Some(file) = file else { return };
         self.finish_file_choice(purpose, &file);
@@ -1650,7 +1710,7 @@ impl DesktopApp {
         }
         match crate::dx7::Cartridge::load(file) {
             Ok(cart) => {
-                self.app.set_cartridge(cartridge_info(&cart, ""));
+                self.app.set_cartridge(cartridge_info(&cart, "", false));
                 self.app
                     .set_dx7_cartridge(file.to_string_lossy().into_owned());
                 self.cartridge = Some(cart);
@@ -1660,7 +1720,10 @@ impl DesktopApp {
             // pick a different file from the same folder.
             Err(e) => self
                 .app
-                .set_cartridge(ivory_ui::ports::CartridgeInfo { error: e, ..Default::default() }),
+                .set_cartridge(ivory_ui::ports::CartridgeInfo {
+                    error: e,
+                    ..Default::default()
+                }),
         }
     }
 
@@ -1702,6 +1765,24 @@ impl DesktopApp {
     /// while a dialog is open, so `Z` did nothing either. Not a hang: a modal
     /// nobody could see, with the keyboard locked out. Force quit was the only
     /// way back, which is exactly what was reported.
+    /// Hold a file-panel request back for exactly one frame, once.
+    ///
+    /// Returns whether the caller should give up this frame and try again on
+    /// the next. See the call site for why a frame has to pass at all.
+    fn arm_panel(&mut self, ctx: &egui::Context, request: &ivory_ui::ports::FileRequest) -> bool {
+        if self.panel_armed {
+            self.panel_armed = false;
+            return false;
+        }
+        if !self.app.native_panel_up() {
+            return false;
+        }
+        self.panel_armed = true;
+        self.deferred_file = Some(request.clone());
+        ctx.request_repaint();
+        true
+    }
+
     fn restore_fullscreen(&mut self, ctx: &egui::Context) {
         if !self.refullscreen {
             return;
@@ -2505,6 +2586,7 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             refullscreen: false,
             #[cfg(feature = "recorder")]
+            panel_armed: false,
             deferred_file: None,
             #[cfg(feature = "recorder")]
             deferred_dir: None,

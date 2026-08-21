@@ -66,6 +66,9 @@ pub enum Dialog {
         /// What the loaded cartridge calls itself, or empty for the patch that
         /// is compiled in.
         bank: String,
+        /// The loaded bank is the one that ships, so there is nowhere to go
+        /// back to and no Factory button.
+        factory: bool,
         /// The cartridge failed its own checksum. Shown, never refused — see
         /// `Cartridge::parse`.
         bad_checksum: bool,
@@ -465,6 +468,9 @@ pub enum DialogAction {
     /// Raise a file panel for a `.syx` cartridge. The dialog stays open: the
     /// answer comes back into it.
     LoadCartridge,
+    /// Put the shipped cartridge back. The dialog stays open and refills with
+    /// its thirty-two names, exactly as loading a file does.
+    UseFactoryCartridge,
     /// Open the patch editor on whatever the built-in is playing.
     EditPatch {
         slot: usize,
@@ -1973,11 +1979,21 @@ pub const CARTRIDGE_VOICES: usize = 32;
 /// The row shown when no cartridge is loaded: the patch compiled into the app.
 pub const BUILTIN_PATCH_ROW: &str = "E.PIANO 1  (built in)";
 
-/// What the two buttons on the cartridge row need between them.
+/// What the buttons on the cartridge row need between them.
 ///
 /// Reserved rather than measured: measuring means laying the row out twice,
 /// and the failure it prevents is a bank name running under "Edit...".
 const BANK_BUTTONS_W: f32 = 176.0;
+
+/// Clear air between the bank name and the first button.
+///
+/// Without it the name is allowed to fill every remaining point and ends up
+/// touching "Edit...", which reads as a layout bug even though nothing is
+/// overlapping. The shipped bank's own name is long enough to do it.
+const BANK_NAME_GAP: f32 = 14.0;
+
+/// And what "Factory" needs, on top, when there is a cartridge to leave.
+const FACTORY_BUTTON_W: f32 = 74.0;
 
 const PATCH_DIALOG_W: f32 = 520.0;
 const PATCH_DIALOG_H: f32 = 470.0;
@@ -1992,6 +2008,7 @@ impl Dialog {
         slot: usize,
         bank: String,
         bad_checksum: bool,
+        factory: bool,
         voices: Vec<String>,
         selected: Option<usize>,
     ) -> Dialog {
@@ -1999,6 +2016,7 @@ impl Dialog {
             slot,
             bank,
             bad_checksum,
+            factory,
             // A cartridge is 32 voices or it is not a cartridge, but this comes
             // from outside and indexes an array.
             selected: selected.filter(|i| *i < voices.len()),
@@ -2139,6 +2157,12 @@ pub struct Placement {
     /// What the host allows. `child_windows` decides whether a dialog is an OS
     /// window or is drawn in the canvas.
     pub caps: crate::host::Caps,
+    /// The OS is showing a file panel of its own right now.
+    ///
+    /// Dialogs stop floating while it is, or they float above it — see
+    /// `SurfaceSpec::on_top`. The panel is parented to the MAIN window, so
+    /// nothing else can put it in front.
+    pub native_panel_up: bool,
 }
 
 impl Placement {
@@ -2206,6 +2230,8 @@ fn show_dialog_viewport(
         resizable: true,
         takes_focus: true,
         modal: true,
+        // Down for as long as the OS's own panel is up. See `on_top`.
+        on_top: !placement.native_panel_up,
         // Without this a tiling WM (i3, sway) TILES the dialog — it opens as
         // a pane underneath the floating main window, invisible, while
         // `handle_main_interaction` drops every event waiting on it. That is
@@ -2735,6 +2761,7 @@ pub fn show(
             slot,
             bank,
             bad_checksum,
+            factory,
             voices,
             selected,
             filter,
@@ -2766,7 +2793,15 @@ pub fn show(
                                 // anything, and the one that ships is called
                                 // something long: a label sized to its own
                                 // text ran straight under "Edit...".
-                                let room = (ui.available_width() - BANK_BUTTONS_W).max(40.0);
+                                // The Factory button is only there when there
+                                // is a loaded cartridge to leave, so the room
+                                // it takes is conditional too — a permanent
+                                // reservation would crop the bank name on the
+                                // one row that never has the button.
+                                let buttons = BANK_BUTTONS_W
+                                    + BANK_NAME_GAP
+                                    + if *factory { 0.0 } else { FACTORY_BUTTON_W };
+                                let room = (ui.available_width() - buttons).max(40.0);
                                 // **The width has to be ALLOCATED, not merely
                                 // asked for.** `add_sized` reserves the space
                                 // but a `Label` still lays out against the
@@ -2806,6 +2841,26 @@ pub fn show(
                                         .clicked()
                                     {
                                         action = Some(DialogAction::LoadCartridge);
+                                    }
+                                    // **The way back, which there was not
+                                    // one of.** Loading somebody else's bank
+                                    // was a one-way door: the shipped
+                                    // cartridge is only reached at startup
+                                    // from an empty setting, so getting it
+                                    // back meant quitting the app. Offered
+                                    // only while there IS a cartridge to
+                                    // leave, so the row stays two buttons
+                                    // wide on a fresh install.
+                                    if !*factory
+                                        && ui
+                                            .add(Button::new(
+                                                RichText::new("Factory")
+                                                    .font(bold(11.0))
+                                                    .color(t.text),
+                                            ))
+                                            .clicked()
+                                    {
+                                        action = Some(DialogAction::UseFactoryCartridge);
                                     }
                                     // **Edit what is playing**, which is the
                                     // only patch anybody wants to start from.
@@ -5064,6 +5119,7 @@ mod tests {
         // `None` and let the platform decide, which meant the first thing
         // anybody saw was a window placed wherever.
         let p = Placement {
+            native_panel_up: false,
             parent: None,
             monitor,
             caps: crate::host::Caps::DESKTOP,
@@ -5077,6 +5133,7 @@ mod tests {
         // Neither: nothing to centre on, so the platform really does decide.
         assert_eq!(
             Placement {
+            native_panel_up: false,
                 parent: None,
                 monitor: None,
                 caps: crate::host::Caps::DESKTOP
@@ -5088,6 +5145,7 @@ mod tests {
         // Parent known: dead centre of the parent.
         let parent = Rect::from_min_size(Pos2::new(600.0, 400.0), Vec2::new(1300.0, 200.0));
         let p = Placement {
+            native_panel_up: false,
             parent: Some(parent),
             monitor,
             caps: crate::host::Caps::DESKTOP,
@@ -5107,6 +5165,7 @@ mod tests {
         // A window near an edge still puts the whole dialog on the monitor.
         let edge = Rect::from_min_size(Pos2::new(2400.0, 1380.0), Vec2::new(1300.0, 200.0));
         let p = Placement {
+            native_panel_up: false,
             parent: Some(edge),
             monitor,
             caps: crate::host::Caps::DESKTOP,
@@ -5512,6 +5571,7 @@ mod tests {
 
         let mut dialog = Some(Dialog::custom_tuning(&Tuning::standard(), true));
         let placement = Placement {
+            native_panel_up: false,
             parent: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
@@ -6068,6 +6128,7 @@ mod tests {
         // The post-take case, which is the one with greyed controls in it.
         let mut dialog = Some(Dialog::export(ExportSpec::default(), true, false));
         let placement = Placement {
+            native_panel_up: false,
             parent: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
@@ -6169,6 +6230,7 @@ mod tests {
         fonts::install(&ctx, fonts::FontChoice::default(), None);
         fonts::apply_text_styles(&ctx);
         let placement = Placement {
+            native_panel_up: false,
             parent: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
@@ -6431,6 +6493,7 @@ mod tests {
         fonts::install(&ctx, fonts::FontChoice::default(), None);
         fonts::apply_text_styles(&ctx);
         let placement = Placement {
+            native_panel_up: false,
             parent: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,

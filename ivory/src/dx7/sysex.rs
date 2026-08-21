@@ -451,3 +451,22 @@ mod tests {
         assert!(carts > 0, "no cartridges were found under IVORY_SYX_CORPUS");
     }
 }
+
+#[cfg(test)]
+mod write_a_bank {
+    /// Write the shipped bank out as an ordinary `.syx`, for looking at the
+    /// picker with a cartridge loaded.
+    ///
+    ///   IVORY_BANK_OUT=/tmp/bank.syx cargo test -p ivory --bins \
+    ///     dx7::sysex::write_a_bank -- --ignored --nocapture
+    #[test]
+    #[ignore = "writes a file for a person to load"]
+    fn a_syx_for_the_picker() {
+        let Ok(out) = std::env::var("IVORY_BANK_OUT") else {
+            eprintln!("IVORY_BANK_OUT not set");
+            return;
+        };
+        std::fs::write(&out, super::factory().to_bytes()).expect("write the bank");
+        println!("wrote {out}");
+    }
+}

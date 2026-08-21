@@ -261,6 +261,17 @@ pub struct IvoryApp {
     /// A folder the host has been asked to choose. Drained after the frame so
     /// the native panel's nested run loop never starts inside an egui frame.
     dir_request: Option<crate::ports::DirRequest>,
+    /// The OS's own file panel is on screen right now.
+    ///
+    /// **Set when a panel is asked for, cleared by the HOST when it closes.**
+    /// Two owners, deliberately: only the app knows a button was pressed and
+    /// only the host knows the panel has gone. What it is for is one line in
+    /// `SurfaceSpec::on_top` — a dialog stops floating while the panel is up,
+    /// because the panel is parented to the main window and cannot be put in
+    /// front of a floating dialog by any other means.
+    native_panel_up: bool,
+    /// The user pressed Factory in the patch picker. Taken by the host.
+    factory_cartridge: bool,
     file_request: Option<crate::ports::FileRequest>,
     /// The in-app browser's three messages to the host: list this, I chose a
     /// file, I chose a folder. See `Dialog::FileBrowser`.
@@ -664,6 +675,8 @@ impl IvoryApp {
             recorder: recorder::RecorderState::default(),
             recorder_request: std::collections::VecDeque::new(),
             dir_request: None,
+            native_panel_up: false,
+            factory_cartridge: false,
             file_request: None,
             browse_request: None,
             browsed_file: None,
@@ -2190,6 +2203,15 @@ impl IvoryApp {
         std::mem::take(&mut self.plugin_rescan)
     }
 
+    /// The user asked for the shipped cartridge back.
+    ///
+    /// A flag rather than a request with a payload, because there is nothing
+    /// to say: the bank is in the binary and the host already knows how to
+    /// reach it — it does so on every launch that has no cartridge chosen.
+    pub fn take_factory_cartridge(&mut self) -> bool {
+        std::mem::take(&mut self.factory_cartridge)
+    }
+
     /// Take a pending "choose a folder" request. Same contract.
     pub fn take_directory_request(&mut self) -> Option<crate::ports::DirRequest> {
         self.dir_request.take()
@@ -2511,6 +2533,7 @@ impl IvoryApp {
     /// filter dims non-matching files on macOS and HIDES them on Windows, and
     /// a folder that looks empty is a dialog somebody closes again.
     fn ask_for_track(&mut self) {
+        self.native_panel_up = true;
         self.file_request = Some(crate::ports::FileRequest {
             start_at: (!self.settings.track_path.is_empty())
                 .then(|| std::path::PathBuf::from(&self.settings.track_path))
@@ -2792,6 +2815,21 @@ impl IvoryApp {
         self.file_request.take()
     }
 
+    /// Whether a dialog is currently standing down for the OS's own panel.
+    ///
+    /// The host reads this to know it must let ONE frame go by before raising
+    /// the panel: the window level is a property of the surface, so it changes
+    /// on the frame after the button was pressed, and a panel raised before
+    /// that opens underneath the dialog that asked for it.
+    pub fn native_panel_up(&self) -> bool {
+        self.native_panel_up
+    }
+
+    /// The panel has closed. Dialogs may float again.
+    pub fn native_panel_closed(&mut self) {
+        self.native_panel_up = false;
+    }
+
     /// The host has read a cartridge (or failed to). Show it.
     ///
     /// **Pushed in, because the UI cannot open a file.** `ivory-ui` has no
@@ -2803,6 +2841,7 @@ impl IvoryApp {
         let Some(dialogs::Dialog::PatchPicker {
             bank,
             bad_checksum,
+            factory,
             voices,
             selected,
             filter,
@@ -2821,6 +2860,9 @@ impl IvoryApp {
         error.clear();
         bank.clone_from(&self.cartridge.bank);
         *bad_checksum = self.cartridge.bad_checksum;
+        // So pressing Factory makes the button that did it disappear, which is
+        // the honest report: there is nowhere left to go back to.
+        *factory = self.cartridge.factory;
         voices.clone_from(&self.cartridge.voices);
         // A new bank means the old selection is a different patch. Nothing is
         // selected until somebody picks, and until then the built-in plays.
@@ -2882,6 +2924,7 @@ impl IvoryApp {
             slot,
             self.cartridge.bank.clone(),
             self.cartridge.bad_checksum,
+            self.cartridge.factory,
             self.cartridge.voices.clone(),
             selected,
         ));
@@ -3618,6 +3661,7 @@ impl IvoryApp {
         if !self.caps.capture_devices || !self.caps.native_file_dialogs {
             return;
         }
+        self.native_panel_up = true;
         self.dir_request = Some(crate::ports::DirRequest {
             start_at: Some(self.settings.record_root()),
             title: "Where should Tangent put your takes?".to_owned(),
@@ -4118,7 +4162,8 @@ impl IvoryApp {
             }
             MenuAction::AddPluginFolder => {
                 if self.caps.native_file_dialogs {
-                    self.dir_request = Some(crate::ports::DirRequest {
+                    self.native_panel_up = true;
+        self.dir_request = Some(crate::ports::DirRequest {
                         start_at: None,
                         title: "Where else should Tangent look for VST3 plugins?".to_owned(),
                         purpose: crate::ports::DirPurpose::PluginFolder,
@@ -4603,10 +4648,22 @@ impl IvoryApp {
             DialogAction::SavePatch => {
                 self.request_recorder(recorder::RecorderRequest::SavePatch);
             }
+            DialogAction::UseFactoryCartridge => {
+                // **The setting is what selects it.** An empty path is what a
+                // fresh install has and what `load_cartridge_at_launch` reads
+                // as "the one that ships", so putting the cartridge back is
+                // putting the setting back — and the host then loads exactly
+                // what a first launch would.
+                self.settings.dx7_cartridge.clear();
+                self.settings.dx7_patch = 0;
+                self.save_settings();
+                self.factory_cartridge = true;
+            }
             DialogAction::LoadCartridge => {
                 if !self.caps.native_file_dialogs {
                     return;
                 }
+                self.native_panel_up = true;
                 self.file_request = Some(crate::ports::FileRequest {
                     // Where the last one came from, which is where the next one
                     // almost certainly is: people keep cartridges in one folder
@@ -6255,6 +6312,7 @@ impl IvoryApp {
         // screen no matter where the user has put the piano.
         let placement = dialogs::Placement {
             caps: self.caps,
+            native_panel_up: self.native_panel_up,
             // The rect the layout was actually DRAWN into, which is centred in
             // the pane and is not the same as one anchored at its corner. With
             // a band turned off, the two differ by half the slack and dialogs
@@ -6347,6 +6405,61 @@ mod tests {
 
     fn headless(caps: Caps) -> (egui::Context, IvoryApp) {
         headless_with(caps, Settings::default())
+    }
+
+    /// **The way back to the shipped bank exists at all.**
+    ///
+    /// The owner's report: "when loading another sysex bank, there's no button
+    /// to reset to the default patch bank — you have to relaunch the entire app
+    /// to access it again." They were right, and the reason is that an empty
+    /// `dx7_cartridge` is what selects the shipped bank and only
+    /// `load_cartridge_at_launch` ever read it.
+    #[test]
+    fn the_shipped_cartridge_can_be_put_back() {
+        let mut settings = Settings::default();
+        settings.dx7_cartridge = "/somewhere/ROM1A.syx".to_owned();
+        settings.dx7_patch = 17;
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, settings);
+        assert_eq!(app.dx7_choice(), ("/somewhere/ROM1A.syx", 17));
+
+        app.apply_dialog_action(DialogAction::UseFactoryCartridge);
+        assert_eq!(
+            app.dx7_choice(),
+            ("", 0),
+            "the setting still names a file, so the next launch loads it again"
+        );
+        // The host is told once, and only once: a flag that stayed set would
+        // reload the bank on every frame for the rest of the session.
+        assert!(app.take_factory_cartridge(), "the host was never told");
+        assert!(!app.take_factory_cartridge(), "the flag latched on");
+    }
+
+    /// **A dialog stops floating while the OS's file panel is up.**
+    ///
+    /// The owner's report: choosing a sysex bank opens the file chooser BEHIND
+    /// the instrument window. It does, and it has to — every dialog is created
+    /// always-on-top so that a modal one cannot end up buried behind the main
+    /// window, which is an app that has silently frozen. The panel is parented
+    /// to the main window, so nothing else can put it in front.
+    #[test]
+    fn a_dialog_stands_down_while_the_file_panel_is_up() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        assert!(!app.native_panel_up(), "nothing has been asked for yet");
+
+        app.apply_dialog_action(DialogAction::LoadCartridge);
+        assert!(
+            app.take_file_request().is_some(),
+            "no panel was asked for at all"
+        );
+        assert!(
+            app.native_panel_up(),
+            "the dialogs went on floating over the panel"
+        );
+
+        // Cleared by the HOST, because only the host knows the panel has gone
+        // — including when it was cancelled.
+        app.native_panel_closed();
+        assert!(!app.native_panel_up());
     }
 
     /// **The chooser opens, draws, and holds many inputs at once.**
@@ -6610,6 +6723,7 @@ mod tests {
         app.apply_recorder_hit(recorder_panel::Hit::OpenSlotEditor(0));
 
         app.set_cartridge(crate::ports::CartridgeInfo {
+            factory: false,
             bank: "ROM1A".to_owned(),
             bad_checksum: true,
             voices: (0..32).map(|i| format!("PATCH {i}")).collect(),
@@ -6643,11 +6757,13 @@ mod tests {
         app.settings.plugin_slots[0] = Some(dialogs::BUILTIN_PATH.to_owned());
         app.apply_recorder_hit(recorder_panel::Hit::OpenSlotEditor(0));
         app.set_cartridge(crate::ports::CartridgeInfo {
+            factory: false,
             bank: "ROM1A".to_owned(),
             voices: (0..32).map(|i| format!("PATCH {i}")).collect(),
             ..Default::default()
         });
         app.set_cartridge(crate::ports::CartridgeInfo {
+            factory: false,
             error: "this is a single-voice dump, not a 32-voice cartridge".to_owned(),
             ..Default::default()
         });

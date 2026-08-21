@@ -55,6 +55,17 @@ pub struct SurfaceSpec<'a> {
     pub modal: bool,
     /// Inline stacking. The submenu must sit above the menu.
     pub order: egui::Order,
+    /// Whether the surface floats above ordinary windows.
+    ///
+    /// **True for everything, except while a native file panel is up.** A
+    /// modal dialog has to float: this app enforces modality by dropping input,
+    /// so a dialog that ends up behind the main window is an app that has
+    /// frozen with nothing on screen saying why — that failure has been fixed
+    /// twice already. But a floating dialog also floats above the OS's own file
+    /// panel, which is parented to the MAIN window, and then "Load .syx..."
+    /// appears to do nothing at all. So it is a flag rather than a constant,
+    /// and the one moment it goes false is the one moment it must.
+    pub on_top: bool,
     /// The `_NET_WM_WINDOW_TYPE` hint, X11 only, ignored everywhere else.
     ///
     /// This is what tells a Linux window manager what the window IS. It
@@ -78,6 +89,7 @@ impl Default for SurfaceSpec<'_> {
             resizable: false,
             takes_focus: true,
             modal: false,
+            on_top: true,
             order: egui::Order::Foreground,
             window_type: None,
         }
@@ -176,7 +188,11 @@ pub fn surface(
             .with_title(spec.title)
             .with_decorations(spec.decorated)
             .with_resizable(spec.resizable)
-            .with_always_on_top()
+            .with_window_level(if spec.on_top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            })
             .with_active(spec.takes_focus)
             .with_visible(existing)
             .with_inner_size(spec.size)
