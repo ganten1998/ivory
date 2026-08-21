@@ -1,6 +1,9 @@
 # Ivory 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-20. **The app is now called TANGENT.** Newest work is
+§2u: the DESK — the effects as a bus, the limiter on the master, and a mixer
+view behind Tab — plus the camera preview, two DX7 reports and the plugin rack
+that was listing effects it could not load. Before it,
 §2t: the submenu that opened the wrong row, two Windows-only white flashes, the
 channel chooser as tick boxes, and one tick that was wired to itself. Before it,
 §2s: the potato pass. Before it, §2r: the takes with no instrument in them.
@@ -1830,6 +1833,164 @@ the folder was remembered whether the box was ticked or not. Its doc comment
 described behaviour that did not exist. Removed — the setting, the `Hit`, the
 `MenuAction` and the `remember` parameter threaded through the host — and the
 FOLDER field took the width it was using (`0.00..0.79` where it had `0.00..0.54`).
+
+---
+
+## 2u. 2026-08-20 — the desk, and four bugs on the way to it
+
+Shipped as **4.24.0**. The mixer plan, stages one and two, plus everything
+that was reported while it was being built. The plan itself is an artifact the
+owner has: routing, several inputs from one interface, and a home for user
+effect plugins, staged.
+
+### The effects are a bus now, and the limiter is on the master
+
+**Read this before touching `Renderer::render`.** Six knobs used to be an
+insert on the instrument bus, with the backing track and the input monitor
+joining downstream of them — so nothing but the instrument could be
+reverberated, and the limiter never saw the two sources most likely to clip
+the output it was protecting.
+
+They are two things now. **Reverb, delay and chorus are a BUS**: each strip
+sends a percentage of itself and what comes back is added at the bus's own
+fader. **High-pass, low-pass and the limiter are an INSERT on the master.**
+That split is not a preference — only three of the six were ever wet amounts;
+the other three are a corner frequency, a corner frequency and a threshold,
+and a send knob into those is not a question anybody could answer. It is
+visible in `effects::Sends`, whose name has been a misnomer since it was
+written.
+
+**The bug this nearly shipped with, and the one to remember.** Every effect in
+`effects.rs` is ADDITIVE — `out = dry + wet * knob`, never a crossfade — which
+is right for an insert and catastrophic for a send: a bus is handed a COPY of
+signal that already reaches the master by another route, so returning the dry
+with it adds that signal twice. Up to six decibels and a comb filter, at every
+setting, which reads as "the reverb makes everything strange" rather than as a
+routing mistake. `Effects::new_send` subtracts the dry from the sum at the end
+— the chain still RUNS on it, because the reverb has to be fed something and
+with the chorus at zero there would be nothing — and returns silence rather
+than its input when nothing is switched on.
+
+The defaults are the old routing written down: instrument sends everything,
+nothing else sends anything, and `wet_only(x)` is exactly `insert(x) - x`, so
+an upgrade with the mixer untouched is arithmetically the same signal. What
+does change: the backing track and the microphone now pass through the
+master's filters and limiter. That is the fix, not a side effect.
+
+### The mixer is a view, and the band did not move
+
+Tab swaps the piano, the theory band and the neck for six channel strips. The
+recorder band stays exactly where it is, so the transport and the record
+button are in the same place in both and you can cross over mid-take. The
+window does not resize: the layout still asks for what the bands asked for, so
+Tab changes what is drawn and no geometry at all.
+
+**The band is the rack and the mixer is the routing.** That division is why
+nothing in the band had to move: the six knobs stay where a hand reaches for
+them, and the mixer draws none of its own. It shows what they never had — who
+feeds them, how much, and what is heard.
+
+Nothing in the mixer is a second copy of anything. A mixer fader and the
+band's fader are ONE value in settings that both read
+(`the_two_surfaces_move_one_value`). The master takes no send and cannot be
+muted; the effects return takes no send either, because a bus that can feed
+itself is a bus that howls.
+
+`IVORY_INLINE=mixer` opens the view on the first frame. Use it: photographing
+the view otherwise means sending a keystroke at a desktop that may not be
+listening, and a stray keystroke on a shared machine lands somewhere else.
+
+### A monitored microphone was being written twice
+
+Monitoring puts the live input into the mix and the mix is what the tap
+carries, so a take whose sources were `both` wrote the microphone from the
+capture ring AND again inside the bus. Six decibels up and comb-filtered
+against itself by the monitor ring's latency.
+
+`TakeSource::resolve` takes `monitored` now and keeps the BUS when it is set,
+which is the owner's rule made literal — if the effects were audible while it
+was recorded, they are in the take. `Input` is left alone: somebody who asked
+for the microphone ALONE cannot be handed a wet one, because the bus is a mix
+and the input's share cannot be taken back out of it.
+
+`mix_monitor`'s doc said the opposite of all this and had been wrong since the
+day it was written.
+
+### A plugin says whether it plays notes
+
+The rack lists every VST3 on the machine, so a Pro-R or VintageVerb owner
+loaded one, waited a second and got silence — a slot is fed MIDI and an effect
+has no notes to play. The app could not tell the two apart:
+`PClassInfo::category` is "Audio Module Class" for a synth and a reverb alike,
+and `subCategories` is a `PClassInfo2` field behind `IPluginFactory2`.
+
+Two rules keep the fix from doing harm. **Instrument wins a tie** — samplers
+with an audio input declare `Fx|Instrument` and genuinely do play notes — and
+**silence is not a no**: a factory too old to be asked tells us nothing, and
+reading nothing as "not an instrument" would refuse plugins that have always
+worked.
+
+Refused at `Instance::create`, not filtered out of the picker, and that is a
+cost decision worth keeping: the picker is a filesystem walk that never opens
+a bundle, so labelling the LIST means reading `subCategories` for every VST3
+on the machine — a scan with a cache and a crash boundary, which is a
+subsystem rather than a check.
+
+### The camera preview was capped at ten a second, everywhere
+
+4.20.0's potato pass stopped the capture thread converting thirty frames a
+second for a preview nobody frames a shot in — and picked ten a second for
+every host, from a 2013 MacBook Air's JPEG decode. Only V4L2 decodes JPEG; on
+macOS a conversion is a BGRA-to-RGBA copy costing a fraction of a millisecond,
+so the cap bought nothing and spent two thirds of the preview on it.
+
+The host says WHO IS LOOKING now (`FrameWant::None | Preview | Every`) and how
+fast a preview can be is measured where the conversions happen, as a share of
+one core scaled by core count and floored at twelve percent — which is exactly
+what that Air was hard-coded to. The smoothing is asymmetric on purpose: an
+eighth of the way up, half the way down. A preview that dips for a moment
+costs nothing; one STUCK slow after the machine went quiet is the bug.
+
+### Two DX7 reports
+
+**No way back to the shipped bank.** An empty `dx7_cartridge` is what SELECTS
+it and only `load_cartridge_at_launch` ever read it, so loading somebody
+else's was a one-way door. There is a Factory button, offered only while there
+is a cartridge to leave. `CartridgeInfo::factory` says which bank is loaded,
+because the shipped one has a NAME like any other and an empty name never
+meant "the factory bank".
+
+**The file panel opened behind the instrument window**, and it is not about
+sysex. Every dialog is created always-on-top so a modal one cannot end up
+buried behind the main window — an app that has silently frozen, fixed twice
+already — and the OS's panel is parented to the MAIN window, so nothing can
+put it in front of a floating dialog. `SurfaceSpec::on_top` is a flag now, and
+it goes false for exactly one thing: `native_panel_up`, set when a panel is
+asked for and cleared by the HOST when it closes, including on cancel. The
+host holds the request back one frame first, because a window level changes on
+the frame AFTER the press.
+
+### What is NOT done
+
+Stages three and four of the plan, and they are releases of their own.
+
+**Stage 3, inserts.** Each strip's insert holds a user effect plugin, which is
+what makes Pro-R work rather than merely explain itself. The host already
+instantiates VST3s and `Instance` already activates audio inputs; what does
+not exist is a per-strip processing path, its latency reporting, and the
+load-on-a-worker-thread swap protocol that `Engine` has for instrument slots.
+
+**Stage 4, several strips from one interface.** Cheaper than it sounds on the
+capture side — the callback already receives every channel and `ChannelPick`
+already knows how to take one or a pair out of them; today exactly one pick is
+kept and the rest of the buffer is discarded. It is NOT as cheap as first
+claimed once followed through: with N input strips, what `TakeSource::Input`
+means has to be answered, and the honest answer is probably "the bus", which
+is a second decision.
+
+**A second interface is declined, not deferred.** An aggregate device presents
+as one device with one clock, so anyone with that rig arrives at stage 4's
+cheap case anyway. The feature would be a worse version of what the OS does.
 
 ---
 
