@@ -1377,9 +1377,9 @@ impl IvoryApp {
             return None;
         }
         let input = self.theory_input(display);
-        (input.pcs != 0).then(|| fretboard_panel::Intervals {
-            pcs: input.pcs,
+        Some(fretboard_panel::Intervals {
             tonic: input.tonic(),
+            any: input.pcs != 0,
         })
     }
 
