@@ -264,10 +264,15 @@ impl Geom {
     }
 
     /// Where an open-string ring or a damped-string cross goes, now that there
-    /// is no margin to put them in: centred one radius in from the left edge,
-    /// so the mark straddles the nut and is still drawn whole.
+    /// is no margin to put them in.
+    ///
+    /// **A radius and a bit in from the left edge, not exactly one.** At one
+    /// radius the ring is tangent to the edge of the band — so its stroke, and
+    /// the letter inside it, are clipped by the window, and an open string
+    /// reads as a smudge on the frame rather than as a note on the neck. The
+    /// extra third of a radius is what puts the whole mark on screen.
     fn mark_x(&self, rect: Rect) -> f32 {
-        rect.left() + self.dot_r()
+        rect.left() + self.dot_r() * 1.35
     }
 }
 
@@ -654,12 +659,35 @@ pub fn draw(
                 p.dot,
             );
         } else if pos.fret == g.capo {
-            // Open (or capo'd): a ring behind the nut, never a dot on it.
-            painter.circle_stroke(
-                Pos2::new(gutter_x(rect, &g), y),
-                r * 0.75,
-                Stroke::new(2.0_f32, p.dot),
-            );
+            // **Open (or capo'd): a ring behind the nut, and it has to read as
+            // a NOTE.**
+            //
+            // It was three quarters the size of a fretted dot, hollow, in the
+            // margin outside the board, and — with note names on — the only
+            // note on the neck without its letter in it. Three screenshots of
+            // one held key came back with "it does not display": E4 and G3
+            // were open strings drawn like that, and the F3 beside them was a
+            // filled dot with an F in it. The difference was not in the
+            // solving; it was that one of them looked like a note and the
+            // others looked like the edge of the panel.
+            //
+            // It stays a RING, because that is what an open string is in every
+            // chord chart ever printed — but at full size, at the weight of a
+            // dot, and carrying the same letter.
+            let c = Pos2::new(gutter_x(rect, &g), y);
+            painter.circle_stroke(c, r, Stroke::new((r * 0.42).clamp(2.0, 3.5), p.dot));
+            if s.show_fret_note_names {
+                let size = r * 0.95;
+                if size >= 6.0 {
+                    painter.text(
+                        c,
+                        Align2::CENTER_CENTER,
+                        pc_name(n.pitch % 12, s.prefer_flats),
+                        FontId::new(size, fonts::courier_bold()),
+                        p.dot,
+                    );
+                }
+            }
         } else {
             let c = Pos2::new(g.press_x(pos.fret), y);
             painter.circle_filled(c, r, p.dot);
@@ -1479,6 +1507,37 @@ mod tests {
             }
         }
     }
+    /// **An open string is a note, and has to look like one.**
+    ///
+    /// Three screenshots of one held key came back with "it does not
+    /// display". Two of them were open strings — a hollow ring at three
+    /// quarters the size of a fretted dot, tangent to the edge of the band so
+    /// its stroke was clipped by the window, and the only note on the neck
+    /// without its letter in it. The third was a fretted dot with an F in it,
+    /// and that was the one that "displayed".
+    #[test]
+    fn an_open_string_is_drawn_whole_and_inside_the_band() {
+        let spec = FretboardSpec::default();
+        for w in [1300.0_f32, 900.0, 620.0] {
+            let r = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(w, 120.0));
+            let g = Geom::new(r, &spec).expect("six strings");
+            let x = gutter_x(r, &g);
+            let rad = g.dot_r();
+            assert!(
+                x - rad >= r.left(),
+                "at {w} wide the open-string ring is clipped by the band's own \
+                 edge: centre {x}, radius {rad}, left {}",
+                r.left()
+            );
+            // And still LEFT of the first fret, or it is not an open string
+            // any more, it is a note at fret one.
+            assert!(
+                x + rad < g.press_x(1),
+                "at {w} wide the open marker has walked onto the first fret"
+            );
+        }
+    }
+
 
     /// A click must land on the note the eye sees, which means hit_test has to
     /// be the exact inverse of draw. The piano has had this property since the

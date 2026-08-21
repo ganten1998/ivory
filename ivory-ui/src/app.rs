@@ -7546,6 +7546,59 @@ mod tests {
         );
     }
 
+    /// **The neck draws the note you are holding, keytoggle or not.**
+    ///
+    /// Reported against 4.29.0: hold one key and the fretboard shows something
+    /// else, in a pattern, on most notes — and switching keytoggle off makes
+    /// it stop. This walks every note of two octaves through the same path a
+    /// held key takes and checks the neck can actually make the pitch it drew.
+    #[test]
+    fn every_held_note_lands_on_a_string_that_makes_it() {
+        for keytoggle in [false, true] {
+            let mut s = Settings::default();
+            s.keytoggle_enabled = keytoggle;
+            let (_ctx, mut app) = headless_with(Caps::DESKTOP, s);
+            let spec = app.settings.fretboard_spec();
+            for note in 52u8..=76 {
+                app.notes.apply(crate::midi_event::MidiEvent::NoteOn {
+                    note,
+                    velocity: 100,
+                });
+                app.voicing_tick(true);
+                let v = app.voicing.current();
+                let placed: Vec<_> = v
+                    .notes
+                    .iter()
+                    .filter_map(|n| match n.outcome {
+                        ivory_core::voicing::Outcome::Placed { pos, octave_shift, .. } => {
+                            Some((n.pitch, pos, octave_shift))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    placed.len(),
+                    1,
+                    "keytoggle {keytoggle}: holding {note} put {} notes on the neck",
+                    placed.len()
+                );
+                let (pitch, pos, shift) = placed[0];
+                assert_eq!(pitch, note, "keytoggle {keytoggle}: the neck drew {pitch}");
+                let made = spec.pitch_at(pos.string, pos.fret);
+                assert_eq!(
+                    made,
+                    Some(note),
+                    "keytoggle {keytoggle}: {note} was drawn on string {} fret {} \
+                     (shift {shift}), which makes {made:?}",
+                    pos.string,
+                    pos.fret
+                );
+                app.notes.apply(crate::midi_event::MidiEvent::NoteOff { note });
+                app.voicing_tick(true);
+            }
+        }
+    }
+
     fn headless_with(caps: Caps, settings: Settings) -> (egui::Context, IvoryApp) {
         let ctx = egui::Context::default();
         let app = IvoryApp::new(&ctx, settings, caps);
