@@ -66,6 +66,15 @@ pub struct SurfaceSpec<'a> {
     /// appears to do nothing at all. So it is a flag rather than a constant,
     /// and the one moment it goes false is the one moment it must.
     pub on_top: bool,
+    /// Come to the front NOW, whatever the window manager decided earlier.
+    ///
+    /// **Set when the user presses the window this one is modal over.** A
+    /// modal dialog behind its parent is an app that has stopped responding
+    /// with no visible reason why — `handle_main_interaction` drops every
+    /// event while one is open — and `AlwaysOnTop` is a request some window
+    /// managers ignore. A press on the parent is the moment the user is
+    /// wondering where their click went, so it is the moment to answer.
+    pub raise: bool,
     /// The `_NET_WM_WINDOW_TYPE` hint, X11 only, ignored everywhere else.
     ///
     /// This is what tells a Linux window manager what the window IS. It
@@ -90,6 +99,7 @@ impl Default for SurfaceSpec<'_> {
             takes_focus: true,
             modal: false,
             on_top: true,
+            raise: false,
             order: egui::Order::Foreground,
             window_type: None,
         }
@@ -227,8 +237,16 @@ pub fn surface(
                 // only way some of them close. Only for surfaces that asked to
                 // take focus: the submenu passes `takes_focus: false` because
                 // stealing it from the menu is what closes the menu.
-                if revealing && spec.takes_focus {
+                if (revealing && spec.takes_focus) || spec.raise {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                    // The level as well as the focus: a window manager that
+                    // dropped the request the first time gets asked again, and
+                    // on the one that honoured it this changes nothing.
+                    if spec.on_top {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                            egui::WindowLevel::AlwaysOnTop,
+                        ));
+                    }
                 }
                 add(ui, &mut body_wants_close);
             });

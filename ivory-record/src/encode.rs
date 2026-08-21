@@ -176,6 +176,17 @@ impl Encoder {
         self.0.frames_written()
     }
 
+    /// Frames written a second time to fill a gap the compositor left.
+    ///
+    /// **Not a loss — the opposite of one.** It is the count of slots that
+    /// would have been missing from the video's timeline, and filling them is
+    /// what keeps the picture in step with the sound. A high number means the
+    /// machine could not composite at the rate it was asked for, which is
+    /// worth saying, but the take is still the right length.
+    pub fn frames_repeated(&self) -> u64 {
+        self.0.frames_repeated()
+    }
+
     /// Close the file. **Must** be called, or the container has no index and
     /// nothing will play it.
     pub fn finish(self) -> Result<(), String> {

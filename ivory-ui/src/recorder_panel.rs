@@ -399,6 +399,15 @@ struct Layout {
 
     /// One line of status, and the clip warning beside it.
     status: Rect,
+    /// The × that dismisses the message, at the right end of the status row.
+    ///
+    /// **A message with no way out is a message that has to be right about
+    /// everything.** One of them sat on the owner's screen for eight minutes
+    /// and across several takes, because nothing in the video path ever
+    /// cleared it and there was nothing to press: it was painted with a bare
+    /// `Painter::text` call, so it had no rect in `targets()` and a click on it
+    /// returned `None`.
+    status_close: Rect,
 
     /// Hairlines in the gaps between the groups. Not controls, and not hits —
     /// they are the cheapest way to make four groups look like four groups
@@ -663,6 +672,7 @@ impl Layout {
             export: Rect::NOTHING,
             open_when_done: Rect::NOTHING,
             status: Rect::NOTHING,
+            status_close: Rect::NOTHING,
             rules: [Rect::NOTHING; 2],
         }
     }
@@ -710,9 +720,21 @@ impl Layout {
         // band that changed shape when a warning appeared would move the
         // controls under a hand — but it is the height of the line now.
         let status_h = (rest.height() * 0.10).min(15.0);
-        let status = Rect::from_min_max(
+        let whole_status = Rect::from_min_max(
             Pos2::new(rest.left(), rest.bottom() - status_h),
             rest.max,
+        );
+        // The × always has its place, whether or not there is a message: a row
+        // that changes width when a warning appears would move the text under
+        // a hand that was reading it.
+        let close_w = status_h.min(whole_status.width() * 0.5);
+        let status_close = Rect::from_min_max(
+            Pos2::new(whole_status.right() - close_w, whole_status.top()),
+            whole_status.max,
+        );
+        let status = Rect::from_min_max(
+            whole_status.min,
+            Pos2::new(status_close.left() - 4.0, whole_status.bottom()),
         );
         let body = Rect::from_min_max(
             rest.min,
@@ -730,6 +752,7 @@ impl Layout {
             // gone: the lamp on the VU face says that, in the place somebody
             // watching levels is already looking.
             status,
+            status_close,
             ..Self::empty(rolling)
         };
 
@@ -1192,7 +1215,7 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 61] {
+    fn targets(&self) -> [(Rect, Produces); 62] {
         use Produces::{Along, AlongV, Fixed, SlotGain};
         let track = |row: Rect| fader_zones(row).1;
         // The dB at the end of a fader row, which is the box you type into.
@@ -1265,6 +1288,7 @@ impl Layout {
             // place somebody is already looking, and two indicators for one
             // fact is one of them being wrong.
             (self.meter, Fixed(Hit::DismissClip)),
+            (self.status_close, Fixed(Hit::DismissMessage)),
             (self.record, Fixed(Hit::Record)),
             (self.stop, Fixed(Hit::Stop)),
             (self.setup, Fixed(Hit::OpenSetup)),
@@ -1383,6 +1407,14 @@ pub enum Hit {
     /// The take-settings popup's DONE button. It only ever closes the popup,
     /// which is why it is a hit here and not an action anywhere else.
     CloseSetup,
+    /// The × on the status row: put the message away.
+    ///
+    /// **A message with no way out has to be right about everything.** The
+    /// video path's "frames were dropped" line was cleared by nothing at all —
+    /// it sat on the owner's screen for eight minutes and across several takes
+    /// — and it could not be pressed, because it was painted rather than laid
+    /// out.
+    DismissMessage,
     /// Reachable only from the popup: the four rows below have no home in the
     /// band, and a control that exists in exactly one place needs no rule about
     /// which place wins.
@@ -1600,6 +1632,7 @@ impl Hit {
             Hit::Record => "Record",
             Hit::OpenSetup => "Take settings",
             Hit::CloseSetup => "Done",
+            Hit::DismissMessage => "Dismiss",
             Hit::ShowAudioStatus => "Setup: the audio system, devices, rate and buffer",
             Hit::ToggleCountInInTake => "Record the count-in into the take",
             Hit::ToggleHideElapsed => "Hide the elapsed time",
@@ -4208,14 +4241,43 @@ fn draw_tick(painter: &Painter, r: Rect, cap: &str, on: bool, p: &Palette) {
 }
 
 /// A line of unboxed text in a row, left- or right-aligned.
+/// What to draw, and how big, for a line that has to fit its row.
+///
+/// **Cut it rather than lose it.** `fit_text` shrinks to fit and returns a size
+/// below [`MIN_TEXT`] when it cannot — and the caller used to take that as
+/// "draw nothing". So a 155-character sentence explaining why a take came out
+/// wrong was, on a narrower window, silently absent: the one line that had the
+/// answer in it. A message the reader has to widen the window to finish is
+/// still a message; an empty row is not.
+fn fit_or_cut(r: Rect, text: &str) -> (std::borrow::Cow<'_, str>, f32) {
+    let want = r.height() * 0.82;
+    let size = fit_text(r, text, want);
+    if size >= MIN_TEXT {
+        return (std::borrow::Cow::Borrowed(text), size);
+    }
+    // Take characters off the end until what is left fits at the floor. From
+    // the end, because the front of a sentence is the half that says what it
+    // is about.
+    let mut keep = text.len();
+    while keep > 0 {
+        keep -= 1;
+        while keep > 0 && !text.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        let cut = format!("{}…", text[..keep].trim_end());
+        if fit_text(r, &cut, want) >= MIN_TEXT {
+            return (std::borrow::Cow::Owned(cut), MIN_TEXT);
+        }
+    }
+    (std::borrow::Cow::Borrowed("…"), MIN_TEXT)
+}
+
 fn text_line(painter: &Painter, r: Rect, text: &str, colour: Color32, right: bool) {
     if !r.is_positive() || text.is_empty() {
         return;
     }
-    let size = fit_text(r, text, r.height() * 0.82);
-    if size < MIN_TEXT {
-        return;
-    }
+    let (text, size) = fit_or_cut(r, text);
+    let text = text.as_ref();
     let (at, align) = if right {
         (Pos2::new(r.right(), r.center().y), Align2::RIGHT_CENTER)
     } else {
@@ -4224,9 +4286,29 @@ fn text_line(painter: &Painter, r: Rect, text: &str, colour: Color32, right: boo
     painter.text(at, align, text, font_light(size), colour);
 }
 
+/// The × on the status row. Two strokes, because a glyph at this size is a
+/// smudge in most fonts.
+fn draw_close_glyph(painter: &Painter, r: Rect, colour: Color32) {
+    if !r.is_positive() {
+        return;
+    }
+    let d = r.width().min(r.height()) * 0.30;
+    let c = r.center();
+    let w = (d * 0.22).clamp(0.8, 1.6);
+    for (a, b) in [
+        (Pos2::new(c.x - d, c.y - d), Pos2::new(c.x + d, c.y + d)),
+        (Pos2::new(c.x - d, c.y + d), Pos2::new(c.x + d, c.y - d)),
+    ] {
+        painter.line_segment([a, b], Stroke::new(w, colour));
+    }
+}
+
 fn draw_status(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palette) {
     if let Some(m) = view.message {
         text_line(painter, l.status, m, p.ink, false);
+        // And the way out of it. Only while there is something to dismiss —
+        // an × over an empty row is a control for nothing.
+        draw_close_glyph(painter, l.status_close, p.ink.gamma_multiply(0.7));
     }
     // Latched, so it is still there after Stop. An indicator that clears itself
     // is one the performer never sees, because they were looking at their hands
@@ -5343,7 +5425,7 @@ mod tests {
     /// The two effect knobs are in it for the same reason the faders are: they
     /// are a mix, they cost the audio thread nothing to move, and riding the
     /// reverb through a take is a thing a person does on purpose.
-    const SURVIVORS: [Hit; 38] = [
+    const SURVIVORS: [Hit; 39] = [
         Hit::Stop,
         Hit::SetSlotGain(0, 0.0),
         Hit::SetSlotGain(1, 0.0),
@@ -5362,6 +5444,11 @@ mod tests {
         Hit::SetMaster(0.0),
         // The backing track's level, but not its import button: see `targets`.
         Hit::SetTrackGain(0.0),
+        // And putting a message away, for the same reason: a warning that
+        // appears mid-take — a muted microphone, say — is exactly when
+        // somebody reads it, and dismissing it cannot change what is being
+        // written.
+        Hit::DismissMessage,
         // Pressing the VU puts its clip lamp out, and a clip during a take is
         // exactly when somebody does that.
         Hit::DismissClip,
@@ -5906,6 +5993,64 @@ mod tests {
             assert_eq!(hit_test(r, &v, r.max + Vec2::splat(4.0)), None);
         }
     }
+    /// **A message that does not fit must still say something.**
+    ///
+    /// `fit_text` shrinks to fit and gives up below `MIN_TEXT`, and the caller
+    /// read that as "draw nothing" — so the one line explaining why a take
+    /// came out wrong was, on a narrower window, silently absent. The owner
+    /// found it by reading the source; from the outside the app simply had no
+    /// answer.
+    #[test]
+    fn a_message_too_long_for_its_row_is_cut_rather_than_lost() {
+        // The real thing: the old dropped-frames sentence, 155 characters.
+        let long = "the video is complete, but 282 frames were repeated to keep                     the video on the clock - this machine could not composite                     and encode in real time; a smaller resolution will help";
+        assert!(long.len() > 150, "the test's own string got shorter");
+        for width in [1300.0_f32, 900.0, 620.0, 420.0] {
+            let r = band(width);
+            let l = Layout::new(r, &with_rack(RecordState::Idle, racks()[1]));
+            let row = l.status;
+            if !row.is_positive() {
+                continue;
+            }
+            let (text, size) = fit_or_cut(row, long);
+            assert!(
+                size >= MIN_TEXT,
+                "at {width} wide the line would be drawn at {size}, under the floor"
+            );
+            assert!(
+                !text.is_empty(),
+                "at {width} wide the message came out empty, which is the bug"
+            );
+            // A cut one still starts with the sentence, so the reader knows
+            // what it is about even when they cannot read all of it.
+            assert!(
+                long.starts_with(&text[..text.len().saturating_sub(3).min(12)]),
+                "at {width} wide the cut lost the front of the sentence: {text}"
+            );
+        }
+    }
+
+    /// The × on the status row is a real target, wherever the band is.
+    #[test]
+    fn the_message_can_be_put_away() {
+        for width in [1300.0_f32, 900.0, 620.0] {
+            let r = band(width);
+            let v = with_rack(RecordState::Idle, racks()[1]);
+            let l = Layout::new(r, &v);
+            assert!(l.status_close.is_positive(), "no × at {width} wide");
+            assert!(
+                !l.status.intersects(l.status_close),
+                "the message and its × overlap at {width} wide, so one of them \
+                 cannot be read or cannot be pressed"
+            );
+            assert_eq!(
+                hit_test(r, &v, l.status_close.center()),
+                Some(Hit::DismissMessage),
+                "the × does not answer a press at {width} wide"
+            );
+        }
+    }
+
 
     /// **Which controls survive a live take**, asserted by sweeping the whole
     /// band rather than by asking the layout, because the question is what a

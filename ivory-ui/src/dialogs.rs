@@ -2186,6 +2186,11 @@ pub struct Placement {
     /// `SurfaceSpec::on_top`. The panel is parented to the MAIN window, so
     /// nothing else can put it in front.
     pub native_panel_up: bool,
+    /// The user just pressed the main window while this dialog was up.
+    ///
+    /// See `SurfaceSpec::raise`. Passed through rather than read here, because
+    /// only the app knows a press happened.
+    pub raise: bool,
 }
 
 impl Placement {
@@ -2252,6 +2257,7 @@ fn show_dialog_viewport(
         decorated: true,
         resizable: true,
         takes_focus: true,
+        raise: placement.raise,
         modal: true,
         // Down for as long as the OS's own panel is up. See `on_top`.
         on_top: !placement.native_panel_up,
@@ -5143,6 +5149,7 @@ mod tests {
         // anybody saw was a window placed wherever.
         let p = Placement {
             native_panel_up: false,
+            raise: false,
             parent: None,
             monitor,
             caps: crate::host::Caps::DESKTOP,
@@ -5157,6 +5164,7 @@ mod tests {
         assert_eq!(
             Placement {
             native_panel_up: false,
+            raise: false,
                 parent: None,
                 monitor: None,
                 caps: crate::host::Caps::DESKTOP
@@ -5169,6 +5177,7 @@ mod tests {
         let parent = Rect::from_min_size(Pos2::new(600.0, 400.0), Vec2::new(1300.0, 200.0));
         let p = Placement {
             native_panel_up: false,
+            raise: false,
             parent: Some(parent),
             monitor,
             caps: crate::host::Caps::DESKTOP,
@@ -5189,6 +5198,7 @@ mod tests {
         let edge = Rect::from_min_size(Pos2::new(2400.0, 1380.0), Vec2::new(1300.0, 200.0));
         let p = Placement {
             native_panel_up: false,
+            raise: false,
             parent: Some(edge),
             monitor,
             caps: crate::host::Caps::DESKTOP,
@@ -5595,6 +5605,7 @@ mod tests {
         let mut dialog = Some(Dialog::custom_tuning(&Tuning::standard(), true));
         let placement = Placement {
             native_panel_up: false,
+            raise: false,
             parent: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
@@ -6152,6 +6163,7 @@ mod tests {
         let mut dialog = Some(Dialog::export(ExportSpec::default(), true, false));
         let placement = Placement {
             native_panel_up: false,
+            raise: false,
             parent: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
@@ -6254,6 +6266,7 @@ mod tests {
         fonts::apply_text_styles(&ctx);
         let placement = Placement {
             native_panel_up: false,
+            raise: false,
             parent: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
@@ -6517,6 +6530,7 @@ mod tests {
         fonts::apply_text_styles(&ctx);
         let placement = Placement {
             native_panel_up: false,
+            raise: false,
             parent: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,

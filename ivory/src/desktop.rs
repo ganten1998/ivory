@@ -193,6 +193,16 @@ struct Recorder {
     /// what knows: which inputs are open is a fact about the device and the
     /// selection, and `ivory-ui` can reach neither.
     input_names: [String; crate::instrument::INPUTS],
+    /// What the LAST take is worth saying about it, if anything.
+    ///
+    /// **Its own field, not `engine_error`.** The video path used to put this
+    /// in the audio engine's error slot, which nothing in the video path ever
+    /// cleared — so "frames were dropped" sat on the owner's screen for eight
+    /// minutes and across several takes, outliving the take it described by a
+    /// long way. This is cleared when a take starts and by the × on the status
+    /// row, and it is the last thing in the message chain because a live
+    /// problem always matters more than a finished one.
+    take_note: Option<String>,
     /// The newest camera frame, kept as RGBA for the compositor.
     ///
     /// A copy, and a deliberate one: the preview uploads its own texture and
@@ -894,6 +904,9 @@ impl DesktopApp {
             // afternoon would teach everybody to ignore the line that also
             // says the camera was denied.
             .or_else(|| self.muted_out_of_the_take())
+            // And what the LAST take was worth saying, which is the only thing
+            // here that is about the past — so it goes last.
+            .or_else(|| self.recorder.take_note.clone())
             // **The take's report is not here any more.** It was the last
             // `or_else` in this chain, which meant it sat in a one-line strip
             // competing with live errors and stayed up until something else
@@ -958,8 +971,21 @@ impl DesktopApp {
         // another `&mut self.app`.
         if let Some(summary) = self.recorder.session.last_summary() {
             let (message, problem) = (summary.message(), summary.is_problem());
+            let silent = summary.is_silent();
             if self.reported_take.as_deref() != Some(message.as_str()) {
                 self.reported_take = Some(message.clone());
+                // **A silent take gets a line, not a modal.** It is worth
+                // saying — "I recorded silence" is the failure this recorder
+                // exists to prevent — and it is not worth a window that
+                // swallows every event until it is found and closed. See
+                // `Summary::is_problem`.
+                if silent {
+                    self.recorder.take_note = Some(
+                        "that take is silent - check the input, and the mute \
+                         buttons in the mixer"
+                            .to_owned(),
+                    );
+                }
                 self.app.report_take(message, problem);
             }
         }
@@ -1365,9 +1391,19 @@ impl DesktopApp {
             }
         }
 
+        // The × on the status row. The message is the host's, so the host is
+        // what puts it away — see `IvoryApp::take_dismiss_message`.
+        if self.app.take_dismiss_message() {
+            self.recorder.take_note = None;
+        }
         while let Some(request) = self.app.take_recorder_request() {
             match request {
                 R::Toggle => {
+                    // **Whatever the last take had to say, it is not about
+                    // this one.** Stale post-take advice that outlives the
+                    // take it describes is how a line about dropped frames sat
+                    // on screen for eight minutes across several takes.
+                    self.recorder.take_note = None;
                     // The click counts the take in, on the audio thread's own
                     // sample clock. Started here, at the press, so the first
                     // beat lands immediately rather than a frame later.
@@ -2686,6 +2722,7 @@ impl DesktopApp {
             Recorder {
                 pending_monitor: None,
                 input_names: std::array::from_fn(|_| String::new()),
+                take_note: None,
                 session: crate::record::Session::new(tap, timebase),
                 audio,
                 camera,
@@ -3159,19 +3196,20 @@ impl DesktopApp {
                     // and both mean the same advice about this machine.
                     let mut what = Vec::new();
                     if dropped > 0 {
-                        what.push(format!("{dropped} frames were dropped"));
+                        what.push(format!("{dropped} video frames lost"));
                     }
                     if v.padded > 0 {
-                        what.push(format!(
-                            "{} frames were repeated to keep the video on the clock",
-                            v.padded
-                        ));
+                        what.push(format!("{} repeated", v.padded));
                     }
-                    self.recorder.engine_error = Some(format!(
-                        "the video is complete, but {} - this machine could \
-                         not composite and encode in real time; a smaller \
-                         resolution in Take Settings will help",
-                        what.join(" and ")
+                    // **Short, and it names the right panel.** The old one
+                    // ran to about 155 characters, which `fit_text` shrank
+                    // past its own floor — so on a narrower window the line
+                    // that says why the take is wrong drew NOTHING at all. And
+                    // it sent the user to Take Settings, where the resolution
+                    // is not: that is the Export dialog.
+                    self.recorder.take_note = Some(format!(
+                        "{} - lower the video size in Export",
+                        what.join(", ")
                     ));
                 }
                 // The manifest was written at Stop, before this file existed;

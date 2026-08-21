@@ -364,6 +364,16 @@ pub struct IvoryApp {
     ///
     /// Off at every launch, by construction rather than by a clamp.
     input_monitor: bool,
+    /// The user pressed the main window while a MODAL dialog was open.
+    ///
+    /// **A press that goes nowhere is how an app looks frozen.** Every event
+    /// is dropped while a dialog is up, which is what modal means — but a
+    /// dialog the window manager put BEHIND the main window is a dialog nobody
+    /// can see, and the owner sat through ten minutes of a Tangent that looked
+    /// hung and was not. The press is now the cue to bring it to the front.
+    raise_dialog: bool,
+    /// The × on the status row was pressed. Taken by the host.
+    dismiss_message: bool,
     /// The effect panel a right-click on a knob opened, if any.
     ///
     /// One at a time, like `dialog`: three panels at once over a band this
@@ -714,6 +724,8 @@ impl IvoryApp {
             recorder: recorder::RecorderState::default(),
             recorder_request: std::collections::VecDeque::new(),
             dir_request: None,
+            raise_dialog: false,
+            dismiss_message: false,
             mixer_open: false,
             mixer_grab: None,
             mixer_palette: None,
@@ -1850,6 +1862,13 @@ impl IvoryApp {
             egui::Sense::click_and_drag(),
         );
         if self.dialog.is_some() {
+            // **Dropped, but not silently.** A press here is somebody trying
+            // to use a window that is waiting on a dialog they may not be able
+            // to see — so it asks the dialog to come to the front rather than
+            // going nowhere at all. See `raise_dialog`.
+            if ctx.input(|i| i.pointer.any_pressed()) {
+                self.raise_dialog = true;
+            }
             return; // Qt dialogs are modal: main window ignores input.
         }
         let (primary_pressed, pointer_down, pointer_released, pointer, ctrl) = ctx.input(|i| {
@@ -3401,6 +3420,14 @@ impl IvoryApp {
         self.input_monitor
     }
 
+    /// Take a pending "put that message away" request.
+    ///
+    /// The host owns the message, so the host is what clears it. See
+    /// `Hit::DismissMessage`.
+    pub fn take_dismiss_message(&mut self) -> bool {
+        std::mem::take(&mut self.dismiss_message)
+    }
+
     /// Take a pending "show me this folder" request. Same contract.
     pub fn take_reveal_request(&mut self) -> Option<std::path::PathBuf> {
         self.reveal_request.take()
@@ -3440,6 +3467,10 @@ impl IvoryApp {
             // question — and a menu row can show none of that.
             Hit::OpenSetup => self.setup_open = true,
             Hit::CloseSetup => self.setup_open = false,
+            // **Requested, not done here.** The message belongs to the host —
+            // it is the one that knows a take dropped frames — and this crate
+            // cannot reach it. Same shape as `take_reveal_request`.
+            Hit::DismissMessage => self.dismiss_message = true,
             Hit::ShowAudioStatus => self.open_audio_setup(),
             Hit::ToggleCountInInTake => {
                 self.settings.record_count_in_in_take = !self.settings.record_count_in_in_take;
@@ -6941,6 +6972,8 @@ impl IvoryApp {
         let placement = dialogs::Placement {
             caps: self.caps,
             native_panel_up: self.native_panel_up,
+            // Taken, so one press asks once. See `SurfaceSpec::raise`.
+            raise: std::mem::take(&mut self.raise_dialog),
             // The rect the layout was actually DRAWN into, which is centred in
             // the pane and is not the same as one anchored at its corner. With
             // a band turned off, the two differ by half the slack and dialogs

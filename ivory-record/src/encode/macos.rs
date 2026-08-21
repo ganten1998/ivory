@@ -317,6 +317,14 @@ impl Encoder {
         self.frames
     }
 
+    /// Always zero. **AVFoundation is given the real presentation time**, so
+    /// there are no gaps to fill: a frame that arrives late is written late
+    /// and the file's own clock says so. The pipe-fed encoder has to rebuild
+    /// that timeline by hand — see `ffmpeg::Frame::pad`.
+    pub fn frames_repeated(&self) -> u64 {
+        0
+    }
+
     pub fn finish(self) -> Result<(), String> {
         unsafe { self.input.markAsFinished() };
         if let Some(track) = self.audio.as_ref() {

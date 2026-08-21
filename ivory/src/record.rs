@@ -858,8 +858,25 @@ impl Summary {
     /// message anybody meant to stop seeing. A silent take counts — it is the
     /// failure the meter exists to prevent and the one nobody notices until
     /// they open the file.
+    /// Whether this take FAILED, as opposed to being worth a remark.
+    ///
+    /// **A silent take is not a failure.** It used to be, and the consequence
+    /// was a MODAL dialog over a working app: every event is dropped while one
+    /// is open, and on the owner's Linux box it opened behind the main window
+    /// and swallowed ten minutes of clicks and keystrokes. Tangent looked
+    /// hung and was not.
+    ///
+    /// It is still worth saying — "I recorded silence" is the failure class
+    /// this whole recorder exists to prevent — so it says it in the band's
+    /// status row, which is a line you can read and dismiss. See
+    /// `silent`, and `DesktopApp::take_note`.
     pub fn is_problem(&self) -> bool {
-        self.problem.is_some() || self.silent
+        self.problem.is_some()
+    }
+
+    /// The take produced no sound. Worth a line, not a modal.
+    pub fn is_silent(&self) -> bool {
+        self.silent
     }
 
     pub fn message(&self) -> String {
