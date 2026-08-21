@@ -1736,7 +1736,6 @@ impl IvoryApp {
             recorder_first: self.menu_over_recorder && self.settings.show_recorder,
             staff_first: self.menu_over_staff,
             staff_key: self.settings.staff_key,
-            record_sources: self.settings.record_sources.clone(),
             metronome_on: self.settings.metronome_on,
             metronome_in_take: self.settings.metronome_in_take,
             hide_elapsed: self.settings.record_hide_elapsed,
@@ -3576,11 +3575,6 @@ impl IvoryApp {
         self.settings.record_count_in_in_take
     }
 
-    /// `auto` / `input` / `plugin` / `both`, verbatim from the file.
-    pub fn audio_source_setting(&self) -> &str {
-        &self.settings.record_sources
-    }
-
     pub fn metronome_on(&self) -> bool {
         self.settings.metronome_on
     }
@@ -4597,10 +4591,6 @@ impl IvoryApp {
             MenuAction::AttachRecorder => self.reattach_recorder(),
             MenuAction::ShowExportDialog => self.open_export_dialog(),
             MenuAction::ShowAudioStatus => self.open_audio_setup(),
-            MenuAction::SetRecordSources(kind) => {
-                self.settings.record_sources = kind.to_owned();
-                self.save_settings();
-            }
             MenuAction::SetCountIn(bars) => self.set_count_in_bars(bars),
             MenuAction::SetTimeSignature(sig) => self.set_time_signature(sig),
             MenuAction::ToggleCountInInTake => {

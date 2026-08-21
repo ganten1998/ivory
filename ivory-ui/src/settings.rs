@@ -357,19 +357,6 @@ pub struct Settings {
     /// — so these are stored verbatim and handed straight back at startup. See
     /// `ports::AudioSetup::set_exposed`.
     pub record_input_channels: Vec<String>,
-    /// What a take is made of: `auto`, `input`, `plugin` or `both`.
-    ///
-    /// **A NEW key, and the old `record_audio_source` is deliberately left
-    /// unread in `extra`.** That key defaulted to `"input"` and no control ever
-    /// existed to change it, so every value it holds was written by the app
-    /// rather than chosen by anybody — and the result was the first thing a
-    /// user hit: load a piano, press record, get a file with only the
-    /// microphone in it. Migrating it would mean guessing which `"input"`s were
-    /// decisions; a new key has no such history.
-    ///
-    /// `auto` means "record whatever there is", which with an instrument loaded
-    /// is the instrument and the input together.
-    pub record_sources: String,
     /// The user picked "None - record MIDI only" in the audio-input picker.
     ///
     /// Its own key, because `record_audio_source` used to carry BOTH this and
@@ -706,7 +693,6 @@ impl Default for Settings {
             record_camera_uid: None,
             record_audio_device: None,
             record_input_channels: Vec::new(),
-            record_sources: "auto".to_owned(),
             record_input_off: false,
             record_count_in_beats: 4,
             record_count_in_bars: 1,
@@ -1260,11 +1246,12 @@ impl Settings {
                 .collect();
         }
         take_bool(&mut map, "record_input_off", &mut s.record_input_off);
-        if let Some(v) = map.shift_remove("record_sources") {
-            if let Some(t) = v.as_str() {
-                s.record_sources = t.to_owned();
-            }
-        }
+        // `record_sources` is NOT read, and is left in `extra` to be written
+        // back untouched — the same treatment `record_audio_source` got when it
+        // was retired before it. A take is the desk now and there is nothing
+        // left for the key to say; see `record::TakeSource`. Reading it would
+        // mean honouring `input`, which is a microphone with none of the
+        // effects that were audible while it was played.
         // Whether the FILE carried a bars key. A local rather than a field on
         // `Settings`, because it is a fact about the file and not about the
         // user: a field would have to round-trip, and two settings that differ
@@ -1790,10 +1777,6 @@ impl Settings {
         map.insert(
             "shows_default_applied".into(),
             Value::Bool(self.shows_default_applied),
-        );
-        map.insert(
-            "record_sources".into(),
-            Value::String(self.record_sources.clone()),
         );
         map.insert(
             "record_input_off".into(),

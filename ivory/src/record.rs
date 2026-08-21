@@ -102,8 +102,6 @@ enum Cmd {
     /// Boxed and sent rather than shared: the tap is the read end of a
     /// lock-free ring and belongs to exactly one thread, which is this one.
     Plugin(Option<Box<crate::instrument::RecorderTap>>),
-    /// Which sources the next take is made of.
-    Source(TakeSource),
     /// Put out the clip latch on the writer's OWN tracker.
     ///
     /// **The half of "clear the clip" that was missing.** `Session::clear_clip`
@@ -187,130 +185,31 @@ struct AudioReport {
 }
 
 /// Which sources a take is made of.
+
+/// Where a take's audio comes from.
 ///
-/// Not `graph::SourceMode` (yet). That type carries the full mixer with its
-/// per-source gains and delay compensation, and this is the subset that is
-/// actually wired: the recorder writes ONE rate master and optionally sums a
-/// second source into it. When the graph is made real this collapses into it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TakeSource {
-    /// The audio input device. What a microphone take is.
-    Input,
-    /// The hosted instrument. What a piano take is, and the default whenever a
-    /// plugin is loaded — the plugin IS the sound the user is playing.
-    Plugin,
-    /// Both, summed.
-    ///
-    /// **The two run on independent device clocks**, so this is only exactly
-    /// right when the input and the output are the same interface — which is
-    /// the ordinary setup for a piano rig with one box, and the reason it is
-    /// offered at all. On two separate devices the sum drifts by their relative
-    /// crystal error, and `take.json` says which source was the rate master so
-    /// the drift is at least attributable.
-    Both,
-}
-
-impl TakeSource {
-    pub fn to_setting(self) -> &'static str {
-        match self {
-            TakeSource::Input => "input",
-            TakeSource::Plugin => "plugin",
-            TakeSource::Both => "both",
-        }
-    }
-
-    /// Forgiving, and it resolves the cases the setting cannot know about.
-    ///
-    /// **An absent setting means "record whatever there is".** That is the fix
-    /// for the first thing anybody hit: load a piano, press record, and get a
-    /// file with only the microphone in it — the instrument you could plainly
-    /// hear was monitored but never recorded, because the stored setting said
-    /// `input` and nothing had ever offered to change it. A loaded instrument
-    /// is one the user went and chose; leaving it out of the take is never what
-    /// they meant.
-    ///
-    /// **A backing track is the same argument and it took a second bug to
-    /// notice.** `TakeSource::Plugin` is not really "the plugin": it is the
-    /// instrument BUS, and the bus carries the instruments, the click and the
-    /// backing track. This function knew about plugins and inputs only, so
-    /// somebody with a microphone selected, no instrument loaded and a backing
-    /// track playing got `Input` — a take of themselves playing along to
-    /// something that is not in the file. The track was audible in the room, so
-    /// the recording was not silent; it just had the bleed instead of the
-    /// track, which is the version of this failure that survives a listen.
-    ///
-    /// Loaded, not playing: a take is armed before the transport rolls, and a
-    /// track that starts with it would decide the sources one buffer too late.
-    ///
-    /// An EXPLICIT setting is still obeyed, which is what makes
-    /// instrument-only and microphone-only reachable.
-    pub fn resolve(
-        setting: &str,
-        plugin_loaded: bool,
-        track_loaded: bool,
-        input_open: bool,
-        monitored: bool,
-    ) -> Self {
-        // Everything downstream asks "is there anything on the instrument bus",
-        // never "is there a plugin". Those were the same question until the
-        // backing track arrived, and every arm below was written when they were.
-        let bus = plugin_loaded || track_loaded;
-        let want = match setting {
-            "plugin" => TakeSource::Plugin,
-            "both" => TakeSource::Both,
-            "input" => TakeSource::Input,
-            // Anything else, including the absent default, is "everything
-            // there is".
-            _ => {
-                if bus {
-                    TakeSource::Both
-                } else {
-                    TakeSource::Input
-                }
-            }
-        };
-        let want = match (want, bus, input_open) {
-            (TakeSource::Plugin, false, _) => TakeSource::Input,
-            (TakeSource::Both, false, _) => TakeSource::Input,
-            (TakeSource::Both, true, false) => TakeSource::Plugin,
-            (TakeSource::Input, _, false) if bus => TakeSource::Plugin,
-            (other, ..) => other,
-        };
-        // **A monitored microphone is already on the bus, and must not be
-        // written twice.**
-        //
-        // Monitoring puts the live input into the mix, and the mix is what the
-        // tap carries — so `Both` would write the microphone once from the
-        // capture ring and once more inside the bus. Twice, about six decibels
-        // up, and comb-filtered against itself by the monitor ring's own
-        // latency. What that sounds like is a take that is somehow wrong in a
-        // way nobody can name.
-        //
-        // The bus is the right one to keep, and that is the owner's rule: if
-        // the effects were audible while it was recorded, they are in the take.
-        // Through the bus the microphone arrives with its fader, its send, its
-        // mute and the master's limiter already applied — which is what was
-        // coming out of the speakers.
-        //
-        // **`Input` is deliberately left alone.** Somebody who asked for the
-        // microphone ALONE cannot be given a wet one: the bus is a mix and
-        // there is no way to take the input's share back out of it. They get
-        // the dry capture, which is what they asked for and the only thing that
-        // can be delivered.
-        match (want, monitored) {
-            (TakeSource::Both, true) => TakeSource::Plugin,
-            (other, _) => other,
-        }
-    }
-
-    fn uses_plugin(self) -> bool {
-        matches!(self, TakeSource::Plugin | TakeSource::Both)
-    }
-
-    fn uses_input(self) -> bool {
-        matches!(self, TakeSource::Input | TakeSource::Both)
-    }
-}
+/// **There is one answer and this type is the note that says so**: the DESK.
+/// The tap carries `Renderer::mix` — every strip that is not muted, at its
+/// fader, through its sends, under the master's limiter — and that is what
+/// the file gets, always.
+///
+/// It used to be a choice of three, `input`, `plugin` or `both`, and the
+/// choice was the bug. `input` meant the dry capture ring, so a microphone
+/// recorded that way arrived with none of the effects that had been audible
+/// while it was played; `both` summed the dry ring INTO the desk mix, which
+/// wrote a monitored microphone twice, six decibels up and comb-filtered
+/// against its own monitor latency. Every arm of it needed a rule about the
+/// other arms, and the rules were where the bugs lived.
+///
+/// The mixer made the choice unnecessary. A strip that should not be in the
+/// take has a mute, which is a control the user can see, in a place that shows
+/// them what it did — and "what is in the file" now has exactly one answer to
+/// look up rather than a setting nobody ever had a control for.
+///
+/// **The input device is still the take's CLOCK.** It is the only source with
+/// device timestamps, so it is the only one that can measure the crystal, and
+/// a take of a piano still has to not drift. Its samples are popped and
+/// dropped; its marks drive the timeline. See `Writer::pump`.
 
 /// Scale an interleaved block towards `target`, and say where the gain got to.
 ///
@@ -368,7 +267,6 @@ struct Writer {
     /// nothing.
     plugin_buf: Vec<f32>,
     plugin: Option<crate::instrument::RecorderTap>,
-    source: TakeSource,
     silence: Vec<f32>,
     /// Timebase instant of the first frame written to the current file.
     /// `None` until the take's first mark arrives. See `pump`.
@@ -432,18 +330,18 @@ impl Writer {
                 } else {
                     0
                 };
-                // Recording the instrument and not the room: the input's
-                // samples are still POPPED (the ring has to keep moving) and
-                // its marks still drive the clock and the rate fit, but its
-                // audio does not reach the file.
+                // **The capture ring is popped and thrown away, every time.**
                 //
-                // **The input device stays the clock even when it is not the
-                // content.** It is the only source with device timestamps, so
-                // it is the only one that can measure the crystal — and a take
-                // of a plugin is still a take that has to not drift.
-                if !self.source.uses_input() {
-                    self.buf.iter_mut().for_each(|s| *s = 0.0);
-                }
+                // The input reaches the file through the DESK — see
+                // `TakeSource` — where it has already been given its fader, its
+                // send and the master's limiter. Adding these samples too would
+                // be the same microphone twice.
+                //
+                // Popped rather than skipped, because the ring has to keep
+                // moving and its marks are the take's clock: this device is the
+                // only one with timestamps, so it measures the crystal whether
+                // or not it is the content.
+                self.buf.iter_mut().for_each(|s| *s = 0.0);
                 // **The fader, before anything else touches the block.**
                 //
                 // Here and not later, because everything downstream has to see
@@ -468,19 +366,7 @@ impl Writer {
                 // devices they drift, which is why `take.json` records which
                 // source was the master.
                 let frames = self.buf.len() / self.tracker.channels().max(1);
-                if self.source.uses_plugin() {
-                    self.mix_plugin(frames);
-                } else {
-                    // Drained and thrown away, NOT left alone.
-                    //
-                    // Leaving it filled a ring that nothing was reading, and
-                    // every frame it then refused counted as a take loss: a
-                    // 37-second take reported "1,608,192 frames were lost to
-                    // the system and padded with silence" — 33 seconds of a
-                    // 37-second recording — when in truth nothing was lost at
-                    // all. The instrument simply was not part of the take.
-                    self.discard_plugin(frames);
-                }
+                self.mix_plugin(frames);
                 self.tracker.absorb(&self.buf);
                 // The ring can hold fewer frames than the mark promised — the
                 // idle path drains marks and samples in two statements, so a
@@ -627,20 +513,6 @@ impl Writer {
             }
         }
     }
-
-    /// Move `frames` of instrument audio out of the ring and drop it.
-    ///
-    /// The same amount `mix_plugin` would have taken, so the ring keeps pace
-    /// with the take instead of backing up.
-    fn discard_plugin(&mut self, frames: usize) {
-        let Some(tap) = self.plugin.as_mut() else {
-            return;
-        };
-        self.plugin_buf.clear();
-        tap.drain_frames(frames, &mut self.plugin_buf);
-        self.plugin_buf.clear();
-    }
-
     fn write_samples(&mut self, samples: &[f32]) {
         let Some(wav) = self.wav.as_mut() else {
             return;
@@ -724,25 +596,20 @@ impl Writer {
             // crystal is the same one, so a longer fit is strictly a better
             // measurement of it. It is the counters that would lie, not the fit.
             unstamped: self.clock.unstamped().saturating_sub(self.unstamped_at_arm),
-            // The instrument ring's losses count ONLY when the instrument is
-            // part of the take. Counting them regardless is what produced the
-            // false "1,608,192 frames were lost" on a take that lost nothing:
-            // the ring was not being read because the instrument was not being
-            // recorded, which is not a dropout, it is a decision.
+            // The desk's ring is always part of the take now, so its losses
+            // always count. They did not always: for as long as a take could
+            // leave the instrument out, a ring nobody was reading reported
+            // every frame it refused as a dropout — "1,608,192 frames were
+            // lost" on a take that lost nothing.
             frames_dropped: self
                 .sink
                 .stats()
                 .frames_dropped()
                 .saturating_sub(self.dropped_at_arm)
                 + self.short_frames
-                + if self.source.uses_plugin() {
+                + {
                     let armed = self.plugin_dropped_at_arm;
                     self.plugin.as_ref().map_or(0, |t| t.dropped().saturating_sub(armed))
-                } else {
-                    // An instrument that is not in the take cannot cost the take
-                    // anything. Its ring is drained and discarded, so whatever it
-                    // "dropped" is audio nobody asked to keep.
-                    0
                 },
             // Taken, not copied. It is reset on `Cmd::Start`, and a take that
             // writes no `.wav` at all never sends one — so without this the
@@ -873,7 +740,6 @@ impl Audio {
             error: None,
             plugin_buf: Vec::new(),
             plugin: None,
-            source: TakeSource::Input,
             first_frame_ns: None,
             short_frames: 0,
             dropped_at_arm: 0,
@@ -939,7 +805,6 @@ impl Audio {
                             let _ = report_tx.send(report);
                         }
                         Ok(Cmd::Plugin(tap)) => writer.plugin = tap.map(|t| *t),
-                        Ok(Cmd::Source(mode)) => writer.source = mode,
                         // `clear_clip`, never `arm`: arming also forgets the
                         // take peak and the frame count, which are the take's
                         // history. Acknowledging a red light must not erase the
@@ -1144,9 +1009,6 @@ pub struct Session {
     /// opened mid-take and a take that changed what it was writing halfway
     /// through would produce a directory matching neither answer.
     spec: ExportSpec,
-    /// What the take is made of. Mirrored to the writer thread by
-    /// [`set_source`](Session::set_source).
-    source: TakeSource,
     /// Something noticed at `begin` that the summary at `stop` should say.
     pending_note: Option<String>,
     /// A T0 supplied from outside; see [`arm_at`](Session::arm_at).
@@ -1223,7 +1085,6 @@ impl Session {
             count_in_of: 0,
             take: None,
             spec: ExportSpec::default(),
-            source: TakeSource::Input,
             pending_note: None,
             arm_override: None,
             last: None,
@@ -1502,20 +1363,6 @@ impl Session {
         if !self.state.is_active() {
             self.meter = meter;
         }
-    }
-
-    pub fn set_source(&mut self, source: TakeSource) {
-        if self.state.is_active() {
-            return;
-        }
-        self.source = source;
-        if let Some(audio) = &self.audio {
-            let _ = audio.cmds.send(Cmd::Source(source));
-        }
-    }
-
-    pub fn source(&self) -> TakeSource {
-        self.source
     }
 
     pub fn close_input(&mut self) {
@@ -2172,7 +2019,7 @@ impl Session {
             .sources
             .push(take::SourceReport::from_clock("take_source", &self.midi_clock));
         if let Some(last) = manifest.sources.last_mut() {
-            last.name = format!("sources: {}", self.source.to_setting());
+            last.name = "sources: the desk".to_owned();
         }
         manifest.midi = take::MidiReport {
             tempo_bpm: spec.tempo_bpm,
@@ -2601,7 +2448,6 @@ mod tests {
             error: None,
             plugin_buf: Vec::new(),
             plugin: None,
-            source: TakeSource::Input,
             first_frame_ns: None,
             short_frames: 0,
             dropped_at_arm: 0,
@@ -2677,15 +2523,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **The instrument's ring must be drained even when it is not recorded.**
+    /// **What you hear is what you get, asserted on the samples.**
     ///
-    /// It was not, so it filled, and every frame it then refused was counted as
-    /// a take loss: a 37-second take reported "1,608,192 frames were lost to
-    /// the system and padded with silence" — 33 seconds of a 37-second
-    /// recording — when nothing had been lost at all. The instrument simply was
-    /// not part of that take.
+    /// The capture ring carries the raw microphone at 0.25 and the desk's tap
+    /// carries 0.5. A take is the DESK, so the file must peak at 0.5 exactly:
+    ///
+    ///   0.75 is the microphone written twice — once dry from the ring and once
+    ///         more inside the mix it was already part of. That was `Both`, and
+    ///         it was six decibels and a comb filter.
+    ///   0.25 is the dry ring alone, which is a microphone with none of the
+    ///         effects that were audible while it was played. That was `Input`.
+    ///   0.5  is the desk.
+    ///
+    /// And the ring still has to be DRAINED, which is the other half: it was
+    /// not once, so it filled, and every frame it then refused was counted as a
+    /// take loss — a 37-second take reporting "1,608,192 frames were lost to
+    /// the system and padded with silence".
     #[test]
-    fn an_instrument_left_out_of_the_take_reports_no_losses() {
+    fn the_take_is_the_desk_and_not_the_capture_ring() {
         let dir = std::env::temp_dir().join("tangent-writer-nodrain");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -2693,7 +2548,6 @@ mod tests {
         const CH: usize = 2;
         const BLOCK: usize = 256;
         let (mut source, mut writer) = writer_with_ring(CH);
-        writer.source = TakeSource::Input;
         // A REAL tap, deliberately tiny, and one the test keeps filling. The
         // first version of this test had `plugin: None` and passed with the fix
         // removed, which is no test at all: with nothing to drain there is
@@ -2728,9 +2582,18 @@ mod tests {
         let report = writer.stop();
         assert_eq!(
             report.frames_dropped, 0,
-            "an instrument that is not being recorded cannot lose a take any              frames"
+            "the desk's ring is drained every pump, so a take that lost nothing \
+             must report nothing"
         );
         assert_eq!(report.frames, (BLOCK * 40) as u64);
+        // THE assertion. See the doc comment for what each other value means.
+        let peak = report.take_peak;
+        assert!(
+            (peak - 0.5).abs() < 1.0e-4,
+            "the take peaked at {peak}, and the desk was at 0.5: 0.75 is the \
+             microphone written twice, 0.25 is the dry ring with no effects on \
+             it, and either one is a take that is not what was heard"
+        );
 
         // And the other half: the ring was actually kept MOVING. Reporting zero
         // losses is easy to get right by accident — the conditional above does
@@ -2748,9 +2611,9 @@ mod tests {
             .dropped();
         assert_eq!(
             overflowed, 0,
-            "the instrument's ring overflowed {overflowed} times during a take \
-             that does not record it - it is not being drained, so it backs up \
-             and every later take inherits the loss"
+            "the desk's ring overflowed {overflowed} times during a take - it is \
+             not being drained, so it backs up and every later take inherits \
+             the loss"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2782,7 +2645,6 @@ mod tests {
             error: None,
             plugin_buf: Vec::new(),
             plugin: None,
-            source: TakeSource::Input,
             first_frame_ns: None,
             short_frames: 0,
             dropped_at_arm: 0,
@@ -3511,181 +3373,6 @@ mod input_gain_tests {
     }
 }
 
-#[cfg(test)]
-mod source_tests {
-    use super::TakeSource;
-
-    /// **Everything on the instrument bus counts, not just a VST3.**
-    ///
-    /// The bug this exists for cost the owner twelve takes across three
-    /// releases and was invisible from inside the app: the monitor played the
-    /// built-in DX7, the meters moved, the `.mid` captured every note, and the
-    /// `.wav` had the microphone and nothing else. `resolve` was asking "is a
-    /// PLUGIN loaded", the built-in is not one, so `auto` answered `Input` and
-    /// the whole bus was left out of the file.
-    ///
-    /// The backing track is the same mistake found a second way: loaded, in the
-    /// mix, audible, and not in the take — which reads as "the backing track
-    /// does not record", because the bleed into the microphone is still there.
-    ///
-    /// So the parameter is `track_loaded` beside `plugin_loaded` and the caller
-    /// passes `any_instrument_loaded()`, which counts the built-in. Every arm
-    /// below is a case that produced a wrong file.
-    /// **A monitored microphone is written once, not twice.**
-    ///
-    /// Monitoring puts the live input into the mix and the mix is what the tap
-    /// carries, so `Both` wrote the microphone from the capture ring AND again
-    /// inside the bus — six decibels up and comb-filtered against itself by the
-    /// monitor ring's latency. A take that is wrong in a way nobody can name.
-    #[test]
-    fn a_monitored_microphone_is_not_recorded_twice() {
-        // Not monitoring: both sources, as it always was.
-        assert_eq!(
-            TakeSource::resolve("both", true, false, true, false),
-            TakeSource::Both
-        );
-        // Monitoring: the bus alone, because the bus already has the
-        // microphone in it — with its fader, its send and the limiter on it,
-        // which is what was coming out of the speakers.
-        assert_eq!(
-            TakeSource::resolve("both", true, false, true, true),
-            TakeSource::Plugin,
-            "the microphone was written twice"
-        );
-        // The same for the default, which resolves to `Both` when there is a
-        // bus and an input.
-        assert_eq!(
-            TakeSource::resolve("auto", true, false, true, true),
-            TakeSource::Plugin
-        );
-        // **`Input` is left alone even while monitoring.** Somebody who asked
-        // for the microphone ALONE cannot be handed a wet one — the bus is a
-        // mix and the input's share cannot be taken back out of it — so they
-        // get the dry capture, which is what they asked for.
-        assert_eq!(
-            TakeSource::resolve("input", true, false, true, true),
-            TakeSource::Input
-        );
-        // And with nothing on the bus, monitoring changes nothing: there is no
-        // second copy to collide with.
-        assert_eq!(
-            TakeSource::resolve("auto", false, false, true, true),
-            TakeSource::Input
-        );
-    }
-
-    #[test]
-    fn anything_on_the_instrument_bus_is_worth_recording() {
-        // A backing track and a microphone: the take must have both.
-        assert_eq!(
-            TakeSource::resolve("auto", false, true, true, false),
-            TakeSource::Both,
-            "a take made while a backing track plays left the track out"
-        );
-        // A backing track and no microphone: the bus is the whole take.
-        assert_eq!(
-            TakeSource::resolve("auto", false, true, false, false),
-            TakeSource::Plugin
-        );
-        // The same for an instrument, which is what the caller now passes for
-        // the built-in as well as for a VST3.
-        assert_eq!(
-            TakeSource::resolve("auto", true, false, true, false),
-            TakeSource::Both
-        );
-        // And with neither, the input is still the only thing there is.
-        assert_eq!(
-            TakeSource::resolve("auto", false, false, true, false),
-            TakeSource::Input
-        );
-
-        // **An explicit choice is still obeyed**, including the one that says
-        // the bus only. "Record the instruments" with a backing track loaded
-        // and no plugin is a real request, and it used to fall through to the
-        // microphone.
-        assert_eq!(
-            TakeSource::resolve("plugin", false, true, true, false),
-            TakeSource::Plugin,
-            "instruments-only with a track loaded recorded the microphone"
-        );
-        assert_eq!(
-            TakeSource::resolve("both", false, true, true, false),
-            TakeSource::Both
-        );
-        // Microphone-only stays reachable, which is what makes the setting
-        // worth having at all.
-        assert_eq!(
-            TakeSource::resolve("input", true, true, true, false),
-            TakeSource::Input
-        );
-    }
-
-    /// "Record the plugin" with no plugin loaded must not record silence. A
-    /// take of nothing is never what anybody meant, and it is a setting that
-    /// survives from a session where a plugin WAS loaded.
-    #[test]
-    fn asking_for_a_plugin_that_is_not_loaded_records_the_input_instead() {
-        assert_eq!(
-            TakeSource::resolve("plugin", false, false, true, false),
-            TakeSource::Input
-        );
-        assert_eq!(TakeSource::resolve("both", false, false, true, false), TakeSource::Input);
-    }
-
-    /// And the mirror: with a plugin loaded and no input device open, the
-    /// plugin is the only thing there is to record.
-    #[test]
-    fn with_no_input_open_a_loaded_plugin_is_the_take() {
-        assert_eq!(
-            TakeSource::resolve("input", true, false, false, false),
-            TakeSource::Plugin
-        );
-        assert_eq!(TakeSource::resolve("both", true, false, false, false), TakeSource::Plugin);
-    }
-
-    /// **The bug a user hit within minutes.** Load a piano, press record, and
-    /// the file had only the microphone in it — the instrument was monitored,
-    /// plainly audible, and absent from the take, because the stored default
-    /// said `input` and no control had ever existed to say otherwise.
-    #[test]
-    fn a_loaded_instrument_is_in_the_take_unless_somebody_says_otherwise() {
-        assert_eq!(
-            TakeSource::resolve("auto", true, false, true, false),
-            TakeSource::Both,
-            "an instrument you went and loaded belongs in the recording"
-        );
-        assert_eq!(
-            TakeSource::resolve("auto", false, false, true, false),
-            TakeSource::Input,
-            "and with none loaded there is nothing extra to add"
-        );
-        // An EXPLICIT choice still wins, which is what makes the other three
-        // menu rows mean anything.
-        assert_eq!(TakeSource::resolve("input", true, false, true, false), TakeSource::Input);
-        assert_eq!(
-            TakeSource::resolve("plugin", true, false, true, false),
-            TakeSource::Plugin
-        );
-    }
-
-    #[test]
-    fn an_ordinary_setup_gets_what_it_asked_for() {
-        assert_eq!(TakeSource::resolve("input", true, false, true, false), TakeSource::Input);
-        assert_eq!(TakeSource::resolve("plugin", true, false, true, false), TakeSource::Plugin);
-        assert_eq!(TakeSource::resolve("both", true, false, true, false), TakeSource::Both);
-        assert_eq!(
-            TakeSource::resolve("nonsense from a later build", false, false, true, false),
-            TakeSource::Input
-        );
-    }
-
-    #[test]
-    fn the_setting_round_trips() {
-        for s in ["input", "plugin", "both"] {
-            assert_eq!(TakeSource::resolve(s, true, false, true, false).to_setting(), s);
-        }
-    }
-}
 
 // ───────────────────────────────────────────────────────────────────────────
 // A take with no input device
@@ -3770,7 +3457,6 @@ impl PluginAudio {
                         Ok(Cmd::Plugin(t)) => w.tap = t.map(|t| *t),
                         // Meaningless here: with no input there is only one
                         // thing this can be recording.
-                        Ok(Cmd::Source(_)) => {}
                         // Meaningful here for exactly the same reason it is
                         // meaningful on the input writer: this thread's `pump`
                         // republishes its own latch every cycle, so clearing

@@ -1566,6 +1566,40 @@ struct Renderer {
     /// The master INSERT: high-pass, low-pass and the limiter, across
     /// everything on its way out.
     master_effects: crate::effects::Effects,
+    /// The SPEAKERS' own master insert.
+    ///
+    /// **Two mixes leave this renderer, and they are not always the same
+    /// one.** The take is the desk: every strip that is not muted is in it.
+    /// The room is the desk minus an input nobody asked to hear — which is the
+    /// ordinary rig, because monitoring is off at every launch and a
+    /// microphone through speakers is how a room starts feeding back.
+    ///
+    /// The two diverge BEFORE the master insert, so the speakers need their
+    /// own instance of it: a limiter is not a linear thing and its output for
+    /// the room cannot be derived from its output for the file. It runs only
+    /// when the two actually differ — see `room_live` — so a rig with no input
+    /// pays nothing at all for it.
+    room_effects: crate::effects::Effects,
+    /// The room's mix, interleaved like `mix`, valid only while `room_live`.
+    room: Vec<f32>,
+    /// What the room must NOT be given: the input's own contribution to `mix`,
+    /// already scaled by how much of it monitoring is currently withholding.
+    ///
+    /// Subtracted rather than separately summed, because everything upstream
+    /// of the master insert is a plain sum and the difference between the two
+    /// mixes is exactly this. One buffer, filled by the pass that made the
+    /// samples in the first place.
+    input_dry: Vec<f32>,
+    /// Whether the room and the take differ this block.
+    room_live: bool,
+    /// How much of the input the room is hearing, slewed 0..1 by
+    /// `Shared::monitor_on`.
+    ///
+    /// Slewed, and not a branch, because toggling monitoring is a hand on a
+    /// control and a step of a whole microphone is a click in the speakers.
+    /// It scales the send as well as the dry: a channel switched out of the
+    /// room does not get to arrive back in it through the reverb.
+    room_gain: f32,
     /// The click, one value per frame of the current chunk, and the same
     /// again as it should reach the FILE — zero on the frames the take is not
     /// meant to carry it. Two buffers rather than a flag, so the pass that
@@ -2076,6 +2110,29 @@ impl Renderer {
                 lpf: Shared::f32_of(&self.shared.lpf_mix),
                 limiter: Shared::f32_of(&self.shared.limiter_mix),
             };
+            // **The room's mix is made here, one subtraction, while the sum
+            // is still a sum.** Everything upstream of the master insert adds,
+            // so the difference between the file's mix and the speakers' is
+            // exactly the input that monitoring is withholding — and `mix_in`
+            // wrote that down frame by frame as it made it.
+            //
+            // After the insert it could not be done at all: a limiter is not
+            // linear, and there is no arithmetic that takes one voice back out
+            // of what it decided.
+            let split = self.room_live;
+            if split {
+                let end = n * TAP_CHANNELS;
+                if let (Some(room), Some(mix), Some(dry)) = (
+                    self.room.get_mut(..end),
+                    self.mix.get(..end),
+                    self.input_dry.get(..end),
+                ) {
+                    for i in 0..end {
+                        room[i] = mix[i] - dry[i];
+                    }
+                }
+            }
+            let master = Shared::f32_of(&self.shared.master_gain);
             if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
                 self.master_effects.process(
                     mix,
@@ -2088,10 +2145,29 @@ impl Renderer {
                 // **The master, last on the bus and after the limiter.** A
                 // master that fed the limiter would be a second drive control;
                 // this one is what leaves, which is what a master fader is.
-                let master = Shared::f32_of(&self.shared.master_gain);
                 if (master - 1.0).abs() > 1.0e-6 {
                     for v in mix.iter_mut() {
                         *v *= master;
+                    }
+                }
+            }
+            // The speakers' own insert, the same settings, its own state —
+            // and only while the two mixes differ. Idle it costs nothing; a
+            // rig with no input device never reaches it at all.
+            if split {
+                if let Some(room) = self.room.get_mut(..n * TAP_CHANNELS) {
+                    self.room_effects.process(
+                        room,
+                        n,
+                        TAP_CHANNELS,
+                        master_sends,
+                        &self.effect_params,
+                        bpm,
+                    );
+                    if (master - 1.0).abs() > 1.0e-6 {
+                        for v in room.iter_mut() {
+                            *v *= master;
+                        }
                     }
                 }
             }
@@ -2104,12 +2180,18 @@ impl Renderer {
             }
 
             // ── out, to the take and to the speakers ───────────────────────
+            //
+            // Two mixes when monitoring is withholding an input, one when it
+            // is not. The click has always been two already, at two levels —
+            // `click_taped` and `click_out` — for the same reason: what is
+            // worth hearing and what is worth keeping are not always the same
+            // signal.
             for i in 0..n {
                 let frame_index = done + i;
                 let at2 = i * TAP_CHANNELS;
-                let src = &self.mix[at2..at2 + TAP_CHANNELS];
+                let take = &self.mix[at2..at2 + TAP_CHANNELS];
 
-                map_frame(src, &mut self.frame[..TAP_CHANNELS]);
+                map_frame(take, &mut self.frame[..TAP_CHANNELS]);
                 let tap_at = tap_frames * TAP_CHANNELS;
                 for c in 0..TAP_CHANNELS {
                     let s = self.frame[c] + self.click_taped[i];
@@ -2117,6 +2199,11 @@ impl Renderer {
                 }
                 tap_frames += 1;
 
+                let src = if split {
+                    &self.room[at2..at2 + TAP_CHANNELS]
+                } else {
+                    &self.mix[at2..at2 + TAP_CHANNELS]
+                };
                 let at = frame_index * dev_ch;
                 map_frame(src, &mut self.frame[..dev_ch]);
                 for c in 0..dev_ch {
@@ -2163,7 +2250,7 @@ impl Renderer {
     /// chose. `widths` is what actually rendered this block, which is the
     /// honest test — a slot holding a faulted plugin is an empty slot as far as
     /// the bus is concerned.
-    /// Add the live input to the bus, if monitoring is on.
+    /// Add the live input to the bus.
     ///
     /// **The ring is drained every block whether or not anybody is
     /// listening.** Left alone it would fill within a second of the device
@@ -2173,20 +2260,19 @@ impl Renderer {
     /// for no reason. Drained-and-discarded is the same discipline the take's
     /// instrument ring already follows between takes.
     ///
-    /// **It reaches the take as well as the speakers, and that is the point.**
-    /// This adds the input to `self.mix`, and `self.mix` is what the tap
-    /// carries — so a monitored microphone arrives in the file with its fader,
-    /// its send and the master's limiter already on it, which is what was
-    /// coming out of the speakers. The owner's rule, in one line: if the
-    /// effects were audible while it was recorded, they are in the take.
+    /// **It reaches the take, and that is the point.** This adds the input to
+    /// `self.mix`, and `self.mix` is what the tap carries — so the microphone
+    /// arrives in the file with its fader, its send and the master's limiter
+    /// already on it, which is what a desk is. The owner's rule, in one line:
+    /// if the effects were audible while it was recorded, they are in the
+    /// take.
     ///
-    /// The comment that used to be here said the opposite — "listen-only,
-    /// nothing here touches what the take records" — and had been wrong since
-    /// the day it was written. The code it described never existed; what did
-    /// exist was a microphone written TWICE whenever the take's sources
-    /// included the input. See `TakeSource::resolve`, which is where that is
-    /// now prevented.
+    /// It reaches the SPEAKERS only when somebody asked to hear it, and the
+    /// two used to be the same switch. See the gate below.
     fn mix_monitor(&mut self, frames: usize, muted: u32, soloed: u32) {
+        // Cleared first, so every path out of here that adds nothing to the
+        // mix also leaves the room equal to the take.
+        self.room_live = false;
         // A ring arriving, or being taken away. `try_lock`, never `lock`.
         if let Ok(mut pending) = self.shared.pending_monitor.try_lock() {
             if let Some(next) = pending.take() {
@@ -2227,23 +2313,49 @@ impl Renderer {
             Err(_) => 0,
         };
 
-        let on = self.shared.monitor_on.load(Ordering::Relaxed)
-            && strip_is_heard(Strip::Input, muted, soloed);
-        let target = if on {
+        // **Mute decides the take. Monitoring decides only the room.**
+        //
+        // The strip is on the bus whenever it is not muted, so the file gets
+        // what the desk says it gets — and `monitor_on` narrows to the one
+        // question it can answer without lying: whether the SPEAKERS get it
+        // too. It used to answer both, and the take was the casualty: a
+        // microphone monitored through the interface's own hardware — the
+        // ordinary way anybody records one, because it is the only way with no
+        // latency — is not monitored here, and produced a take with no
+        // microphone in it.
+        //
+        // Feedback is why the room half exists at all and why it is still off
+        // at every launch. See `IvoryApp::input_monitor`.
+        let heard = strip_is_heard(Strip::Input, muted, soloed);
+        let target = if heard {
             Shared::f32_of(&self.shared.monitor_gain)
+        } else {
+            0.0
+        };
+        let room_target = if self.shared.monitor_on.load(Ordering::Relaxed) {
+            1.0
         } else {
             0.0
         };
         let send = Shared::f32_of(&self.shared.send[Strip::Input.index()]).clamp(0.0, 1.0);
         // Silent and already faded out: the drain above was the whole job.
-        if !on && self.monitor_gain <= 1.0e-6 {
+        if !heard && self.monitor_gain <= 1.0e-6 {
             self.monitor_gain = 0.0;
+            self.room_gain = room_target;
             return;
+        }
+        if let Some(dry) = self.input_dry.get_mut(..frames * TAP_CHANNELS) {
+            dry.fill(0.0);
         }
         let frames_got = got / ch_in;
         let mut peak = [0.0f32; 2];
+        let mut withheld = 0.0f32;
         for i in 0..frames.min(frames_got) {
             self.monitor_gain += (target - self.monitor_gain) * self.gain_coeff;
+            self.room_gain += (room_target - self.room_gain) * self.gain_coeff;
+            // How much of this frame the room is NOT being given.
+            let keep_out = 1.0 - self.room_gain;
+            withheld = withheld.max(keep_out);
             let at = i * TAP_CHANNELS;
             for c in 0..TAP_CHANNELS {
                 // A mono input goes to both sides; a stereo one keeps its
@@ -2255,12 +2367,24 @@ impl Renderer {
                 if let Some(v) = self.mix.get_mut(at + c) {
                     *v += src;
                 }
-                // Post-fader, like every other send here.
+                // The room's subtrahend, written by the pass that made the
+                // sample. Zero while monitoring is fully on, which is when the
+                // two mixes are one mix and the second master insert is idle.
+                if let Some(d) = self.input_dry.get_mut(at + c) {
+                    *d = src * keep_out;
+                }
+                // Post-fader, like every other send here, and closed with the
+                // room: a channel nobody can hear must not arrive back in the
+                // speakers through the reverb.
                 if let Some(a) = self.aux.get_mut(at + c) {
-                    *a += src * send;
+                    *a += src * send * self.room_gain;
                 }
             }
         }
+        // A hundredth of a decibel of the input still withheld is still two
+        // mixes. The threshold is what stops a fully-monitored rig from
+        // running a second limiter forever over a rounding error.
+        self.room_live = withheld > 1.0e-4;
         self.shared.note_strip_peak(Strip::Input, peak);
     }
 
@@ -2964,6 +3088,11 @@ impl Engine {
             builtin_gain: 1.0,
             effects: crate::effects::Effects::new_send(rate as f32),
             master_effects: crate::effects::Effects::new(rate as f32),
+            room_effects: crate::effects::Effects::new(rate as f32),
+            room: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            input_dry: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            room_live: false,
+            room_gain: 0.0,
             aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             fx_plugin: PluginBox(None),
             fx_incoming,
@@ -5426,6 +5555,11 @@ mod tests {
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             master_effects: crate::effects::Effects::new(RATE as f32),
+            room_effects: crate::effects::Effects::new(RATE as f32),
+            room: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            input_dry: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            room_live: false,
+            room_gain: 0.0,
             aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],
             click_taped: vec![0.0; MAX_BLOCK as usize],
@@ -6140,6 +6274,72 @@ mod tests {
             bled, 0.0,
             "the click bled into the take, which is the failure nobody notices until playback"
         );
+    }
+
+    /// **The take is the desk. The room is the desk minus what nobody asked
+    /// to hear.**
+    ///
+    /// Monitoring used to decide both, and the take was the casualty: a
+    /// microphone monitored through the interface's own hardware — the
+    /// ordinary way anybody records one, because it is the only way with no
+    /// latency — is not monitored here, and produced a file with no microphone
+    /// in it. Now mute decides the file and monitoring decides the speakers,
+    /// which is why this asserts on BOTH sides of the same render.
+    #[test]
+    fn an_unmonitored_input_is_in_the_take_and_out_of_the_room() {
+        for monitored in [false, true] {
+            let shared = Arc::new(Shared::new());
+            let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
+            let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+            // The live input, one mono channel of a steady half.
+            let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
+            for _ in 0..4096 {
+                let _ = in_tx.push(0.5);
+            }
+            r.monitor = Some(in_rx);
+            r.monitor_channels = 1;
+            r.monitor_scratch = vec![0.0; 8192];
+            // At the fader's destination rather than on its way there: the
+            // slews are per sample and this test is about routing.
+            shared.monitor_gain.store(1.0f32.to_bits(), Ordering::Relaxed);
+            r.monitor_gain = 1.0;
+            shared.monitor_on.store(monitored, Ordering::Relaxed);
+            r.room_gain = if monitored { 1.0 } else { 0.0 };
+
+            let mut out = vec![0.0f32; 256 * 2];
+            r.render(&mut out, 0, 0);
+
+            let mut tap = RecorderTap {
+                rx: tap_rx,
+                channels: TAP_CHANNELS,
+                sample_rate: 48_000,
+                dropped: Arc::clone(&shared),
+            };
+            let mut captured = Vec::new();
+            tap.drain(&mut captured);
+            let taped = captured.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+            let room = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+
+            assert!(
+                taped > 0.4,
+                "the input is missing from the take (peak {taped}) with \
+                 monitoring {monitored} - a take is the desk and the strip was \
+                 not muted"
+            );
+            if monitored {
+                assert!(
+                    room > 0.4,
+                    "monitoring is on and the speakers got nothing (peak {room})"
+                );
+            } else {
+                assert!(
+                    room < 1.0e-3,
+                    "the input reached the speakers (peak {room}) with \
+                     monitoring off, which is the feedback this switch exists \
+                     to prevent"
+                );
+            }
+        }
     }
 
     #[test]

@@ -169,8 +169,6 @@ pub enum MenuAction {
     SetTimeSignature(crate::recorder::TimeSignature),
     /// Write the count-in into the take rather than before it.
     ToggleCountInInTake,
-    /// What a take is made of: `auto` / `input` / `plugin` / `both`.
-    SetRecordSources(&'static str),
     /// The click.
     ToggleMetronome,
     /// Whether the click is mixed into the FILE as well as the monitors.
@@ -290,8 +288,6 @@ pub struct MenuView {
     /// which has already clamped a stray value from a later build's file to
     /// something this menu can mark.
     pub count_in_beats: u32,
-    /// What a take is made of, verbatim from the settings.
-    pub record_sources: String,
     /// The click is running.
     pub metronome_on: bool,
     /// The click is mixed into the recording as well as the monitors.
@@ -1821,7 +1817,6 @@ mod tests {
             count_in_bars: 1,
             count_in_in_take: false,
             recorder_first: false,
-            record_sources: "auto".to_owned(),
             metronome_on: false,
             metronome_in_take: false,
             hide_elapsed: false,
@@ -2540,7 +2535,6 @@ mod tests {
         // choice cannot be added to `COUNT_IN_CHOICES` and quietly arrive in a
         // plugin unlisted here.
         forbidden.extend(crate::recorder::COUNT_IN_CHOICES.map(MenuAction::SetCountIn));
-        forbidden.extend(["auto", "plugin", "input", "both"].map(MenuAction::SetRecordSources));
         for (label, action, _) in all_rows(v.clone()) {
             assert!(
                 !forbidden.contains(&action),

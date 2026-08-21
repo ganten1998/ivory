@@ -1105,7 +1105,6 @@ impl DesktopApp {
             self.reconcile_camera(false, ctx);
             self.reconcile_plugin(ctx);
             self.push_monitor_settings();
-            self.push_take_source();
         }
 
         let root = self.app.record_root();
@@ -2199,41 +2198,6 @@ impl DesktopApp {
         if !self.recorder.session.is_recording() {
             let sig = self.app.time_signature();
             e.set_meter(u32::from(sig.beats), u32::from(sig.unit));
-        }
-    }
-
-    /// Decide what the next take is made of, from what is actually available.
-    fn push_take_source(&mut self) {
-        // **Any instrument, not any PLUGIN.** `any_plugin_loaded` asks about
-        // VST3 slots, and the built-in DX7 is not one — it is a sentinel path
-        // that takes a different branch in `reconcile_plugin` and never writes
-        // `Engine::loaded`. So a take made with the built-in playing resolved
-        // to `input` and recorded the microphone instead of the instrument.
-        let plugin = self
-            .recorder
-            .engine
-            .as_ref()
-            .is_some_and(crate::instrument::Engine::any_instrument_loaded);
-        // The other half of the instrument bus. Without it, a take made while a
-        // backing track plays records the microphone and leaves the track out.
-        let track = self
-            .recorder
-            .engine
-            .as_ref()
-            .is_some_and(crate::instrument::Engine::track_loaded);
-        let input = self.recorder.session.audio_device_name().is_some();
-        let want = crate::record::TakeSource::resolve(
-            self.app.audio_source_setting(),
-            plugin,
-            track,
-            input,
-            // Monitoring puts the microphone on the bus, and the bus is what
-            // the tap writes. See `resolve`: taking it from the capture ring
-            // as well would write it twice.
-            self.app.input_monitor(),
-        );
-        if want != self.recorder.session.source() {
-            self.recorder.session.set_source(want);
         }
     }
 
