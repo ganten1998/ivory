@@ -573,7 +573,7 @@ struct Audio {
     running: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The live tap, until the engine takes it. See `Session::take_monitor`.
-    monitor: Option<(rtrb::Consumer<f32>, u16, [u8; crate::instrument::INPUTS])>,
+    monitor: Option<(rtrb::Consumer<f32>, u16, [u8; crate::instrument::INPUTS], u32)>,
 }
 
 impl Audio {
@@ -612,6 +612,15 @@ impl Audio {
         // from what was asked for would then point every strip at the wrong
         // column of the block.
         let sink_widths = sink.widths::<{ crate::instrument::INPUTS }>();
+        // **The device's own block, for the monitor's backlog ceiling.**
+        // `Default` means cpal did not say, so this takes the largest buffer
+        // the app offers rather than guessing small — a ceiling that is too
+        // low throws away audio that was legitimately in flight, and that is
+        // a worse failure than a millisecond of latency.
+        let in_block = match config.buffer_size {
+            cpal::BufferSize::Fixed(n) => n,
+            cpal::BufferSize::Default => 1024,
+        };
         // `capture_channel` asserts this, and an assert on the UI thread goes
         // through the panic hook to a dialog and exit(1) — a device claiming
         // zero channels would kill the app the moment the band opened.
@@ -771,10 +780,12 @@ impl Audio {
             meters,
             running,
             thread: Some(thread),
-            // The ring's own width, and how it is shared out between the
-            // input strips. NOT the take's width — those parted company when
-            // the take became the desk.
-            monitor: monitor.map(|m| (m, config.channels, sink_widths)),
+            // The ring's own width, how it is shared out between the input
+            // strips, and the device's BLOCK — which is what tells the monitor
+            // how much of the ring is legitimately in flight and how much is
+            // history to be thrown away. NOT the take's width: those parted
+            // company when the take became the desk.
+            monitor: monitor.map(|m| (m, config.channels, sink_widths, in_block)),
         })
     }
 
@@ -1087,7 +1098,7 @@ impl Session {
     /// consumer, and that is the engine's render thread.
     pub fn take_monitor(
         &mut self,
-    ) -> Option<(rtrb::Consumer<f32>, u16, [u8; crate::instrument::INPUTS])> {
+    ) -> Option<(rtrb::Consumer<f32>, u16, [u8; crate::instrument::INPUTS], u32)> {
         self.audio.as_mut().and_then(|a| a.monitor.take())
     }
 

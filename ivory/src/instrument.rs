@@ -1094,7 +1094,16 @@ struct Shared {
     /// pair is one channel then two — and without the widths this side would
     /// have a block of three channels and no idea which strip owns which.
     pending_monitor:
-        std::sync::Mutex<Option<Option<(rtrb::Consumer<f32>, u16, [u8; INPUTS])>>>,
+        std::sync::Mutex<Option<Option<(rtrb::Consumer<f32>, u16, [u8; INPUTS], u32)>>>,
+    /// Frames of the monitor ring that were STALE and thrown away, so that what
+    /// is heard is what is happening.
+    ///
+    /// Non-zero at the start of every session by design — see `mix_monitor` —
+    /// and climbing afterwards means the two device clocks are pulling apart.
+    monitor_slip: AtomicU64,
+    /// How much audio the monitor ring is holding, in frames: the monitoring
+    /// path's own latency, on top of the two device buffers, as a number.
+    monitor_backlog: AtomicU32,
     /// The master, as a LINEAR gain. The last thing on the instrument bus,
     /// after the limiter, reaching both the device mix and the take — the same
     /// rule the effects follow.
@@ -1238,6 +1247,8 @@ impl Shared {
             track_out: AtomicU64::new(0),
             pending_track: std::sync::Mutex::new(None),
             pending_monitor: std::sync::Mutex::new(None),
+            monitor_slip: AtomicU64::new(0),
+            monitor_backlog: AtomicU32::new(0),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
             // The routing every build before the mixer had, written down: the
             // instruments send everything and nothing else sends anything.
@@ -1705,6 +1716,9 @@ struct Renderer {
     monitor_gain: [f32; INPUTS],
     /// Channels per input strip, in stream order. Zero for one not open.
     monitor_widths: [usize; INPUTS],
+    /// The INPUT device's own block, in frames. What the monitor ring is
+    /// allowed to hold before the surplus is stale rather than in flight.
+    monitor_block: usize,
     monitor_scratch: Vec<f32>,
 }
 
@@ -2304,15 +2318,17 @@ impl Renderer {
         if let Ok(mut pending) = self.shared.pending_monitor.try_lock() {
             if let Some(next) = pending.take() {
                 match next {
-                    Some((ring, channels, widths)) => {
+                    Some((ring, channels, widths, block)) => {
                         self.monitor = Some(ring);
                         self.monitor_channels = usize::from(channels).max(1);
                         self.monitor_widths = widths.map(usize::from);
+                        self.monitor_block = block.max(1) as usize;
                     }
                     None => {
                         self.monitor = None;
                         self.monitor_channels = 0;
                         self.monitor_widths = [0; INPUTS];
+                        self.monitor_block = 0;
                     }
                 }
                 // A new device fades in from silence rather than arriving at
@@ -2325,6 +2341,47 @@ impl Renderer {
         };
         let ch_in = self.monitor_channels.max(1);
         let want = frames * ch_in;
+        // **What is heard has to be what is HAPPENING, and it was not.**
+        //
+        // The consumer takes at most one output block per output callback, so
+        // whatever built up in the ring stayed there for the rest of the
+        // session — a one-way ratchet. And it always built up: the input
+        // stream opens when the band does, the OUTPUT stream starts separately
+        // and can be seconds behind it while a plugin loads, and every input
+        // callback in between pushed a block nobody was draining. The ring is
+        // 120 ms deep, so monitoring could sit a tenth of a second behind the
+        // room for ever, at the smallest buffer the app offers, with nothing
+        // to point at. The owner heard it against REAPER at the same rate and
+        // buffer and was right.
+        //
+        // So the surplus is DROPPED rather than played. What is legitimately
+        // in flight is one input block — the one the device is filling now —
+        // plus one output block, the one this callback is about to take.
+        // Anything beyond that is history.
+        //
+        // WHOLE FRAMES only. A partial frame would rotate the channels for the
+        // rest of the session, which is the rule the capture ring already
+        // insists on and for the same reason.
+        //
+        // This does not close the whole gap and cannot: two AudioUnits means
+        // an output callback can only ever see input that arrived before it
+        // started, which is one buffer a DUPLEX device does not pay.
+        let in_flight = want + self.monitor_block * ch_in;
+        let backlog = ring.slots();
+        self.shared
+            .monitor_backlog
+            .store((backlog / ch_in) as u32, Ordering::Relaxed);
+        if backlog > in_flight {
+            let stale = ((backlog - in_flight) / ch_in) * ch_in;
+            if stale > 0 {
+                if let Ok(chunk) = ring.read_chunk(stale) {
+                    chunk.commit_all();
+                }
+                self.shared
+                    .monitor_slip
+                    .fetch_add((stale / ch_in) as u64, Ordering::Relaxed);
+            }
+        }
         let got = ring.slots().min(want);
         // Read into scratch first: the ring's chunk borrows it, and the mix
         // below needs `self.mix` mutably at the same time.
@@ -3179,6 +3236,7 @@ impl Engine {
             monitor_channels: 0,
             monitor_gain: [0.0; INPUTS],
             monitor_widths: [0; INPUTS],
+            monitor_block: 0,
             monitor_scratch: vec![0.0; widest * 4096],
         };
 
@@ -4014,8 +4072,26 @@ impl Engine {
         }
     }
 
+    /// What the monitoring path is holding, in milliseconds.
+    ///
+    /// **Latency the panel could not see.** The estimate beside it is one
+    /// buffer in plus one buffer out; this is the ring between them, which on
+    /// a session where the output started late used to hold a tenth of a
+    /// second and never give it back. It is bounded now — see `mix_monitor` —
+    /// and this is what makes the bound visible rather than trusted.
+    pub fn monitor_backlog_ms(&self) -> f64 {
+        let rate = f64::from(self.output.sample_rate.max(1));
+        f64::from(self.shared.monitor_backlog.load(Ordering::Relaxed)) * 1000.0 / rate
+    }
+
+    /// Frames of monitoring dropped because they were stale rather than in
+    /// flight. See `mix_monitor`.
+    pub fn monitor_slip(&self) -> u64 {
+        self.shared.monitor_slip.load(Ordering::Relaxed)
+    }
+
     /// Hand the renderer the live input's ring. `None` takes it away.
-    pub fn set_monitor(&mut self, tap: Option<(rtrb::Consumer<f32>, u16, [u8; INPUTS])>) {
+    pub fn set_monitor(&mut self, tap: Option<(rtrb::Consumer<f32>, u16, [u8; INPUTS], u32)>) {
         if let Ok(mut g) = self.shared.pending_monitor.lock() {
             *g = Some(tap);
         }
@@ -5598,6 +5674,7 @@ mod tests {
             monitor_channels: 0,
             monitor_gain: [0.0; INPUTS],
             monitor_widths: [0; INPUTS],
+            monitor_block: 0,
             monitor_scratch: Vec::new(),
             fx_plugin: PluginBox(None),
             fx_incoming,
@@ -6343,6 +6420,76 @@ mod tests {
         for ui in ivory_ui::recorder::Strip::all() {
             assert_eq!(Strip::from(ui).index(), ui.index(), "{ui:?} moved");
         }
+    }
+
+    /// **Monitoring must play what is happening, not what happened.**
+    ///
+    /// The consumer took at most one output block per output callback, so
+    /// anything that built up in the ring stayed there for the rest of the
+    /// session. And it always built up: the input stream opens with the band,
+    /// the OUTPUT stream starts separately and can be seconds behind it while
+    /// a plugin loads, and every input callback in between pushed a block
+    /// nobody was draining. The ring is 120 ms deep, so monitoring could sit a
+    /// tenth of a second behind the room for ever — at the smallest buffer the
+    /// app offers, with nothing on screen to point at.
+    ///
+    /// This fills the ring the way a late start does and checks two things:
+    /// the backlog comes down to what is legitimately in flight, and what is
+    /// HEARD is the newest audio rather than the oldest.
+    #[test]
+    fn a_monitor_that_fell_behind_catches_up_instead_of_lagging() {
+        const BLOCK: usize = 128;
+        let shared = Arc::new(Shared::new());
+        let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
+        let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+        let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 15);
+        // A second of mono input nobody drained: the old audio is 0.25 and the
+        // NEWEST block — the part that should be heard — is 0.75.
+        let stale = BLOCK * 40;
+        for _ in 0..stale {
+            let _ = in_tx.push(0.25);
+        }
+        r.monitor = Some(in_rx);
+        r.monitor_channels = 1;
+        r.monitor_widths = [1, 0, 0, 0];
+        r.monitor_block = BLOCK;
+        r.monitor_scratch = vec![0.0; 8192];
+        shared.monitor_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+        r.monitor_gain[0] = 1.0;
+        shared.monitor_on.store(true, Ordering::Relaxed);
+        r.room_gain = 1.0;
+
+        // Then the room, one input block per output block, which is what a
+        // device that is keeping up actually does.
+        let mut out = vec![0.0f32; BLOCK * 2];
+        let mut heard = 0.0f32;
+        for _ in 0..4 {
+            for _ in 0..BLOCK {
+                let _ = in_tx.push(0.75);
+            }
+            out.fill(0.0);
+            r.render(&mut out, 0, 0);
+            heard = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+        }
+        // Caught up: a second of stale audio did not have to be played out
+        // before the room could be heard.
+        assert!(
+            (heard - 0.75).abs() < 0.05,
+            "after four blocks the monitor is still playing {heard} - the audio \
+             from a second ago, which is a backlog nothing drains and latency \
+             nobody can see"
+        );
+        let slipped = shared.monitor_slip.load(Ordering::Relaxed);
+        assert!(
+            slipped >= stale as u64 / 2,
+            "only {slipped} stale frames were dropped, of {stale}"
+        );
+        // And what is LEFT is what is in flight — one input block and one
+        // output block — rather than everything that fits.
+        assert!(
+            r.monitor.as_ref().is_some_and(|m| m.slots() <= BLOCK * 3),
+            "the ring is still holding a backlog"
+        );
     }
 
     /// **The take is the desk. The room is the desk minus what nobody asked

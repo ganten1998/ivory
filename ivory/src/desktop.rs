@@ -185,7 +185,7 @@ struct Recorder {
     /// ENGINE, and the two are opened by different edges — so it is held here
     /// rather than dropped when the second one is not there yet. See
     /// `push_monitor_settings`, which is where it gets handed over.
-    pending_monitor: Option<(rtrb::Consumer<f32>, u16, [u8; crate::instrument::INPUTS])>,
+    pending_monitor: Option<(rtrb::Consumer<f32>, u16, [u8; crate::instrument::INPUTS], u32)>,
     /// What each input strip is called, as the picker names it. Empty for one
     /// nobody has filled.
     ///
@@ -788,6 +788,14 @@ impl DesktopApp {
                     },
                 )
             }),
+            // Only while something is actually being monitored: a ring nobody
+            // is listening to is not latency, it is a ring.
+            monitor_ms: self
+                .recorder
+                .engine
+                .as_ref()
+                .filter(|_| self.app.input_monitor())
+                .map(crate::instrument::Engine::monitor_backlog_ms),
         });
 
         // The buffer size, on the edge. Reopening both streams is expensive —

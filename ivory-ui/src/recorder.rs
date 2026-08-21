@@ -2069,6 +2069,15 @@ pub struct AudioStatus {
     pub input: Option<(String, StreamStats)>,
     /// The monitor output, when the engine is running.
     pub output: Option<(String, StreamStats)>,
+    /// What the MONITORING path is holding, on top of the two device buffers.
+    ///
+    /// **The number that was missing, and the reason the panel disagreed with
+    /// the room.** Input and output are two separate streams here, so the
+    /// input's samples reach the output through a ring — and whatever that
+    /// ring is holding is latency as surely as a buffer is. It used to build
+    /// up unbounded and never drain; it is bounded now, but bounded is not
+    /// zero and the estimate has to say so.
+    pub monitor_ms: Option<f64>,
 }
 
 impl AudioStatus {
@@ -2087,7 +2096,9 @@ impl AudioStatus {
     pub fn round_trip_ms(&self) -> Option<f64> {
         let a = self.input.as_ref()?.1.buffer_ms()?;
         let b = self.output.as_ref()?.1.buffer_ms()?;
-        Some(a + b)
+        // Plus whatever the monitor ring is carrying between them. A duplex
+        // device would not pay this; two streams do.
+        Some(a + b + self.monitor_ms.unwrap_or(0.0))
     }
 
     /// Whether the two sides disagree about the sample rate.
@@ -3053,23 +3064,37 @@ mod status_tests {
         let both = AudioStatus {
             input: Some(side(48_000, Some(256))),
             output: Some(side(48_000, Some(512))),
+            monitor_ms: None,
         };
         assert!((both.round_trip_ms().unwrap() - 16.0).abs() < 1e-3);
+
+        // **And the ring between them counts.** Two separate streams pass the
+        // input to the output through a ring, and whatever it is holding is
+        // latency as surely as a buffer is — the estimate said 16 ms while the
+        // room said otherwise, which is how the whole thing was found.
+        let with_ring = AudioStatus {
+            monitor_ms: Some(4.0),
+            ..both
+        };
+        assert!((with_ring.round_trip_ms().unwrap() - 20.0).abs() < 1e-3);
 
         for one in [
             AudioStatus {
                 input: Some(side(48_000, Some(256))),
                 output: None,
+                monitor_ms: None,
             },
             AudioStatus {
                 input: None,
                 output: Some(side(48_000, Some(256))),
+                monitor_ms: None,
             },
             // And a side that will not say its buffer size cannot contribute
             // half a figure.
             AudioStatus {
                 input: Some(side(48_000, None)),
                 output: Some(side(48_000, Some(256))),
+                monitor_ms: None,
             },
         ] {
             assert_eq!(one.round_trip_ms(), None);
@@ -3087,12 +3112,14 @@ mod status_tests {
         assert!(AudioStatus {
             input: Some(side(44_100, Some(256))),
             output: Some(side(48_000, Some(256))),
+            monitor_ms: None,
         }
         .rates_disagree());
 
         assert!(!AudioStatus {
             input: Some(side(48_000, Some(256))),
             output: Some(side(48_000, Some(512))),
+            monitor_ms: None,
         }
         .rates_disagree());
 
@@ -3100,6 +3127,7 @@ mod status_tests {
         assert!(!AudioStatus {
             input: Some(side(44_100, Some(256))),
             output: None,
+            monitor_ms: None,
         }
         .rates_disagree());
     }
