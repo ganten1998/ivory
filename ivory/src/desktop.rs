@@ -1367,7 +1367,15 @@ impl DesktopApp {
             self.recorder.inserts_loaded[i] = want.clone();
             if let Some(e) = self.recorder.engine.as_mut() {
                 let path = want.as_ref().map(std::path::Path::new);
-                match e.load_insert(i / inserts, i % inserts, path) {
+                // **With the bay's saved preset, when one belongs to this
+                // plugin.** The same bargain the instrument slots have had for
+                // a while and the racks never did: an effect whose settings
+                // died at every relaunch, silently, because nothing ever asked
+                // its instance for them. See `insert_state_path`.
+                let state = want
+                    .as_deref()
+                    .and_then(|p| saved_insert_state(i / inserts, i % inserts, p));
+                match e.load_insert(i / inserts, i % inserts, path, state.as_deref()) {
                     Ok(_) => self.recorder.engine_error = None,
                     Err(err) => {
                         let which = want
@@ -2207,6 +2215,24 @@ impl DesktopApp {
                 write_state(slot, &bundle, &state);
             }
         }
+        // **And every bay**, which is the half that was never saved at all: a
+        // reverb dialled in for an hour died with the process, every time,
+        // masked only by nobody expecting better of it yet.
+        for strip in 0..=ivory_ui::recorder::STRIPS {
+            for bay in 0..ivory_ui::recorder::INSERTS {
+                let Some(bundle) = self.app.insert(strip, bay).map(str::to_owned) else {
+                    continue;
+                };
+                if let Some(state) = self
+                    .recorder
+                    .engine
+                    .as_ref()
+                    .and_then(|e| e.save_insert_state(strip, bay))
+                {
+                    write_insert_state(strip, bay, &bundle, &state);
+                }
+            }
+        }
     }
 
     /// Start the monitor output, once, when the band opens.
@@ -2735,6 +2761,37 @@ fn write_state(slot: usize, bundle: &str, state: &[u8]) {
     // Best effort. A preset that could not be saved is a preset to choose
     // again, and refusing to quit over it would be worse.
     let _ = std::fs::write(state_path(slot), out);
+}
+
+/// Where one insert bay's plugin state lives. See [`state_path`] for why a
+/// sidecar; keyed by CHANNEL AND BAY because that is what an insert is keyed
+/// by, and validated by bundle path on the way back for the same reason the
+/// slot files are — the wrong plugin's state is not a preset, it is arbitrary
+/// bytes to a `setState` that will believe them.
+#[cfg(feature = "recorder")]
+fn insert_state_path(strip: usize, bay: usize) -> std::path::PathBuf {
+    let dir = Settings::path()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    dir.join(format!("insert-state-{strip}-{bay}.bin"))
+}
+
+#[cfg(feature = "recorder")]
+fn saved_insert_state(strip: usize, bay: usize, bundle: &str) -> Option<Vec<u8>> {
+    let raw = std::fs::read(insert_state_path(strip, bay)).ok()?;
+    let split = raw.iter().position(|b| *b == 0)?;
+    let owner = std::str::from_utf8(&raw[..split]).ok()?;
+    (owner == bundle).then(|| raw[split + 1..].to_vec())
+}
+
+#[cfg(feature = "recorder")]
+fn write_insert_state(strip: usize, bay: usize, bundle: &str, state: &[u8]) {
+    let mut out = Vec::with_capacity(bundle.len() + 1 + state.len());
+    out.extend_from_slice(bundle.as_bytes());
+    out.push(0);
+    out.extend_from_slice(state);
+    let _ = std::fs::write(insert_state_path(strip, bay), out);
 }
 
 /// `/Users/x/Movies/Tangent` reads as `~/Movies/Tangent`.

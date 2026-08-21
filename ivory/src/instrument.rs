@@ -1104,6 +1104,13 @@ struct Shared {
     /// How much audio the monitor ring is holding, in frames: the monitoring
     /// path's own latency, on top of the two device buffers, as a number.
     monitor_backlog: AtomicU32,
+    /// Bit `i` set: channel `i`'s rack voices ignore the note stream.
+    ///
+    /// **The MIDI arm, as one mask**, exactly the shape mute and solo travel
+    /// in. Zero is every channel armed, which is the desk this app has always
+    /// had — an empty channel armed plays nothing, so five loaded instruments
+    /// still layer, and switching a channel to AUDIO is what sets its bit.
+    midi_off: AtomicU32,
     /// The master, as a LINEAR gain. The last thing on the instrument bus,
     /// after the limiter, reaching both the device mix and the take — the same
     /// rule the effects follow.
@@ -1249,6 +1256,7 @@ impl Shared {
             pending_monitor: std::sync::Mutex::new(None),
             monitor_slip: AtomicU64::new(0),
             monitor_backlog: AtomicU32::new(0),
+            midi_off: AtomicU32::new(0),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
             // The routing every build before the mixer had, written down: the
             // instruments send everything and nothing else sends anything.
@@ -1418,6 +1426,16 @@ impl Shared {
 /// that made it is a call into a `ComPtr` whose owner has gone.
 struct Hosted {
     inst: Instance,
+    /// **Whether this plugin GENERATES rather than transforms.**
+    ///
+    /// Decided once, at load time, from the class's own `subCategories` — and
+    /// carried IN the box, because the audio thread may not trust an index a
+    /// UI thread wrote about which bay holds what. A voice in a rack is fed
+    /// the block's notes and REPLACES the channel's signal; an effect is fed
+    /// the channel's signal and transforms it in place. This is the whole of
+    /// the difference between an instrument and an insert, and it travels
+    /// with the instance it describes.
+    voice: bool,
     /// Held, never read: dropping the module unmaps the library and every
     /// `ComPtr` into it becomes a dangling function table. Declared AFTER
     /// `inst` so it is dropped after it.
@@ -1604,12 +1622,33 @@ impl Rack {
 /// keep what they had, and a plugin that answers with fewer channels than it
 /// was given has its last one read twice rather than leaving a silent side —
 /// the same rule the bus insert has always followed.
-fn run_rack(rack: &mut Rack, planar: &mut [Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+fn run_rack(
+    rack: &mut Rack,
+    planar: &mut [Vec<f32>],
+    frames: usize,
+    out: &mut [Vec<f32>],
+    notes: &[ivory_host::Note],
+    controls: &[ivory_host::Control],
+) {
     for slot in &mut rack.slots {
         let Some(p) = slot.0.as_mut() else {
             continue;
         };
-        if p.inst.process_effect(planar, frames, out).is_err() {
+        if p.voice {
+            // **A voice renders into its OWN buffers and replaces the
+            // channel.** Its own, because `fx_out` is TAP_CHANNELS wide and an
+            // instrument's main bus is as wide as it likes — Pianoteq's is
+            // eight — and `process_through` refuses a block whose output is
+            // narrower than the bus. `bufs` was allocated at the instrument's
+            // width in `load_insert` for exactly this call.
+            //
+            // Replaces rather than mixes: a MIDI channel's signal IS its
+            // instrument, and whatever was in `planar` before bay 1 ran is
+            // silence or an upstream voice being superseded.
+            if p.inst.process_with_controls(notes, controls, frames, &mut p.bufs).is_err() {
+                continue;
+            }
+        } else if p.inst.process_effect(planar, frames, out).is_err() {
             // A refused block leaves the audio ALONE rather than replacing it
             // with whatever was in the output buffers: a faulted insert is a
             // channel that stops being processed, not one that starts making
@@ -1617,8 +1656,9 @@ fn run_rack(rack: &mut Rack, planar: &mut [Vec<f32>], frames: usize, out: &mut [
             continue;
         }
         let wrote = p.channels.max(1);
+        let src_bufs: &[Vec<f32>] = if p.voice { &p.bufs } else { &out[..] };
         for c in 0..planar.len() {
-            let Some(src) = out.get(c.min(wrote - 1)) else {
+            let Some(src) = src_bufs.get(c.min(wrote - 1)) else {
                 continue;
             };
             let Some(dst) = planar.get_mut(c) else {
@@ -1837,6 +1877,15 @@ impl Renderer {
     /// Returns immediately on an empty rack, so a channel nobody has put an
     /// effect on costs one branch and folds by exactly the path it always did.
     fn run_insert_chain(&mut self, at: usize, buf_is_aux: bool, frames: usize) {
+        // **The block's notes, gated by the channel's own arm bit.** A voice
+        // in this rack is fed the same list every slot reads — see
+        // `collect_notes`, drained once per block — unless the channel is
+        // switched away from MIDI, in which case it is fed nothing and holds
+        // its tails. The gate is per CHANNEL and travels as one atomic mask,
+        // like mute and solo.
+        let armed = self.shared.midi_off.load(Ordering::Relaxed) & (1 << at.min(31)) == 0;
+        let notes: &[ivory_host::Note] = if armed { &self.notes } else { &[] };
+        let controls: &[ivory_host::Control] = if armed { &self.controls } else { &[] };
         let Some(rack) = self.racks.get(at) else {
             return;
         };
@@ -1861,7 +1910,7 @@ impl Renderer {
         let Some(rack) = self.racks.get_mut(at) else {
             return;
         };
-        run_rack(rack, &mut self.fx_in, frames, &mut self.fx_out);
+        run_rack(rack, &mut self.fx_in, frames, &mut self.fx_out, notes, controls);
         let dst = if buf_is_aux {
             self.aux.get_mut(..n)
         } else {
@@ -2586,12 +2635,22 @@ impl Renderer {
                     }
                 }
             }
-            run_rack(
-                &mut self.racks[strip.index()],
-                &mut self.fx_in,
-                n,
-                &mut self.fx_out,
-            );
+            {
+                // An input channel's rack can hold a voice too — the desk is
+                // about to stop distinguishing — and the gate is the same one.
+                let armed =
+                    self.shared.midi_off.load(Ordering::Relaxed) & (1 << strip.index().min(31)) == 0;
+                let notes: &[ivory_host::Note] = if armed { &self.notes } else { &[] };
+                let controls: &[ivory_host::Control] = if armed { &self.controls } else { &[] };
+                run_rack(
+                    &mut self.racks[strip.index()],
+                    &mut self.fx_in,
+                    n,
+                    &mut self.fx_out,
+                    notes,
+                    controls,
+                );
+            }
             let mut room = room_from;
             for i in 0..n {
                 // The room's own slew, advanced here rather than above: it
@@ -2712,12 +2771,21 @@ impl Renderer {
                 dst[f] = r;
             }
         }
-        run_rack(
-            &mut self.racks[Strip::Track.index()],
-            &mut self.fx_in,
-            frames,
-            &mut self.fx_out,
-        );
+        {
+            let armed = self.shared.midi_off.load(Ordering::Relaxed)
+                & (1 << Strip::Track.index().min(31))
+                == 0;
+            let notes: &[ivory_host::Note] = if armed { &self.notes } else { &[] };
+            let controls: &[ivory_host::Control] = if armed { &self.controls } else { &[] };
+            run_rack(
+                &mut self.racks[Strip::Track.index()],
+                &mut self.fx_in,
+                frames,
+                &mut self.fx_out,
+                notes,
+                controls,
+            );
+        }
         for f in 0..frames {
             let l = self.fx_in.first().map_or(0.0, |b| b[f]);
             let r = self.fx_in.get(1).map_or(0.0, |b| b[f]);
@@ -2931,7 +2999,21 @@ impl Renderer {
                         *d = src.get(f).copied().unwrap_or(0.0);
                     }
                 }
-                run_rack(&mut self.racks[i], &mut self.fx_in, frames, &mut self.fx_out);
+                {
+                    let armed =
+                        self.shared.midi_off.load(Ordering::Relaxed) & (1 << i.min(31)) == 0;
+                    let notes: &[ivory_host::Note] = if armed { &self.notes } else { &[] };
+                    let controls: &[ivory_host::Control] =
+                        if armed { &self.controls } else { &[] };
+                    run_rack(
+                        &mut self.racks[i],
+                        &mut self.fx_in,
+                        frames,
+                        &mut self.fx_out,
+                        notes,
+                        controls,
+                    );
+                }
                 (&self.fx_in[0][..frames], &self.fx_in[1][..frames])
             };
             peaks[i] = mix_in(mix, aux, left, right, gain, *target, send, coeff);
@@ -3210,6 +3292,12 @@ pub struct Engine {
     /// **before** the instance leaves for the audio thread — the one moment
     /// there is an `&Instance` on this thread. See [`Engine::open_editor`].
     insert_editor_handles: [[Option<ivory_host::EditorHandle>; INSERTS]; STRIPS + 1],
+    /// Each loaded insert's processor reference, taken beside the editor's and
+    /// for the same reason: after the handoff there is no `&Instance` to ask.
+    /// This is what lets a bay's settings survive a relaunch — no insert has
+    /// ever had one before, so every effect's knobs and every bay instrument's
+    /// preset died with the process.
+    insert_state_handles: [[Option<ivory_host::StateHandle>; INSERTS]; STRIPS + 1],
     /// A reference to each loaded plugin's edit controller, taken in
     /// [`Engine::load_plugin`] **before** the instance is handed to the audio
     /// thread — see [`Engine::open_editor`], where that is the whole trick.
@@ -3502,6 +3590,7 @@ impl Engine {
             editors: std::array::from_fn(|_| None),
             insert_editors: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             insert_editor_handles: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            insert_state_handles: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             editor_handles: std::array::from_fn(|_| None),
             state_handles: std::array::from_fn(|_| None),
             state_errors: std::array::from_fn(|_| None),
@@ -3588,15 +3677,24 @@ impl Engine {
         strip: usize,
         slot: usize,
         bundle: Option<&Path>,
+        state: Option<&[u8]>,
     ) -> Result<Option<Loaded>, String> {
         if strip > STRIPS || slot >= INSERTS {
             return Ok(None);
         }
         let Some(bundle) = bundle else {
-            // Window first, then the controller reference, then the instance.
+            // Window first, then the controller and state references, then the
+            // instance.
             self.close_insert_editor(strip, slot);
             if let Some(h) = self
                 .insert_editor_handles
+                .get_mut(strip)
+                .and_then(|r| r.get_mut(slot))
+            {
+                *h = None;
+            }
+            if let Some(h) = self
+                .insert_state_handles
                 .get_mut(strip)
                 .and_then(|r| r.get_mut(slot))
             {
@@ -3612,19 +3710,22 @@ impl Engine {
             .first()
             .ok_or_else(|| format!("{} has no Audio Module Class", bundle.display()))?
             .clone();
-        // **The other half of the rack's rule.** An instrument slot refuses an
-        // effect; the bus refuses an instrument, for the same reason and with
-        // the same wording: it would be handed audio it has no input for and
-        // would answer with silence.
-        if class.kind() == ivory_host::scan::Kind::Instrument {
-            return Err(format!("{} is an instrument, not an effect", class.name));
-        }
+        // **Any plugin loads in any bay, and there is no refusal left to
+        // word.** The rack used to refuse instruments the way slots refuse
+        // effects; the desk stopped distinguishing, so a bay decides WHAT the
+        // plugin is instead of whether it may exist: a voice is fed the
+        // block's notes and replaces the channel, an effect is fed the channel
+        // and transforms it. See `Hosted::voice` and `run_rack`.
+        let voice = class.kind() == ivory_host::scan::Kind::Instrument;
         let setup = Setup {
             sample_rate: f64::from(self.output.sample_rate),
             max_block: MAX_BLOCK,
         };
         let mut inst = Instance::create(&module, &class, setup)?;
-        if inst.audio_inputs().is_empty() {
+        if !voice && inst.audio_inputs().is_empty() {
+            // Still a real refusal for an EFFECT: with no audio input there is
+            // nothing to send it and it would answer with silence for ever. A
+            // voice has no audio input by design.
             return Err(format!(
                 "{} has no audio input, so there is nothing to send to it",
                 class.name
@@ -3638,14 +3739,40 @@ impl Engine {
         if channels == 0 {
             return Err(format!("{} has no audio output channels", class.name));
         }
+        // **The preset, BEFORE the warm-up**, for the reason the slot path
+        // documents: a preset change makes a sampled instrument reload, and
+        // state that arrives after the gate has closed means the gate waited
+        // for the wrong load. `load_state` also refuses a restore once the
+        // instance has rendered, so this is the only moment it can happen.
+        let state_error = match state {
+            Some(bytes) => inst.load_state(bytes).err(),
+            None => None,
+        };
+        // **A voice warms up like the slot it used to be.** The gate exists so
+        // a sampled piano is not handed to the callback while it still renders
+        // silence; nothing about moving into a bay changed that. An effect
+        // needs no warm-up — see the note on `load` — and gets none.
+        if voice {
+            let gate = ivory_host::ready::warm_up(&mut inst, ivory_host::Policy::default());
+            if gate.state() == ivory_host::ReadyState::Failed {
+                return Err(gate
+                    .reason()
+                    .unwrap_or("the instrument failed to warm up")
+                    .to_string());
+            }
+        }
         // Processing on, or the plugin is active and refuses every block.
         inst.set_processing(true)?;
-        // **The editor's only chance to get a reference**, for exactly the
-        // reason spelled out in `load_plugin_with_state`: one line below,
-        // `inst` goes into a `Hosted`, into a `PluginBox`, and across a ring
-        // into the audio callback, and after that there is no `&Instance` on
-        // this thread and no safe way to make one.
+        // **The editor's and the state's only chance to get a reference**, for
+        // exactly the reason spelled out in `load_plugin_with_state`: one line
+        // below, `inst` goes into a `Hosted`, into a `PluginBox`, and across a
+        // ring into the audio callback, and after that there is no `&Instance`
+        // on this thread and no safe way to make one. The state handle is what
+        // stops an effect's settings — or a bay instrument's preset — dying at
+        // every relaunch, which until now they did.
         let editor_handle = inst.editor_handle();
+        let state_handle = inst.state_handle();
+        let _ = &state_error;
         let loaded = Loaded {
             bundle: bundle.to_path_buf(),
             class: class.name.clone(),
@@ -3654,12 +3781,20 @@ impl Engine {
             sample_rate: self.output.sample_rate,
         };
         // Whatever was in THIS bay is going away, so its window and then its
-        // controller reference go first — the lifetime rule from `editors`.
+        // controller and state references go first — the lifetime rule from
+        // `editors`.
         // `hand_off_insert` is where the old instance is dropped, and dropping
         // it terminates the controller the old handle points at.
         self.close_insert_editor(strip, slot);
         if let Some(h) = self
             .insert_editor_handles
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *h = None;
+        }
+        if let Some(h) = self
+            .insert_state_handles
             .get_mut(strip)
             .and_then(|r| r.get_mut(slot))
         {
@@ -3673,6 +3808,7 @@ impl Engine {
                 module,
                 bufs: vec![vec![0.0; MAX_BLOCK as usize]; channels.max(TAP_CHANNELS)],
                 channels,
+                voice,
             }))),
         );
         if let Some(h) = self
@@ -3681,6 +3817,13 @@ impl Engine {
             .and_then(|r| r.get_mut(slot))
         {
             *h = editor_handle;
+        }
+        if let Some(h) = self
+            .insert_state_handles
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *h = Some(state_handle);
         }
         self.inserts_loaded[strip][slot] = Some(loaded.clone());
         Ok(Some(loaded))
@@ -3859,6 +4002,9 @@ impl Engine {
             // length change and never an allocation.
             bufs: vec![vec![0.0; MAX_BLOCK as usize]; channels],
             channels,
+            // A slot is fed MIDI by construction; this is the path the racks
+            // learned the flag FROM.
+            voice: true,
         };
 
         // Whatever was in THIS slot is going away, so its editor and then its
@@ -4215,6 +4361,26 @@ impl Engine {
         self.state_handles
             .get(slot)
             .and_then(Option::as_ref)
+            .and_then(|h| h.save().ok())
+    }
+
+    /// Which channels' rack voices ignore the note stream, as one mask.
+    ///
+    /// Pushed whole, like mute and solo: the UI computes it from every
+    /// channel's kind and arm switch, and the audio thread reads it per chunk.
+    /// Zero is every channel armed, which is the desk as it has always been.
+    pub fn set_midi_off(&self, mask: u32) {
+        self.shared.midi_off.store(mask, Ordering::Relaxed);
+    }
+
+    /// One insert's current state, for persisting. `None` for an empty bay —
+    /// or for a plugin whose `getState` failed, which is a preset to choose
+    /// again rather than an error to stop on.
+    pub fn save_insert_state(&self, strip: usize, slot: usize) -> Option<Vec<u8>> {
+        self.insert_state_handles
+            .get(strip)?
+            .get(slot)?
+            .as_ref()
             .and_then(|h| h.save().ok())
     }
 
@@ -4675,7 +4841,7 @@ impl Drop for Engine {
         // retire the instance and drop it HERE, on this thread.
         for strip in 0..=STRIPS {
             for slot in 0..INSERTS {
-                let _ = self.load_insert(strip, slot, None);
+                let _ = self.load_insert(strip, slot, None, None);
             }
         }
         for slot in 0..SLOTS {
@@ -6156,6 +6322,113 @@ mod tests {
         .expect("the test ring is large enough");
     }
 
+    /// **A bay's settings survive: state out, state back in, no complaint.**
+    ///
+    /// The round trip is the whole feature — `save_insert_state` is what the
+    /// quit path writes to disk and the `state` argument is what the reconcile
+    /// hands back at launch. Before this existed, every effect's knobs died
+    /// with the process, silently, masked only by nobody expecting better.
+    ///
+    ///     cargo test -p ivory a_bays_settings -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs an audio device and FabFilter Pro-R 2; runs a vendor's initialiser"]
+    fn a_bays_settings_survive_a_save_and_a_reload() {
+        let Some(bundle) = ivory_host::discover().into_iter().find(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().contains("Pro-R"))
+                .unwrap_or(false)
+        }) else {
+            panic!("no VST3 matching Pro-R; this test needs one installed");
+        };
+        let mut engine = Engine::start(None).expect("an audio output");
+        let at = Strip::Track.index();
+        engine
+            .load_insert(at, 0, Some(&bundle), None)
+            .expect("an effect must load");
+        let state = engine
+            .save_insert_state(at, 0)
+            .expect("a loaded insert must answer for its state");
+        assert!(!state.is_empty(), "a state of zero bytes is not a state");
+
+        // The trip back: the same bytes into a fresh instance of the same
+        // plugin, which must accept them without complaint.
+        engine
+            .load_insert(at, 1, Some(&bundle), Some(&state))
+            .expect("the state a plugin saved must restore into it");
+        assert!(engine.insert(at, 1).is_some());
+    }
+
+    /// **An instrument lives in a bay now: no refusal, a warm-up, notes in,
+    /// sound out — and the arm mask is a real gate.**
+    ///
+    /// On the MASTER's rack, because it is the one that runs unconditionally —
+    /// the track's runs only while the backing track plays and the inputs'
+    /// only while the monitor is open. A voice on the master replaces the whole
+    /// mix, which is exactly what "a voice replaces the channel" means, so the
+    /// master meter moving is the assertion.
+    ///
+    ///     cargo test -p ivory an_instrument_in_a_bay -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs an audio device and Pianoteq installed; runs a vendor's initialiser"]
+    fn an_instrument_in_a_bay_renders_notes_and_the_arm_gate_holds() {
+        let Some(bundle) = ivory_host::discover().into_iter().find(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase().contains("pianoteq"))
+                .unwrap_or(false)
+        }) else {
+            panic!("no VST3 matching Pianoteq; this test needs one installed");
+        };
+        let mut engine = Engine::start(None).expect("an audio output");
+        engine
+            .load_insert(STRIPS, 0, Some(&bundle), None)
+            .expect("an instrument must load in a bay - the refusal is gone");
+        assert!(
+            engine.insert(STRIPS, 0).is_some(),
+            "the bay does not report its instrument"
+        );
+
+        let peak_over = |engine: &Engine, ms: u64| -> f32 {
+            let deadline = Instant::now() + Duration::from_millis(ms);
+            let mut peak = 0.0f32;
+            while Instant::now() < deadline {
+                let m = engine.meters();
+                peak = peak.max(m.left.peak).max(m.right.peak);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            peak
+        };
+
+        // Armed: a chord, and the master must move.
+        let t = engine.timebase().now();
+        for n in [48u8, 60, 64, 67] {
+            engine.send_midi(t, &[0x90, n, 100]);
+        }
+        let heard = peak_over(&engine, 1500);
+        for n in [48u8, 60, 64, 67] {
+            engine.send_midi(engine.timebase().now(), &[0x80, n, 0]);
+        }
+        assert!(
+            heard > 0.001,
+            "a bay instrument fed notes made no sound (peak {heard})"
+        );
+
+        // Let the tails die, then gate the channel and play again.
+        std::thread::sleep(Duration::from_millis(2500));
+        engine.set_midi_off(1 << STRIPS.min(31));
+        let t = engine.timebase().now();
+        for n in [48u8, 60, 64, 67] {
+            engine.send_midi(t, &[0x90, n, 100]);
+        }
+        let gated = peak_over(&engine, 1200);
+        for n in [48u8, 60, 64, 67] {
+            engine.send_midi(engine.timebase().now(), &[0x80, n, 0]);
+        }
+        assert!(
+            gated < heard * 0.2,
+            "the arm gate did not hold: armed peak {heard}, gated peak {gated}"
+        );
+    }
+
     /// **The engine retires its own inserts, on this thread, before anything
     /// else drops.**
     ///
@@ -6194,7 +6467,7 @@ mod tests {
         let mut engine = Engine::start(None).expect("an audio output");
         let at = Strip::Track.index();
         engine
-            .load_insert(at, 0, Some(&bundle))
+            .load_insert(at, 0, Some(&bundle), None)
             .expect("an effect must load on an insert");
         assert!(engine.insert(at, 0).is_some(), "nothing was loaded");
         assert!(
@@ -6206,14 +6479,14 @@ mod tests {
         // window, drop the controller reference, retire the instance and drop
         // it HERE rather than in the callback box's teardown.
         engine
-            .load_insert(at, 0, None)
+            .load_insert(at, 0, None, None)
             .expect("unloading an insert must not fail");
         assert!(engine.insert(at, 0).is_none(), "the bay kept its effect");
         assert!(!engine.insert_editor_open(at, 0), "a window survived the unload");
 
         // And dropping a live engine with a loaded insert completes.
         engine
-            .load_insert(at, 1, Some(&bundle))
+            .load_insert(at, 1, Some(&bundle), None)
             .expect("an effect must load on an insert");
         drop(engine);
     }
