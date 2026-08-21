@@ -47,27 +47,57 @@ const SETTINGS_VERSION: u64 = 11;
 ///
 /// The one input there was becomes the FIRST of the four, which is what it is:
 /// `wanted` is input 1 and the extras are inputs 2 upward.
+///
+/// **The numbers are frozen, and that is the point.** A migration describes a
+/// move between two shapes the app HAD, and both of those are history. Reading
+/// today's `SLOTS` and `INPUTS` here would mean the move silently redefines
+/// itself the next time the desk changes shape — so a file written in the
+/// one-input era, opened after some future rework, would be shuffled by a rule
+/// that no longer describes anything. See [`V10_SLOTS`].
 fn desk_channel_moved(old: usize) -> usize {
-    use crate::recorder::{INPUTS, SLOTS};
-    if old <= SLOTS {
+    if old <= V10_SLOTS {
         // The slots, then the one input, which keeps its place.
         old
     } else {
         // The backing track, the click, the bus and the master, all pushed
         // along by the inputs that were added in front of them.
-        old + INPUTS - 1
+        old + V10_INPUTS - 1
     }
 }
 
+/// The desk's shape at settings_version 10, frozen.
+///
+/// Every constant a migration needs is written down here as a literal rather
+/// than read from `crate::recorder`. The rule is simple and absolute: a
+/// migration is about a shape the app used to have, and a shape that has passed
+/// cannot be described by a constant that is still moving.
+///
+/// It has already almost bitten: `was < 11` computed the effects bus's insert
+/// slot from `Strip::Fx.index() * INSERTS`, so the moment `Strip` gains or
+/// loses a variant, every user upgrading from version 10 would have had their
+/// bus reverb put on some other channel.
+const V10_SLOTS: usize = 5;
+const V10_INPUTS: usize = 4;
+/// `SLOTS + INPUTS + 3` as it stood at version 11.
+const V11_STRIPS: usize = 12;
+/// Insert bays per channel at version 11.
+const V11_INSERTS: usize = 3;
+/// `Strip::Fx.index()` at version 11: five slots, four inputs, then the backing
+/// track and the click before it.
+const V11_FX_INDEX: usize = 11;
+
 /// Move every desk array from the one-input layout to this one.
 fn migrate_desk_channels(s: &mut Settings) {
-    use crate::recorder::{SLOTS, STRIPS};
+    // Frozen, like everything else a migration reads — see `V10_SLOTS`. The
+    // upper bound is the only live one, and it is a BOUNDS CHECK against the
+    // arrays as they are today rather than a description of the old shape.
+    let today = crate::recorder::STRIPS;
     // Highest first, because every channel moves UP: writing low to high would
     // overwrite entries that have not been read yet.
-    let was = SLOTS + 4; // the old `STRIPS`, before the input strips
-    for old in (SLOTS + 1..=was).rev() {
+    let was = V10_SLOTS + 4; // the old `STRIPS`, before the input strips
+    for old in (V10_SLOTS + 1..=was).rev() {
         let new = desk_channel_moved(old);
-        if new == old || new > STRIPS {
+        if new == old || new > today {
             continue;
         }
         s.strip_colors[new] = std::mem::replace(&mut s.strip_colors[old], 0);
@@ -1583,8 +1613,12 @@ impl Settings {
             // three.** A bus is a channel with a send instead of a fader; it
             // simply had the only rack there was.
             if let Some(path) = self.bus_effect.clone() {
-                let at = crate::recorder::Strip::Fx.index() * crate::recorder::INSERTS;
-                let need = (crate::recorder::STRIPS + 1) * crate::recorder::INSERTS;
+                // Frozen — see `V10_SLOTS`. This computed the slot from
+                // `Strip::Fx.index() * INSERTS`, so the next time `Strip` gains
+                // or loses a variant every upgrade from version 10 would have
+                // put the bus reverb on some other channel.
+                let at = V11_FX_INDEX * V11_INSERTS;
+                let need = (V11_STRIPS + 1) * V11_INSERTS;
                 if self.strip_inserts.len() < need {
                     self.strip_inserts.resize(need, String::new());
                 }
@@ -3360,4 +3394,65 @@ mod tests {
         assert_eq!(s.detached_chord_height, -3);
         assert_eq!(s.detached_height_for_use(), 50.0); // D-UI-1 fallback
     }
+    /// **A migration's numbers are frozen, and this is what says so.**
+    ///
+    /// A migration describes a move between two shapes the app HAD. Both are
+    /// history, so neither may be spelled with a constant that is still moving:
+    /// reading today's `SLOTS` in a version-10 rule means the rule silently
+    /// redefines itself the next time the desk changes shape, and a file
+    /// written years ago gets shuffled by something that no longer describes
+    /// anything.
+    ///
+    /// It nearly bit: `was < 11` computed the bus's insert slot as
+    /// `Strip::Fx.index() * INSERTS`, and the desk is about to change shape.
+    ///
+    /// Written as "these numbers are what they were", not "these numbers equal
+    /// today's constants" — the second would pass today and fail for the right
+    /// reason at exactly the wrong moment.
+    #[test]
+    fn the_historical_migrations_do_not_read_todays_constants() {
+        assert_eq!(V10_SLOTS, 5, "version 10 had five instrument slots");
+        assert_eq!(V10_INPUTS, 4, "version 10 had four inputs");
+        assert_eq!(V11_STRIPS, 12, "version 11 had twelve channels plus a master");
+        assert_eq!(V11_INSERTS, 3, "version 11 had three bays");
+        assert_eq!(V11_FX_INDEX, 11, "the effects bus was channel 11 at version 11");
+
+        // And the move itself still does what it did: the one input keeps its
+        // place, and everything after it shifts by the three that were added.
+        assert_eq!(desk_channel_moved(0), 0, "slot 0 moved");
+        assert_eq!(desk_channel_moved(V10_SLOTS), V10_SLOTS, "the one input moved");
+        assert_eq!(
+            desk_channel_moved(V10_SLOTS + 1),
+            V10_SLOTS + V10_INPUTS,
+            "the backing track did not land after the four inputs"
+        );
+
+        // The source itself, because a comment cannot be tested and this rule
+        // is one somebody will break by reaching for the nearest constant.
+        let src = include_str!("settings.rs");
+        let migrations = &src[src
+            .find("fn desk_channel_moved")
+            .expect("the migration helper is still called that")
+            ..src.find("/// Recorder backgrounds this app shipped").expect("anchor")];
+        // Comments explain the frozen numbers by naming the live ones, which is
+        // exactly right in prose and would be a false positive here — so the
+        // search is over CODE. And the frozen constants are named after the
+        // live ones, so they come out first.
+        let mut live: String = migrations
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for frozen in ["V10_SLOTS", "V10_INPUTS", "V11_STRIPS", "V11_INSERTS", "V11_FX_INDEX"] {
+            live = live.replace(frozen, "");
+        }
+        for banned in ["SLOTS", "INPUTS", "INSERTS", "Strip::"] {
+            assert!(
+                !live.contains(banned),
+                "a historical migration reads the live `{banned}`; freeze it \
+                 beside `V10_SLOTS` instead"
+            );
+        }
+    }
+
 }

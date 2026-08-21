@@ -435,7 +435,12 @@ fn pc_name(pc: u8, prefer_flats: bool) -> &'static str {
 /// is fed from the MIDI, not from the shape on the board.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Intervals {
-    /// What everything is measured from: the detected root, else the bass.
+    /// What everything is measured from: **the lowest note being played**.
+    ///
+    /// Not the detected chord's root. That is right for the circle and the
+    /// triangles, which answer "what key am I in"; this column answers "what is
+    /// this shape under my hand", and a guitarist reads a shape from the bottom
+    /// string up. See `IvoryApp::guitar_intervals`.
     ///
     /// **Only the tonic.** Which notes are sounding, and on which STRINGS,
     /// comes from the voicing — the labels line up with the strings they
