@@ -1452,6 +1452,14 @@ impl DesktopApp {
         // what puts it away — see `IvoryApp::take_dismiss_message`.
         if self.app.take_dismiss_message() {
             self.recorder.take_note = None;
+            // **And the engine's error, which is what is usually showing.**
+            // "Pro-R 2 is an effect, not an instrument" is a correct refusal
+            // and a finished conversation — the user has read it and there is
+            // nothing to do — but nothing in that path ever cleared it, so it
+            // sat there with an × beside it that did not apply to it. An ×
+            // that dismisses one message and not the one under the cursor is
+            // worse than no × at all.
+            self.recorder.engine_error = None;
         }
         while let Some(request) = self.app.take_recorder_request() {
             match request {

@@ -118,7 +118,10 @@ pub enum Hit {
     Send(usize),
     Mute(usize),
     Solo(usize),
-    /// The plus on an empty slot: put an instrument here.
+    /// **What is on this channel**: the plus on an empty slot, and the icon
+    /// above the name on a filled one. Both open the same picker — the
+    /// interface for an input, the instrument for a slot, the file for the
+    /// backing track — because both ask the same question.
     Add(usize),
     /// One of the three insert chips: put an effect in it, or take one out.
     Insert(usize, usize),
@@ -310,8 +313,14 @@ impl StripStrip {
 /// Space around the rack, and between the strips.
 const PAD: f32 = 10.0;
 const GAP: f32 = 6.0;
-/// The master is wider, because it is the one you look at.
-const MASTER_EXTRA: f32 = 0.35;
+/// The master is the same width as every other channel.
+///
+/// **It used to be wider, "because it is the one you look at".** That bought
+/// the master a legible scale and left every other channel with a smear where
+/// its numbers should be — and a desk where one strip is a different size is a
+/// desk with two kinds of strip on it. The width it gave back is spread across
+/// all eleven, which is what makes the ticks readable everywhere.
+const MASTER_EXTRA: f32 = 0.0;
 
 impl Layout {
     pub fn new(rect: Rect, view: &MixerView<'_>) -> Self {
@@ -393,7 +402,7 @@ impl Layout {
         // BELOW the insert row, which every channel has now. The two shared a
         // band for one build and the guard test found it before anybody could
         // press a send and get an effect picker.
-        let send = if sends { cut(0.31, 0.45) } else { Rect::NOTHING };
+        let send = if sends { cut(0.41, 0.53) } else { Rect::NOTHING };
         // Short of the bottom edge: a switch flush against the frame reads as
         // something that has been cut off rather than as the end of the strip.
         // **Three inserts, on every channel, and the number never changes.**
@@ -411,13 +420,21 @@ impl Layout {
         // reachable — anybody who fills thirty-six finds out what their
         // hardware does, and that is worth learning from the app rather than
         // from a number the app made up.
-        let insert_row = cut(0.205, 0.295);
+        //
+        // **Stacked, not shoulder to shoulder.** Three chips side by side in a
+        // column ninety points wide are thirty points each, and thirty points
+        // holds about three characters of "FabFilter Pro-R 2" — a rack you
+        // have to click to find out what is in it. Down the strip each one is
+        // as wide as the channel, which is where the reading room comes from;
+        // the height it costs comes out of the fader's travel, which had the
+        // most of anything on the strip.
+        let rack = cut(0.195, 0.395);
         let inserts: [Rect; INSERTS] = std::array::from_fn(|i| {
-            let w = insert_row.width() / INSERTS as f32;
-            let x = insert_row.left() + w * i as f32;
+            let h = rack.height() / INSERTS as f32;
+            let y = rack.top() + h * i as f32;
             Rect::from_min_max(
-                Pos2::new(x + 1.0, insert_row.top()),
-                Pos2::new(x + w - 1.0, insert_row.bottom()),
+                Pos2::new(rack.left() + 2.0, y + 1.0),
+                Pos2::new(rack.right() - 2.0, y + h - 1.0),
             )
         });
         let switches = if switchable { cut(0.902, 0.975) } else { Rect::NOTHING };
@@ -440,23 +457,40 @@ impl Layout {
         // press one and get the other.
         // Every channel has an insert row now, so every channel's travel
         // starts below it — a send is what still moves the line.
-        let travel = cut(if sends { 0.47 } else { 0.32 }, 0.82);
+        let travel = cut(if sends { 0.55 } else { 0.42 }, 0.82);
         // The meter takes the left third and the fader the rest, so the fader
         // still sits near the middle of the strip where a hand expects it.
-        let split = travel.left() + travel.width() * 0.34;
-        // The two sources that carry an icon get a band for it and push their
-        // name down; an instrument slot has none and keeps the room.
-        let has_icon = matches!(view.strip, Some(Strip::Input(_) | Strip::Track));
+        let split = travel.left() + travel.width() * 0.42;
+        // **Every source channel carries one, and it is the way in.** The
+        // microphone and the waveform were labels: they said what the column
+        // was, which the name underneath already said. An instrument had none
+        // at all, so the desk's three kinds of source read as one kind of
+        // column with different words on it.
+        //
+        // They are now the picker — press the microphone to choose the
+        // interface, the keyboard to choose the instrument, the waveform to
+        // choose the file — which is why the instrument needed a glyph of its
+        // own. The bus, the click and the master have no source to choose and
+        // keep the room for their names.
+        let has_icon = matches!(
+            view.strip,
+            Some(Strip::Input(_) | Strip::Track | Strip::Slot(_))
+        );
+        let icon = if has_icon {
+            let r = cut(0.015, 0.075);
+            Rect::from_center_size(r.center(), Vec2::splat(r.height().min(r.width())))
+        } else {
+            Rect::NOTHING
+        };
         StripStrip {
             panel,
-            icon: if has_icon {
-                let r = cut(0.015, 0.075);
-                Rect::from_center_size(r.center(), Vec2::splat(r.height().min(r.width())))
-            } else {
-                Rect::NOTHING
-            },
-            name: if has_icon { cut(0.08, 0.15) } else { cut(0.02, 0.10) },
-            detail: if has_icon { cut(0.15, 0.20) } else { cut(0.10, 0.16) },
+            icon,
+            // **Loosely fitting the text, not a band of face.** These were a
+            // fifteenth of the strip each, which at any usable window size is
+            // three times the height of what is written in them: the plate
+            // behind them then reads as a panel with a word lost in it.
+            name: if has_icon { cut(0.085, 0.135) } else { cut(0.03, 0.088) },
+            detail: if has_icon { cut(0.14, 0.185) } else { cut(0.092, 0.14) },
             meter: Rect::from_min_max(travel.min, Pos2::new(split, travel.max.y)),
             send,
             fader: Rect::from_min_max(Pos2::new(split, travel.min.y), travel.max),
@@ -464,7 +498,11 @@ impl Layout {
             mute,
             solo,
             inserts,
-            add: Rect::NOTHING,
+            // **The same target as the plus on an empty one**, because it is
+            // the same question: what is on this channel. An empty slot draws
+            // a plus and a filled one draws its icon, and both open the picker
+            // that answers it.
+            add: icon,
         }
     }
 
@@ -543,7 +581,12 @@ struct Ink {
     engrave: Color32,
     faint: Color32,
     track: Color32,
+    /// The fader's slot: a dark channel cut into the face, not a hairline.
+    slot: Color32,
+    /// The fader's cap: bone, the colour of the real thing.
     cap: Color32,
+    /// The ridges across it, a shade under the cap so they read as cuts.
+    cap_rib: Color32,
     lit: Color32,
     mute: Color32,
     solo: Color32,
@@ -570,7 +613,13 @@ fn ink(view: &MixerView<'_>) -> Ink {
         // Dark enough to read as a well rather than as a lighter panel: at
         // rest a meter should look like somewhere a level would go.
         track: Color32::from_rgb(0x1A, 0x17, 0x12),
-        cap: Color32::from_rgb(0x4A, 0x42, 0x38),
+        // **Ivory on black, from the owner's photograph of the real desk** —
+        // and the SAME ivory and the same black the band's faders run in, out
+        // of the one place they are written down. Two views of one desk that
+        // disagreed about what a fader is made of would be two desks.
+        slot: crate::recorder_panel::CAP_SLOT,
+        cap: crate::recorder_panel::CAP_BONE,
+        cap_rib: crate::recorder_panel::CAP_RIB,
         lit: Color32::from_rgb(0x1C, 0x6F, 0xD6),
         mute: Color32::from_rgb(0xE0, 0xA8, 0x22),
         solo: Color32::from_rgb(0xE8, 0x3A, 0x4E),
@@ -662,9 +711,17 @@ fn strip(
     let h = l.panel.height();
 
     // The plate the label sits on, so it reads on any colour.
+    // **Down to where the writing stops.** A channel with no second line —
+    // which is most of them — was getting a plate sized for two, and an empty
+    // half of a box reads as something that failed to draw.
+    let bottom = if v.detail.is_empty() {
+        l.name.bottom()
+    } else {
+        l.detail.bottom()
+    };
     let plate = Rect::from_min_max(
         Pos2::new(l.panel.left() + 3.0, l.name.top() - 2.0),
-        Pos2::new(l.panel.right() - 3.0, l.detail.bottom() + 2.0),
+        Pos2::new(l.panel.right() - 3.0, bottom + 2.0),
     );
     // **Under every name, painted or not.** It was drawn only on a coloured
     // channel, where it exists to keep the label legible on any background —
@@ -704,6 +761,10 @@ fn strip(
             crate::recorder_panel::draw_waveform_icon(painter, l.icon, p.engrave);
             true
         }
+        Some(Strip::Slot(_)) => {
+            crate::recorder_panel::draw_instrument_icon(painter, l.icon, p.engrave);
+            true
+        }
         _ => false,
     };
     let _ = named;
@@ -732,44 +793,96 @@ fn strip(
     } else {
         &METER_TICKS
     };
-    meter(painter, l.meter, v.peak, v.stereo, v.gr_db, heard, ticks, p);
+    // The face as it will LOOK, not as it is written down: a silent strip's is
+    // translucent, and the scale has to be chosen against what is on screen.
+    meter(
+        painter,
+        l.meter,
+        v.peak,
+        v.stereo,
+        v.gr_db,
+        heard,
+        ticks,
+        flatten(face, p.wood),
+        p,
+    );
 
     if l.send.is_positive() {
         send_knob(painter, l.send, v.send, p);
     }
-    // **Three chips, always three.** An empty one is an outline with a plus,
-    // which is the same offer an empty instrument slot makes — and drawing the
-    // row on every channel is what stops the desk having two kinds of strip.
+    // **A rack: an ivory field with three strips down it.**
+    //
+    // On the ordinary face rather than in the channel's own colour, for the
+    // reason the name plate is: a plugin's name is text to be read, and text
+    // to be read is dark on bone whatever somebody painted the channel. The
+    // field is drawn once behind all three so the rack reads as one object
+    // with three bays in it, which is what a rack is.
+    let bays: Vec<Rect> = l.inserts.iter().copied().filter(|r| r.is_positive()).collect();
+    if let (Some(first), Some(last)) = (bays.first(), bays.last()) {
+        let field = Rect::from_min_max(
+            Pos2::new(first.left() - 2.0, first.top() - 1.0),
+            Pos2::new(last.right() + 2.0, last.bottom() + 1.0),
+        );
+        painter.rect_filled(field, 2.0, p.face);
+        painter.rect_stroke(
+            field,
+            2.0,
+            Stroke::new(1.0, p.engrave.gamma_multiply(0.30)),
+            egui::StrokeKind::Inside,
+        );
+    }
     for (n, cell) in l.inserts.iter().enumerate() {
         if !cell.is_positive() {
             continue;
         }
         let name = v.inserts.get(n).copied().unwrap_or("");
         let filled = !name.is_empty();
-        if filled {
-            painter.rect_filled(*cell, 2.0, p.lit);
-        } else {
-            painter.rect_stroke(
-                *cell,
-                2.0,
-                Stroke::new(1.0, p.engrave.gamma_multiply(0.35)),
-                egui::StrokeKind::Inside,
+        // The hairline between bays, so three empty ones are three bays and
+        // not one tall blank. Not under the last, which would be a line along
+        // the bottom edge of the field.
+        if n + 1 < INSERTS {
+            painter.line_segment(
+                [
+                    Pos2::new(cell.left() + 1.0, cell.bottom() + 1.0),
+                    Pos2::new(cell.right() - 1.0, cell.bottom() + 1.0),
+                ],
+                Stroke::new(1.0, p.engrave.gamma_multiply(0.18)),
             );
         }
-        centred(
-            painter,
-            *cell,
-            if filled { name } else { "+" },
-            FontId::new(
-                (cell.height() * 0.5).clamp(6.0, 9.5),
-                crate::fonts::courier_bold(),
-            ),
-            if filled {
-                p.face
-            } else {
-                p.engrave.gamma_multiply(0.45)
-            },
+        let font = FontId::new(
+            (cell.height() * 0.46).clamp(6.5, 10.0),
+            crate::fonts::courier_bold(),
         );
+        if filled {
+            // The tab at the left edge is the "loaded" light the whole chip
+            // used to be. Blue on bone says the same thing and leaves the
+            // width for the name, which is the point of stacking them.
+            painter.rect_filled(
+                Rect::from_min_max(
+                    cell.min,
+                    Pos2::new(cell.left() + 3.0, cell.bottom()),
+                ),
+                1.0,
+                p.lit,
+            );
+            let text = Rect::from_min_max(Pos2::new(cell.left() + 6.0, cell.top()), cell.max);
+            centred(
+                painter,
+                text,
+                &shorten_plugin(painter, text.width(), name, &font),
+                font.clone(),
+                p.engrave,
+            );
+        } else {
+            // Big enough to be an offer. At the chip's own text size it was a
+            // speck in the middle of an empty bay, which reads as dirt on the
+            // panel rather than as somewhere to put a plugin.
+            let plus = FontId::new(
+                (cell.height() * 0.62).clamp(9.0, 15.0),
+                crate::fonts::courier_bold(),
+            );
+            centred(painter, *cell, "+", plus, p.engrave.gamma_multiply(0.45));
+        }
     }
 
     fader(painter, l.fader, v.gain, p);
@@ -895,6 +1008,12 @@ fn meter(
     gr_db: f32,
     heard: bool,
     ticks: &[f32],
+    // **The strip's own face**, because the scale is printed on it. The
+    // numbers used to be a faded ivory, which is legible on a channel somebody
+    // painted and completely invisible on one they did not: ivory on ivory.
+    // Every unpainted channel on the desk had a meter with no scale beside it,
+    // and the two kinds of strip looked like two different controls.
+    face: Color32,
     p: &Ink,
 ) {
     if !r.is_positive() {
@@ -903,9 +1022,12 @@ fn meter(
     // **Tall and thin, with the ticks to its left.** A meter you read a number
     // off wants a scale beside it, and the scale is what decides how much of
     // the cell the bars can have.
-    let scale_w = (r.width() * 0.42).clamp(12.0, 26.0);
+    let scale_w = (r.width() * 0.5).clamp(14.0, 30.0);
     let bars = Rect::from_min_max(Pos2::new(r.left() + scale_w, r.top()), r.max);
-    let font = FontId::new((r.width() * 0.16).clamp(5.5, 8.0), crate::fonts::courier());
+    // **Legible or absent.** The floor used to be 5.5 points, which is not a
+    // number anybody reads, it is a grey mark that means "there was a number
+    // here". Sized from the column the numbers actually sit in.
+    let font = FontId::new((scale_w * 0.46).clamp(6.5, 9.0), crate::fonts::courier());
     for &db in ticks {
         let t = gain_to_fader(10f32.powf(db / 20.0)).clamp(0.0, 1.0);
         let y = bars.bottom() - bars.height() * t;
@@ -914,7 +1036,7 @@ fn meter(
             egui::Align2::RIGHT_CENTER,
             format!("{db:.0}"),
             font.clone(),
-            p.face.gamma_multiply(0.55),
+            print_on(face, p).gamma_multiply(0.62),
         );
         painter.line_segment(
             [Pos2::new(bars.left(), y), Pos2::new(bars.right(), y)],
@@ -1002,27 +1124,64 @@ fn send_knob(painter: &Painter, r: Rect, amount: f32, p: &Ink) {
 }
 
 /// A vertical fader: a track, and a cap on it.
+/// A fader: an ivory cap, ribbed, riding in a black slot.
+///
+/// **Modelled on the real thing** — the owner's photograph of a period desk,
+/// where the slot is a dark channel cut into the face and the cap is a bone
+/// block with fine ridges across it for a thumb to find. What was here was a
+/// pale line with a pale block on it, which reads as a diagram of a fader
+/// rather than as one.
+///
+/// The ribs are drawn only when there is room for them to be ribs; below that
+/// they are a smear and the cap is better plain.
 fn fader(painter: &Painter, r: Rect, gain: f32, p: &Ink) {
     if !r.is_positive() {
         return;
     }
     let x = r.center().x;
-    let track = Rect::from_min_max(
-        Pos2::new(x - 2.0, r.top()),
-        Pos2::new(x + 2.0, r.bottom()),
+    // The slot: dark, and wide enough to read as a cut rather than a hairline.
+    let slot_w = (r.width() * 0.16).clamp(3.0, 7.0);
+    let slot = Rect::from_min_max(
+        Pos2::new(x - slot_w * 0.5, r.top()),
+        Pos2::new(x + slot_w * 0.5, r.bottom()),
     );
-    painter.rect_filled(track, 2.0, p.track);
+    painter.rect_filled(slot, slot_w * 0.5, p.slot);
+    painter.rect_stroke(
+        slot,
+        slot_w * 0.5,
+        Stroke::new(1.0, p.engrave.gamma_multiply(0.25)),
+        egui::StrokeKind::Inside,
+    );
+
     let t = gain_to_fader(gain).clamp(0.0, 1.0);
     let y = r.bottom() - r.height() * t;
-    let w = (r.width() * 0.62).clamp(10.0, 30.0);
-    let cap = Rect::from_center_size(Pos2::new(x, y), Vec2::new(w, 8.0));
+    let w = (r.width() * 0.72).clamp(12.0, 34.0);
+    let h = (w * 0.52).clamp(9.0, 20.0);
+    let cap = Rect::from_center_size(Pos2::new(x, y), Vec2::new(w, h));
+    // A dark seat under the cap, so it sits ON the slot rather than in it.
+    painter.rect_filled(cap.expand(1.0), 3.0, p.slot);
     painter.rect_filled(cap, 2.0, p.cap);
+    // The ribs, and the line through the middle that is the cap's own edge —
+    // the one thing on it a hand aims at.
+    let ribs = ((h / 3.0).floor() as usize).min(4);
+    if ribs >= 2 {
+        for i in 1..ribs {
+            let ry = cap.top() + cap.height() * (i as f32 / ribs as f32);
+            painter.line_segment(
+                [
+                    Pos2::new(cap.left() + 2.0, ry),
+                    Pos2::new(cap.right() - 2.0, ry),
+                ],
+                Stroke::new(0.75, p.cap_rib),
+            );
+        }
+    }
     painter.line_segment(
         [
-            Pos2::new(cap.left() + 2.0, y),
-            Pos2::new(cap.right() - 2.0, y),
+            Pos2::new(cap.left() + 1.0, y),
+            Pos2::new(cap.right() - 1.0, y),
         ],
-        Stroke::new(1.0, p.face),
+        Stroke::new(1.25, p.engrave.gamma_multiply(0.55)),
     );
 }
 
@@ -1072,6 +1231,67 @@ fn centred(painter: &Painter, r: Rect, text: &str, font: FontId, colour: Color32
 /// The longest prefix of `text` that fits `width`, with an ellipsis if it was
 /// cut. Measured through the painter's own fonts, because a character's width
 /// is a property of the face and not of the count.
+/// A plugin's name for a rack bay: the end of it, not the beginning.
+///
+/// **The vendor is the first word and the useless one.** "FabFilter Pro-R 2"
+/// cut to fit gives "FabFilter Pro…", and a rack of those is three bays that
+/// all say FabFilter — the manufacturer, which is the same on all of them,
+/// crowding out the part that says which plugin it is. So leading words are
+/// dropped until what is left fits, and only then is it cut.
+fn shorten_plugin(painter: &Painter, width: f32, name: &str, font: &FontId) -> String {
+    let fits = |t: &str| {
+        painter
+            .layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE)
+            .rect
+            .width()
+            <= width
+    };
+    if fits(name) {
+        return name.to_owned();
+    }
+    let words: Vec<&str> = name.split_whitespace().collect();
+    for drop in 1..words.len() {
+        let tail = words[drop..].join(" ");
+        if fits(&tail) {
+            return tail;
+        }
+    }
+    // Nothing fits whole, so the LAST word cut is still better than the first
+    // word whole: "Pro-R…" names a plugin and "FabFilt…" names a company.
+    cut_to_fit(painter, width, words.last().copied().unwrap_or(name), font)
+}
+
+/// What `c` actually looks like once it is painted over `under`.
+///
+/// **Colours here are premultiplied and some of them are translucent.** A
+/// silent strip's face is the bone at 62%, whose raw bytes read as a mid grey
+/// while the eye sees a warm tan over the walnut — so any decision made from
+/// the bytes is made about a colour that is never on screen.
+fn flatten(c: Color32, under: Color32) -> Color32 {
+    let a = f32::from(c.a()) / 255.0;
+    let mix = |s: u8, d: u8| (f32::from(s) + f32::from(d) * (1.0 - a)).min(255.0) as u8;
+    Color32::from_rgb(
+        mix(c.r(), under.r()),
+        mix(c.g(), under.g()),
+        mix(c.b(), under.b()),
+    )
+}
+
+/// Perceived luminance, 0..=255.
+///
+/// Weighted rather than averaged: at equal numbers green reads far lighter
+/// than blue, and a desk with twenty-seven paints on it has several of both.
+fn luma(c: Color32) -> f32 {
+    0.299 * f32::from(c.r()) + 0.587 * f32::from(c.g()) + 0.114 * f32::from(c.b())
+}
+
+/// Ink that can be read on `bg`, whatever somebody painted the channel.
+///
+/// `bg` must be a colour that is really on screen — see [`flatten`].
+fn print_on(bg: Color32, p: &Ink) -> Color32 {
+    if luma(bg) > 140.0 { p.engrave } else { p.face }
+}
+
 fn cut_to_fit(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
     let measure = |t: &str| {
         painter
@@ -1258,10 +1478,67 @@ mod tests {
             Some(Hit::Add(0)),
             "the plus does not open anything"
         );
-        // And a filled one has no plus, or there would be two ways to mean two
-        // different things in one place.
+        // And a filled one has no plus in the MIDDLE of it, where the fader
+        // is. It keeps the same target on its icon — the picker is how you
+        // change what is on a channel, filled or not — so what is checked is
+        // that the two are not in two places: `add` is the icon exactly.
         let filled = Layout::new(rect(), &a_view());
-        assert!(!filled.strips[0].add.is_positive());
+        assert!(filled.strips[0].icon.is_positive(), "a filled slot has no icon");
+        assert_eq!(
+            filled.strips[0].add, filled.strips[0].icon,
+            "the picker is somewhere other than the icon that opens it"
+        );
+        assert!(
+            !filled.strips[0].add.contains(filled.strips[0].fader.center()),
+            "the picker is over the fader"
+        );
+        assert_eq!(
+            hit_test(rect(), &a_view(), filled.strips[0].icon.center()),
+            Some(Hit::Add(0)),
+            "the icon does not open the picker"
+        );
+    }
+
+    /// **The scale beside a meter can be read on every channel.**
+    ///
+    /// The numbers were a faded ivory, chosen against the walnut the desk sits
+    /// on — and every UNPAINTED channel has an ivory face, so on eight strips
+    /// out of twelve the scale was ivory on ivory and simply absent. The
+    /// owner's words were "ensure every single track has legible readout
+    /// ticks", and the fault was never the size.
+    ///
+    /// Contrast rather than a colour: this has to hold for all twenty-seven
+    /// paints as well as for the bare face, and naming the right answer for
+    /// each of them is a table that would go stale the next time one changed.
+    #[test]
+    fn the_scale_can_be_read_on_every_face_a_channel_can_have() {
+        let v = a_view();
+        let p = ink(&v);
+        let mut faces = vec![
+            ("the bare face", p.face),
+            ("a silent strip", p.face.gamma_multiply(0.62)),
+        ];
+        for (i, &(r, g, b)) in STRIP_COLORS.iter().enumerate() {
+            faces.push((
+                match i {
+                    0 => "colour 0",
+                    _ => "a painted strip",
+                },
+                Color32::from_rgb(r, g, b),
+            ));
+        }
+        for (what, face) in faces {
+            // Exactly what the panel does: the face over the desk, then the
+            // ink over that.
+            let face = flatten(face, p.wood);
+            let printed = flatten(print_on(face, &p).gamma_multiply(0.62), face);
+            let d = (luma(printed) - luma(face)).abs();
+            assert!(
+                d > 40.0,
+                "{what} ({face:?}) prints its scale at a difference of {d:.0}, \
+                 which is a mark where a number should be"
+            );
+        }
     }
 
     /// Every instrument slot is a channel, filled or not.
@@ -1318,10 +1595,24 @@ mod tests {
                     "channel {i}'s insert {n} cannot be pressed"
                 );
             }
-            // Side by side and not on top of each other.
-            for n in 1..INSERTS {
+            // **And each bay is as wide as the channel.** The whole reason
+            // they were stacked: three across a hundred-point strip held about
+            // three characters of a plugin's name, which is a rack you have to
+            // click to read.
+            for n in 0..INSERTS {
                 assert!(
-                    s.inserts[n].left() >= s.inserts[n - 1].right(),
+                    s.inserts[n].width() > s.panel.width() / INSERTS as f32 * 2.0,
+                    "channel {i}'s insert {n} is no wider than a third of the \
+                     strip, which is what stacking them was for"
+                );
+            }
+            for n in 1..INSERTS {
+                // **Down the strip now, not across it.** Each bay is as wide
+                // as the channel — that is where the reading room came from —
+                // so what separates them is the top edge of one against the
+                // bottom of the one above.
+                assert!(
+                    s.inserts[n].top() >= s.inserts[n - 1].bottom(),
                     "channel {i}'s inserts {} and {n} overlap",
                     n - 1
                 );

@@ -385,6 +385,59 @@ mod tests {
         }
     }
 
+    /// **Every key answers to the place it is drawn.**
+    ///
+    /// The hit test and the painter compute the same geometry twice, in two
+    /// functions, and nothing but this makes them agree. A drift of one white
+    /// key sounds and lights the note next door; a drift of seven is an
+    /// octave, which is the shape of "I played one note and another showed
+    /// up" — and it would look completely deliberate on screen.
+    #[test]
+    fn every_key_hit_tests_back_to_itself() {
+        for (w, h) in [(1300.0_f32, 150.0_f32), (900.0, 120.0), (620.0, 90.0)] {
+            let white_key_w = f64::from(w) / WHITE_KEYS as f64;
+            let mut idx = 0usize;
+            for note in NOTE_START..=NOTE_END {
+                if !is_white(note) {
+                    continue;
+                }
+                // The middle of the key as the PAINTER lays it out, and low
+                // enough to be under the black keys' reach.
+                let x0 = (idx as f64 * white_key_w).trunc();
+                let x1 = ((idx + 1) as f64 * white_key_w).trunc();
+                let x = ((x0 + x1) * 0.5) as f32;
+                let y = h * 0.92;
+                assert_eq!(
+                    hit_test(x, y, w, h),
+                    Some(note),
+                    "at {w}x{h} the white key drawn for {note} answers to \
+                     something else"
+                );
+                idx += 1;
+            }
+            // And the black keys, at their own centres and above the white
+            // keys' reach.
+            for note in NOTE_START..=NOTE_END {
+                if is_white(note) {
+                    continue;
+                }
+                let Some(before) = white_keys_before(note) else {
+                    continue;
+                };
+                if !(before < WHITE_KEYS && before + 1 < WHITE_KEYS) {
+                    continue;
+                }
+                let x = ((before as f64 + 1.0) * white_key_w) as f32;
+                assert_eq!(
+                    hit_test(x, h * 0.2, w, h),
+                    Some(note),
+                    "at {w}x{h} the black key drawn for {note} answers to \
+                     something else"
+                );
+            }
+        }
+    }
+
     #[test]
     fn hit_test_matches_black_first_semantics() {
         let (w, h) = (1300.0_f32, 150.0_f32);

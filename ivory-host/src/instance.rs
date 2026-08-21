@@ -877,25 +877,18 @@ impl Instance {
         }
         // **An effect refused HERE, with a reason.**
         //
-        // A slot is fed MIDI and mixed into the instrument bus; an effect has
-        // no notes to play and nothing plugged into it, so loading one used to
-        // succeed, take a second, and produce silence for ever. Nothing warned
-        // anybody. The owner's report was that a Pro-R or a VintageVerb owner
-        // "will be irked that they load their vst and nothing happens", and
-        // they were right — it is a broken promise rather than a missing
-        // feature.
+        // **The "is it an instrument" check is NOT here.** It was, and it was
+        // in the wrong place: `create` is how this crate instantiates any
+        // VST3, and once the insert racks existed it was refusing every effect
+        // in the app — a Pro-R dropped on an insert answered "Pro-R 2 is an
+        // effect, not an instrument", which is a correct sentence about the
+        // wrong question.
         //
-        // Refused at instantiation rather than filtered out of the picker,
-        // because the picker is a filesystem walk that never opens a bundle:
-        // reading `subCategories` for every VST3 on the machine is a scan with
-        // a cache and a crash boundary, which is a subsystem, not a check. Here
-        // the bundle is open anyway and the answer is free.
-        if class.kind() == crate::scan::Kind::Effect {
-            // Short on purpose: the caller wraps this in the bundle's name and
-            // a pointer at the built-in, and the three together have to fit on
-            // one line in the band.
-            return Err(format!("{} is an effect, not an instrument", class.name));
-        }
+        // The rule belongs to the caller that has a rule: an instrument slot
+        // is fed MIDI and refuses an effect, an insert is fed audio and
+        // refuses an instrument. Both refusals now sit beside the loader they
+        // are about — see `Engine::load` and `Engine::load_insert` — and
+        // `class.kind()` is public so both can ask.
 
         let host = ComWrapper::new(HostApp::new());
         let host_unknown = host
@@ -3393,6 +3386,43 @@ mod tests {
         let back: Vec<u8> = tuid.iter().map(|b| *b as u8).collect();
         assert_eq!(back.as_slice(), &cid);
     }
+    /// **An effect instantiates.** The refusal that used to live in `create`
+    /// made this impossible, and with it every insert in the app: the owner
+    /// dropped a Pro-R on an input and was told it was an effect, which it is.
+    ///
+    /// Ignored like every other test that opens somebody else's binary — it
+    /// needs the plugin installed and it runs their initialiser.
+    ///
+    ///     cargo test -p ivory-host an_effect -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs FabFilter Pro-R 2 installed; opens a third-party bundle"]
+    fn an_effect_instantiates_because_inserts_are_made_of_them() {
+        let Some(bundle) = crate::scan::discover().into_iter().find(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().contains("Pro-R"))
+                .unwrap_or(false)
+        }) else {
+            panic!("no VST3 matching Pro-R; this test needs one installed");
+        };
+        let module = crate::scan::Module::open(&bundle).expect("open module");
+        let class = module
+            .audio_modules()
+            .into_iter()
+            .next()
+            .expect("no Audio Module Class");
+        assert_eq!(
+            class.kind(),
+            crate::scan::Kind::Effect,
+            "Pro-R is not being read as an effect, so this proves nothing"
+        );
+        let inst = Instance::create(&module, &class, Setup::default())
+            .expect("an effect must instantiate: it is what an insert is for");
+        assert!(
+            !inst.audio_inputs().is_empty(),
+            "an effect with no audio input has nothing to insert into"
+        );
+    }
+
 }
 
 

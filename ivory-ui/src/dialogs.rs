@@ -212,6 +212,14 @@ pub enum Dialog {
         input_channels: u16,
         /// The inputs of it the picker is offering as rows of their own.
         exposed: Vec<(u16, Option<u16>)>,
+        /// **The interface's short name**, or empty for its real one.
+        ///
+        /// It lives HERE, beside the device it renames, and not on the mixer
+        /// strip where it began. A channel's name field should name the
+        /// channel; this names the box, once, for every channel that comes out
+        /// of it. Two fields that looked identical did two different things,
+        /// and the one that looked local was the global one.
+        alias: String,
     },
     /// **Which of an interface's inputs the microphone picker should offer.**
     ///
@@ -392,6 +400,8 @@ pub enum DialogAction {
     SetInputChannels(Vec<(u16, Option<u16>)>),
     /// Open the channel chooser for the device now selected.
     ChooseInputChannels,
+    /// The interface's short name changed. See `Dialog::AudioSetup::alias`.
+    SetInputAlias(String),
     /// Open the microphone picker from Setup. The device half of "the audio
     /// system and device", without a second copy of the list to keep in step.
     ChooseAudioDevice,
@@ -922,10 +932,14 @@ const CHANNELS_W: f32 = 460.0;
 /// nobody can reach.
 const CHANNELS_MAX_H: f32 = 560.0;
 /// Taller since the panel became Setup: four choice blocks and their captions
-/// where there was one. The body scrolls, so this is the size at which nothing
-/// HAS to — a machine whose interface offers all six rates is the tallest case,
-/// and it fits.
-const AUDIO_H: f32 = 520.0;
+/// where there was one, and now the interface's short name as well. The body
+/// scrolls, so this is the size at which nothing HAS to — a machine whose
+/// interface offers all six rates is the tallest case, and it fits.
+///
+/// **Grown with the block that was added, not left to the scroll.** A field
+/// whose caption is under the Close button is a field somebody has to discover
+/// by dragging, and the caption is the half that says what the field is for.
+const AUDIO_H: f32 = 580.0;
 
 /// The Welcome card's window, and the size it opens at.
 ///
@@ -3389,6 +3403,7 @@ pub fn show(
             rates,
             input_channels,
             exposed,
+            alias,
         } => {
             let t = theme(dark_mode);
             show_dialog_viewport(
@@ -3673,6 +3688,50 @@ pub fn show(
                                 } else {
                                     "for an interface with more than two inputs"
                                 })
+                                .font(plain(10.0))
+                                .color(dim),
+                            );
+
+                            ui.add_space(10.0);
+
+                            // ── the short name ───────────────────────────────
+                            //
+                            // "Scarlett 18i20 USB - input 3" is what the
+                            // system calls a channel and a mixer strip is a
+                            // hundred points wide. The half worth shortening
+                            // is the one that repeats on every channel of the
+                            // box, so it is shortened once, here, where the
+                            // box is chosen.
+                            ui.label(
+                                RichText::new("SHORT NAME").font(bold(11.0)).color(t.text),
+                            );
+                            let before = alias.clone();
+                            ui.add(
+                                egui::TextEdit::singleline(alias)
+                                    .font(plain(11.0))
+                                    .text_color(t.text)
+                                    .hint_text(
+                                        RichText::new(
+                                            status
+                                                .input
+                                                .as_ref()
+                                                .map_or("the interface's own name", |d| {
+                                                    d.0.as_str()
+                                                }),
+                                        )
+                                        .font(plain(11.0))
+                                        .color(dim),
+                                    )
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if *alias != before {
+                                action = Some(DialogAction::SetInputAlias(alias.clone()));
+                            }
+                            ui.label(
+                                RichText::new(
+                                    "what the mixer calls this interface - \"x\" makes \
+                                     \"x - 3\"",
+                                )
                                 .font(plain(10.0))
                                 .color(dim),
                             );
@@ -6048,6 +6107,12 @@ mod tests {
             "18 inputs; record the one the piano is in".to_owned(),
             "for an interface with more than two inputs".to_owned(),
             "the device list changes with it".to_owned(),
+            "each one ticked is its own row in the mic picker".to_owned(),
+            // The short name's caption, and the hint inside its field. Both are
+            // the panel's own text at the panel's own size, so both belong in
+            // the measurement that decides how wide the panel is.
+            "what the mixer calls this interface - \"x\" makes \"x - 3\"".to_owned(),
+            "the interface's own name".to_owned(),
         ];
         let mut widest = 0.0_f32;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -6058,7 +6123,7 @@ mod tests {
                     let (size, family) = match i {
                         2 | 3 | 4 => (11.0, fonts::courier_bold()),
                         // The captions and the small print, at 10.
-                        5..=10 => (10.0, fonts::courier()),
+                        5..=13 => (10.0, fonts::courier()),
                         _ => (11.0, fonts::courier()),
                     };
                     let g = ui.painter().layout_no_wrap(

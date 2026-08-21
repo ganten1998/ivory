@@ -3358,13 +3358,10 @@ impl Engine {
         let mut rack_ends = rack_ends.into_iter();
         let insert_handoff: [[Handoff; INSERTS]; STRIPS + 1] =
             std::array::from_fn(|_| rack_ends.next().expect("one set per channel"));
-        // One more pair, for the effect that sits across the bus.
-        let (fx_to_audio, fx_incoming) = RingBuffer::<PluginBox>::new(1);
-        let (fx_retiring, fx_from_audio) = RingBuffer::<PluginBox>::new(1);
-        let fx_handoff = Handoff {
-            to_audio: fx_to_audio,
-            from_audio: fx_from_audio,
-        };
+        // The effect across the bus used to have a pair of its own here. It
+        // does not any more: the bus is a channel like the others and its
+        // effect is `insert_handoff[Strip::Fx.index()]`, so what was left was
+        // two rings built on every engine start with nothing on either end.
 
         let dev_ch = channels as usize;
         let widest = dev_ch.max(TAP_CHANNELS);
@@ -3690,6 +3687,23 @@ impl Engine {
             None => classes[0].clone(),
         };
 
+        // **A slot is fed MIDI**, so an effect loaded into one would take a
+        // second, succeed, and produce silence for ever. The owner's words
+        // were that a Pro-R or a VintageVerb owner "will be irked that they
+        // load their vst and nothing happens" — a broken promise rather than a
+        // missing feature, so it is refused with a sentence instead.
+        //
+        // Refused HERE rather than filtered out of the picker: the picker is a
+        // filesystem walk that never opens a bundle, and reading
+        // `subCategories` for every VST3 on the machine is a scan with a cache
+        // and a crash boundary, which is a subsystem, not a check. The bundle
+        // is open by now and the answer is free.
+        //
+        // Short on purpose: the band wraps it in the bundle's name and a
+        // pointer at the built-in, and the three have to fit on one line.
+        if class.kind() == ivory_host::scan::Kind::Effect {
+            return Err(format!("{} is an effect, not an instrument", class.name));
+        }
         let setup = Setup {
             sample_rate: f64::from(self.output.sample_rate),
             max_block: MAX_BLOCK,

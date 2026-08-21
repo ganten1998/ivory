@@ -2827,6 +2827,44 @@ pub(crate) fn draw_microphone(painter: &Painter, b: Rect, ink: Color32) {
     );
 }
 
+/// An instrument: four keys of a keyboard, with the black ones between the
+/// first three.
+///
+/// **The missing fourth black key is the whole picture.** A uniform comb of
+/// stripes reads as a barcode; C-D-E-F, with sharps between C-D and D-E and a
+/// plain gap between E and F, is a keyboard at sixteen points because the
+/// irregularity is what the eye recognises. Drawn as an outline with two solid
+/// stubs rather than filled, so it carries the same weight as the microphone
+/// and the waveform beside it.
+pub(crate) fn draw_instrument_icon(painter: &Painter, b: Rect, ink: Color32) {
+    let s = b.width();
+    let w = (s * 0.075).max(1.0);
+    // Slightly wide of square: a keyboard taller than it is broad is an
+    // accordion.
+    let body = Rect::from_center_size(b.center(), Vec2::new(s * 0.92, s * 0.72));
+    painter.rect_stroke(body, 1.0, Stroke::new(w, ink), egui::StrokeKind::Inside);
+    let key = body.width() / 4.0;
+    for i in 1..4 {
+        let x = body.left() + key * i as f32;
+        painter.line_segment(
+            [Pos2::new(x, b.center().y), Pos2::new(x, body.bottom())],
+            Stroke::new(w, ink),
+        );
+    }
+    // C# and D#, and nothing between E and F.
+    for i in 1..3 {
+        let x = body.left() + key * i as f32;
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(x - key * 0.22, body.top()),
+                Pos2::new(x + key * 0.22, b.center().y),
+            ),
+            0.0,
+            ink,
+        );
+    }
+}
+
 /// What a control is showing while it is being typed into, if it is.
 ///
 /// A borrow out of the view rather than a flag, so that the panel draws the
@@ -3011,7 +3049,22 @@ fn cap_rect(track: Rect, gain: f32) -> Rect {
 /// channel. A cap that restyled itself for a light background would be a
 /// painted-on rectangle, which is exactly the "strip of colour" the owner
 /// rejected in the first place.
-const CAP_BONE: Color32 = Color32::from_rgb(0xDC, 0xD2, 0xB6);
+pub(crate) const CAP_BONE: Color32 = Color32::from_rgb(0xE8, 0xDE, 0xC4);
+
+/// The channel the cap runs in: black, and the same black in every view.
+///
+/// **From the owner's photograph of the real desk**, where the caps are ivory
+/// and the slots they run in are cut black into the panel — not a shade of the
+/// panel, which is what a slider tinted from `well` produced: a pale line with
+/// a slightly-less-pale block on it, a diagram of a fader rather than a fader.
+///
+/// Fixed like [`CAP_BONE`] and [`VU_FACE`], and for the same reason: a fader is
+/// hardware let into the panel, so it is the same object whatever colour the
+/// panel around it is.
+pub(crate) const CAP_SLOT: Color32 = Color32::from_rgb(0x14, 0x12, 0x0F);
+
+/// The ridges moulded across the cap, a shade under it so they read as cuts.
+pub(crate) const CAP_RIB: Color32 = Color32::from_rgb(0xB4, 0xA8, 0x8C);
 
 /// One fader, drawn like the one on a Tascam 388: a channel cut into the panel,
 /// a scale of ticks either side of it, and a ribbed bone cap riding in it.
@@ -3034,7 +3087,7 @@ fn draw_track(painter: &Painter, track: Rect, gain: f32, p: &Palette) {
     // it is a hole, and the cap in it is the only bright thing in the row.
     let slot_h = slot_height(h);
     let slot = Rect::from_center_size(track.center(), Vec2::new(track.width(), slot_h));
-    painter.rect_filled(slot, 1.0, shade(p.well, 0.55));
+    painter.rect_filled(slot, 1.0, CAP_SLOT);
     painter.rect_stroke(
         slot,
         1.0,
@@ -3082,7 +3135,10 @@ fn draw_track(painter: &Painter, track: Rect, gain: f32, p: &Palette) {
             Pos2::new(unity, slot.top() + 1.0),
             Pos2::new(unity, slot.bottom() - 1.0),
         ],
-        Stroke::new(1.0_f32, p.faint),
+        // On the black slot rather than on the panel, so it is drawn in the
+        // cap's own bone faded back. `faint` is panel ink and disappeared into
+        // the channel the moment the channel turned black.
+        Stroke::new(1.0_f32, CAP_BONE.gamma_multiply(0.45)),
     );
 
     let cap = cap_rect(track, gain);
@@ -3092,7 +3148,7 @@ fn draw_track(painter: &Painter, track: Rect, gain: f32, p: &Palette) {
     // thumb can feel where it is. One when there is only room for one: two
     // hairlines three points apart is a smudge, not a grip.
     let ribs: &[f32] = if cw >= 9.0 { &[0.32, 0.68] } else { &[0.5] };
-    let rib = Stroke::new(1.0_f32, shade(CAP_BONE, 0.62));
+    let rib = Stroke::new(1.0_f32, CAP_RIB);
     for f in ribs {
         let rx = cap.left() + cw * f;
         painter.line_segment(

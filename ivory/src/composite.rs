@@ -1117,6 +1117,19 @@ mod shot {
             );
             app.set_track_trim(9.5, 196.0);
         }
+        // **The desk, with things on it.** The mixer is the one panel whose
+        // faults are all proportional — a rack too narrow to read, a tick too
+        // small to count, a name plate three times the height of its name —
+        // and none of those can be reasoned about from the source. Filled the
+        // way a real desk is: some inserts loaded, some empty, a channel
+        // painted, so the picture answers "does this read" rather than "does
+        // this draw".
+        //
+        //   IVORY_SHOT=/tmp/x.png IVORY_SHOT_MIXER=1 \
+        //     cargo test -p ivory --bins shot::window -- --ignored --nocapture
+        if std::env::var("IVORY_SHOT_MIXER").is_ok() {
+            app.open_mixer_for_shot();
+        }
         let mut shoot = |app: &IvoryApp| {
             c.frame(app, Layout::default(), DisplayShows::default(), false, true, None, 0)
                 .and_then(|_| c.flush())

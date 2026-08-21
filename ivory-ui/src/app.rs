@@ -1002,8 +1002,30 @@ impl IvoryApp {
                 ref other => format!("{}->{other:?}", n.pitch),
             })
             .collect();
+        // **How each note ARRIVED, which is what the first capture could not
+        // say.** It showed a note on screen with nothing held, and "a key was
+        // pressed" and "a key was clicked" are different bugs with the same
+        // picture.
+        let named: Vec<String> = shown
+            .iter()
+            .map(|n| {
+                let how = if self.notes.held().contains(n) {
+                    "midi"
+                } else if self.clicked.contains(n) {
+                    "click"
+                } else if self.manual_notes.contains(n) {
+                    "latch"
+                } else if self.sounding.contains(n) {
+                    "sound"
+                } else {
+                    "?"
+                };
+                format!("{n}=oct{}/{how}", i32::from(*n) / 12 - 1)
+            })
+            .collect();
         let line = format!(
-            "held={held:?} transpose={} keytoggle={} manual={manual:?} pins={pins:?}              display={shown:?} tuning={} capo={} intervals={} placed=[{}]\n",
+            "held={held:?} transpose={} keytoggle={} manual={manual:?} pins={pins:?}              display={shown:?} [{}] tuning={} capo={} intervals={} placed=[{}]\n",
+            named.join(" "),
             self.settings.transpose,
             self.settings.keytoggle_enabled,
             spec.tuning.name,
@@ -1518,22 +1540,25 @@ impl IvoryApp {
     }
 
     /// Where a typed name goes. See `Hit::Name`.
+    ///
+    /// **Every channel the same, the inputs included.** Renaming an input used
+    /// to rename the whole INTERFACE, on the reasoning that its half of the
+    /// label is the half worth shortening. That reasoning was right and the
+    /// place was wrong: a channel's name field should name the channel, and
+    /// the interface's short name belongs where the interface is chosen — see
+    /// the Audio Setup panel's input section.
+    ///
+    /// So the alias makes the DEFAULT name — "x - 3" — and typing here
+    /// replaces it, which is what a default is for.
     fn commit_mixer_name(&mut self, at: usize, name: String) {
         let name = name.trim().to_owned();
-        let strips = crate::recorder::Strip::shown();
-        if let Some(crate::recorder::Strip::Input(_)) = strips.get(at) {
-            // **One name for the box, not one per channel.** See
-            // `Settings::input_alias`.
-            self.settings.input_alias = name;
-        } else {
-            if self.settings.strip_names.len() <= crate::recorder::STRIPS {
-                self.settings
-                    .strip_names
-                    .resize(crate::recorder::STRIPS + 1, String::new());
-            }
-            if let Some(slot) = self.settings.strip_names.get_mut(at) {
-                *slot = name;
-            }
+        if self.settings.strip_names.len() <= crate::recorder::STRIPS {
+            self.settings
+                .strip_names
+                .resize(crate::recorder::STRIPS + 1, String::new());
+        }
+        if let Some(slot) = self.settings.strip_names.get_mut(at) {
+            *slot = name;
         }
         self.save_settings();
     }
@@ -1606,6 +1631,9 @@ impl IvoryApp {
                     Some(Strip::Input(n)) => {
                         self.open_device_picker(dialogs::DeviceKind::ExtraInput(*n));
                     }
+                    // The waveform above BACKING. Same question again: what is
+                    // playing on this channel.
+                    Some(Strip::Track) => self.ask_for_track(),
                     _ => {}
                 }
                 return;
@@ -1617,8 +1645,13 @@ impl IvoryApp {
                 self.open_insert_picker(at, n);
                 return;
             }
+            // **Not the master.** Its colour is the one thing on the desk
+            // that means something on sight: red is where the output is, and a
+            // master somebody painted teal is a desk with no landmark on it.
             H::Palette(i) => {
-                self.mixer_palette = Some(i);
+                if strips.get(i).is_some() {
+                    self.mixer_palette = Some(i);
+                }
                 return;
             }
             // Click the number and say it. Seeded EMPTY rather than with what
@@ -1632,17 +1665,20 @@ impl IvoryApp {
             // is edited — "Rhodes" is two characters off "Rhode" — where a
             // figure is replaced.
             H::Name(i) => {
-                let seed = match strips.get(i) {
-                    // An input renames the INTERFACE, so the field starts from
-                    // the alias and not from the label that has the channel
-                    // number stuck on the end of it.
-                    Some(Strip::Input(_)) => self.settings.input_alias.clone(),
+                // Seeded with what is THERE, default or not: a name is
+                // edited, and starting from the default is how somebody makes
+                // "x - 3" into "x - 3 vox" without typing it twice.
+                let seed = match self.settings.strip_names.get(i) {
+                    Some(n) if !n.is_empty() => n.clone(),
+                    // Nothing typed yet, so the field starts from the DEFAULT —
+                    // "x - 3" for an input, "BACKING" for the track. Editing a
+                    // default in place is how somebody gets to "x - 3 vox"
+                    // without retyping the half the app already knows.
                     _ => self
-                        .settings
-                        .strip_names
+                        .mixer_view()
+                        .strips
                         .get(i)
-                        .cloned()
-                        .unwrap_or_default(),
+                        .map_or(String::new(), |v| v.name.to_owned()),
                 };
                 self.mixer_naming = Some((i, seed));
                 return;
@@ -2058,6 +2094,23 @@ impl IvoryApp {
             egui::Id::new("ivory-main-bg"),
             egui::Sense::click_and_drag(),
         );
+        // **Ending a gesture is not interacting, and it happens first.**
+        //
+        // A note sounded by a mouse button stops when the button comes up —
+        // "wherever the pointer ended up", says the release below. Except that
+        // this function used to return before it, so a release that arrived
+        // while a dialog was open, or while the window was not focused, was
+        // swallowed: the note went on sounding and went on being drawn on
+        // every view, with no gesture behind it and no way to stop it but
+        // quitting. `sounding`'s own doc names that failure and this is where
+        // it was still possible.
+        //
+        // Losing focus counts too. A press that leaves for another application
+        // never delivers its release here at all.
+        let ended = ctx.input(|i| i.pointer.any_released() || !i.focused);
+        if ended && !self.clicked.is_empty() {
+            self.clicked.clear();
+        }
         if self.dialog.is_some() {
             // **Dropped, but not silently.** A press here is somebody trying
             // to use a window that is waiting on a dialog they may not be able
@@ -3576,6 +3629,7 @@ impl IvoryApp {
             // chooser out from that would offer exactly the channel already
             // chosen.
             input_channels: self.audio_setup.as_ref().map_or(0, |s| s.input_channels()),
+            alias: self.settings.input_alias.clone(),
         });
     }
 
@@ -3919,6 +3973,45 @@ impl IvoryApp {
     }
 
     /// Put an effect in one, or take one out.
+    /// Open the desk with a plausible session on it, for a picture.
+    ///
+    /// **Filled, because an empty desk hides every proportional fault.** Twelve
+    /// blank channels prove that twelve channels fit; they say nothing about
+    /// whether a plugin's name can be read in the rack, whether the scale can
+    /// be counted, or whether a painted strip still has legible ink on it.
+    ///
+    /// Names, inserts and colours go through the ordinary setters, so what the
+    /// picture shows is what a saved settings file would produce.
+    pub fn open_mixer_for_shot(&mut self) {
+        self.mixer_open = true;
+        let strips = crate::recorder::STRIPS;
+        for (at, name) in [
+            (crate::recorder::Strip::Slot(0).index(), "Rhodes"),
+            (crate::recorder::Strip::Input(0).index(), "x - 3"),
+            (crate::recorder::Strip::Input(1).index(), "x - 4 vox"),
+        ] {
+            self.commit_mixer_name(at, name.to_owned());
+        }
+        // A long name and a short one, in the first bay and the last, so the
+        // picture shows both what fits and what has to be cut.
+        for (strip, slot, path) in [
+            (crate::recorder::Strip::Slot(0).index(), 0, "/x/FabFilter Pro-R 2.vst3"),
+            (crate::recorder::Strip::Slot(0).index(), 2, "/x/Pro-Q 4.vst3"),
+            (crate::recorder::Strip::Input(0).index(), 0, "/x/Pro-C 3.vst3"),
+            (crate::recorder::Strip::Track.index(), 1, "/x/Saturn 2.vst3"),
+            (strips, 0, "/x/Pro-L 2.vst3"),
+        ] {
+            self.set_insert(strip, slot, Some(path));
+        }
+        if let Some(c) = self
+            .settings
+            .strip_colors
+            .get_mut(crate::recorder::Strip::Slot(0).index())
+        {
+            *c = 3;
+        }
+    }
+
     pub fn set_insert(&mut self, strip: usize, slot: usize, path: Option<&str>) {
         let need = (crate::recorder::STRIPS + 1) * crate::recorder::INSERTS;
         if self.settings.strip_inserts.len() < need {
@@ -5292,6 +5385,12 @@ impl IvoryApp {
                 }
             }
             DialogAction::ChooseInputChannels => self.open_input_channels(),
+            // Saved on every keystroke, like every other Setup control: the
+            // panel has no OK button, so there is no later moment to save at.
+            DialogAction::SetInputAlias(name) => {
+                self.settings.input_alias = name;
+                self.save_settings();
+            }
             // Setup closes and the picker opens in its place, which is the same
             // hand-off the band's own mic icon makes — one device chooser, not
             // two lists of the same hardware.
@@ -6179,6 +6278,19 @@ impl IvoryApp {
             self.demo_menu_done = true;
             self.setup_open = true;
         }
+        // **Audio Setup**, which is now where the interface's short name is
+        // typed as well as where the path is chosen. Held until the host has
+        // handed over `audio_setup`: opened on the first frame the panel would
+        // list no systems and no rates, which is a picture of a different
+        // dialog.
+        //   IVORY_INLINE=audio /Applications/Tangent.app/Contents/MacOS/tangent
+        if !self.demo_menu_done
+            && self.audio_setup.is_some()
+            && std::env::var("IVORY_INLINE").as_deref() == Ok("audio")
+        {
+            self.demo_menu_done = true;
+            self.open_audio_setup();
+        }
         // The mixer, on the first frame, so it can be photographed without a
         // keypress — which on a shared desktop is a keypress that might land
         // somewhere else.
@@ -6873,7 +6985,11 @@ impl IvoryApp {
             if ctx.input(|i| i.pointer.secondary_pressed()) {
                 if let Some(pos) = ctx.pointer_interact_pos().filter(|p| rect.contains(*p)) {
                     let view = self.mixer_view();
-                    self.mixer_palette = crate::mixer_panel::strip_at(rect, &view, pos);
+                    // Not the master: see `Hit::Palette`. `strip_at` answers
+                    // with the master's index like any other, so the refusal
+                    // belongs here as well as there.
+                    self.mixer_palette = crate::mixer_panel::strip_at(rect, &view, pos)
+                        .filter(|i| *i < crate::recorder::Strip::shown().len());
                 }
             }
             let pressed = ctx.input(|i| i.pointer.primary_pressed());
