@@ -1557,10 +1557,33 @@ impl Rack {
     /// it for the UI thread to drop.
     fn swap(&mut self) {
         for i in 0..INSERTS {
-            while let Ok(next) = self.incoming[i].pop() {
-                let old = std::mem::replace(&mut self.slots[i], next);
-                let _ = self.retiring[i].push(old);
+            // **Room to give the old one back, checked BEFORE taking the new
+            // one.** This was `while let Ok(next) = incoming.pop()` followed by
+            // `let _ = retiring.push(old)`, and `let _` on an rtrb push is a
+            // trap: `PushError::Full(T)` carries the value, so discarding the
+            // `Result` DROPS the `PluginBox` — which runs `IComponent::terminate`,
+            // frees the vendor's sample memory and joins its worker threads,
+            // on the audio callback, between two blocks.
+            //
+            // It is reachable: `hand_off_insert` gives up after `RETIRE_TIMEOUT`
+            // and leaves the retired plugin sitting in the ring, so the next
+            // load finds `retiring` full.
+            //
+            // The instrument slots have always had this right — see
+            // `swap_plugins`, which tests `retiring.slots() == 0` first and
+            // leaves the arrival in its ring for the next block. This is that,
+            // and the two protocols are now the same protocol.
+            if self.retiring[i].slots() == 0 {
+                continue;
             }
+            let Ok(next) = self.incoming[i].pop() else {
+                continue;
+            };
+            let old = std::mem::replace(&mut self.slots[i], next);
+            // Cannot fail: the room was checked one line above and this is the
+            // only producer. Still not `unwrap` — a panic here is a panic on
+            // the audio thread.
+            let _ = self.retiring[i].push(old);
         }
     }
 
@@ -4636,6 +4659,25 @@ impl Drop for Engine {
     /// all three and then waiting — would have the UI thread holding a deadline
     /// for a callback that may already have stopped.
     fn drop(&mut self) {
+        // **Every insert too, and its window BEFORE its instance.**
+        //
+        // This unloaded the instrument slots and nothing else, and then the
+        // fields dropped in declaration order: `stream` is first, so the
+        // callback box went, then the `Renderer`, then `racks`, and every
+        // insert's `Hosted` was terminated — and only after all that did
+        // `insert_editors` drop and call `IPlugView::removed()` and
+        // `setFrame(null)` on a view whose controller no longer existed.
+        //
+        // That is precisely the lifetime rule `editors` is documented with and
+        // ordered for, and it was reachable by quitting with an effect's
+        // window open. `load_insert(.., None)` is the whole teardown in the
+        // right order: close the window, drop the controller reference, then
+        // retire the instance and drop it HERE, on this thread.
+        for strip in 0..=STRIPS {
+            for slot in 0..INSERTS {
+                let _ = self.load_insert(strip, slot, None);
+            }
+        }
         for slot in 0..SLOTS {
             self.unload_plugin(slot);
         }
@@ -6112,6 +6154,170 @@ mod tests {
             data2: bytes[2],
         })
         .expect("the test ring is large enough");
+    }
+
+    /// **The engine retires its own inserts, on this thread, before anything
+    /// else drops.**
+    ///
+    /// `Drop for Engine` unloaded the instrument slots and nothing else, and
+    /// then the fields dropped in declaration order — `stream` is first, so the
+    /// callback box went, then the `Renderer`, then `racks`, and every insert's
+    /// instance was terminated from wherever cpal happens to free its closure.
+    /// Only after all of that did `insert_editors` drop and call
+    /// `IPlugView::removed()` and `setFrame(null)` on a view whose controller
+    /// no longer existed — which is precisely the rule `editors` is documented
+    /// with and ordered for, and it was reachable by quitting with an effect's
+    /// window open.
+    ///
+    /// **What this test cannot do, honestly.** The window half is not reachable
+    /// from a test harness: libtest runs every test on a spawned thread, even
+    /// at `--test-threads=1`, and `Editor::open_handle` refuses with "a plugin
+    /// editor can only be opened on the main thread" — correctly, because that
+    /// is what VST3 and AppKit require. So this tests the teardown PRIMITIVE
+    /// that `Drop` now calls for every bay, and the ordering above it is two
+    /// lines of reading. The window path is exercised by quitting the app with
+    /// an effect window open.
+    ///
+    /// Ignored like every test that opens somebody else's binary.
+    ///
+    ///     cargo test -p ivory an_insert_is_retired -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs an audio device and FabFilter Pro-R 2; runs a vendor's initialiser"]
+    fn an_insert_is_retired_by_the_call_drop_makes() {
+        let Some(bundle) = ivory_host::discover().into_iter().find(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().contains("Pro-R"))
+                .unwrap_or(false)
+        }) else {
+            panic!("no VST3 matching Pro-R; this test needs one installed");
+        };
+        let mut engine = Engine::start(None).expect("an audio output");
+        let at = Strip::Track.index();
+        engine
+            .load_insert(at, 0, Some(&bundle))
+            .expect("an effect must load on an insert");
+        assert!(engine.insert(at, 0).is_some(), "nothing was loaded");
+        assert!(
+            !engine.insert_editor_open(at, 0),
+            "a window opened that nobody asked for"
+        );
+
+        // The exact call `Drop for Engine` now makes for every bay: close the
+        // window, drop the controller reference, retire the instance and drop
+        // it HERE rather than in the callback box's teardown.
+        engine
+            .load_insert(at, 0, None)
+            .expect("unloading an insert must not fail");
+        assert!(engine.insert(at, 0).is_none(), "the bay kept its effect");
+        assert!(!engine.insert_editor_open(at, 0), "a window survived the unload");
+
+        // And dropping a live engine with a loaded insert completes.
+        engine
+            .load_insert(at, 1, Some(&bundle))
+            .expect("an effect must load on an insert");
+        drop(engine);
+    }
+
+    /// **A rack never drops a plugin, and the proof is that it declines to take
+    /// the new one.**
+    ///
+    /// The callback may not run a vendor's teardown: `terminate` frees sample
+    /// memory and joins worker threads, and doing that between two blocks of
+    /// audio is a dropout at best. So the protocol is that the old instance
+    /// goes BACK for the UI thread to drop, and the only way to guarantee that
+    /// is to check there is room for it before taking the new one.
+    ///
+    /// `Rack::swap` did the opposite — pop, replace, `let _ = push(old)` — and
+    /// `let _` on an rtrb push is a trap, because `PushError::Full(T)` carries
+    /// the value: discarding the `Result` drops the plugin, on the audio
+    /// thread, exactly where it must not happen. It is reachable, because
+    /// `hand_off_insert` gives up after `RETIRE_TIMEOUT` and leaves the old one
+    /// sitting in the ring, so the next load finds `retiring` full.
+    ///
+    /// Measured by OCCUPANCY, which needs no real plugin: with no room to give
+    /// one back, the arrival must still be in its ring afterwards.
+    #[test]
+    fn a_full_retiring_ring_makes_a_rack_wait_rather_than_drop() {
+        let mut to_audio = Vec::new();
+        let mut from_audio = Vec::new();
+        let mut inc = Vec::new();
+        let mut ret = Vec::new();
+        for _ in 0..INSERTS {
+            let (t, i) = RingBuffer::<PluginBox>::new(1);
+            let (r, f) = RingBuffer::<PluginBox>::new(1);
+            to_audio.push(t);
+            inc.push(i);
+            ret.push(r);
+            from_audio.push(f);
+        }
+        let mut inc = inc.into_iter();
+        let mut ret = ret.into_iter();
+        let mut rack = Rack {
+            slots: std::array::from_fn(|_| PluginBox(None)),
+            incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
+            retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
+        };
+
+        // Bay 0's retiring ring is full — the UI thread timed out and never
+        // collected what it was given.
+        rack.retiring[0].push(PluginBox(None)).expect("room for one");
+        // And a fresh plugin has been sent to that bay.
+        to_audio[0].push(PluginBox(None)).expect("room for one");
+        assert_eq!(rack.incoming[0].slots(), 1, "the arrival never reached the ring");
+
+        rack.swap();
+
+        assert_eq!(
+            rack.incoming[0].slots(),
+            1,
+            "the rack took a plugin it had nowhere to put the old one - which is \
+             a `terminate` on the audio thread"
+        );
+
+        // And once the UI thread collects, the very next swap goes through.
+        from_audio[0].pop().expect("the retired one was there to collect");
+        rack.swap();
+        assert_eq!(rack.incoming[0].slots(), 0, "the rack never took the arrival");
+        assert_eq!(from_audio[0].slots(), 1, "the displaced one was not handed back");
+    }
+
+    /// The other bays are untouched by a bay that is waiting.
+    #[test]
+    fn one_stuck_bay_does_not_stall_the_rest_of_the_rack() {
+        let mut to_audio = Vec::new();
+        let mut from_audio = Vec::new();
+        let mut inc = Vec::new();
+        let mut ret = Vec::new();
+        for _ in 0..INSERTS {
+            let (t, i) = RingBuffer::<PluginBox>::new(1);
+            let (r, f) = RingBuffer::<PluginBox>::new(1);
+            to_audio.push(t);
+            inc.push(i);
+            ret.push(r);
+            from_audio.push(f);
+        }
+        let mut inc = inc.into_iter();
+        let mut ret = ret.into_iter();
+        let mut rack = Rack {
+            slots: std::array::from_fn(|_| PluginBox(None)),
+            incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
+            retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
+        };
+        rack.retiring[0].push(PluginBox(None)).expect("room for one");
+        for t in &mut to_audio {
+            t.push(PluginBox(None)).expect("room for one");
+        }
+
+        rack.swap();
+
+        assert_eq!(rack.incoming[0].slots(), 1, "bay 0 should still be waiting");
+        for i in 1..INSERTS {
+            assert_eq!(
+                rack.incoming[i].slots(),
+                0,
+                "bay {i} was held up by a bay it has nothing to do with"
+            );
+        }
     }
 
     /// **Mute, solo, and the one interaction between them.**

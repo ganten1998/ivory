@@ -1551,6 +1551,12 @@ impl IvoryApp {
     /// So the alias makes the DEFAULT name — "x - 3" — and typing here
     /// replaces it, which is what a default is for.
     fn commit_mixer_name(&mut self, at: usize, name: String) {
+        // **A COLUMN, converted.** `at` is where the field was drawn and
+        // `strip_names` is a desk array, and the two agree on every column but
+        // the last — so the master's name was being written into the CLICK's
+        // slot while `mixer_view` read it back from `STRIPS`. Third time this
+        // aliasing has shipped; `Strip::column_index` exists for it.
+        let at = crate::recorder::Strip::column_index(at);
         let name = name.trim().to_owned();
         if self.settings.strip_names.len() <= crate::recorder::STRIPS {
             self.settings
@@ -1721,7 +1727,11 @@ impl IvoryApp {
                 // Seeded with what is THERE, default or not: a name is
                 // edited, and starting from the default is how somebody makes
                 // "x - 3" into "x - 3 vox" without typing it twice.
-                let seed = match self.settings.strip_names.get(i) {
+                let seed = match self
+                    .settings
+                    .strip_names
+                    .get(Strip::column_index(i))
+                {
                     Some(n) if !n.is_empty() => n.clone(),
                     // Nothing typed yet, so the field starts from the DEFAULT —
                     // "x - 3" for an input, "BACKING" for the track. Editing a
@@ -8063,6 +8073,49 @@ mod tests {
             assert!(
                 (got - want).abs() < 1.0e-6,
                 "{what} reset to {got}, not to its default {want}"
+            );
+        }
+    }
+
+    /// **Every column names ITSELF, the master included.**
+    ///
+    /// Written as a sweep rather than one case, because the fault is never in
+    /// one arm: `Hit::Name` carries a COLUMN and `strip_names` is a DESK array,
+    /// and those agree on every column but the last — so the master's name was
+    /// written into the CLICK's slot while the view read it back from `STRIPS`,
+    /// and renaming the master looked like a field that simply did nothing.
+    /// That is the third time this aliasing has shipped.
+    #[test]
+    fn every_column_writes_its_own_name_and_no_others() {
+        use crate::recorder::{Strip, COLUMNS_FOR_TEST, STRIPS};
+        for col in 0..COLUMNS_FOR_TEST {
+            let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+            app.commit_mixer_name(col, format!("col{col}"));
+            let named: Vec<usize> = (0..=STRIPS)
+                .filter(|i| {
+                    app.settings.strip_names.get(*i).is_some_and(|n| !n.is_empty())
+                })
+                .collect();
+            assert_eq!(
+                named,
+                vec![Strip::column_index(col)],
+                "column {col} ({:?}) named {named:?}",
+                Strip::column(col)
+            );
+        }
+    }
+
+    /// And what it names is what the desk reads back for that column.
+    #[test]
+    fn a_typed_name_is_the_one_the_desk_shows() {
+        use crate::recorder::COLUMNS_FOR_TEST;
+        for col in 0..COLUMNS_FOR_TEST {
+            let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+            app.commit_mixer_name(col, "Rhodes".to_owned());
+            assert_eq!(
+                app.mixer_view().strips[col].name,
+                "Rhodes",
+                "column {col} does not show the name it was given"
             );
         }
     }
