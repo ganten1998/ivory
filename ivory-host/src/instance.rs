@@ -804,6 +804,8 @@ pub struct Instance {
     active: bool,
     processing: bool,
     audio_out: Vec<Bus>,
+    /// The audio the plugin wants FED to it. Empty on an instrument.
+    audio_in: Vec<Bus>,
     event_in: Vec<Bus>,
     /// CC-to-parameter, `channel * CTRL_COUNT + controller`, read once at
     /// creation. `kNoParamId` means this plugin published nothing for it.
@@ -971,10 +973,20 @@ impl Instance {
             MediaTypes_::kEvent as i32,
             BusDirections_::kInput as i32,
         );
+        // **And the audio INPUTS, which an instrument does not have and an
+        // effect is nothing without.** Read here with the rest of the layout
+        // so the scratch can be sized for them; a plugin handed `numInputs: 0`
+        // processes silence and returns `kResultOk`, which is a reverb that
+        // appears to load and does nothing.
+        let audio_in = read_buses(
+            &component,
+            MediaTypes_::kAudio as i32,
+            BusDirections_::kInput as i32,
+        );
         // **The last allocation this instance makes.** Everything `process`
         // needs is sized here, from the layout the plugin has just described and
         // from `setup.max_block`; see [`Scratch`].
-        let scratch = match Scratch::new(setup.max_block, &audio_out) {
+        let scratch = match Scratch::new(setup.max_block, &audio_out, &audio_in) {
             Ok(s) => s,
             Err(why) => {
                 release_controller(editing);
@@ -994,6 +1006,7 @@ impl Instance {
             active: false,
             processing: false,
             audio_out,
+            audio_in,
             event_in,
             midi_map,
             changes,
@@ -1089,6 +1102,33 @@ impl Instance {
         }
         self.processing = on;
         Ok(())
+    }
+
+    /// The audio buses this plugin wants fed. Empty on an instrument, which is
+    /// what tells the two apart at the point it matters.
+    pub fn audio_inputs(&self) -> &[Bus] {
+        &self.audio_in
+    }
+
+    /// Run a block THROUGH the plugin: audio in, audio out.
+    ///
+    /// **The effect path, and the only one that fills `ProcessData::inputs`.**
+    /// [`process`](Instance::process) leaves them null because an instrument
+    /// makes its sound from notes; an effect handed nothing processes silence
+    /// and reports success, which is a reverb that loads and does nothing.
+    ///
+    /// `input` is one `Vec` per channel, at least `frames` long. A plugin
+    /// wanting more channels than it is given has the last one repeated —
+    /// mono into a stereo reverb is the ordinary case and refusing it would be
+    /// a refusal nobody could act on.
+    pub fn process_effect(
+        &mut self,
+        input: &[Vec<f32>],
+        frames: usize,
+        out: &mut [Vec<f32>],
+    ) -> Result<usize, String> {
+        self.process_through(&[], &[], input, frames, out)
+            .map(|r| r.frames)
     }
 
     pub fn audio_outputs(&self) -> &[Bus] {
@@ -1311,6 +1351,23 @@ impl Instance {
         frames: usize,
         out: &mut [Vec<f32>],
     ) -> Result<Rendered, String> {
+        self.process_through(events, controls, &[], frames, out)
+    }
+
+    /// The one `process` call. Notes, controls, audio in, audio out.
+    ///
+    /// **Both paths go through here** so that an instrument and an effect
+    /// cannot drift apart in how they set up a block — the parameter changes,
+    /// the event list and the output binding are the same work, and the only
+    /// difference is whether `ProcessData::inputs` is filled.
+    fn process_through(
+        &mut self,
+        events: &[Note],
+        controls: &[Control],
+        input: &[Vec<f32>],
+        frames: usize,
+        out: &mut [Vec<f32>],
+    ) -> Result<Rendered, String> {
         if frames > self.setup.max_block as usize {
             return Err(format!(
                 "asked for {frames} frames but the plugin was set up for {}",
@@ -1404,14 +1461,17 @@ impl Instance {
         // Last, deliberately: `bind` hands back a raw pointer into the scratch
         // and nothing may take `&mut self` between here and `process`.
         let (outputs, bus_count) = self.scratch.bind(channels, frames, out);
+        // **Bound after the outputs**, and both point into the same scratch:
+        // nothing may take `&mut self` between here and `process`.
+        let (inputs, in_count) = self.scratch.bind_inputs(input, frames);
 
         let mut data = ProcessData {
             processMode: ProcessModes_::kRealtime as i32,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
             numSamples: frames as i32,
-            numInputs: 0,
+            numInputs: in_count as i32,
             numOutputs: bus_count as i32,
-            inputs: std::ptr::null_mut(),
+            inputs,
             outputs,
             inputParameterChanges: self.changes_ptr.as_ptr(),
             outputParameterChanges: std::ptr::null_mut(),
@@ -1872,6 +1932,10 @@ struct Scratch {
     /// is where [`Scratch::bind`] reads the layout back from; only the pointer
     /// and the silence flags are rewritten per block.
     buses: Vec<AudioBusBuffers>,
+    /// One block for every input channel of every input bus, contiguous.
+    in_samples: Vec<f32>,
+    in_ptrs: Vec<*mut f32>,
+    in_buses: Vec<AudioBusBuffers>,
     /// The event list and the interface pointer handed to the plugin, held for
     /// the same reason `changes`/`changes_ptr` are: `to_com_ptr` clones an
     /// `Arc`, which is an atomic increment on the audio thread for a pointer
@@ -1883,7 +1947,7 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(max_block: i32, audio_out: &[Bus]) -> Result<Self, String> {
+    fn new(max_block: i32, audio_out: &[Bus], audio_in: &[Bus]) -> Result<Self, String> {
         let max_block = max_block.max(0) as usize;
         let channels = |b: &Bus| b.channels.max(0) as usize;
         let main = audio_out.first().map(&channels).unwrap_or(0);
@@ -1917,11 +1981,38 @@ impl Scratch {
             push(channels(b));
         }
 
+        // ── the input side ──────────────────────────────────────────────
+        //
+        // Sized the same way and for the same reason. An instrument has no
+        // input buses at all, so all of this is empty and costs nothing; an
+        // effect usually has exactly one stereo bus.
+        //
+        // **Every input channel gets scratch of its own**, unlike the outputs,
+        // which borrow the caller's. The caller hands over as many channels as
+        // it has and the plugin may want more — mono into a stereo reverb is
+        // the ordinary case — so the samples are COPIED into buffers that are
+        // always the right width. A plugin handed a short array walks off the
+        // end of it.
+        let in_channels: usize = audio_in.iter().map(&channels).sum();
+        let mut in_buses = Vec::with_capacity(audio_in.len());
+        for b in audio_in {
+            in_buses.push(AudioBusBuffers {
+                numChannels: channels(b) as i32,
+                silenceFlags: 0,
+                __field0: AudioBusBuffers__type0 {
+                    channelBuffers32: std::ptr::null_mut(),
+                },
+            });
+        }
+
         Ok(Self {
             ptrs: vec![std::ptr::null_mut(); main],
             aux: vec![0.0; aux_channels * max_block],
             aux_ptrs: vec![std::ptr::null_mut(); aux_channels],
             buses,
+            in_samples: vec![0.0; in_channels * max_block],
+            in_ptrs: vec![std::ptr::null_mut(); in_channels],
+            in_buses,
             events,
             events_ptr,
             max_block,
@@ -1943,6 +2034,64 @@ impl Scratch {
     ///   freshly allocated (and therefore zeroed) every block, and a plugin
     ///   that sums into its outputs rather than overwriting them would
     ///   otherwise accumulate into last block's numbers until it overflowed.
+    /// Copy this block's input into the scratch and point the input buses at
+    /// it. Returns the array and its length for `ProcessData`.
+    ///
+    /// **Null and zero when there is nothing to feed**, which is every
+    /// instrument: a plugin with no input buses must be handed `numInputs: 0`,
+    /// and one WITH them that we have no audio for is better fed silence than
+    /// a dangling pointer.
+    ///
+    /// Allocates nothing and cannot panic: every index goes through `get`, and
+    /// the scratch was sized from the bus layout before the audio thread ever
+    /// saw this instance.
+    fn bind_inputs(&mut self, input: &[Vec<f32>], frames: usize) -> (*mut AudioBusBuffers, usize) {
+        if self.in_buses.is_empty() {
+            return (std::ptr::null_mut(), 0);
+        }
+        let frames = frames.min(self.max_block);
+        let mut at = 0usize;
+        for (bus, buf) in self.in_buses.iter_mut().enumerate() {
+            let want = buf.numChannels.max(0) as usize;
+            for c in 0..want {
+                let start = (at + c) * self.max_block;
+                let Some(dst) = self.in_samples.get_mut(start..start + frames) else {
+                    continue;
+                };
+                // **The last channel repeats.** Mono into a stereo reverb is
+                // the ordinary case; the alternative is silence down one side,
+                // which sounds like a broken plugin rather than a mono source.
+                // Only the FIRST bus is fed at all — the others are side-chains
+                // and this app has nothing to put in one.
+                let src = (bus == 0)
+                    .then(|| input.get(c).or_else(|| input.last()))
+                    .flatten();
+                match src {
+                    Some(ch) => {
+                        for (d, s) in dst.iter_mut().zip(ch.iter()) {
+                            *d = *s;
+                        }
+                        // A short channel leaves the tail of the block silent
+                        // rather than holding the last sample.
+                        for d in dst.iter_mut().skip(ch.len()) {
+                            *d = 0.0;
+                        }
+                    }
+                    None => dst.fill(0.0),
+                }
+                if let Some(p) = self.in_ptrs.get_mut(at + c) {
+                    *p = self.in_samples[start..].as_mut_ptr();
+                }
+            }
+            buf.__field0.channelBuffers32 = match self.in_ptrs.get_mut(at) {
+                Some(p) => p as *mut *mut f32,
+                None => std::ptr::null_mut(),
+            };
+            at += want;
+        }
+        (self.in_buses.as_mut_ptr(), self.in_buses.len())
+    }
+
     fn bind(
         &mut self,
         channels: usize,
@@ -2882,6 +3031,69 @@ mod tests {
         assert_eq!(quiet, 0);
     }
 
+    /// **An effect is fed audio, and a plugin that wants more channels than
+    /// it is handed gets the last one repeated.**
+    ///
+    /// The binding is the whole of what makes an effect possible: every
+    /// `process` call before this one set `numInputs: 0` and `inputs: null`,
+    /// which a plugin answers by processing silence and reporting success — a
+    /// reverb that loads and does nothing.
+    ///
+    /// Checked through the scratch rather than through a plugin, because the
+    /// thing that can be wrong here is pointer arithmetic and there is no
+    /// third-party reverb on a build machine.
+    #[test]
+    fn an_effects_input_is_bound_channel_by_channel() {
+        let stereo_in = vec![Bus {
+            name: "in".into(),
+            channels: 2,
+            aux: false,
+        }];
+        let stereo_out = vec![Bus {
+            name: "out".into(),
+            channels: 2,
+            aux: false,
+        }];
+        let mut scratch =
+            Scratch::new(64, &stereo_out, &stereo_in).expect("build the scratch");
+
+        // MONO in, stereo wanted: the one channel is copied to both sides.
+        let mono = vec![vec![0.25_f32; 8]];
+        let (ptr, count) = scratch.bind_inputs(&mono, 8);
+        assert!(!ptr.is_null(), "an effect was handed no input at all");
+        assert_eq!(count, 1, "one input bus");
+        // SAFETY: the pointer is into `scratch`, which outlives this block, and
+        // `count` is the length `bind_inputs` just reported.
+        let bus = unsafe { &*ptr };
+        assert_eq!(bus.numChannels, 2);
+        for c in 0..2usize {
+            // SAFETY: two channels, as the bus says, each `max_block` long.
+            let ch = unsafe { *bus.__field0.channelBuffers32.add(c) };
+            let samples = unsafe { std::slice::from_raw_parts(ch, 8) };
+            assert!(
+                samples.iter().all(|v| (v - 0.25).abs() < 1e-9),
+                "channel {c} was not fed: {samples:?}"
+            );
+        }
+
+        // A SHORT channel leaves the tail silent rather than holding the last
+        // sample, which would be a click repeated for the rest of the block.
+        let short = vec![vec![1.0_f32; 3], vec![1.0_f32; 3]];
+        let (ptr, _) = scratch.bind_inputs(&short, 8);
+        let bus = unsafe { &*ptr };
+        let ch = unsafe { *bus.__field0.channelBuffers32 };
+        let samples = unsafe { std::slice::from_raw_parts(ch, 8) };
+        assert_eq!(&samples[..3], &[1.0, 1.0, 1.0]);
+        assert!(samples[3..].iter().all(|v| *v == 0.0), "{samples:?}");
+
+        // **An instrument is handed nothing at all.** No input buses means
+        // `numInputs: 0` and a null array, which is what every VST3 host does
+        // and what this one did unconditionally until now.
+        let mut instrument = Scratch::new(64, &stereo_out, &[]).expect("scratch");
+        let (ptr, count) = instrument.bind_inputs(&mono, 8);
+        assert!(ptr.is_null() && count == 0, "an instrument was fed audio");
+    }
+
     #[test]
     fn a_block_of_process_scratch_is_bound_without_touching_the_allocator() {
         // Everything `process` does on the host's side of the plugin call,
@@ -2898,7 +3110,7 @@ mod tests {
                 aux: i > 0,
             })
             .collect();
-        let mut scratch = Scratch::new(512, &buses).expect("build the scratch");
+        let mut scratch = Scratch::new(512, &buses, &[]).expect("build the scratch");
         let changes = ParamChanges::new();
         let mut out: Vec<Vec<f32>> = vec![vec![0.0; 512]; 2];
         let notes = [
