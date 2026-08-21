@@ -486,6 +486,25 @@ pub struct Settings {
     pub master_gain: f64,
     /// The backing track's level, linear.
     pub track_gain: f64,
+    /// The instrument bus's own fader, and the effects bus's return.
+    ///
+    /// **Both new with the mixer, both unity.** Every other level on the desk
+    /// already existed and is already drawn in the band; these two are the
+    /// channels that had no fader because they were not channels yet.
+    pub instrument_gain: f64,
+    pub fx_return_gain: f64,
+    /// How much of each strip goes to the effects bus, 0..=1, in
+    /// [`crate::recorder::Strip::ALL`] order.
+    ///
+    /// **The default is the routing this app had before the mixer**: the
+    /// instrument sends everything and nothing else sends anything, which is
+    /// what an insert on the instrument bus was.
+    pub strip_sends: [f64; 5],
+    /// Mute and solo, as bitmasks over the same order. A mask rather than five
+    /// keys, because "is anything soloed" is a question about all of them at
+    /// once and five keys is five chances to answer it from a stale half.
+    pub strip_muted: u32,
+    pub strip_soloed: u32,
     /// Whether the after-a-take report appears. A take with a PROBLEM ignores
     /// this: see [`crate::dialogs::Dialog::TakeSummary`].
     pub show_take_summary: bool,
@@ -693,6 +712,12 @@ impl Default for Settings {
             input_gain: 1.0,
             master_gain: 1.0,
             track_gain: 1.0,
+            instrument_gain: 1.0,
+            fx_return_gain: 1.0,
+            // The instrument sends everything; nothing else sends anything.
+            strip_sends: [1.0, 0.0, 0.0, 0.0, 0.0],
+            strip_muted: 0,
+            strip_soloed: 0,
             show_take_summary: true,
             track_path: String::new(),
             track_in: 0.0,
@@ -1170,6 +1195,19 @@ impl Settings {
         take_opt_str(&mut map, "record_take_name", &mut s.record_take_name);
         take_opt_str(&mut map, "record_camera_uid", &mut s.record_camera_uid);
         take_opt_str(&mut map, "record_audio_device", &mut s.record_audio_device);
+        if let Some(Value::Array(v)) = map.shift_remove("strip_sends") {
+            for (i, x) in v.iter().take(5).enumerate() {
+                if let Some(n) = x.as_f64() {
+                    s.strip_sends[i] = n.clamp(0.0, 1.0);
+                }
+            }
+        }
+        if let Some(n) = map.shift_remove("strip_muted").and_then(|v| v.as_u64()) {
+            s.strip_muted = n as u32;
+        }
+        if let Some(n) = map.shift_remove("strip_soloed").and_then(|v| v.as_u64()) {
+            s.strip_soloed = n as u32;
+        }
         if let Some(Value::Array(v)) = map.shift_remove("record_input_channels") {
             s.record_input_channels = v
                 .into_iter()
@@ -1299,6 +1337,8 @@ impl Settings {
         take_gain(&mut map, "input_gain", &mut s.input_gain);
         take_gain(&mut map, "master_gain", &mut s.master_gain);
         take_gain(&mut map, "track_gain", &mut s.track_gain);
+        take_gain(&mut map, "instrument_gain", &mut s.instrument_gain);
+        take_gain(&mut map, "fx_return_gain", &mut s.fx_return_gain);
         if let Some(Value::String(path)) = map.shift_remove("track_path") {
             s.track_path = path;
         }
@@ -1670,6 +1710,17 @@ impl Settings {
                 map.insert(key.into(), Value::String(v.clone()));
             }
         }
+        map.insert(
+            "instrument_gain".into(),
+            Value::from(self.instrument_gain),
+        );
+        map.insert("fx_return_gain".into(), Value::from(self.fx_return_gain));
+        map.insert(
+            "strip_sends".into(),
+            Value::Array(self.strip_sends.iter().map(|v| Value::from(*v)).collect()),
+        );
+        map.insert("strip_muted".into(), Value::from(self.strip_muted));
+        map.insert("strip_soloed".into(), Value::from(self.strip_soloed));
         map.insert(
             "record_input_channels".into(),
             Value::Array(
@@ -2081,6 +2132,8 @@ impl Settings {
                 input: self.input_gain as f32,
                 master: self.master_gain as f32,
                 track: self.track_gain as f32,
+                instrument: self.instrument_gain as f32,
+                fx_return: self.fx_return_gain as f32,
             },
             metronome_on: self.metronome_on,
             metronome_in_take: self.metronome_in_take,

@@ -385,6 +385,107 @@ pub struct Gains {
     pub master: f32,
     /// The backing track, which rolls with the transport.
     pub track: f32,
+    /// **The instrument bus, as a channel.** The slots have had faders for
+    /// releases; what they have not had is a level for the bus they are summed
+    /// onto, which is what a strip needs to exist.
+    pub instrument: f32,
+    /// What comes back from the effects bus, at its own fader.
+    pub fx_return: f32,
+}
+
+/// A channel of the desk.
+///
+/// **Declared here rather than in the host** so that a painter can name one
+/// without reaching across the firewall, and converted on the other side by an
+/// exhaustive match — which is what makes the two orders provably the same
+/// rather than the same by inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Strip {
+    Instrument,
+    Input,
+    Track,
+    Click,
+    /// The return from the effects bus. It has no send of its own: a bus that
+    /// could feed itself is a bus that howls.
+    Fx,
+}
+
+impl Strip {
+    /// Every strip, in the order they are drawn.
+    pub const ALL: [Strip; 5] = [
+        Strip::Instrument,
+        Strip::Input,
+        Strip::Track,
+        Strip::Click,
+        Strip::Fx,
+    ];
+
+    /// The four that can send to the effects bus.
+    pub const SENDERS: [Strip; 4] = [Strip::Instrument, Strip::Input, Strip::Track, Strip::Click];
+
+    /// Its place in `Desk`'s arrays.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// What the strip is called on screen.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Strip::Instrument => "INSTRUMENT",
+            Strip::Input => "INPUT",
+            Strip::Track => "BACKING",
+            Strip::Click => "CLICK",
+            Strip::Fx => "FX BUS",
+        }
+    }
+}
+
+/// The routing half of the desk: what goes to the effects, and what is heard.
+///
+/// **Levels are in [`Gains`] and not here**, because every one of them already
+/// existed and is already pushed: the mixer's faders are the band's faders seen
+/// a second time, which is the whole reason the band can stay exactly as it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Desk {
+    /// How much of each sender goes to the effects bus, 0..=1. Indexed by
+    /// [`Strip::index`]; the `Fx` slot is unused and stays zero.
+    pub send: [f32; 5],
+    pub muted: [bool; 5],
+    pub soloed: [bool; 5],
+}
+
+impl Default for Desk {
+    /// **The routing this app had before it had a mixer.** The instrument sends
+    /// everything, nothing else sends anything, nothing is muted and nothing is
+    /// soloed — so a settings file written before any of this existed comes up
+    /// sounding exactly as it did.
+    fn default() -> Self {
+        let mut send = [0.0; 5];
+        send[Strip::Instrument.index()] = 1.0;
+        Self {
+            send,
+            muted: [false; 5],
+            soloed: [false; 5],
+        }
+    }
+}
+
+impl Desk {
+    /// Whether anything is soloed, which is what makes solo exclusive.
+    pub fn any_solo(&self) -> bool {
+        self.soloed.iter().any(|s| *s)
+    }
+
+    /// Whether a strip is heard. Solo wins, and a soloed strip is heard even
+    /// if it is also muted — pressing solo on a muted channel is a request to
+    /// hear it, and a solo button that sometimes does nothing is worse than
+    /// one that overrules.
+    pub fn heard(&self, strip: Strip) -> bool {
+        if self.any_solo() {
+            return self.soloed[strip.index()];
+        }
+        !self.muted[strip.index()]
+    }
 }
 
 impl Default for Gains {
@@ -400,6 +501,8 @@ impl Default for Gains {
             input: 1.0,
             master: 1.0,
             track: 1.0,
+            instrument: 1.0,
+            fx_return: 1.0,
         }
     }
 }
@@ -418,6 +521,9 @@ impl Default for Gains {
 pub struct RecorderState {
     pub state: RecordState,
     pub elapsed_s: f64,
+    /// The loudest thing each strip made since the last frame, in
+    /// [`Strip::ALL`] order. Pushed by the host, read by the mixer.
+    pub strip_peaks: [f32; 5],
     pub meters: Meters,
     /// The output's levels and the limiter's reduction. See the same two
     /// fields on [`RecorderView`].

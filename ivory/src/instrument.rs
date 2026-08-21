@@ -503,18 +503,21 @@ fn fold_strip(
     target: f32,
     send: f32,
     coeff: f32,
-) {
+) -> f32 {
+    let mut peak = 0.0f32;
     for f in 0..frames {
         *gain += (target - *gain) * coeff;
         let at = f * TAP_CHANNELS;
         for c in 0..TAP_CHANNELS {
-            let Some(v) = mix.get_mut(at + c) else { return };
+            let Some(v) = mix.get_mut(at + c) else { return peak };
             *v *= *gain;
+            peak = peak.max(v.abs());
             if let Some(a) = aux.get_mut(at + c) {
                 *a += *v * send;
             }
         }
     }
+    peak
 }
 
 /// Add what came back from the effects bus, at the bus's own fader.
@@ -525,15 +528,49 @@ fn add_return(
     gain: &mut f32,
     target: f32,
     coeff: f32,
-) {
+) -> f32 {
+    let mut peak = 0.0f32;
     for f in 0..frames {
         *gain += (target - *gain) * coeff;
         let at = f * TAP_CHANNELS;
         for c in 0..TAP_CHANNELS {
             let (Some(v), Some(a)) = (mix.get_mut(at + c), aux.get(at + c)) else {
-                return;
+                return peak;
             };
-            *v += *a * *gain;
+            let wet = *a * *gain;
+            peak = peak.max(wet.abs());
+            *v += wet;
+        }
+    }
+    peak
+}
+
+impl From<ivory_ui::recorder::Strip> for Strip {
+    /// **Exhaustive on purpose.** The UI declares its own `Strip` because it
+    /// may not reach across the firewall for this one; adding a channel there
+    /// and forgetting it here would silently route the new strip to whatever
+    /// index happened to line up. This way it does not compile.
+    fn from(ui: ivory_ui::recorder::Strip) -> Self {
+        use ivory_ui::recorder::Strip as Ui;
+        match ui {
+            Ui::Instrument => Strip::Instrument,
+            Ui::Input => Strip::Input,
+            Ui::Track => Strip::Track,
+            Ui::Click => Strip::Click,
+            Ui::Fx => Strip::Fx,
+        }
+    }
+}
+
+impl Shared {
+    /// Keep the loudest sample a strip has made since the UI last looked.
+    ///
+    /// `fetch_max` on the BITS, which is only correct for non-negative floats
+    /// — and these are magnitudes, so they are. The same trick the limiter's
+    /// gain reduction uses two fields up.
+    fn note_strip_peak(&self, strip: Strip, peak: f32) {
+        if peak > 0.0 {
+            self.strip_peak[strip as usize].fetch_max(peak.to_bits(), Ordering::Relaxed);
         }
     }
 }
@@ -1035,6 +1072,11 @@ struct Shared {
     send_click: AtomicU32,
     /// The effects bus's own fader, applied to what comes back from it.
     fx_return: AtomicU32,
+    /// The loudest sample each strip produced since the UI last looked, as
+    /// f32 bits. Read and RESET, like the limiter's gain reduction beside it:
+    /// a peak is a transient and an average would read as almost nothing on
+    /// exactly the material a meter is there for.
+    strip_peak: [AtomicU32; 5],
     /// One bit per strip. See [`Strip`].
     ///
     /// **Two masks rather than a flag each**, because solo is a question about
@@ -1157,6 +1199,7 @@ impl Shared {
             send_track: AtomicU32::new(0.0f32.to_bits()),
             send_click: AtomicU32::new(0.0f32.to_bits()),
             fx_return: AtomicU32::new(1.0f32.to_bits()),
+            strip_peak: std::array::from_fn(|_| AtomicU32::new(0)),
             muted: AtomicU32::new(0),
             soloed: AtomicU32::new(0),
             gr_db: AtomicU32::new(0),
@@ -1812,7 +1855,7 @@ impl Renderer {
             let inst_target = level(Strip::Instrument, &self.shared.instrument_gain);
             let inst_send = send_of(&self.shared.send_instrument);
             let coeff = self.gain_coeff;
-            fold_strip(
+            let inst_peak = fold_strip(
                 &mut self.mix,
                 &mut self.aux,
                 n,
@@ -1821,6 +1864,7 @@ impl Renderer {
                 inst_send,
                 coeff,
             );
+            self.shared.note_strip_peak(Strip::Instrument, inst_peak);
 
             // The BACKING TRACK and the INPUT, each adding itself to the mix
             // and to the bus in one pass. Both were downstream of the effects
@@ -1843,6 +1887,7 @@ impl Renderer {
                 0.0
             };
             let click_send = send_of(&self.shared.send_click);
+            let mut click_peak = 0.0f32;
             for i in 0..n {
                 let frame_index = done + i;
 
@@ -1885,6 +1930,7 @@ impl Renderer {
                 } else {
                     0.0
                 };
+                click_peak = click_peak.max(click.abs());
                 let at = i * TAP_CHANNELS;
                 for c in 0..TAP_CHANNELS {
                     if let Some(v) = self.aux.get_mut(at + c) {
@@ -1892,6 +1938,7 @@ impl Renderer {
                     }
                 }
             }
+            self.shared.note_strip_peak(Strip::Click, click_peak);
 
             // ── the bus, and then the master ───────────────────────────────
             let sends = crate::effects::Sends {
@@ -1911,7 +1958,7 @@ impl Renderer {
             }
             // What comes back, at the bus's own fader.
             let return_target = level(Strip::Fx, &self.shared.fx_return);
-            add_return(
+            let fx_peak = add_return(
                 &mut self.mix,
                 &self.aux,
                 n,
@@ -1919,6 +1966,7 @@ impl Renderer {
                 return_target,
                 coeff,
             );
+            self.shared.note_strip_peak(Strip::Fx, fx_peak);
 
             let master_sends = crate::effects::Sends {
                 reverb: 0.0,
@@ -2084,6 +2132,7 @@ impl Renderer {
             return;
         }
         let frames_got = got / ch_in;
+        let mut peak = 0.0f32;
         for i in 0..frames.min(frames_got) {
             self.monitor_gain += (target - self.monitor_gain) * self.gain_coeff;
             let at = i * TAP_CHANNELS;
@@ -2093,6 +2142,7 @@ impl Renderer {
                 // which is what a monitor is for — hearing that something is
                 // arriving, not auditioning a surround mix.
                 let src = scratch[i * ch_in + c.min(ch_in - 1)] * self.monitor_gain;
+                peak = peak.max(src.abs());
                 if let Some(v) = self.mix.get_mut(at + c) {
                     *v += src;
                 }
@@ -2102,6 +2152,7 @@ impl Renderer {
                 }
             }
         }
+        self.shared.note_strip_peak(Strip::Input, peak);
     }
 
     /// Add the backing track to the bus, if one is loaded and rolling.
@@ -2156,6 +2207,7 @@ impl Renderer {
         ) else {
             return;
         };
+        let mut peak = 0.0f32;
         for f in 0..frames {
             self.track_gain += (target - self.track_gain) * coeff;
             if self.track_pos >= out {
@@ -2167,6 +2219,7 @@ impl Renderer {
             // the audio thread if that ever stopped being true.
             if let (Some(l), Some(r)) = (clip.samples.get(at), clip.samples.get(at + 1)) {
                 let (l, r) = (l * self.track_gain, r * self.track_gain);
+                peak = peak.max(l.abs()).max(r.abs());
                 mix[f * TAP_CHANNELS] += l;
                 mix[f * TAP_CHANNELS + 1] += r;
                 // Post-fader, like every other send here. A backing track
@@ -2177,6 +2230,7 @@ impl Renderer {
             }
             self.track_pos += 1;
         }
+        self.shared.note_strip_peak(Strip::Track, peak);
     }
 
     fn render_builtin(&mut self, frames: usize, widths: &[usize; SLOTS], targets: &[f32; SLOTS]) {
@@ -3536,6 +3590,62 @@ impl Engine {
         if let Ok(mut g) = self.shared.pending_monitor.lock() {
             *g = Some(tap);
         }
+    }
+
+    /// The desk: what every strip sends to the effects bus, and what is heard.
+    ///
+    /// **Pushed whole, every frame, like the gains.** The masks are built here
+    /// rather than toggled bit by bit so that "is anything soloed" can never be
+    /// answered from a half-written state, and the `From` below is exhaustive —
+    /// which is what makes the UI's strip order and this one provably the same
+    /// rather than the same by inspection.
+    pub fn set_desk(&self, desk: &ivory_ui::recorder::Desk) {
+        let mut send = [0.0f32; 5];
+        let mut muted = 0u32;
+        let mut soloed = 0u32;
+        for ui in ivory_ui::recorder::Strip::ALL {
+            let here = Strip::from(ui);
+            send[here as usize] = desk.send[ui.index()].clamp(0.0, 1.0);
+            if desk.muted[ui.index()] {
+                muted |= here.bit();
+            }
+            if desk.soloed[ui.index()] {
+                soloed |= here.bit();
+            }
+        }
+        let sh = &self.shared;
+        sh.send_instrument
+            .store(send[Strip::Instrument as usize].to_bits(), Ordering::Relaxed);
+        sh.send_input
+            .store(send[Strip::Input as usize].to_bits(), Ordering::Relaxed);
+        sh.send_track
+            .store(send[Strip::Track as usize].to_bits(), Ordering::Relaxed);
+        sh.send_click
+            .store(send[Strip::Click as usize].to_bits(), Ordering::Relaxed);
+        sh.muted.store(muted, Ordering::Relaxed);
+        sh.soloed.store(soloed, Ordering::Relaxed);
+    }
+
+    /// The loudest thing each strip has made since this was last called, and
+    /// it CLEARS as it reads. Zero for a strip that has been silent.
+    pub fn strip_peaks(&self) -> [f32; 5] {
+        std::array::from_fn(|i| {
+            f32::from_bits(self.shared.strip_peak[i].swap(0, Ordering::Relaxed))
+        })
+    }
+
+    /// The instrument bus's own fader.
+    pub fn set_instrument_gain(&self, linear: f32) {
+        self.shared
+            .instrument_gain
+            .store(linear.clamp(0.0, 8.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// What comes back from the effects bus, at its own fader.
+    pub fn set_fx_return(&self, linear: f32) {
+        self.shared
+            .fx_return
+            .store(linear.clamp(0.0, 8.0).to_bits(), Ordering::Relaxed);
     }
 
     /// The master, as a linear gain. See [`Shared::master_gain`].

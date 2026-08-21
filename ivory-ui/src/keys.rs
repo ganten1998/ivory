@@ -53,6 +53,8 @@ pub enum KeyAction {
     /// DAW the user already owns is bound to.
     StopRecording,
     ToggleRecorder,
+    /// Swap the piano and the bands under it for the mixer, and back.
+    ToggleMixer,
     /// Fill the screen, and come back.
     ///
     /// Gated on [`Gates::window_sizing`] for the same reason every other
@@ -202,6 +204,11 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     (Key::ArrowUp, "Up", KeyAction::TransposeUp, true),
     (Key::ArrowDown, "Down", KeyAction::TransposeDown, true),
     (Key::V, "V", KeyAction::ToggleRecorder, true),
+    // **Tab, and it was free.** Nothing in this app cycled a view before the
+    // mixer, because every surface was a band you turn on; the mixer is a
+    // place you go, and Tab is what a program with more than one screen uses
+    // to go there.
+    (Key::Tab, "Tab", KeyAction::ToggleMixer, true),
     (Key::Enter, "Enter", KeyAction::StartRecording, true),
     (Key::Space, "Space", KeyAction::StopRecording, true),
     // Escape only closes the card; it is not worth a row of its own.
@@ -230,6 +237,7 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ToggleKeytoggle => "keytoggle: click the piano or the neck to place notes",
         KeyAction::ClearNotes => "clear every note you placed",
         KeyAction::ToggleFretboard => "guitar view",
+        KeyAction::ToggleMixer => "mixer view",
         KeyAction::ToggleCameraPane => "camera",
         KeyAction::CycleClef => "clef",
         KeyAction::ToggleNoteNames => "note names",
@@ -514,6 +522,56 @@ pub fn draw_help(painter: &Painter, rect: Rect, dark: bool, t: f32, gates: Gates
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Tab reaches the app, and egui does not eat it.**
+    ///
+    /// Worth a test rather than a look, because Tab is the one key in this
+    /// table that a UI toolkit has its own designs on: egui reads it in
+    /// `Memory::begin_pass` to move focus between widgets. It only READS it —
+    /// the event is left in the queue — but "only reads it" is a fact about a
+    /// version of a dependency, and this is the assertion that notices if that
+    /// ever stops being true.
+    #[test]
+    fn tab_reaches_the_mixer_rather_than_egui() {
+        let ctx = egui::Context::default();
+        let mut got = None;
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            got = pressed(ctx, Gates::default());
+        });
+        // A key nobody argues about, through the same harness, so a failure
+        // above is about Tab and not about this test.
+        let mut control = None;
+        let g = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::G,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let ctx2 = egui::Context::default();
+        let _ = ctx2.run(g, |ctx| {
+            control = pressed(ctx, Gates::default());
+        });
+        assert_eq!(control, Some(KeyAction::ToggleFretboard), "the harness is wrong");
+        assert_eq!(
+            got,
+            Some(KeyAction::ToggleMixer),
+            "Tab did not reach the app"
+        );
+    }
 
     /// The card is generated from the binding table, so a shortcut that works
     /// but is not listed cannot exist. This asserts the table itself is sane.

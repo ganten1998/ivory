@@ -959,6 +959,9 @@ impl DesktopApp {
         if let Some(e) = self.recorder.engine.as_ref() {
             state.master = e.meters();
             state.gr_db = e.gain_reduction_db();
+            // The desk's own meters. Read-and-reset on the engine's side, so
+            // this has to happen exactly once a frame and here is that once.
+            state.strip_peaks = e.strip_peaks();
             // **And the VU falls back to it when nothing else is feeding.**
             // The band's meter shows what is being recorded: the input when
             // there is one, and otherwise the instrument. With no interface
@@ -2090,6 +2093,12 @@ impl DesktopApp {
         }
         e.set_metronome_gain(gains.metronome);
         e.set_master_gain(gains.master);
+        // **The two channels that had no fader before there was a mixer**, and
+        // the routing that decides what reaches the effects bus. Pushed whole
+        // every frame, like the gains above and for the same reason.
+        e.set_instrument_gain(gains.instrument);
+        e.set_fx_return(gains.fx_return);
+        e.set_desk(&self.app.desk());
         // **And the microphone, which used to stop here.** `gains.input` was
         // packaged, drawn and dragged and had no consumer anywhere in
         // `ivory/src`: the fader moved nothing at all. It goes to the SESSION

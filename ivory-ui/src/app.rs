@@ -261,6 +261,16 @@ pub struct IvoryApp {
     /// A folder the host has been asked to choose. Drained after the frame so
     /// the native panel's nested run loop never starts inside an egui frame.
     dir_request: Option<crate::ports::DirRequest>,
+    /// The mixer is the view, in place of the piano and the bands under it.
+    ///
+    /// **Session state, not a setting.** Coming back to the app on the mixer
+    /// rather than on the piano would be a surprise every launch, and the view
+    /// costs one key to reach.
+    mixer_open: bool,
+    /// The mixer control being dragged, and where the hand started.
+    mixer_grab: Option<MixerGrab>,
+    /// Where the mixer was last drawn, so a press can be tested against it.
+    mixer_rect: Option<Rect>,
     /// The OS's own file panel is on screen right now.
     ///
     /// **Set when a panel is asked for, cleared by the HOST when it closes.**
@@ -480,6 +490,17 @@ struct Grab {
     from_value: f32,
 }
 
+/// A mixer control being dragged. The band's [`Grab`], for the other surface.
+#[derive(Clone, Copy)]
+struct MixerGrab {
+    hit: crate::mixer_panel::Hit,
+    from: Pos2,
+    moved: bool,
+    /// What it read when it was grabbed, 0..=1 — the same relative-drag
+    /// contract the band uses, so the two surfaces feel like one instrument.
+    from_value: f32,
+}
+
 /// Points of travel for a knob's whole sweep. See the panel's own constant.
 use crate::recorder_panel::KNOB_TRAVEL;
 
@@ -675,6 +696,9 @@ impl IvoryApp {
             recorder: recorder::RecorderState::default(),
             recorder_request: std::collections::VecDeque::new(),
             dir_request: None,
+            mixer_open: false,
+            mixer_grab: None,
+            mixer_rect: None,
             native_panel_up: false,
             factory_cartridge: false,
             file_request: None,
@@ -1263,6 +1287,134 @@ impl IvoryApp {
     /// One builder for all of it. The arguments were identical at seven call
     /// sites, which is seven places to forget a new one — and the one being
     /// forgotten silently is a band that draws from stale state.
+    /// What a mixer control reads now, 0..=1, for a drag to start from.
+    fn mixer_value(&self, hit: crate::mixer_panel::Hit) -> f32 {
+        use crate::mixer_panel::Hit as H;
+        let view = self.mixer_view();
+        match hit {
+            H::Fader(i) => view
+                .strips
+                .get(i)
+                .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
+            H::Send(i) => view.strips.get(i).map_or(0.0, |s| s.send),
+            H::Mute(_) | H::Solo(_) => 0.0,
+        }
+    }
+
+    /// Move a mixer control. `value` is 0..=1 off the drag.
+    ///
+    /// **Written to settings, like every other fader in this app.** The band
+    /// and the mixer show the same numbers because there is one copy of each
+    /// and both read it — which is the whole reason the band did not have to
+    /// change to make room for this.
+    fn apply_mixer_hit(&mut self, hit: crate::mixer_panel::Hit, value: f32) {
+        use crate::mixer_panel::Hit as H;
+        use crate::recorder::Strip;
+        let v = value.clamp(0.0, 1.0);
+        let gain = f64::from(recorder::fader_to_gain(v));
+        match hit {
+            H::Fader(i) => match Strip::ALL.get(i) {
+                Some(Strip::Instrument) => self.settings.instrument_gain = gain,
+                Some(Strip::Input) => self.settings.input_gain = gain,
+                Some(Strip::Track) => self.settings.track_gain = gain,
+                Some(Strip::Click) => self.settings.metronome_gain = gain,
+                Some(Strip::Fx) => self.settings.fx_return_gain = gain,
+                // Past the five strips is the master, which is index five.
+                None => self.settings.master_gain = gain,
+            },
+            H::Send(i) => {
+                if let Some(slot) = self.settings.strip_sends.get_mut(i) {
+                    *slot = f64::from(v);
+                }
+            }
+            // **A press, not a drag**, so it acts on the way down and the
+            // value is ignored.
+            H::Mute(i) => self.settings.strip_muted ^= 1 << i,
+            H::Solo(i) => self.settings.strip_soloed ^= 1 << i,
+        }
+        self.save_settings_soon();
+    }
+
+    /// The desk, as the painter wants it.
+    ///
+    /// **Assembled here rather than stored**, like every other view in this
+    /// file: the values live in settings and in the meters the host pushed, so
+    /// there is one copy of each and no chance of a fader that disagrees with
+    /// the sound.
+    fn mixer_view(&self) -> crate::mixer_panel::MixerView<'_> {
+        use crate::recorder::Strip;
+        let g = self.settings.knobs().gains;
+        let desk = self.desk();
+        let peaks = self.recorder.strip_peaks;
+        let level = |s: Strip| -> f32 {
+            match s {
+                Strip::Instrument => g.instrument,
+                Strip::Input => g.input,
+                Strip::Track => g.track,
+                Strip::Click => g.metronome,
+                Strip::Fx => g.fx_return,
+            }
+        };
+        let strip = |s: Strip| crate::mixer_panel::StripView {
+            strip: Some(s),
+            detail: self.strip_detail(s),
+            gain: level(s),
+            send: desk.send[s.index()],
+            peak: peaks[s.index()],
+            muted: desk.muted[s.index()],
+            soloed: desk.soloed[s.index()],
+        };
+        crate::mixer_panel::MixerView {
+            strips: [
+                strip(Strip::Instrument),
+                strip(Strip::Input),
+                strip(Strip::Track),
+                strip(Strip::Click),
+                strip(Strip::Fx),
+                crate::mixer_panel::StripView {
+                    strip: None,
+                    detail: "",
+                    gain: g.master,
+                    send: 0.0,
+                    peak: self.recorder.meters.left.peak.max(self.recorder.meters.right.peak),
+                    muted: false,
+                    soloed: false,
+                },
+            ],
+            any_solo: desk.any_solo(),
+            dark_mode: self.settings.dark_mode,
+            wood: {
+                let c = self.settings.recorder_bg_color;
+                (c.r, c.g, c.b)
+            },
+        }
+    }
+
+    /// The second line on a strip: what it is actually carrying.
+    fn strip_detail(&self, strip: crate::recorder::Strip) -> &str {
+        use crate::recorder::Strip;
+        match strip {
+            // The loaded instrument, or the built-in that plays when none is.
+            // **What is playing, by the name a person gave it.** The slot
+            // holds a PATH, and a bundle path under a strip is the sort of
+            // detail that makes an app look like it is showing you its
+            // insides.
+            Strip::Instrument => match self.chosen_plugin(0) {
+                Some(p) if p == dialogs::BUILTIN_PATH => "Tangent DX7",
+                Some(p) => p
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(p)
+                    .trim_end_matches(".vst3"),
+                None => "",
+            },
+            Strip::Input => self.audio_status.input.as_ref().map_or("", |(n, _)| n.as_str()),
+            Strip::Track => self.track.name.as_str(),
+            Strip::Click => "",
+            Strip::Fx => "reverb · delay · chorus",
+        }
+    }
+
     fn recorder_layout_view(&self) -> recorder::RecorderView<'_> {
         recorder::RecorderView {
             fx_units: self.fx_units(),
@@ -3285,6 +3437,19 @@ impl IvoryApp {
         self.settings.record_camera_uid.as_deref()
     }
 
+    /// The desk's routing, for the host to push to the engine.
+    ///
+    /// **Read from settings every frame, like the gains beside it.** One live
+    /// value, so a fader moved, a file loaded and a hand-edited `settings.json`
+    /// all arrive by the same path.
+    pub fn desk(&self) -> recorder::Desk {
+        recorder::Desk {
+            send: std::array::from_fn(|i| self.settings.strip_sends[i] as f32),
+            muted: std::array::from_fn(|i| self.settings.strip_muted & (1 << i) != 0),
+            soloed: std::array::from_fn(|i| self.settings.strip_soloed & (1 << i) != 0),
+        }
+    }
+
     /// The inputs of an interface the picker should offer as rows of their
     /// own, as the host's own opaque uids. Handed back verbatim at startup.
     pub fn exposed_input_channels(&self) -> &[String] {
@@ -3893,6 +4058,15 @@ impl IvoryApp {
                 }
             }
             K::ToggleRecorder => self.apply_menu_action(ctx, MenuAction::ToggleRecorder),
+            // **A view, not a band.** Nothing is turned on or off: the piano
+            // and the bands under it are replaced by the desk for as long as
+            // you are there, and the recorder band stays exactly where it is
+            // so the transport never moves. A half-finished drag does not
+            // survive the swap, because the control it was on is gone.
+            K::ToggleMixer => {
+                self.mixer_open = !self.mixer_open;
+                self.mixer_grab = None;
+            }
             K::TransposeUp => self.transpose_by(1),
             K::TransposeDown => self.transpose_by(-1),
             K::ToggleDarkMode => self.apply_menu_action(ctx, MenuAction::ToggleDarkMode),
@@ -5449,6 +5623,14 @@ impl IvoryApp {
             self.demo_menu_done = true;
             self.setup_open = true;
         }
+        // The mixer, on the first frame, so it can be photographed without a
+        // keypress — which on a shared desktop is a keypress that might land
+        // somewhere else.
+        //   IVORY_INLINE=mixer /Applications/Tangent.app/Contents/MacOS/tangent
+        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("mixer") {
+            self.demo_menu_done = true;
+            self.mixer_open = true;
+        }
         // And the input chooser, which needs hardware nobody developing this
         // has: it only offers itself on an interface with more than two
         // inputs. A fake eighteen-in device is the only way to look at the two
@@ -5745,6 +5927,24 @@ impl IvoryApp {
         let band_at = |top: f32, h: f32| {
             Rect::from_min_size(Pos2::new(origin.x, origin.y + top), Vec2::new(w, h))
         };
+        // **The mixer takes the room the piano and the bands under it were
+        // going to use.** Not the recorder band, which stays exactly where it
+        // is in both views — the transport, the meters and the record button
+        // never move, so you can Tab across mid-take.
+        //
+        // The window does not resize: `target` is still the layout the bands
+        // asked for, so pressing Tab changes what is drawn and not one pixel
+        // of geometry. A view that resized the window would be a view nobody
+        // could Tab back out of on a small screen.
+        let mixer_rect = self
+            .mixer_open
+            .then(|| band_at(recorder_h, (target.y - recorder_h).max(0.0)))
+            .filter(Rect::is_positive);
+        self.mixer_rect = mixer_rect;
+        if mixer_rect.is_none() {
+            // The control being dragged is not on screen any more.
+            self.mixer_grab = None;
+        }
         let piano_rect = band_at(recorder_h + theory_h + chord_h, piano_h);
         let mut chord_rect_for_hit: Option<Rect> = None;
         // Where the thanks card hangs from, once the heart has been drawn.
@@ -5767,6 +5967,21 @@ impl IvoryApp {
             }
             None => (None, None),
         };
+        // **Nothing under the mixer is drawn, not merely covered.** Painting a
+        // piano behind an opaque panel costs the same as painting one nobody
+        // has hidden, and the machine this app is careful about is the one
+        // where that is measurable.
+        let (theory_row, theory_rect_for_hit, camera_pane_rect, fret_rect_for_hit) =
+            if mixer_rect.is_some() {
+                (None, None, None, None)
+            } else {
+                (
+                    theory_row,
+                    theory_rect_for_hit,
+                    camera_pane_rect,
+                    fret_rect_for_hit,
+                )
+            };
         let recorder_rect_for_hit: Option<Rect> =
             (recorder_h > 0.0).then(|| band_at(0.0, recorder_h));
         self.last_band = recorder_rect_for_hit.unwrap_or(Rect::NOTHING);
@@ -5833,7 +6048,7 @@ impl IvoryApp {
                 &self.settings,
             );
         }
-        if chord_h > 0.0 {
+        if chord_h > 0.0 && mixer_rect.is_none() {
             let chord_rect = band_at(recorder_h + theory_h, chord_h);
             chord_rect_for_hit = Some(chord_rect);
             chord_strip::draw(
@@ -5855,13 +6070,18 @@ impl IvoryApp {
                 heart_rect_for_card = Some(hr);
             }
         }
-        piano::draw(
-            ui.painter(),
-            piano_rect,
-            &display,
-            self.notes.sustain_down(),
-            &self.settings,
-        );
+        if let Some(rect) = mixer_rect {
+            let view = self.mixer_view();
+            crate::mixer_panel::draw(ui.painter(), rect, &view);
+        } else {
+            piano::draw(
+                ui.painter(),
+                piano_rect,
+                &display,
+                self.notes.sustain_down(),
+                &self.settings,
+            );
+        }
         if let Some(fret_rect) = fret_rect_for_hit {
             let spec = self.settings.fretboard_spec();
             fretboard_panel::draw(
@@ -6040,6 +6260,62 @@ impl IvoryApp {
                         };
                         let v = (grab.from_value + moved / travel * fine).clamp(0.0, 1.0);
                         self.apply_recorder_hit(grab.hit.with_value(v));
+                    }
+                }
+            }
+        }
+
+        // ── the mixer's gestures ───────────────────────────────────────────
+        //
+        // The band's contract, on the other surface: a press grabs, movement
+        // makes it a drag, and the value follows how far the hand has MOVED
+        // rather than where it ended up — so the pointer can leave the fader
+        // and go on pulling, and a press never makes a cap jump to meet it.
+        // A switch is not dragged at all and acts on the way down.
+        if let Some(rect) = self.mixer_rect {
+            let pressed = ctx.input(|i| i.pointer.primary_pressed());
+            let released = ctx.input(|i| i.pointer.any_released());
+            let pos = ctx.pointer_interact_pos();
+            if pressed {
+                if let Some(pos) = pos.filter(|p| rect.contains(*p)) {
+                    let view = self.mixer_view();
+                    match crate::mixer_panel::hit_test(rect, &view, pos) {
+                        Some(hit @ (crate::mixer_panel::Hit::Mute(_)
+                        | crate::mixer_panel::Hit::Solo(_))) => {
+                            self.apply_mixer_hit(hit, 0.0);
+                        }
+                        Some(hit) => {
+                            self.mixer_grab = Some(MixerGrab {
+                                hit,
+                                from: pos,
+                                moved: false,
+                                from_value: self.mixer_value(hit),
+                            });
+                        }
+                        None => {}
+                    }
+                }
+            }
+            if released {
+                self.mixer_grab = None;
+            }
+            if let (Some(grab), Some(pos)) = (self.mixer_grab, pos) {
+                if !grab.moved && (pos - grab.from).length() > TAP_SLOP {
+                    if let Some(g) = self.mixer_grab.as_mut() {
+                        g.moved = true;
+                    }
+                }
+                if self.mixer_grab.is_some_and(|g| g.moved) {
+                    if let (Some(_), Some(travel)) = (grab.hit.axis(), grab.hit.travel()) {
+                        // Up is louder, so the distance is measured upward.
+                        let moved = grab.from.y - pos.y;
+                        let fine = if ctx.input(|i| i.modifiers.shift) {
+                            recorder_panel::FINE_DRAG
+                        } else {
+                            1.0
+                        };
+                        let v = (grab.from_value + moved / travel * fine).clamp(0.0, 1.0);
+                        self.apply_mixer_hit(grab.hit, v);
                     }
                 }
             }
@@ -6405,6 +6681,89 @@ mod tests {
 
     fn headless(caps: Caps) -> (egui::Context, IvoryApp) {
         headless_with(caps, Settings::default())
+    }
+
+    /// **Tab swaps the view, and the mixer takes the piano's room.**
+    ///
+    /// The whole chain in one test: the key resolves to the action
+    /// (`keys::tab_reaches_the_mixer_rather_than_egui` proves that half), the
+    /// action flips the view, and the view is what gets drawn — asserted by
+    /// the rect the painter was handed, because "it drew" is the claim and a
+    /// bool would only say "it was asked to".
+    #[test]
+    fn tab_puts_the_mixer_where_the_piano_was() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let run = |ctx: &egui::Context, app: &mut IvoryApp| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        run(&ctx, &mut app);
+        assert!(app.mixer_rect.is_none(), "the mixer was up before it was asked for");
+
+        app.apply_key_action(&ctx, keys::KeyAction::ToggleMixer);
+        run(&ctx, &mut app);
+        let rect = app.mixer_rect.expect("the mixer was not drawn");
+        assert!(rect.is_positive(), "the mixer was given no room");
+        // **Under the band, never over it.** The transport, the meters and the
+        // record button must not move when the view changes: you have to be
+        // able to Tab across mid-take.
+        assert!(
+            rect.top() >= app.last_band.bottom() - 0.5,
+            "the mixer covered the recorder band"
+        );
+
+        // And back, with no trace left of a drag that was in progress.
+        app.mixer_grab = Some(MixerGrab {
+            hit: crate::mixer_panel::Hit::Fader(0),
+            from: Pos2::ZERO,
+            moved: true,
+            from_value: 0.5,
+        });
+        app.apply_key_action(&ctx, keys::KeyAction::ToggleMixer);
+        run(&ctx, &mut app);
+        assert!(app.mixer_rect.is_none(), "the mixer stayed up");
+        assert!(
+            app.mixer_grab.is_none(),
+            "a drag survived the control it was on going away"
+        );
+    }
+
+    /// **A mixer fader and the band's fader are the same fader.**
+    ///
+    /// Not two copies kept in step: one value in settings that both read. This
+    /// is the test that keeps it that way — write through the mixer, read
+    /// through the band's own accessor.
+    #[test]
+    fn the_two_surfaces_move_one_value() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        use crate::mixer_panel::Hit;
+        use crate::recorder::Strip;
+
+        // The click is index three, and its fader is the band's metronome.
+        app.apply_mixer_hit(Hit::Fader(Strip::Click.index()), 0.25);
+        let quiet = app.settings.knobs().gains.metronome;
+        app.apply_mixer_hit(Hit::Fader(Strip::Click.index()), 0.75);
+        let loud = app.settings.knobs().gains.metronome;
+        assert!(loud > quiet, "the mixer's fader moved nothing: {quiet} then {loud}");
+
+        // A send is a percentage and lands where the host reads it.
+        app.apply_mixer_hit(Hit::Send(Strip::Input.index()), 0.4);
+        assert!(
+            (app.desk().send[Strip::Input.index()] - 0.4).abs() < 1.0e-6,
+            "the input's send did not stick"
+        );
+
+        // Mute and solo toggle, and they are separate switches.
+        app.apply_mixer_hit(Hit::Mute(Strip::Track.index()), 0.0);
+        assert!(app.desk().muted[Strip::Track.index()]);
+        assert!(!app.desk().soloed[Strip::Track.index()]);
+        app.apply_mixer_hit(Hit::Mute(Strip::Track.index()), 0.0);
+        assert!(!app.desk().muted[Strip::Track.index()], "mute did not toggle back");
     }
 
     /// **The way back to the shipped bank exists at all.**
