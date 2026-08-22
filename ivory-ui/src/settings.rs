@@ -87,6 +87,13 @@ struct LegacyDesk {
     sends: Vec<f64>,
     inserts: Vec<String>,
     names: Vec<String>,
+    /// The v11 rack and input trims, read for the migration and then spent:
+    /// their instruments live in bays now and their levels in
+    /// `channel_gains`, so no `Settings` field carries them any more — a
+    /// field that did would be a second copy to disagree.
+    plugin_slots: Vec<Option<String>>,
+    plugin_gains: Vec<f64>,
+    input_gains: Vec<f64>,
 }
 
 /// As many channels as a hand-edited file may claim before we stop reading.
@@ -147,7 +154,7 @@ fn migrate_split_desk(s: &mut Settings, desk: &mut LegacyDesk) {
     // Old general k: k < V10_SLOTS is slot k, else input k - V10_SLOTS.
     let occupied = |k: usize| -> bool {
         if k < V10_SLOTS {
-            s.plugin_slots.get(k).is_some_and(Option::is_some)
+            desk.plugin_slots.get(k).is_some_and(Option::is_some)
         } else {
             let j = k - V10_SLOTS;
             j == 0
@@ -201,8 +208,8 @@ fn migrate_split_desk(s: &mut Settings, desk: &mut LegacyDesk) {
     for old in 0..OLD_GENERALS {
         let Some(new) = to_new[old] else { continue };
         if old < V10_SLOTS {
-            gains[new] = s.plugin_gains.get(old).copied().unwrap_or(1.0);
-            if let Some(Some(instrument)) = s.plugin_slots.get(old) {
+            gains[new] = desk.plugin_gains.get(old).copied().unwrap_or(1.0);
+            if let Some(Some(instrument)) = desk.plugin_slots.get(old) {
                 kinds[new] = 1;
                 // The instrument takes bay 1; the effects shuffle down and the
                 // third, if there was one, goes. Silently — the alternative is
@@ -217,7 +224,7 @@ fn migrate_split_desk(s: &mut Settings, desk: &mut LegacyDesk) {
             // and the plus is exactly that.
         } else {
             let j = old - V10_SLOTS;
-            gains[new] = s.input_gains.get(j).copied().unwrap_or(1.0);
+            gains[new] = desk.input_gains.get(j).copied().unwrap_or(1.0);
             if occupied(old) {
                 kinds[new] = 2;
             }
@@ -269,9 +276,6 @@ fn migrate_split_desk(s: &mut Settings, desk: &mut LegacyDesk) {
     desk.inserts = inserts;
     s.channel_kinds = kinds;
     s.channel_gains = gains;
-    // The slots are spent: their instruments live in bays now, and a slot
-    // array that still named them would be a second copy to disagree.
-    s.plugin_slots = std::array::from_fn(|_| None);
 }
 
 fn migrate_desk_channels(s: &mut Settings, desk: &mut LegacyDesk) {
@@ -719,10 +723,8 @@ pub struct Settings {
     /// ARRAY under `plugin_slots`, and a file written by the single-instrument
     /// build is migrated on read — its `plugin_path` becomes slot 0, so nobody
     /// loses the instrument they had chosen.
-    pub plugin_slots: [Option<String>; crate::recorder::SLOTS],
     /// Linear gain per slot. Linear because that is what the audio path
     /// multiplies by; the band converts to dB to draw.
-    pub plugin_gains: [f64; crate::recorder::SLOTS],
     /// One fader per general channel, whatever its kind. The slot and input
     /// gain arrays above are the legacy rack's; the v12 migration folds them
     /// in here and they die with the rack.
@@ -761,12 +763,6 @@ pub struct Settings {
     /// without `dx7_cartridge`, and ignored when that does not load.
     pub dx7_patch: usize,
     pub metronome_gain: f64,
-    /// One per input strip, linear. The band shows the first; the mixer shows
-    /// all of them.
-    ///
-    /// **The old `input_gain` is read into `[0]`**, because that is what it
-    /// was: the one microphone this app could open.
-    pub input_gains: [f64; crate::recorder::INPUTS],
     /// The master, linear. Unity by default: it is a master, and a master that
     /// ships anywhere else is one every user has to put back.
     pub master_gain: f64,
@@ -1023,8 +1019,6 @@ impl Default for Settings {
             record_sample_rate: 0,
             audio_system: String::new(),
             video_defaults_lowered: false,
-            plugin_slots: [const { None }; crate::recorder::SLOTS],
-            plugin_gains: [1.0; crate::recorder::SLOTS],
             channel_gains: [1.0; crate::recorder::CHANNELS],
             // **Channel 0 ships as the DX7.** The default sound lives in a
             // pre-added MIDI channel with the built-in in bay 1 — see
@@ -1045,7 +1039,6 @@ impl Default for Settings {
             dx7_cartridge: String::new(),
             dx7_patch: 0,
             metronome_gain: 0.5,
-            input_gains: [1.0; crate::recorder::INPUTS],
             master_gain: 1.0,
             track_gain: 1.0,
             strip_colors: {
@@ -1238,15 +1231,9 @@ impl Settings {
             show_recorder: true,
             ..Self::default()
         };
-        // **The built-in is IN a slot, not merely available.**
-        //
-        // It sounds either way — the renderer plays it when nothing else has —
-        // but a rack of five empty rows says the app has no instrument, and
-        // the patch picker and the patch editor are both reached by clicking
-        // the slot it is in. Somebody who has just asked for everything to go
-        // back to how it was would find an app that plays and a rack that
-        // says it does not.
-        s.plugin_slots[0] = Some(crate::dialogs::BUILTIN_PATH.to_owned());
+        // The built-in needs no seeding here: the default desk already
+        // carries it, in channel 1's first bay. One definition of "the
+        // instrument that ships", and `Settings::default` is it.
         s
     }
 
@@ -1694,27 +1681,29 @@ impl Settings {
         let legacy_gain = map.shift_remove("plugin_gain").and_then(|v| v.as_f64());
         match map.shift_remove("plugin_slots") {
             Some(Value::Array(items)) => {
-                for (slot, item) in s.plugin_slots.iter_mut().zip(items) {
-                    if let Value::String(path) = item {
-                        if !path.trim().is_empty() {
-                            *slot = Some(path);
-                        }
-                    }
-                }
+                desk.plugin_slots = items
+                    .into_iter()
+                    .take(LEGACY_MAX_STRIPS)
+                    .map(|item| match item {
+                        Value::String(path) if !path.trim().is_empty() => Some(path),
+                        _ => None,
+                    })
+                    .collect();
             }
-            _ => s.plugin_slots[0] = legacy_path,
+            _ => desk.plugin_slots = vec![legacy_path],
         }
         if let Some(Value::Array(items)) = map.shift_remove("plugin_gains") {
-            for (gain, item) in s.plugin_gains.iter_mut().zip(items) {
-                if let Some(g) = item.as_f64() {
-                    if g.is_finite() && (0.0..=MAX_GAIN).contains(&g) {
-                        *gain = g;
-                    }
-                }
-            }
+            desk.plugin_gains = items
+                .iter()
+                .take(LEGACY_MAX_STRIPS)
+                .map(|item| match item.as_f64() {
+                    Some(g) if g.is_finite() && (0.0..=MAX_GAIN).contains(&g) => g,
+                    _ => 1.0,
+                })
+                .collect();
         } else if let Some(g) = legacy_gain {
             if g.is_finite() && (0.0..=MAX_GAIN).contains(&g) {
-                s.plugin_gains[0] = g;
+                desk.plugin_gains = vec![g];
             }
         }
         if let Some(Value::Array(items)) = map.shift_remove("channel_gains") {
@@ -1774,15 +1763,20 @@ impl Settings {
             }
         };
         take_gain(&mut map, "metronome_gain", &mut s.metronome_gain);
-        take_gain(&mut map, "input_gain", &mut s.input_gains[0]);
+        // The v11 input trims, staged like the rack: the migration folds them
+        // into `channel_gains` and nothing else reads them.
+        let mut legacy_input = 1.0f64;
+        take_gain(&mut map, "input_gain", &mut legacy_input);
+        desk.input_gains = vec![legacy_input];
         if let Some(Value::Array(v)) = map.shift_remove("input_gains") {
-            for (i, x) in v.iter().take(crate::recorder::INPUTS).enumerate() {
-                if let Some(n) = x.as_f64() {
-                    if n.is_finite() && (0.0..=16.0).contains(&n) {
-                        s.input_gains[i] = n;
-                    }
-                }
-            }
+            desk.input_gains = v
+                .iter()
+                .take(LEGACY_MAX_STRIPS)
+                .map(|x| match x.as_f64() {
+                    Some(n) if n.is_finite() && (0.0..=16.0).contains(&n) => n,
+                    _ => 1.0,
+                })
+                .collect();
         }
         take_gain(&mut map, "master_gain", &mut s.master_gain);
         take_gain(&mut map, "track_gain", &mut s.track_gain);
@@ -2325,31 +2319,6 @@ impl Settings {
             "video_defaults_lowered".into(),
             Value::Bool(self.video_defaults_lowered),
         );
-        // Written as full-length arrays including the empty slots, so slot 2
-        // stays slot 2 when slot 1 is empty. A compacted list would silently
-        // promote an instrument into a slot the user did not put it in.
-        map.insert(
-            "plugin_slots".into(),
-            Value::Array(
-                self.plugin_slots
-                    .iter()
-                    .map(|p| match p {
-                        Some(path) => Value::String(path.clone()),
-                        None => Value::Null,
-                    })
-                    .collect(),
-            ),
-        );
-        map.insert(
-            "plugin_gains".into(),
-            Value::Array(
-                self.plugin_gains
-                    .iter()
-                    .filter_map(|g| serde_json::Number::from_f64(*g))
-                    .map(Value::Number)
-                    .collect(),
-            ),
-        );
         map.insert(
             "channel_gains".into(),
             Value::Array(
@@ -2390,15 +2359,6 @@ impl Settings {
             Value::String(self.dx7_cartridge.clone()),
         );
         map.insert("dx7_patch".into(), Value::Number(self.dx7_patch.into()));
-        map.insert(
-            "input_gains".into(),
-            Value::Array(
-                self.input_gains
-                    .iter()
-                    .filter_map(|g| serde_json::Number::from_f64(*g).map(Value::Number))
-                    .collect(),
-            ),
-        );
         map.insert("track_path".into(), Value::String(self.track_path.clone()));
         for (key, gain) in [
             ("metronome_gain", self.metronome_gain),
@@ -2690,10 +2650,8 @@ impl Settings {
     pub fn knobs(&self) -> crate::recorder::Knobs {
         crate::recorder::Knobs {
             gains: crate::recorder::Gains {
-                slots: std::array::from_fn(|i| self.plugin_gains[i] as f32),
                 channels: std::array::from_fn(|i| self.channel_gains[i] as f32),
                 metronome: self.metronome_gain as f32,
-                inputs: std::array::from_fn(|i| self.input_gains[i] as f32),
                 master: self.master_gain as f32,
                 track: self.track_gain as f32,
                 fx_return: self.fx_return_gain as f32,
@@ -3176,7 +3134,7 @@ mod tests {
         );
         // And what came up is usable rather than a half-empty window.
         assert!(s.show_recorder && s.show_fretboard);
-        assert_eq!(s.plugin_slots[0].as_deref(), Some(crate::dialogs::BUILTIN_PATH));
+        assert_eq!(s.strip_inserts.first().map(String::as_str), Some(crate::dialogs::BUILTIN_PATH));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3194,7 +3152,7 @@ mod tests {
 
         assert!(!dir.join("settings.json.unreadable").exists());
         assert!(s.show_recorder);
-        assert_eq!(s.plugin_slots[0].as_deref(), Some(crate::dialogs::BUILTIN_PATH));
+        assert_eq!(s.strip_inserts.first().map(String::as_str), Some(crate::dialogs::BUILTIN_PATH));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3334,15 +3292,14 @@ mod tests {
             first.show_recorder,
             "the recorder is invisible on a fresh install"
         );
-        // **The built-in is loaded, and that is visibility too.** It sounds
-        // whether or not a slot claims it — the renderer plays it when nothing
-        // else has — so this is not a preference about the SOUND. It is about
-        // the rack saying so, and about the patch picker and the patch editor
-        // being reachable, which is done by clicking the slot it is in.
+        // **The built-in is loaded, and that is visibility too.** The default
+        // desk carries it in channel 1's first bay, and a first launch keeps
+        // that: the patch picker and the patch editor are reached by clicking
+        // the bay it is in.
         assert_eq!(
-            first.plugin_slots[0].as_deref(),
+            first.strip_inserts.first().map(String::as_str),
             Some(crate::dialogs::BUILTIN_PATH),
-            "a fresh install has no instrument in the rack"
+            "a fresh install has no instrument on the desk"
         );
 
         // Nothing else moves: a first launch is the DEFAULTS plus what somebody
@@ -3353,7 +3310,6 @@ mod tests {
             show_fretboard: false,
             theory_order: String::new(),
             show_recorder: false,
-            plugin_slots: [const { None }; crate::recorder::SLOTS],
             ..first.clone()
         };
         assert_eq!(same, Settings::default());
@@ -3924,8 +3880,9 @@ mod tests {
             ("/x/Diva.vst3", "/x/Pro-C 3.vst3", ""),
             "channel 1 is not the lead with its one effect"
         );
-        // The slots are spent.
-        assert!(s.plugin_slots.iter().all(Option::is_none));
+        // The slots are spent: the file's keys were consumed and nothing
+        // writes them back.
+        assert!(!s.to_json().contains("plugin_slots"), "the spent key was written back");
 
         // Gains followed their channels.
         assert!((s.channel_gains[0] - 0.8).abs() < 1e-9, "the piano's fader moved");

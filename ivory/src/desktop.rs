@@ -126,25 +126,11 @@ struct Recorder {
     engine: Option<crate::instrument::Engine>,
     /// Why the output device would not open, if it would not.
     engine_error: Option<String>,
-    /// What the engine has in each slot, so a change in settings is noticed on
-    /// the edge rather than re-decided every frame.
-    plugin_loaded: [Option<String>; ivory_ui::recorder::SLOTS],
-    /// What was last ASKED for on the effects bus, whether or not it loaded.
-    /// Settled either way, so a plugin that refuses is not retried every frame.
     /// What is loaded in each insert slot, flat like `Settings::strip_inserts`.
     /// Remembered whether or not the load worked, so a plugin that refuses is
-    /// asked once.
+    /// asked once — `load_insert` blocks for seconds on a sampler, and a
+    /// plugin that refuses must not be retried sixty times a second.
     inserts_loaded: Vec<Option<String>>,
-    /// The slot whose load has been announced but not yet performed.
-    ///
-    /// `load_plugin` blocks for **about five seconds** — the module's own
-    /// initialiser, then a warm-up, because four of six instruments on this
-    /// machine render silence if recorded cold. That happens on the UI thread,
-    /// so doing it the moment the selection changes freezes the window for five
-    /// seconds with the previous frame still painted and nothing on screen
-    /// saying why. Same two-phase treatment the camera already gets: announce
-    /// on one frame, block on the next.
-    plugin_opening: Option<usize>,
     audio: crate::devices::Shared,
     camera: crate::devices::Shared,
     /// Why enumeration failed last time, so the band can say "permission" and
@@ -849,7 +835,8 @@ impl DesktopApp {
             // five-second instrument load still happens over the following
             // frames, announced as usual.
             self.recorder.engine = None;
-            self.recorder.plugin_loaded = std::array::from_fn(|_| None);
+            self.recorder.inserts_loaded =
+                vec![None; (ivory_ui::recorder::STRIPS + 1) * ivory_ui::recorder::INSERTS];
             self.open_audio_path(ctx);
         }
 
@@ -863,28 +850,12 @@ impl DesktopApp {
         // not open beats a device that is denied beats the last take's report.
         let message = self
             .recorder
-            .plugin_opening
-            .and_then(|slot| {
-                // Named, because "loading…" with no subject is the least
-                // informative thing a status line can say.
-                match self.app.chosen_plugin(slot) {
-                    Some(p) => Some(format!(
-                        "loading {} - instruments warm up for a few seconds so \
-                         the first take is not silent",
-                        std::path::Path::new(p)
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| p.to_owned())
-                    )),
-                    None => None,
-                }
-            })
-            .or_else(|| self.recorder.camera_opening
+            .camera_opening
             .then(|| {
                 "starting the camera - this can take a few seconds on a USB \
                  webcam"
                     .to_owned()
-            }))
+            })
             .or_else(|| self.recorder.session.audio_error().map(str::to_owned))
             .or_else(|| self.recorder.engine_error.clone())
             .or_else(|| self.recorder.session.camera_error().map(str::to_owned))
@@ -947,50 +918,6 @@ impl DesktopApp {
             texture: h.id(),
             size: self.recorder.preview_px,
         });
-        // Computed BEFORE the mutable borrow of the app: `chosen_plugin()`
-        // borrows it immutably and `recorder_state_mut()` holds it mutably.
-        let engine = self.recorder.engine.as_ref();
-        let slots: [ivory_ui::recorder::SlotState; ivory_ui::recorder::SLOTS] =
-            std::array::from_fn(|i| {
-                // **The built-in is never "missing".** It is compiled in, so
-                // there is no `plugin(i)` behind it and every test below would
-                // otherwise conclude that the instrument failed to load — which
-                // is what the band said, in red, about the one instrument that
-                // cannot fail.
-                if self.app.chosen_plugin(i) == Some(ivory_ui::dialogs::BUILTIN_PATH) {
-                    return ivory_ui::recorder::SlotState {
-                        // The PATCH, not the instrument. "Tangent DX7" in a
-                        // slot says what it is; "E.PIANO 1" says what it
-                        // sounds like, which is the thing being chosen.
-                        name: Some(self.builtin_patch_name()),
-                        missing: false,
-                        // Its editor is the patch picker, and the app opens
-                        // that itself — but the row has to offer the gesture.
-                        has_editor: true,
-                        editor_open: matches!(
-                            self.app.open_dialog(),
-                            Some(ivory_ui::dialogs::Dialog::PatchPicker { slot, .. }) if *slot == i
-                        ),
-                    };
-                }
-                let loaded = engine.and_then(|e| e.plugin(i));
-                ivory_ui::recorder::SlotState {
-                    // The instrument's own name when it loaded; the bundle's
-                    // file name when it did not, so the band can say WHICH
-                    // instrument is missing rather than just that one is.
-                    name: loaded.map(|p| p.class.clone()).or_else(|| {
-                        self.app.chosen_plugin(i).map(|p| {
-                            std::path::Path::new(p)
-                                .file_stem()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| p.to_owned())
-                        })
-                    }),
-                    missing: loaded.is_none() && self.app.chosen_plugin(i).is_some(),
-                    has_editor: engine.is_some_and(|e| e.has_editor(i)),
-                    editor_open: engine.is_some_and(|e| e.editor_open(i)),
-                }
-            });
 
         // **Once per take, on the edge.** `last_summary` keeps answering with
         // the same take until the next one, so the message it carries is the
@@ -1134,7 +1061,6 @@ impl DesktopApp {
             .recorder
             .disk_bytes
             .and_then(|b| ivory_ui::recorder::minutes_on_disk(b, &spec));
-        state.slots = slots;
         state.message = message;
         state.clip_warning = self.recorder.session.clipped();
         // Cleared the moment a new take starts: "re-export the last take" stops
@@ -1172,11 +1098,11 @@ impl DesktopApp {
                 .get_or_insert_with(|| std::time::Instant::now() + DEV_EDITOR_DELAY);
             if std::time::Instant::now() >= *due {
                 self.recorder.dev_editor_done = true;
-                // Through the app's own gesture and not `Engine::open_editor`,
+                // Through the app's own gesture and not the engine directly,
                 // so the hook opens whatever a CLICK would open — the built-in's
                 // patch picker as readily as a VST3's window. A hook that called
                 // the engine directly could only ever reproduce half the bugs.
-                self.app.open_slot_editor(0);
+                self.app.open_insert_face(0, 0);
                 // `=patch` goes one further, to the patch EDITOR, which is
                 // otherwise two clicks in and cannot be reached from a script.
                 if std::env::var("IVORY_OPEN_EDITOR").as_deref() == Ok("patch") {
@@ -1189,17 +1115,26 @@ impl DesktopApp {
             ctx.request_repaint();
         }
 
-        // The instrument's own window, if it has one open. Polled rather than
-        // notified because the user closes it with the OS's close button, which
-        // the plugin's view knows about and we only find out by asking.
+        // The plugins' own windows, if any are open. Polled rather than
+        // notified because the user closes one with the OS's close button,
+        // which the plugin's view knows about and we only find out by asking.
         if let Some(e) = self.recorder.engine.as_mut() {
-            let was: Vec<bool> = (0..ivory_ui::recorder::SLOTS).map(|i| e.editor_open(i)).collect();
+            let bays: Vec<(usize, usize)> = (0..=ivory_ui::recorder::STRIPS)
+                .flat_map(|s| (0..ivory_ui::recorder::INSERTS).map(move |b| (s, b)))
+                .collect();
+            let was: Vec<bool> =
+                bays.iter().map(|&(st, b)| e.insert_editor_open(st, b)).collect();
             e.poll_editor();
             // An editor that has just closed is a preset that has just been
             // chosen. Save then, rather than only at quit, because the gap
             // between the two is where a force-quit loses the sound.
-            let closed = (0..ivory_ui::recorder::SLOTS)
-                .any(|i| was[i] && !self.recorder.engine.as_ref().is_some_and(|e| e.editor_open(i)));
+            let closed = bays.iter().zip(&was).any(|(&(st, b), &w)| {
+                w && !self
+                    .recorder
+                    .engine
+                    .as_ref()
+                    .is_some_and(|e| e.insert_editor_open(st, b))
+            });
             if closed {
                 self.save_plugin_states();
             }
@@ -1233,12 +1168,12 @@ impl DesktopApp {
                 // which is what "the band is closed" should mean: no device
                 // held, no third-party code resident.
                 self.recorder.engine = None;
-                self.recorder.plugin_loaded = [const { None }; ivory_ui::recorder::SLOTS];
+                self.recorder.inserts_loaded =
+                    vec![None; (ivory_ui::recorder::STRIPS + 1) * ivory_ui::recorder::INSERTS];
             }
         } else if open {
             self.reconcile_audio(false);
             self.reconcile_camera(false, ctx);
-            self.reconcile_plugin(ctx);
             self.push_monitor_settings();
         }
 
@@ -1690,24 +1625,6 @@ impl DesktopApp {
                         }
                     }
                 }
-                R::OpenPluginEditor(slot) => {
-                    // The plugin's own window, created here rather than in the
-                    // frame: VST3 requires the main thread and AppKit will not
-                    // have a window built while an egui frame is on the stack.
-                    // The engine owns it, because the engine owns the plugin
-                    // the view belongs to.
-                    if let Some(e) = self.recorder.engine.as_mut() {
-                        // One row, two names, one action: open it, or close the
-                        // one that is open. A second menu row for closing a
-                        // window that has its own close button is clutter.
-                        if e.editor_open(slot) {
-                            e.close_editor(slot);
-                        } else if let Err(err) = e.open_editor(slot) {
-                            self.recorder.engine_error =
-                                Some(format!("could not open the instrument window: {err}"));
-                        }
-                    }
-                }
             }
             ctx.request_repaint();
         }
@@ -1793,20 +1710,6 @@ impl DesktopApp {
             }
             Err(e) => format!("Could not save: {e}"),
         }
-    }
-
-    /// What the built-in is playing, for its slot row.
-    ///
-    /// The patch's own name when a cartridge is loaded, and the instrument's
-    /// otherwise — a fresh install has no cartridge and "E.PIANO 1" alone would
-    /// look like a VST3 nobody remembers installing.
-    fn builtin_patch_name(&self) -> String {
-        let (_, patch) = self.app.dx7_choice();
-        self.cartridge
-            .as_ref()
-            .and_then(|c| c.voices.get(patch))
-            .map(crate::dx7::Voice::display_name)
-            .unwrap_or_else(|| ivory_ui::dialogs::BUILTIN_NAME.to_owned())
     }
 
     /// Read the cartridge named in the settings, if it is still there.
@@ -2257,29 +2160,13 @@ impl DesktopApp {
         }
     }
 
-    /// Write every loaded slot's plugin state beside the settings.
+    /// Write every loaded bay's plugin state beside the settings.
     ///
     /// Called on quit and whenever an editor closes — the second matters more
     /// than the first, because closing the editor is the moment right after
     /// somebody chose a preset, and it is also the moment they are most likely
     /// to then force-quit or unplug something.
     fn save_plugin_states(&mut self) {
-        for slot in 0..ivory_ui::recorder::SLOTS {
-            let Some(bundle) = self.app.chosen_plugin(slot).map(str::to_owned) else {
-                continue;
-            };
-            if let Some(state) = self
-                .recorder
-                .engine
-                .as_ref()
-                .and_then(|e| e.save_slot_state(slot))
-            {
-                write_state(slot, &bundle, &state);
-            }
-        }
-        // **And every bay**, which is the half that was never saved at all: a
-        // reverb dialled in for an hour died with the process, every time,
-        // masked only by nobody expecting better of it yet.
         for strip in 0..=ivory_ui::recorder::STRIPS {
             for bay in 0..ivory_ui::recorder::INSERTS {
                 let Some(bundle) = self.app.insert(strip, bay).map(str::to_owned) else {
@@ -2360,7 +2247,11 @@ impl DesktopApp {
                 self.recorder.engine = Some(e);
                 self.recorder.engine_error = None;
                 self.recorder.engine_retry = None;
-                self.recorder.plugin_loaded = [const { None }; ivory_ui::recorder::SLOTS];
+                // A fresh engine has nothing loaded, whatever was loaded in
+                // the one it replaces — forgetting that here is what asks the
+                // reconcile below to fill the bays again.
+                self.recorder.inserts_loaded =
+                    vec![None; (ivory_ui::recorder::STRIPS + 1) * ivory_ui::recorder::INSERTS];
                 // **The tap belongs to the ENGINE, so it is taken when the
                 // engine starts.**
                 //
@@ -2408,10 +2299,6 @@ impl DesktopApp {
                         e.set_builtin_voice(v);
                     }
                 }
-                // Announces rather than loads on this frame: the band has just
-                // appeared and a remembered instrument would otherwise freeze
-                // it for five seconds before it had drawn once.
-                self.reconcile_plugin(ctx);
             }
             Err(e) => {
                 self.recorder.engine_error = Some(format!("no audio output: {e}"));
@@ -2486,9 +2373,6 @@ impl DesktopApp {
             return;
         };
         let gains = self.app.gains();
-        for (slot, g) in gains.slots.iter().enumerate() {
-            e.set_slot_gain(slot, *g);
-        }
         e.set_metronome_gain(gains.metronome);
         e.set_master_gain(gains.master);
         // **The channel that had no fader before there was a mixer**, and the
@@ -2535,9 +2419,6 @@ impl DesktopApp {
         e.set_midi_off(midi_off);
         e.set_pick_strips(picks);
         e.set_builtin_strip(builtin);
-        for (i, g) in gains.inputs.iter().enumerate() {
-            e.set_monitor_gain(i, *g);
-        }
         // Never read from a settings file — see `IvoryApp::input_monitor`. It
         // is pushed every frame like every other monitor setting, and its value
         // at launch is false because the field it comes from starts false.
@@ -2628,118 +2509,6 @@ impl DesktopApp {
             lost.push(Strip::Track);
         }
         ivory_ui::recorder::missing_from_take(&lost)
-    }
-
-    /// Load or unload the instrument the settings name.
-    ///
-    /// **Blocking**, like the camera: `Module::open` runs a third-party
-    /// library's initialiser and `Instance::create` can take seconds on a
-    /// sampler. Hence after the frame, never inside one.
-    fn reconcile_plugin(&mut self, ctx: &egui::Context) {
-        // ONE slot per call. Loading blocks for about five seconds, so three
-        // stale slots would freeze the window for fifteen; taking them one
-        // frame at a time keeps the band alive and lets the status line name
-        // each instrument as it arrives.
-        let Some(slot) = (0..ivory_ui::recorder::SLOTS).find(|i| {
-            self.app.chosen_plugin(*i).map(str::to_owned) != self.recorder.plugin_loaded[*i]
-        }) else {
-            return;
-        };
-        let wanted = self.app.chosen_plugin(slot).map(str::to_owned);
-
-        // **No engine, nothing to load into.** Checked BEFORE announcing, and
-        // that ordering is the whole of a bug that looked like a failing
-        // plugin: announcing first meant frame one set "loading…", frame two
-        // found no engine and returned WITHOUT settling `plugin_loaded`, and
-        // frame three announced again — for ever, at sixty frames a second,
-        // each one asking for a repaint. What the user sees is an instrument
-        // flickering between loading and not, and it is not the instrument's
-        // fault at all.
-        if self.recorder.engine.is_none() {
-            self.recorder.plugin_opening = None;
-            return;
-        }
-
-        // Announce first, act next frame — but only when there is a wait to
-        // explain. Unloading is instant, so making the user watch a frame of
-        // "loading…" in order to REMOVE an instrument would be silly.
-        if wanted.is_some() && self.recorder.plugin_opening != Some(slot) {
-            self.recorder.plugin_opening = Some(slot);
-            ctx.request_repaint();
-            return;
-        }
-        self.recorder.plugin_opening = None;
-        let Some(e) = self.recorder.engine.as_mut() else {
-            return;
-        };
-        // The editor FIRST, in both branches: it is a view onto THIS
-        // instrument, and a window still attached to a plugin that has been
-        // terminated is a use-after-free with a title bar.
-        e.close_editor(slot);
-        // **The built-in is not a bundle.** Its path is a sentinel that has
-        // travelled through the picker, the settings and the saved session as
-        // if it were one, which is what kept every one of those layers from
-        // needing to know it exists. This is the one place that looks.
-        if wanted.as_deref() == Some(ivory_ui::dialogs::BUILTIN_PATH) {
-            e.unload_plugin(slot);
-            e.set_builtin_slot(Some(slot));
-            self.recorder.engine_error = None;
-            self.recorder.plugin_loaded[slot] = wanted;
-            return;
-        }
-        if self.recorder.plugin_loaded[slot].as_deref()
-            == Some(ivory_ui::dialogs::BUILTIN_PATH)
-        {
-            e.set_builtin_slot(None);
-        }
-        match &wanted {
-            None => {
-                e.unload_plugin(slot);
-                self.recorder.engine_error = None;
-            }
-            Some(path) => match e.load_plugin_with_state(
-                slot,
-                std::path::Path::new(path),
-                None,
-                saved_state(slot, path).as_deref(),
-            ) {
-                Ok(_) => {
-                    self.recorder.engine_error = None;
-                    // The take has to be able to RECORD what it can now hear.
-                    // Taken once for the engine's lifetime — the tap belongs to
-                    // the engine rather than to any one instrument, so it
-                    // survives a slot changing and a take already rolling never
-                    // changes width.
-                    if let Some(tap) =
-                        self.recorder.engine.as_mut().and_then(|e| e.take_recorder_tap())
-                    {
-                        self.recorder.session.set_plugin_tap(Some(tap));
-                    }
-                }
-                Err(err) => {
-                    // The path is REMEMBERED even though it failed. A plugin
-                    // that will not load today because its licence server was
-                    // unreachable should still be the chosen one tomorrow, and
-                    // the band shows it as `Missing` rather than forgetting it.
-                    //
-                    // **Named, and with somewhere to go.** "could not load the
-                    // instrument" over a rack of five rows does not say WHICH,
-                    // and a tester who has just chosen something reads a bare
-                    // failure as the app being broken rather than that file
-                    // being unsuitable.
-                    let which = std::path::Path::new(path)
-                        .file_name()
-                        .map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
-                    self.recorder.engine_error = Some(format!(
-                        "{which} did not load: {err} - Tangent DX7 in the same \
-                         list is the built-in instrument"
-                    ));
-                }
-            },
-        }
-        // Settled either way, so a plugin that refuses to load is not retried
-        // sixty times a second for the rest of the session.
-        self.recorder.plugin_loaded[slot] = wanted;
     }
 
     /// Open the camera the user asked for, if it is not already open.
@@ -2834,46 +2603,6 @@ impl DesktopApp {
             self.recorder.session.audio_error().map(str::to_owned),
         );
     }
-}
-
-/// Where one slot's plugin state lives.
-///
-/// A sidecar file rather than a key in `settings.json`: Pianoteq's state is
-/// **41,233 bytes**, so three slots would put ~165 KB of base64 into a file a
-/// human is expected to be able to open and read. It sits beside the settings
-/// so it travels with them.
-#[cfg(feature = "recorder")]
-fn state_path(slot: usize) -> std::path::PathBuf {
-    let dir = Settings::path()
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_default();
-    dir.join(format!("plugin-state-{slot}.bin"))
-}
-
-/// The saved state for `slot`, but only if it belongs to `bundle`.
-///
-/// The bundle path is written into the file and checked on the way back,
-/// because handing Pianoteq's state to Piano V3 is not a preset, it is
-/// arbitrary bytes to a `setState` that will believe them. `ivory-host`'s
-/// container catches corruption; nothing but this catches *the wrong plugin*.
-#[cfg(feature = "recorder")]
-fn saved_state(slot: usize, bundle: &str) -> Option<Vec<u8>> {
-    let raw = std::fs::read(state_path(slot)).ok()?;
-    let split = raw.iter().position(|b| *b == 0)?;
-    let owner = std::str::from_utf8(&raw[..split]).ok()?;
-    (owner == bundle).then(|| raw[split + 1..].to_vec())
-}
-
-#[cfg(feature = "recorder")]
-fn write_state(slot: usize, bundle: &str, state: &[u8]) {
-    let mut out = Vec::with_capacity(bundle.len() + 1 + state.len());
-    out.extend_from_slice(bundle.as_bytes());
-    out.push(0);
-    out.extend_from_slice(state);
-    // Best effort. A preset that could not be saved is a preset to choose
-    // again, and refusing to quit over it would be worse.
-    let _ = std::fs::write(state_path(slot), out);
 }
 
 /// Where one insert bay's plugin state lives. See [`state_path`] for why a
@@ -3019,12 +2748,10 @@ impl DesktopApp {
                 camera_denied,
                 engine: None,
                 engine_error: None,
-                plugin_loaded: [const { None }; ivory_ui::recorder::SLOTS],
                 inserts_loaded: vec![
                     None;
                     (ivory_ui::recorder::STRIPS + 1) * ivory_ui::recorder::INSERTS
                 ],
-                plugin_opening: None,
                 camera_opening: false,
                 camera_silent_since: None,
                 preview: None,
@@ -3675,14 +3402,11 @@ impl DesktopApp {
         // What is still being waited on. The splash no longer SAYS it — the
         // lattice is the whole picture — but readiness still depends on it.
         #[cfg(feature = "recorder")]
-        let (instrument, camera) = (
-            self.recorder.plugin_opening.is_some(),
-            self.recorder.camera_opening,
-        );
+        let camera = self.recorder.camera_opening;
         #[cfg(not(feature = "recorder"))]
-        let (instrument, camera) = (false, false);
+        let camera = false;
 
-        let busy = instrument || camera;
+        let busy = camera;
         // "Ready" is a minimum time AND nothing outstanding — or the cap.
         if !busy && elapsed >= SPLASH_MIN && splash.done_at.is_none() {
             splash.done_at = Some(now);

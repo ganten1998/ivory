@@ -321,9 +321,6 @@ pub struct IvoryApp {
     export_override: Option<recorder::ExportSpec>,
     /// A settings write owed once the user stops dragging a fader.
     settings_save_at: Option<Instant>,
-    /// Which instrument slot the open picker is filling. See
-    /// [`open_plugin_picker`](IvoryApp::open_plugin_picker).
-    picker_slot: usize,
     /// Which insert the open picker is filling, if it is filling one.
     picker_insert: Option<(usize, usize)>,
     /// Every VST3 bundle the host found, for the picker.
@@ -390,7 +387,6 @@ pub struct IvoryApp {
     /// small is three panels covering each other.
     fx_open: Option<recorder_panel::Fx>,
     /// The backing track's waveform panel, and which handle a hand is on.
-    track_open: bool,
 
     /// The row of that panel a drag is on, once one has started. `&'static
     /// str` because it is the settings KEY — the same thing the panel reports
@@ -768,7 +764,6 @@ impl IvoryApp {
             reveal_request: None,
             export_override: None,
             settings_save_at: None,
-            picker_slot: 0,
             picker_insert: None,
             grabbed: None,
             num_edit: None,
@@ -778,7 +773,6 @@ impl IvoryApp {
             setup_open: false,
             input_monitor: false,
             fx_open: None,
-            track_open: false,
 
             fx_drag: None,
             fx_defaults: crate::ports::EffectDefaults::default(),
@@ -1751,17 +1745,7 @@ impl IvoryApp {
             // control lives inside a window nothing opens is an effect you
             // cannot use — which is what a rack was until now.
             H::Insert(i, n) => {
-                let at = i.desk_index();
-                match self.insert(at, n) {
-                    // **The built-in has no window to open.** Its bay shows
-                    // the patch picker, which IS its editor — one gesture,
-                    // "click the bay to see the instrument", not two.
-                    Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(at),
-                    Some(_) => self.request_recorder(
-                        recorder::RecorderRequest::OpenInsertEditor(at, n),
-                    ),
-                    None => self.open_insert_picker(at, n),
-                }
+                self.open_insert_face(i.desk_index(), n);
                 return;
             }
             // **Not the master.** Its colour is the one thing on the desk
@@ -2340,41 +2324,12 @@ impl IvoryApp {
                 if self.fader_under(recorder_rect, pos) {
                     return;
                 }
-                // **Right-clicking the metronome sets whether the click goes
-                // into the FILE**, and opens no menu. It is the one control in
-                // the band with no box of its own: it is set once and it was
-                // taking a caption and a tick in the busiest row there is.
-                // Everywhere else on the band, a right-click opens the menu.
-                if let Some(r) = recorder_rect.filter(|r| r.contains(pos)) {
-                    let view = self.recorder_layout_view();
-                    // **And right-clicking the waveform icon opens the
-                    // waveform.** A left click imports; where the file starts
-                    // and stops is a question about a picture, and the row is
-                    // fifteen points tall.
-                    if recorder_panel::track_icon(r, &view).is_some_and(|i| i.contains(pos)) {
-                        self.track_open = true;
-                        return;
-                    }
-                    if recorder_panel::hit_test(r, &view, pos)
-                        == Some(recorder_panel::Hit::ToggleMetronome)
-                    {
-                        self.settings.metronome_in_take = !self.settings.metronome_in_take;
-                        self.save_settings();
-                        return;
-                    }
-                    // **And right-clicking the microphone hears it.** The same
-                    // shape as the metronome's: one setting, no box, a dot on
-                    // the icon while it is on — red, because monitoring your
-                    // own microphone through speakers is how a room starts
-                    // feeding back and it may not be a quiet state.
-                    //
-                    // `save_settings` is deliberately NOT called and there is
-                    // nothing to save: see `input_monitor`.
-                    if recorder_panel::input_icon(r, &view).is_some_and(|i| i.contains(pos)) {
-                        self.input_monitor = !self.input_monitor;
-                        return;
-                    }
-                }
+                // The icon gestures the band used to carry — the metronome,
+                // the microphone, the waveform — left with their rows: the
+                // click and the input are channels on the desk now, and the
+                // waveform is the timeline in the band itself. A right-click
+                // anywhere on the band opens the menu, which is where the
+                // in-take and monitoring switches live.
                 self.menu_over_recorder = recorder_rect.is_some_and(|r| r.contains(pos));
                 // And the same for the sheet music: right-clicking the staff
                 // leads with its own controls, which is where the key signature
@@ -2442,16 +2397,6 @@ impl IvoryApp {
         // release is what ends the gesture, not where it happened.
         if pointer_released {
             self.clicked.clear();
-        }
-
-        // The backing track's panel, on the same terms as the effect panels.
-        if self.track_open {
-            if primary_pressed {
-                if let Some(pos) = pointer {
-                    self.press_in_track_panel(ui.max_rect(), pos, primary_pressed);
-                }
-                return;
-            }
         }
 
         // The effect panel, on the same terms as the take settings below it.
@@ -3051,13 +2996,7 @@ impl IvoryApp {
         let view = self.recorder_layout_view();
         matches!(
             recorder_panel::hit_test(r, &view, pos),
-            Some(
-                recorder_panel::Hit::SetSlotGain(..)
-                    | recorder_panel::Hit::SetMetronomeGain(_)
-                    | recorder_panel::Hit::SetInputGain(_)
-                    | recorder_panel::Hit::SetTrackGain(_)
-                    | recorder_panel::Hit::Type(_)
-            )
+            Some(recorder_panel::Hit::Type(_))
         )
     }
 
@@ -3073,47 +3012,6 @@ impl IvoryApp {
     fn fx_anchor(&self, fx: recorder_panel::Fx) -> Rect {
         let view = self.recorder_layout_view();
         recorder_panel::knob_rect(self.last_band, &view, fx.hit()).unwrap_or(Rect::NOTHING)
-    }
-
-    /// Where the track panel hangs from: the waveform icon in the band.
-    fn track_anchor(&self) -> Rect {
-        let view = self.recorder_layout_view();
-        recorder_panel::track_icon(self.last_band, &view).unwrap_or(Rect::NOTHING)
-    }
-
-    /// A press inside the backing track's panel.
-    ///
-    /// **A click on the waveform is a LOCATE.** The panel stopped being a trim
-    /// editor — trim is gone — and became the timeline's first face: press
-    /// where you want the playhead and the transport goes there, rolling or
-    /// not. The maths goes through `seconds_at`, whose inverse draws the
-    /// playhead, so a click and the line it produces cannot disagree.
-    fn press_in_track_panel(&mut self, screen: Rect, pos: Pos2, pressed: bool) {
-        let anchor = self.track_anchor();
-        self.press_in_track_panel_at(screen, anchor, pos, pressed);
-    }
-
-    /// The same, with the anchor handed in — the testable half, because the
-    /// anchor comes from the band's live layout and a headless test has none.
-    fn press_in_track_panel_at(&mut self, screen: Rect, anchor: Rect, pos: Pos2, pressed: bool) {
-        if !pressed {
-            return;
-        }
-        let seconds = self.track.seconds;
-        match recorder_panel::track_hit_test(screen, anchor, seconds, pos) {
-            Some(recorder_panel::TrackHit::Close) => {
-                self.track_open = false;
-            }
-            Some(recorder_panel::TrackHit::Seek(seconds)) => {
-                self.request_recorder(recorder::RecorderRequest::Locate(seconds));
-            }
-            // Inside the panel and on nothing: swallowed. Outside: dismissed.
-            None => {
-                if !recorder_panel::track_popup_rect(screen, anchor).contains(pos) {
-                    self.track_open = false;
-                }
-            }
-        }
     }
 
     /// A press or a drag inside the open effect panel.
@@ -3168,9 +3066,8 @@ impl IvoryApp {
 
     /// Load a made-up backing track and open its panel, for the screenshot
     /// hook — which has no file to import and no dialog to import it with.
-    pub fn set_track_for_shot(&mut self, info: crate::ports::TrackInfo, open: bool) {
+    pub fn set_track_for_shot(&mut self, info: crate::ports::TrackInfo) {
         self.track = info;
-        self.track_open = open;
     }
 
     /// Put a level on the master meter and a reduction on the limiter, so the
@@ -3491,16 +3388,7 @@ impl IvoryApp {
         let fader = |g: f64| recorder::gain_to_fader(g as f32);
         match hit {
             H::SetFx(fx, _) => self.fx_value(fx),
-            H::SetMetronomeGain(_) => fader(self.settings.metronome_gain),
-            H::SetInputGain(_) => fader(self.settings.input_gains[0]),
             H::SetMaster(_) => fader(self.settings.master_gain),
-            H::SetTrackGain(_) => fader(self.settings.track_gain),
-            H::SetSlotGain(i, _) => self
-                .settings
-                .plugin_gains
-                .get(i)
-                .copied()
-                .map_or(0.0, fader),
             H::SetTempo(_) => recorder_panel::tempo_knob_position(
                 self.settings.record_export.tempo_bpm,
             ),
@@ -3612,20 +3500,23 @@ impl IvoryApp {
         filter.clear();
     }
 
-    /// Show what is in `slot`: a VST3's own editor, or the built-in's patches.
+    /// Show what is in a bay: a VST3's own editor, or the built-in's patches.
     ///
     /// **The built-in has no window to open.** Same gesture either way, and it
-    /// has to be: "click the slot to see the instrument" is one thing a user
+    /// has to be: "click the bay to see the instrument" is one thing a user
     /// learns, not two. A VST3 shows its editor; the built-in shows the patch
-    /// picker, which IS its editor.
+    /// picker, which IS its editor. An empty bay opens the picker, which is
+    /// the same question one step earlier.
     ///
     /// Public because the host's `IVORY_OPEN_EDITOR` hook drives it too, and a
     /// dev hook that took a different path would exercise a path no user has.
-    pub fn open_slot_editor(&mut self, slot: usize) {
-        if self.chosen_plugin(slot) == Some(dialogs::BUILTIN_PATH) {
-            self.open_patch_picker(slot);
-        } else {
-            self.request_recorder(recorder::RecorderRequest::OpenPluginEditor(slot));
+    pub fn open_insert_face(&mut self, strip: usize, bay: usize) {
+        match self.insert(strip, bay) {
+            Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
+            Some(_) => {
+                self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(strip, bay));
+            }
+            None => self.open_insert_picker(strip, bay),
         }
     }
 
@@ -3859,55 +3750,36 @@ impl IvoryApp {
                 self.set_count_in_bars(next);
             }
             Hit::Export => self.open_export_dialog(),
-            Hit::PickSlot(slot) => self.open_plugin_picker(slot),
-            Hit::ClearSlot(slot) => {
-                if let Some(p) = self.settings.plugin_slots.get_mut(slot) {
-                    *p = None;
-                    self.save_settings();
-                }
-            }
-            Hit::OpenSlotEditor(slot) => self.open_slot_editor(slot),
-            // Both knobs write to settings and are pushed to the engine after
-            // the frame, the same shape as a fader: `save_settings_soon`
-            // because a drag is a hundred of these and each one is a file.
+            // The knobs write to settings and are pushed to the engine after
+            // the frame: `save_settings_soon` because a drag is a hundred of
+            // these and each one is a file.
             Hit::SetFx(fx, v) => {
                 *self.fx_mix(fx) = f64::from(v.clamp(0.0, 1.0));
                 self.save_settings_soon();
-            }
-            Hit::SetSlotGain(slot, p) => {
-                if let Some(g) = self.settings.plugin_gains.get_mut(slot) {
-                    *g = f64::from(recorder::fader_to_gain(p));
-                    self.save_settings_soon();
-                }
-            }
-            Hit::ToggleMetronome => {
-                self.settings.metronome_on = !self.settings.metronome_on;
-                self.save_settings();
             }
             Hit::ToggleMetronomeInTake => {
                 self.settings.metronome_in_take = !self.settings.metronome_in_take;
                 self.save_settings();
             }
-            // The faders. Saved through the same debounce the window geometry
-            // uses rather than on every frame of a drag — a fader written to
-            // disk sixty times a second is sixty file rewrites per gesture.
-            Hit::SetMetronomeGain(p) => {
-                self.settings.metronome_gain = f64::from(recorder::fader_to_gain(p));
-                self.save_settings_soon();
-            }
-            Hit::SetInputGain(p) => {
-                self.settings.input_gains[0] = f64::from(recorder::fader_to_gain(p));
-                self.save_settings_soon();
+            // Deliberately not saved: monitoring is off at every launch, by
+            // construction. See the field.
+            Hit::ToggleInputMonitor => {
+                self.input_monitor = !self.input_monitor;
             }
             Hit::SetMaster(p) => {
                 self.settings.master_gain = f64::from(recorder::fader_to_gain(p));
                 self.save_settings_soon();
             }
-            Hit::SetTrackGain(p) => {
-                self.settings.track_gain = f64::from(recorder::fader_to_gain(p));
-                self.save_settings_soon();
-            }
             Hit::ImportTrack => self.ask_for_track(),
+            // A click on the timeline is a LOCATE: the fraction along the box
+            // is the fraction into the file, because the box is the time
+            // axis. The transport goes there, playing or parked.
+            Hit::SeekTimeline(t) => {
+                if self.track.seconds > 0.0 {
+                    let seconds = f64::from(t.clamp(0.0, 1.0)) * self.track.seconds;
+                    self.request_recorder(recorder::RecorderRequest::Locate(seconds));
+                }
+            }
             Hit::Type(field) => {
                 self.num_edit = Some(recorder::NumEdit::new(field));
                 self.name_focused = false;
@@ -4256,15 +4128,6 @@ impl IvoryApp {
         self.plugin_list = bundles;
     }
 
-    /// The instrument chosen for each slot, for the host to load after the
-    /// frame.
-    pub fn chosen_plugin(&self, slot: usize) -> Option<&str> {
-        self.settings
-            .plugin_slots
-            .get(slot)
-            .and_then(|p| p.as_deref())
-    }
-
     /// Which slot the open picker is filling.
     ///
     /// The dialog does not know about slots — it chooses a bundle — so the app
@@ -4289,22 +4152,6 @@ impl IvoryApp {
         self.dialog = Some(Dialog::plugin_picker(
             &self.plugin_list,
             self.insert(strip, slot).map(str::to_owned),
-        ));
-    }
-
-    fn open_plugin_picker(&mut self, slot: usize) {
-        if !self.caps.capture_devices || slot >= recorder::SLOTS {
-            return;
-        }
-        self.picker_insert = None;
-        self.picker_slot = slot;
-        // The dialog's own constructor rather than building the variant here:
-        // it sorts, it derives the rows from the paths, and it preselects the
-        // loaded one. Three things that would otherwise be duplicated and
-        // would drift.
-        self.dialog = Some(Dialog::plugin_picker(
-            &self.plugin_list,
-            self.settings.plugin_slots[slot].clone(),
         ));
     }
 
@@ -4431,21 +4278,12 @@ impl IvoryApp {
         let hit = match edit.field {
             F::Meter => None,
             F::Tempo => recorder::parse_bpm(&edit.text).map(Hit::SetTempo),
-            // The setters take a FADER POSITION, not a gain, so a typed dB has
-            // to go back through the same curve the drag uses. Doing it here
-            // rather than teaching the setters a second unit keeps one
+            // The setter takes a FADER POSITION, not a gain, so a typed dB
+            // has to go back through the same curve the drag uses. Doing it
+            // here rather than teaching the setter a second unit keeps one
             // definition of what a fader position means.
-            F::Slot(i) => recorder::parse_gain(&edit.text)
-                .map(|g| Hit::SetSlotGain(i, recorder::gain_to_fader(g))),
-            F::Metronome => recorder::parse_gain(&edit.text)
-                .map(|g| Hit::SetMetronomeGain(recorder::gain_to_fader(g))),
-            F::Input => recorder::parse_gain(&edit.text)
-                .map(|g| Hit::SetInputGain(recorder::gain_to_fader(g))),
-            // Decibels, like the faders it shares a curve with.
             F::Master => recorder::parse_gain(&edit.text)
                 .map(|g| Hit::SetMaster(recorder::gain_to_fader(g))),
-            F::Track => recorder::parse_gain(&edit.text)
-                .map(|g| Hit::SetTrackGain(recorder::gain_to_fader(g))),
             // A PERCENT, not a gain: these are not faders and there is no dB
             // curve to invert. "40" is four tenths wet.
             // In the knob's OWN unit: a filter is typed in hertz.
@@ -5532,18 +5370,13 @@ impl IvoryApp {
                 self.save_settings();
             }
             DialogAction::LoadPlugin { path } => {
-                // The bus, not a slot. See `open_bus_effect_picker`.
-                if let Some((strip, at)) = self.picker_insert.take() {
-                    self.set_insert(strip, at, path.as_deref());
-                    return;
-                }
-                let slot = self.picker_slot.min(recorder::SLOTS - 1);
                 // Written to settings and nothing else: loading is the host's
                 // job, done after the frame, because `Module::open` runs
                 // third-party code and `Instance::create` can take seconds.
-                // The host notices the change by watching `chosen_plugin()`.
-                self.settings.plugin_slots[slot] = path;
-                self.save_settings();
+                // The host notices the change by watching `insert()`.
+                if let Some((strip, at)) = self.picker_insert.take() {
+                    self.set_insert(strip, at, path.as_deref());
+                }
             }
             DialogAction::ChoosePatch { slot, index } => {
                 // `usize::MAX` is the built-in row: no cartridge patch, the one
@@ -6923,25 +6756,6 @@ impl IvoryApp {
         // would float on top of its own dimming. Only the thanks card comes
         // later, and only because a card raised from a heart you can still see
         // is a card that belongs in front.
-        if self.track_open {
-            let anchor = self.track_anchor();
-            if anchor.is_positive() {
-                recorder_panel::draw_track_panel(
-                    ui.painter(),
-                    recorder_panel::TrackPanel {
-                        screen: ui.max_rect(),
-                        anchor,
-                        track: &self.track,
-                        position_s: self.recorder.position_s,
-                        playing: self.recorder.playing
-                            || matches!(self.recorder.state, recorder::RecordState::Rolling),
-                    },
-                    &self.settings,
-                );
-            } else {
-                self.track_open = false;
-            }
-        }
         // The effect panels, on the same terms and for the same reasons.
         if let Some(fx) = self.fx_open {
             let anchor = self.fx_anchor(fx);
@@ -8148,8 +7962,8 @@ mod tests {
         for (what, got, want) in [
             ("master", app.settings.master_gain, fresh.master_gain),
             ("track", app.settings.track_gain, fresh.track_gain),
-            ("slot 0", app.settings.plugin_gains[0], fresh.plugin_gains[0]),
-            ("input 0", app.settings.input_gains[0], fresh.input_gains[0]),
+            ("channel 0", app.settings.channel_gains[0], fresh.channel_gains[0]),
+            ("channel 2", app.settings.channel_gains[2], fresh.channel_gains[2]),
         ] {
             assert!(
                 (got - want).abs() < 1.0e-6,
@@ -8346,10 +8160,11 @@ mod tests {
     #[test]
     fn opening_the_builtin_shows_patches_and_a_vst_shows_its_own_editor() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.settings.plugin_slots[0] = Some(dialogs::BUILTIN_PATH.to_owned());
-        app.settings.plugin_slots[1] = Some("/x/Pianoteq 8.vst3".to_owned());
+        // The shipped desk: the Tangent DX7 in channel 1's first bay. A VST
+        // beside it in the second, to prove the two bays answer differently.
+        app.set_insert(0, 1, Some("/x/Pianoteq 8.vst3"));
 
-        app.apply_recorder_hit(recorder_panel::Hit::OpenSlotEditor(0));
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(0), 0), 0.0);
         assert!(
             matches!(app.dialog, Some(dialogs::Dialog::PatchPicker { slot: 0, .. })),
             "the built-in did not open its patches"
@@ -8358,11 +8173,11 @@ mod tests {
         assert!(app.take_recorder_request().is_none());
 
         app.dialog = None;
-        app.apply_recorder_hit(recorder_panel::Hit::OpenSlotEditor(1));
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(0), 1), 0.0);
         assert!(app.dialog.is_none(), "a VST3 does not use the patch picker");
         assert_eq!(
             app.take_recorder_request(),
-            Some(recorder::RecorderRequest::OpenPluginEditor(1))
+            Some(recorder::RecorderRequest::OpenInsertEditor(0, 1))
         );
     }
 
@@ -8371,8 +8186,7 @@ mod tests {
     #[test]
     fn loading_a_cartridge_refills_the_open_picker() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.settings.plugin_slots[0] = Some(dialogs::BUILTIN_PATH.to_owned());
-        app.apply_recorder_hit(recorder_panel::Hit::OpenSlotEditor(0));
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(0), 0), 0.0);
 
         app.set_cartridge(crate::ports::CartridgeInfo {
             factory: false,
@@ -8406,8 +8220,7 @@ mod tests {
     #[test]
     fn a_cartridge_that_fails_leaves_the_good_one_alone() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.settings.plugin_slots[0] = Some(dialogs::BUILTIN_PATH.to_owned());
-        app.apply_recorder_hit(recorder_panel::Hit::OpenSlotEditor(0));
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(0), 0), 0.0);
         app.set_cartridge(crate::ports::CartridgeInfo {
             factory: false,
             bank: "ROM1A".to_owned(),
@@ -9040,20 +8853,21 @@ mod tests {
         );
     }
 
-    /// **Every readable decibel is reachable by hand.** A fader spans seventy-
-    /// two decibels and reads to a tenth of one; over its own track that is
-    /// four tenths of a decibel per point, so half the numbers it can display
+    /// **Every readable decibel is reachable by hand.** The master spans
+    /// seventy-two decibels and reads to a tenth of one; over a knob's travel
+    /// that is coarser than the display, so half the numbers it can show
     /// could not be landed on. The fine modifier is what closes that.
     #[test]
-    fn a_fader_can_be_landed_on_any_tenth_of_a_decibel() {
+    fn the_master_can_be_landed_on_any_tenth_of_a_decibel() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         let from = {
             let band = app.last_band;
             let v = app.recorder_layout_view();
-            let (_, track, _) = recorder_panel::fader_zones(
-                recorder_panel::metronome_row(band, &v).expect("the click fader is there"),
-            );
-            track.center()
+            let cell = recorder_panel::knob_rect(band, &v, recorder_panel::Hit::SetMaster(0.0))
+                .expect("the master knob is there");
+            // Below the cell's word, on the dial itself — the cap is a
+            // separate target that opens the typing box.
+            Pos2::new(cell.center().x, cell.top() + cell.height() * 0.7)
         };
         press(&ctx, &mut app, from);
         let travel = {
@@ -9061,41 +8875,41 @@ mod tests {
             recorder_panel::drag_travel(
                 app.last_band,
                 &v,
-                recorder_panel::Hit::SetMetronomeGain(0.0),
+                recorder_panel::Hit::SetMaster(0.0),
             )
-            .expect("the fader travels")
+            .expect("the knob travels")
         };
 
         // Past the tap slop first — under it a press is still on its way to
         // being a tap and sets nothing, which is the point of the slop.
-        move_to_fine(&ctx, &mut app, Pos2::new(from.x + TAP_SLOP + 6.0, from.y));
+        move_to_fine(&ctx, &mut app, Pos2::new(from.x, from.y - TAP_SLOP - 6.0));
         // Now one more point, held fine. The step it produces has to be smaller
         // than the tenth of a decibel the reading shows, or there are values on
         // screen no hand can reach.
-        let before = app.settings.metronome_gain;
-        move_to_fine(&ctx, &mut app, Pos2::new(from.x + TAP_SLOP + 7.0, from.y));
+        let before = app.settings.master_gain;
+        move_to_fine(&ctx, &mut app, Pos2::new(from.x, from.y - TAP_SLOP - 7.0));
         let db = |g: f64| 20.0 * (g as f32).max(1e-9).log10();
-        let step = (db(app.settings.metronome_gain) - db(before)).abs();
+        let step = (db(app.settings.master_gain) - db(before)).abs();
         assert!(
             step > 0.0 && step < 0.1,
-            "one fine point moved the fader {step:.3} dB, and it reads to 0.1"
+            "one fine point moved the master {step:.3} dB, and it reads to 0.1"
         );
 
-        // And the ordinary gesture still crosses the whole track in a track's
-        // width, or a fader has stopped feeling like a fader.
+        // And the ordinary gesture still crosses the whole range in a knob's
+        // travel, or a knob has stopped feeling like a knob.
         let (_, mut app) = (0, app);
-        app.settings.metronome_gain = 0.0;
+        app.settings.master_gain = 0.0;
         app.grabbed = Some(Grab {
-            hit: recorder_panel::Hit::SetMetronomeGain(0.0),
+            hit: recorder_panel::Hit::SetMaster(0.0),
             from,
             moved: true,
             from_value: 0.0,
         });
-        move_to(&ctx, &mut app, Pos2::new(from.x + travel, from.y));
+        move_to(&ctx, &mut app, Pos2::new(from.x, from.y - travel));
         assert!(
-            app.settings.metronome_gain > 3.9,
-            "a full track's drag reached only {}",
-            app.settings.metronome_gain
+            app.settings.master_gain > 3.9,
+            "a full travel's drag reached only {}",
+            app.settings.master_gain
         );
     }
 
@@ -9361,46 +9175,36 @@ mod tests {
         );
     }
 
-    /// **A click on the waveform is a locate, and the maths is the drawn
+    /// **A click on the timeline is a locate, and the maths is the drawn
     /// playhead's exact inverse.**
     ///
-    /// This replaced the trim tests — trim is gone; the panel's one gesture is
-    /// "put the playhead where I pressed", and the host answers it with
-    /// `RecorderRequest::Locate` in seconds.
+    /// This replaced the trim tests — trim is gone, and the popup went with
+    /// it; the timeline's one gesture is "put the playhead where I pressed",
+    /// and the host answers it with `RecorderRequest::Locate` in seconds.
     #[test]
-    fn a_click_on_the_waveform_asks_for_that_second_of_the_file() {
+    fn a_click_on_the_timeline_asks_for_that_second_of_the_file() {
         let (_, mut app) = headless_with_fx(Caps::DESKTOP);
-        app.set_track_for_shot(
-            crate::ports::TrackInfo {
-                name: "b.mp3".to_owned(),
-                seconds: 200.0,
-                wave: vec![0.5; 100],
-                error: String::new(),
-            },
-            true,
-        );
-        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
-        let anchor = Rect::from_min_size(Pos2::new(600.0, 40.0), Vec2::new(20.0, 15.0));
-        let l = recorder_panel::TrackLayout::new(screen, anchor);
-        assert!(l.wave.is_positive(), "the panel has no waveform");
+        app.set_track_for_shot(crate::ports::TrackInfo {
+            name: "b.mp3".to_owned(),
+            seconds: 200.0,
+            wave: vec![0.5; 100],
+            error: String::new(),
+        });
 
-        // The middle of the waveform is the middle of the file.
-        let mid = Pos2::new(l.wave.center().x, l.wave.center().y);
-        match recorder_panel::track_hit_test(screen, anchor, 200.0, mid) {
-            Some(recorder_panel::TrackHit::Seek(s)) => {
-                assert!((s - 100.0).abs() < 1.5, "the middle asked for {s} of 200");
-            }
-            other => panic!("a click on the waveform answered {other:?}"),
-        }
-
-        // And the app turns it into a Locate request, in those seconds.
-        app.press_in_track_panel_at(screen, anchor, mid, true);
+        // The middle of the timeline is the middle of the file.
+        app.apply_recorder_hit(recorder_panel::Hit::SeekTimeline(0.5));
         match app.take_recorder_request() {
             Some(recorder::RecorderRequest::Locate(s)) => {
-                assert!((s - 100.0).abs() < 1.5, "the locate asked for {s}");
+                assert!((s - 100.0).abs() < 1e-6, "the locate asked for {s}");
             }
             other => panic!("the press produced {other:?}"),
         }
+
+        // With nothing loaded there is nothing to locate in, and a request
+        // would move a playhead over a file that does not exist.
+        app.set_track_for_shot(crate::ports::TrackInfo::default());
+        app.apply_recorder_hit(recorder_panel::Hit::SeekTimeline(0.5));
+        assert_eq!(app.take_recorder_request(), None);
     }
 
     /// The waveform's two mappings are exact inverses, at every position and
@@ -10636,16 +10440,22 @@ mod tests {
             theory_panel::Views::all(),
             "a reset did not restore every theory element"
         );
-        // **And an instrument in the rack.** It sounds either way, because the
-        // renderer plays the built-in when nothing else has — but a reset that
-        // left five empty rows told somebody the app had no instrument while
-        // it was playing one, and the patch picker is reached by clicking the
-        // slot it is in.
+        // **And an instrument on the desk.** A reset that left every bay
+        // empty would tell somebody the app had no instrument, and the patch
+        // picker is reached by clicking the bay it is in.
         assert_eq!(
-            s.plugin_slots[0].as_deref(),
+            bay_of(&s, 0, 0),
             Some(dialogs::BUILTIN_PATH),
-            "a reset left the rack empty"
+            "a reset left the desk empty"
         );
+    }
+
+    /// One bay of a `Settings`, the way `IvoryApp::insert` reads it.
+    fn bay_of(s: &crate::settings::Settings, strip: usize, bay: usize) -> Option<&str> {
+        s.strip_inserts
+            .get(strip * crate::recorder::INSERTS + bay)
+            .map(String::as_str)
+            .filter(|p| !p.is_empty())
     }
 
     /// A fresh install lands in the same place, which is the whole point of
@@ -10653,9 +10463,14 @@ mod tests {
     #[test]
     fn a_fresh_install_has_the_built_in_loaded() {
         let s = crate::settings::Settings::first_launch();
-        assert_eq!(s.plugin_slots[0].as_deref(), Some(dialogs::BUILTIN_PATH));
-        // And nothing else, so the rack is not four rows of something.
-        assert!(s.plugin_slots[1..].iter().all(Option::is_none));
+        assert_eq!(bay_of(&s, 0, 0), Some(dialogs::BUILTIN_PATH));
+        // And nothing else: one channel with the instrument, not eight of
+        // something.
+        assert!(
+            (1..=crate::recorder::STRIPS)
+                .all(|st| (0..crate::recorder::INSERTS).all(|b| bay_of(&s, st, b).is_none())),
+            "a fresh install loaded more than the one instrument"
+        );
         // No cartridge chosen means the one that ships. See `dx7::factory`.
         assert!(s.dx7_cartridge.is_empty());
     }
@@ -10698,14 +10513,10 @@ mod tests {
     #[test]
     fn a_typed_level_is_the_level_that_was_typed() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
-        for (field, read) in [
-            (
-                recorder::NumField::Slot(1),
-                (|a: &IvoryApp| a.settings.plugin_gains[1]) as fn(&IvoryApp) -> f64,
-            ),
-            (recorder::NumField::Metronome, |a| a.settings.metronome_gain),
-            (recorder::NumField::Input, |a| a.settings.input_gains[0]),
-        ] {
+        for (field, read) in [(
+            recorder::NumField::Master,
+            (|a: &IvoryApp| a.settings.master_gain) as fn(&IvoryApp) -> f64,
+        )] {
             app.num_edit = Some(recorder::NumEdit {
                 field,
                 text: "-6".to_owned(),

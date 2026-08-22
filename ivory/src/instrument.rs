@@ -538,40 +538,6 @@ fn strip_is_heard(strip: Strip, muted: u32, soloed: u32) -> bool {
     muted & strip.bit() == 0
 }
 
-/// Apply a strip's fader in place and add what it sends to the bus.
-///
-/// **One pass over the block for both**, because they are the same signal read
-/// twice: the fader is what leaves the strip and the send is a percentage of
-/// exactly that. Doing them apart would mean two passes and an intermediate
-/// nobody needs.
-///
-/// `gain` is the slewed value and is carried between blocks — a fader that
-/// jumped in one sample would click, and these are moved by a hand.
-fn fold_strip(
-    mix: &mut [f32],
-    aux: &mut [f32],
-    frames: usize,
-    gain: &mut f32,
-    target: f32,
-    send: f32,
-    coeff: f32,
-) -> [f32; 2] {
-    let mut peak = [0.0f32; 2];
-    for f in 0..frames {
-        *gain += (target - *gain) * coeff;
-        let at = f * TAP_CHANNELS;
-        for c in 0..TAP_CHANNELS {
-            let Some(v) = mix.get_mut(at + c) else { return peak };
-            *v *= *gain;
-            peak[c.min(1)] = peak[c.min(1)].max(v.abs());
-            if let Some(a) = aux.get_mut(at + c) {
-                *a += *v * send;
-            }
-        }
-    }
-    peak
-}
-
 /// Add what came back from the effects bus, at the bus's own fader.
 fn add_return(
     mix: &mut [f32],
@@ -648,91 +614,6 @@ fn place(stamp: Nanos, block_start: Nanos, rate: f64, frames: usize) -> Placemen
 // ───────────────────────────────────────────────────────────────────────────
 // Channel mapping
 // ───────────────────────────────────────────────────────────────────────────
-
-/// The two sides one slot contributes to the stereo sum.
-///
-/// **This is where an instrument's own width is resolved**, and it has to happen
-/// here rather than after the sum: once three instruments are added together
-/// there is no "the source is mono" left to ask about, and a mono pad added to a
-/// stereo piano would either vanish from one side or force the whole bus to
-/// mono. The rules are [`map_frame`]'s, moved up to the one place the answer is
-/// still knowable:
-///
-/// * **Mono goes to both sides.** A mono instrument heard only on the left is
-///   reported as a broken plugin.
-/// * **Two or more contributes its first two channels.** Bus 0 is the main mix
-///   by VST3 convention — Pianoteq's other seven are stem outputs of the same
-///   performance, and summing them would be the same piano eight times.
-/// * **Anything short of `frames` contributes nothing**, rather than a slice of
-///   whatever the last block left there. A refused block leaves stale samples in
-///   the buffers, and `frames` is the only thing that tells them apart.
-fn stereo_of(bufs: &[Vec<f32>], channels: usize, frames: usize) -> (&[f32], &[f32]) {
-    match channels {
-        0 => (&[], &[]),
-        1 => match bufs.first() {
-            Some(b) if b.len() >= frames => (&b[..frames], &b[..frames]),
-            _ => (&[], &[]),
-        },
-        _ => match (bufs.first(), bufs.get(1)) {
-            (Some(l), Some(r)) if l.len() >= frames && r.len() >= frames => {
-                (&l[..frames], &r[..frames])
-            }
-            _ => (&[], &[]),
-        },
-    }
-}
-
-/// Add one slot into the stereo sum, advancing its gain a frame at a time.
-///
-/// The gain is smoothed **inside** this loop rather than applied per block: a
-/// per-block gain is a staircase, and a staircase at 48 kHz is a buzz on every
-/// fader move. It also runs when the slot contributes nothing, so that a slot
-/// whose instrument is unloaded and reloaded does not resume from a gain the
-/// user moved half a minute ago and jump.
-#[allow(clippy::too_many_arguments)]
-fn mix_in(
-    mix: &mut [f32],
-    aux: &mut [f32],
-    left: &[f32],
-    right: &[f32],
-    gain: &mut f32,
-    target: f32,
-    send: f32,
-    coeff: f32,
-) -> [f32; 2] {
-    let frames = mix.len() / TAP_CHANNELS;
-    if left.len() < frames || right.len() < frames {
-        // **The gain still travels.** A slot with nothing in it this block is
-        // usually a slot that has just been emptied, and leaving its fader
-        // where it was means the next thing loaded into it starts at whatever
-        // the last one was fading through.
-        for _ in 0..frames {
-            *gain += (target - *gain) * coeff;
-        }
-        return [0.0; 2];
-    }
-    let mut peak = [0.0f32; 2];
-    for i in 0..frames {
-        *gain += (target - *gain) * coeff;
-        let g = *gain;
-        // Bounded by construction: `frames` is `mix.len() / 2` and both sides
-        // were just measured against it. Written as an add-assign because this
-        // is a SUM — the bus already holds whatever the slots before it put
-        // there, and an assignment here would make the last slot the only one
-        // anybody hears.
-        let (l, r) = (left[i] * g, right[i] * g);
-        peak[0] = peak[0].max(l.abs());
-        peak[1] = peak[1].max(r.abs());
-        mix[i * TAP_CHANNELS] += l;
-        mix[i * TAP_CHANNELS + 1] += r;
-        // Post-fader, like every send on this desk.
-        if let Some(a) = aux.get_mut(i * TAP_CHANNELS..i * TAP_CHANNELS + 2) {
-            a[0] += l * send;
-            a[1] += r * send;
-        }
-    }
-    peak
-}
 
 /// Map one frame of the stereo sum onto one frame of some destination.
 ///
@@ -1046,12 +927,7 @@ fn period_frames(rate: f64, bpm: f64, unit: u32) -> f64 {
 /// conversions are exact both ways.
 #[derive(Debug)]
 struct Shared {
-    /// One per instrument slot. An array rather than three fields because every
-    /// reader iterates them, and because a fourth slot should be a change to
-    /// one constant rather than a fourth field in four structs.
-    slot_gains: [AtomicU32; SLOTS],
-    /// One fader per general channel, whatever the channel's kind. The slot
-    /// and monitor gain arrays are the legacy rack's plumbing and die with it.
+    /// One fader per general channel, whatever the channel's kind.
     channel_gains: [AtomicU32; CHANNELS],
     /// Which general channel the built-in DX7 belongs to: a DESK INDEX, or -1
     /// for none. It stopped being a slot when the slots stopped existing on
@@ -1103,26 +979,10 @@ struct Shared {
     /// of feedback the moment somebody turns their speakers on after a relaunch
     /// they had forgotten was monitoring.
     monitor_on: AtomicBool,
-    /// The monitor's own level, as a linear gain. The microphone fader.
-    /// One microphone fader per input strip.
-    monitor_gain: [AtomicU32; INPUTS],
     /// Where the track starts and stops, in frames. `out` of zero means "to
     /// the end", so a clip with no trim needs no knowledge of its own length
     /// down here.
 
-    /// A clip on its way to the renderer, or `Some(None)` to take one away.
-    ///
-    /// **A mutex the audio thread only ever `try_lock`s**, exactly like
-    /// `pending_voice`: importing a file is a thing that happens once and can
-    /// wait a block; a block that waits on a file import is a dropout.
-    /// The take: the clip travels by RING now, in each direction, exactly as a
-    /// plugin does — because the mutex it replaced had no return channel, so
-    /// `self.track = next` freed up to 460 MB of `Vec<f32>` INSIDE the audio
-    /// callback whenever the renderer held the last reference. The displaced
-    /// clip goes back on `track_retiring` and is dropped by the UI thread that
-    /// sent its replacement. The rings live on `Engine`/`Renderer`; this
-    /// struct keeps only the flag.
-    track_loaded_flag: (),
     /// A live-input ring on its way to the renderer, or `None` taking one away.
     ///
     /// Behind a mutex and picked up with `try_lock`, exactly like the backing
@@ -1255,19 +1115,6 @@ struct Shared {
     tap_dropped: AtomicU64,
     midi_dropped: AtomicU64,
     pedal_dropped: AtomicU64,
-    /// Latched by the callback when `Instance::process` refuses a block, **per
-    /// slot**: one instrument that stops rendering must not silence the two
-    /// beside it, and the band has to be able to say which one to reload. The
-    /// words are chosen by the reader on the UI thread, because building a
-    /// `String` here would allocate on the audio thread.
-    slot_faulted: [AtomicBool; SLOTS],
-    /// Which slot holds the built-in instrument, or -1 for none.
-    ///
-    /// An `i32` because it is read on the audio thread every block and an
-    /// `Option<usize>` is not atomic. -1 does not mean "silent": with no slot
-    /// claiming it, the built-in still plays when nothing else does, which is
-    /// what makes a fresh install audible.
-    builtin_slot: AtomicI32,
     /// A patch waiting to be picked up by the renderer.
     ///
     /// A mutex, and the audio thread only ever `try_lock`s it: a patch change
@@ -1282,7 +1129,6 @@ struct Shared {
 impl Shared {
     fn new() -> Self {
         Self {
-            slot_gains: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             channel_gains: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             builtin_strip: AtomicI64::new(-1),
             pick_strip: std::array::from_fn(|_| AtomicI64::new(-1)),
@@ -1298,9 +1144,6 @@ impl Shared {
             transport_pos: AtomicU64::new(0),
             track_loaded: AtomicBool::new(false),
             monitor_on: AtomicBool::new(false),
-            monitor_gain: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
-
-            track_loaded_flag: (),
             pending_monitor: std::sync::Mutex::new(None),
             monitor_slip: AtomicU64::new(0),
             monitor_backlog: AtomicU32::new(0),
@@ -1351,8 +1194,6 @@ impl Shared {
             tap_dropped: AtomicU64::new(0),
             midi_dropped: AtomicU64::new(0),
             pedal_dropped: AtomicU64::new(0),
-            slot_faulted: std::array::from_fn(|_| AtomicBool::new(false)),
-            builtin_slot: AtomicI32::new(-1),
             pending_voice: std::sync::Mutex::new(None),
             running: AtomicBool::new(false),
             callbacks: AtomicU64::new(0),
@@ -1369,8 +1210,11 @@ impl Shared {
             .store(sane_gain(linear).to_bits(), Ordering::Relaxed);
     }
 
-    fn set_slot_gain(&self, slot: usize, linear: f32) {
-        if let Some(cell) = self.slot_gains.get(slot) {
+    /// One channel fader. An out-of-range channel is a no-op, never a panic:
+    /// this is reached from UI code, where the panic hook turns a panic into
+    /// a dialog and `exit(1)`.
+    fn set_channel_gain(&self, ch: usize, linear: f32) {
+        if let Some(cell) = self.channel_gains.get(ch) {
             cell.store(sane_gain(linear).to_bits(), Ordering::Relaxed);
         }
     }
@@ -1408,31 +1252,6 @@ impl Shared {
         }
     }
 
-    /// The instrument fault line, naming the slots so the other two are not
-    /// blamed for one instrument that stopped.
-    ///
-    /// Built here, on the UI thread, from bits the callback latched — the
-    /// callback cannot make a `String` and this cannot be a `&'static str` once
-    /// it has to say *which*.
-    fn instrument_fault(&self) -> Option<String> {
-        let mut names = String::new();
-        for (i, f) in self.slot_faulted.iter().enumerate() {
-            if f.load(Ordering::Relaxed) {
-                if !names.is_empty() {
-                    names.push_str(", ");
-                }
-                // 1-based: the band's three rows are 1, 2 and 3 to everyone who
-                // is not reading this file.
-                names.push_str(&(i + 1).to_string());
-            }
-        }
-        if names.is_empty() {
-            return None;
-        }
-        Some(format!(
-            "instrument {names} stopped rendering; reload it or choose another"
-        ))
-    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1546,27 +1365,6 @@ struct PluginBox(Option<Box<Hosted>>);
 // is being shared rather than moved.
 unsafe impl Send for PluginBox {}
 
-/// One instrument slot, as the audio thread sees it.
-///
-/// The whole per-slot world in one struct so that [`Renderer`] holds
-/// `[Slot; SLOTS]` and every loop over the three is a loop over one array
-/// instead of three parallel ones that can fall out of step.
-struct Slot {
-    /// The resident instrument, in the same newtype it travelled in. It has to
-    /// be the newtype and not a bare `Option<Box<Hosted>>`: cpal requires the
-    /// whole callback closure to be `Send`, so every field of this struct must
-    /// be, and the `unsafe impl` on [`PluginBox`] is the one place that claim is
-    /// made and argued.
-    plugin: PluginBox,
-    /// This slot's half of the handoff. The pair is the routing: an instance
-    /// arriving here belongs *here*, and no index says so.
-    incoming: Consumer<PluginBox>,
-    retiring: Producer<PluginBox>,
-    /// Smoothed gain, advanced one frame at a time so a fader move is a fade
-    /// and not a step. Per slot, because the three faders move independently.
-    gain: f32,
-}
-
 /// A clip and where it begins on the timeline, in frames.
 ///
 /// **`start` is 0 for the backing track, and it is one field and one
@@ -1608,7 +1406,8 @@ impl Rack {
     /// callback never DROPS a plugin — dropping runs the vendor's teardown,
     /// which is not something to do between two blocks of audio — it returns
     /// it for the UI thread to drop.
-    fn swap(&mut self) {
+    fn swap(&mut self) -> usize {
+        let mut swapped = 0;
         for i in 0..INSERTS {
             // **Room to give the old one back, checked BEFORE taking the new
             // one.** This was `while let Ok(next) = incoming.pop()` followed by
@@ -1637,7 +1436,9 @@ impl Rack {
             // only producer. Still not `unwrap` — a panic here is a panic on
             // the audio thread.
             let _ = self.retiring[i].push(old);
+            swapped += 1;
         }
+        swapped
     }
 
     /// Whether anything is loaded. The whole point of asking is to leave the
@@ -1715,8 +1516,6 @@ struct Renderer {
     rate: f64,
     dev_channels: usize,
 
-    /// The three slots, all rendered every block from the same note list.
-    slots: [Slot; SLOTS],
     /// The instruments summed, interleaved stereo, one chunk long.
     ///
     /// **Sized at [`Engine::start`] and never again**, which is what makes the
@@ -1774,9 +1573,6 @@ struct Renderer {
     /// that reached the settings, the engine and the meter, and never once
     /// reached the audio.
     builtin_scratch: Vec<f32>,
-    /// Where the built-in's slot gain has slewed to. Same treatment as a
-    /// plugin's: stepping a gain at a block boundary is a click.
-    builtin_gain: f32,
     /// Where each general channel's fader has slewed to. Per channel, because
     /// the eight move independently — the same treatment every fader gets.
     channel_gain: [f32; CHANNELS],
@@ -1855,9 +1651,6 @@ struct Renderer {
     fx_out: Vec<Vec<f32>>,
     /// The effects bus's own buffer, one block long, interleaved like `mix`.
     aux: Vec<f32>,
-    /// Slewed, like every other gain here: a fader jumping in one sample is a
-    /// click, and these are moved by a hand on a knob.
-    instrument_gain: f32,
     fx_return_gain: f32,
     /// The renderer's OWN copy of the parameters.
     ///
@@ -1865,9 +1658,6 @@ struct Renderer {
     /// thread never blocks on a lock in the common case and never blocks at
     /// all: a `try_lock` that fails simply means next block.
     effect_params: crate::effects::Params,
-    /// Whether a slot has asked for the built-in by name. When none has, it
-    /// still plays if nothing else does; when one has, it plays regardless.
-    builtin_slot: Option<usize>,
     /// Control changes for this block — the sustain pedal, above all.
     ///
     /// Preallocated beside `notes` and for the same reason: `process` runs on
@@ -1984,30 +1774,15 @@ impl Renderer {
     }
 
     fn swap_plugins(&mut self) -> usize {
-        // Every rack first, by the same protocol the slots use: whatever
-        // arrives replaces what is there and the old one goes back to be
-        // dropped on the thread that made it.
-        for rack in &mut self.racks {
-            rack.swap();
-        }
+        // Every rack, by one protocol: whatever arrives replaces what is
+        // there and the old one goes back to be dropped on the thread that
+        // made it.
         let mut swapped = 0;
-        for (slot, faulted) in self.slots.iter_mut().zip(&self.shared.slot_faulted) {
-            if slot.retiring.slots() == 0 {
-                continue;
-            }
-            let Ok(next) = slot.incoming.pop() else {
-                continue;
-            };
-            let old = std::mem::replace(&mut slot.plugin, next);
-            // Only this slot's fault is cleared. A new pad does not vouch for
-            // the piano that stopped rendering an hour ago.
-            faulted.store(false, Ordering::Relaxed);
-            self.shared.swaps.fetch_add(1, Ordering::Relaxed);
-            // Cannot fail: `slots()` was checked above and this is the only
-            // producer. `let _` rather than `expect` because a panic here is
-            // undefined behaviour, not a bug report.
-            let _ = slot.retiring.push(old);
-            swapped += 1;
+        for rack in &mut self.racks {
+            swapped += rack.swap();
+        }
+        if swapped > 0 {
+            self.shared.swaps.fetch_add(swapped as u64, Ordering::Relaxed);
         }
         swapped
     }
@@ -2135,11 +1910,6 @@ impl Renderer {
         // cost: they are published at human speed.
         let muted = self.shared.muted.load(Ordering::Relaxed);
         let soloed = self.shared.soloed.load(Ordering::Relaxed);
-        // The legacy slots have no strips on the desk any more, so their
-        // gains are raw: nothing can mute what nothing draws. They render
-        // only in the plugin test harness now.
-        let slot_targets: [f32; SLOTS] =
-            std::array::from_fn(|i| Shared::f32_of(&self.shared.slot_gains[i]).clamp(0.0, 8.0));
         let metro_target = Shared::f32_of(&self.shared.metro_gain).clamp(0.0, 8.0);
         let metro_on = self.shared.metro_on.load(Ordering::Relaxed);
         let in_take = self.shared.metro_in_take.load(Ordering::Relaxed);
@@ -2191,8 +1961,13 @@ impl Renderer {
             if let Some(aux) = self.aux.get_mut(..n * TAP_CHANNELS) {
                 aux.fill(0.0);
             }
-            let widths = self.render_slots(n);
-            self.sum_slots(n, &widths, &slot_targets);
+            // **And the mix itself.** `sum_slots` used to zero it on its way
+            // through; with the legacy rack gone, forgetting this line leaves
+            // every block summed on top of the last one — the backing track
+            // a block ago is still in the buffer, at full level, for ever.
+            if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
+                mix.fill(0.0);
+            }
             self.mix_channels(n, muted, soloed);
 
             // A parameter change, if one is waiting and the lock is free this
@@ -3099,133 +2874,6 @@ impl Renderer {
         }
     }
 
-    fn render_slots(&mut self, frames: usize) -> [usize; SLOTS] {
-        let notes = &self.notes;
-        let controls = &self.controls;
-        let shared = &self.shared;
-        let mut widths = [0usize; SLOTS];
-        // The controls this block found no home in. **The minimum across the
-        // slots that rendered**, not the sum: one pedal press refused by three
-        // instruments is one message that did not arrive, and summing would
-        // report the same press three times and make `pedal_dropped` a function
-        // of how many slots are full.
-        let mut unmapped = usize::MAX;
-        for ((width, slot), faulted) in widths
-            .iter_mut()
-            .zip(self.slots.iter_mut())
-            .zip(&shared.slot_faulted)
-        {
-            if faulted.load(Ordering::Relaxed) {
-                continue;
-            }
-            let Some(p) = slot.plugin.0.as_mut() else {
-                continue;
-            };
-            match p
-                .inst
-                .process_with_controls(notes, controls, frames, &mut p.bufs)
-            {
-                Ok(rendered) => {
-                    unmapped = unmapped.min(rendered.unmapped);
-                    *width = p.channels;
-                }
-                Err(_) => {
-                    // The message is discarded on purpose: reading it means
-                    // holding a `String` the audio thread would have to free.
-                    // `fault()` turns this flag into words, and into a number.
-                    faulted.store(true, Ordering::Relaxed);
-                }
-            }
-        }
-        // A control no instrument published a mapping for. Counted rather than
-        // ignored, so the band can say "these instruments have no pedal" instead
-        // of the user concluding the app has none. `usize::MAX` means no slot
-        // rendered at all, which is not the pedal's fault.
-        if unmapped != usize::MAX && unmapped > 0 {
-            shared
-                .pedal_dropped
-                .fetch_add(unmapped as u64, Ordering::Relaxed);
-        }
-        widths
-    }
-
-    /// Sum the slots into the stereo bus, at their own smoothed gains.
-    ///
-    /// One pass per slot over a contiguous buffer, which is the cheap way round:
-    /// the alternative reads three plugins' buffers per frame and touches three
-    /// cache lines to write one.
-    fn sum_slots(&mut self, frames: usize, widths: &[usize; SLOTS], targets: &[f32; SLOTS]) {
-        // `get_mut` and not a slice expression: `render` bounds `frames` to what
-        // the bus holds, and this is the line that would panic — on the audio
-        // thread, across an FFI boundary — if that bound were ever loosened.
-        //
-        // **Both buffers, because a slot is a channel.** Each instrument goes
-        // to the mix at its own fader and to the effects bus at its own send,
-        // in one pass over one signal — the same rule every other strip
-        // follows, and the reason a rack of five is a rack rather than a sum
-        // with one fader on it.
-        let (Some(mix), Some(aux)) = (
-            self.mix.get_mut(..frames * TAP_CHANNELS),
-            self.aux.get_mut(..frames * TAP_CHANNELS),
-        ) else {
-            return;
-        };
-        mix.fill(0.0);
-        let coeff = self.gain_coeff;
-        let mut peaks = [[0.0f32; 2]; SLOTS];
-        for (i, ((slot, width), target)) in
-            self.slots.iter_mut().zip(widths).zip(targets).enumerate()
-        {
-            // Destructured so the gain can be advanced while the buffers are
-            // read: they are separate fields and the borrow checker knows it,
-            // but only if the two are named separately.
-            let Slot { plugin, gain, .. } = slot;
-            let (left, right) = match plugin.0.as_ref() {
-                Some(p) => stereo_of(&p.bufs, *width, frames),
-                None => (&[][..], &[][..]),
-            };
-            let send = f32::from_bits(self.shared.send[i].load(Ordering::Relaxed)).clamp(0.0, 1.0);
-            // **This slot's inserts, before its fader.** An instrument's audio
-            // is already PLANAR — one array per channel is what the host hands
-            // back and what an effect wants — so this is the one channel on
-            // the desk that needs no interleaving to reach its rack.
-            //
-            // An empty rack is a branch and nothing else: the pair goes to
-            // `mix_in` exactly as it did before racks existed.
-            let (left, right) = if self.racks[i].is_empty() {
-                (left, right)
-            } else {
-                for (c, src) in [left, right].into_iter().enumerate() {
-                    let Some(dst) = self.fx_in.get_mut(c) else {
-                        continue;
-                    };
-                    for (f, d) in dst.iter_mut().take(frames).enumerate() {
-                        *d = src.get(f).copied().unwrap_or(0.0);
-                    }
-                }
-                {
-                    let armed =
-                        self.shared.midi_off.load(Ordering::Relaxed) & (1 << i.min(31)) == 0;
-                    let notes: &[ivory_host::Note] = if armed { &self.notes } else { &[] };
-                    let controls: &[ivory_host::Control] =
-                        if armed { &self.controls } else { &[] };
-                    run_rack(
-                        &mut self.racks[i],
-                        &mut self.fx_in,
-                        frames,
-                        &mut self.fx_out,
-                        notes,
-                        controls,
-                    );
-                }
-                (&self.fx_in[0][..frames], &self.fx_in[1][..frames])
-            };
-            peaks[i] = mix_in(mix, aux, left, right, gain, *target, send, coeff);
-        }
-        // No peaks: the legacy slots have no strips on the desk to show them.
-        let _ = peaks;
-    }
-
     /// Push the recorder's mix, whole frames only.
     ///
     /// **Only whole frames**, exactly as `ivory-record`'s capture ring insists:
@@ -3458,9 +3106,6 @@ pub struct Engine {
     /// atomics and no waiting.
     midi: RefCell<Producer<MidiEvent>>,
 
-    /// This thread's end of each slot's handoff, one pair per slot.
-    handoff: [Handoff; SLOTS],
-    /// The bus effect's half of the same protocol.
     /// The UI thread's ends of every rack's hand-offs. See `Rack`.
     insert_handoff: [[Handoff; INSERTS]; STRIPS + 1],
     /// The clip's two rings, in the plugin handoff's exact shape and for its
@@ -3471,31 +3116,21 @@ pub struct Engine {
     track_from_audio: Consumer<Option<Placed>>,
     /// What is in each of them, for the desk to name.
     inserts_loaded: [[Option<Loaded>; INSERTS]; STRIPS + 1],
-    loaded: [Option<Loaded>; SLOTS],
-    warm: [Option<WarmUp>; SLOTS],
 
     tap: Option<RecorderTap>,
     fault: Arc<Mutex<Option<String>>>,
 
-    /// The open editor window for each slot, if the user has asked for one.
+    /// The open editor window for each loaded insert, if the user has asked
+    /// for one. **An insert is a plugin with a window like any other**, and
+    /// until this existed there was no way to reach one: a reverb loaded into
+    /// a channel came up, worked, and could not be adjusted — every control
+    /// it has is inside a window nothing opened.
     ///
     /// The engine owns them because the engine owns the plugins, and the two
     /// have a lifetime rule: an editor must never outlive the instance whose
-    /// controller built its view. Everything that unloads goes through
-    /// [`Engine::close_editor`] first, and this is declared **before**
-    /// `editor_handles` so that even a plain `drop(engine)` releases every
-    /// window and its `IPlugView` before the controller references that made
-    /// them.
-    editors: [Option<ivory_host::Editor>; SLOTS],
-    /// The same, for the racks. **An insert is a plugin with a window like any
-    /// other**, and until this existed there was no way to reach one: a
-    /// reverb loaded into a channel came up, worked, and could not be adjusted
-    /// — every control it has is inside a window nothing opened.
-    ///
-    /// Declared before `insert_editor_handles`, exactly as `editors` is before
-    /// `editor_handles`, and for the identical reason: a plain `drop(engine)`
-    /// has to release every window and its `IPlugView` before the controller
-    /// references that built them.
+    /// controller built its view. Declared **before** `insert_editor_handles`
+    /// so that even a plain `drop(engine)` releases every window and its
+    /// `IPlugView` before the controller references that made them.
     insert_editors: [[Option<ivory_host::Editor>; INSERTS]; STRIPS + 1],
     /// Each loaded insert's edit controller, taken in [`Engine::load_insert`]
     /// **before** the instance leaves for the audio thread — the one moment
@@ -3507,29 +3142,15 @@ pub struct Engine {
     /// ever had one before, so every effect's knobs and every bay instrument's
     /// preset died with the process.
     insert_state_handles: [[Option<ivory_host::StateHandle>; INSERTS]; STRIPS + 1],
-    /// A reference to each loaded plugin's edit controller, taken in
-    /// [`Engine::load_plugin`] **before** the instance is handed to the audio
-    /// thread — see [`Engine::open_editor`], where that is the whole trick.
-    /// `None` for a slot with nothing loaded.
-    editor_handles: [Option<ivory_host::EditorHandle>; SLOTS],
-    /// A reference to each loaded plugin's **processor**, taken in the same
-    /// moment and for the same reason, so that [`Engine::save_slot_state`] can
-    /// ask an instrument what it sounds like after it has left for the audio
-    /// callback. `None` for a slot with nothing loaded.
+    /// Why a bay's saved state was not restored, if it was not.
     ///
-    /// Cleared before the slot's instance is retired, exactly like
-    /// `editor_handles`: a handle that outlives the instance is a live pointer
-    /// into a terminated object.
-    state_handles: [Option<ivory_host::StateHandle>; SLOTS],
-    /// Why a slot's saved state was not restored, if it was not.
-    ///
-    /// A stale or hand-edited blob in the settings file must not stop the
-    /// instrument loading — the user wants their piano more than they want
-    /// their preset — so the load continues with the plugin's defaults and the
-    /// reason lands here, where [`Engine::state_error`] can put it in front of
-    /// someone. Silently ignoring it is how "my preset keeps resetting" becomes
+    /// A stale or hand-edited blob must not stop the plugin loading — the
+    /// user wants their piano more than they want their preset — so the load
+    /// continues with the plugin's defaults and the reason lands here, where
+    /// [`Engine::insert_state_error`] can put it in front of someone.
+    /// Silently ignoring it is how "it keeps forgetting my piano" becomes
     /// unreportable.
-    state_errors: [Option<String>; SLOTS],
+    insert_state_errors: [[Option<String>; INSERTS]; STRIPS + 1],
 
     /// Meter hold, decayed on the UI thread because that is where it is read.
     hold: Cell<(f32, f32)>,
@@ -3633,35 +3254,14 @@ impl Engine {
         let tap_frames = (DEFAULT_RING_SECONDS * rate as f32) as usize;
         let (tap_tx, tap_rx) = RingBuffer::<f32>::new(tap_frames.max(4096) * TAP_CHANNELS);
 
-        // Two rings of two per slot. Two and two because at most one handoff per
-        // slot is ever in flight — `hand_off` waits for the return before it
-        // starts another — and the spare element is what lets `swap_plugins`
-        // check for room before it commits. Six small rings rather than one
-        // shared pair, because the ring an instance travels on is what says
-        // which slot it belongs to; see [`PluginBox`], condition 1.
-        let mut ends: Vec<Handoff> = Vec::with_capacity(SLOTS);
-        let slots: [Slot; SLOTS] = std::array::from_fn(|_| {
-            let (to_audio, incoming) = RingBuffer::<PluginBox>::new(2);
-            let (retiring, from_audio) = RingBuffer::<PluginBox>::new(2);
-            ends.push(Handoff {
-                to_audio,
-                from_audio,
-            });
-            Slot {
-                plugin: PluginBox(None),
-                incoming,
-                retiring,
-                gain: 1.0,
-            }
-        });
-        let mut ends = ends.into_iter();
-        let handoff: [Handoff; SLOTS] =
-            std::array::from_fn(|_| ends.next().expect("one Handoff was pushed per slot"));
         // **A rack per channel, master last, three hand-off pairs each.**
-        // Thirty-nine small rings rather than one shared pair, for the same
-        // reason the slots have six: the ring an instance travels on is what
-        // says where it belongs, and a pair carrying an index would be the
-        // audio thread trusting a number a UI thread wrote. See `PluginBox`.
+        // Thirty-nine small rings rather than one shared pair, because the
+        // ring an instance travels on is what says where it belongs, and a
+        // pair carrying an index would be the audio thread trusting a number
+        // a UI thread wrote. See `PluginBox`. Two and two per bay because at
+        // most one handoff per bay is ever in flight — `hand_off_insert`
+        // waits for the return before it starts another — and the spare
+        // element is what lets `Rack::swap` check for room before it commits.
         let mut rack_ends: Vec<[Handoff; INSERTS]> = Vec::with_capacity(STRIPS + 1);
         let racks: [Rack; STRIPS + 1] = std::array::from_fn(|_| {
             let mut ends: Vec<Handoff> = Vec::with_capacity(INSERTS);
@@ -3708,10 +3308,9 @@ impl Engine {
             timebase,
             rate: f64::from(rate),
             dev_channels: dev_ch,
-            slots,
             // Sized for one whole render block, here and never again — this is
-            // the buffer that makes summing three instruments allocation-free
-            // whether they arrive now or in an hour.
+            // the buffer that makes summing the desk allocation-free whether
+            // its channels fill up now or in an hour.
             mix: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             midi: midi_rx,
             pending: None,
@@ -3726,7 +3325,6 @@ impl Engine {
             track_retiring,
             builtin: crate::dx7::Dx7::new(rate as f32),
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
-            builtin_gain: 1.0,
             channel_gain: [1.0; CHANNELS],
             effects: crate::effects::Effects::new_send(rate as f32),
             master_effects: crate::effects::Effects::new(rate as f32),
@@ -3741,10 +3339,8 @@ impl Engine {
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],
             click_taped: vec![0.0; MAX_BLOCK as usize],
-            instrument_gain: 1.0,
             fx_return_gain: 1.0,
             effect_params: crate::effects::Params::default(),
-            builtin_slot: None,
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
             tap: tap_tx,
             tap_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
@@ -3793,13 +3389,10 @@ impl Engine {
             shared: Arc::clone(&shared),
             timebase,
             midi: RefCell::new(midi_tx),
-            handoff,
             insert_handoff,
             track_to_audio,
             track_from_audio,
             inserts_loaded: std::array::from_fn(|_| std::array::from_fn(|_| None)),
-            loaded: std::array::from_fn(|_| None),
-            warm: std::array::from_fn(|_| None),
             tap: Some(RecorderTap {
                 rx: tap_rx,
                 channels: TAP_CHANNELS,
@@ -3807,13 +3400,10 @@ impl Engine {
                 dropped: shared,
             }),
             fault,
-            editors: std::array::from_fn(|_| None),
             insert_editors: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             insert_editor_handles: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             insert_state_handles: std::array::from_fn(|_| std::array::from_fn(|_| None)),
-            editor_handles: std::array::from_fn(|_| None),
-            state_handles: std::array::from_fn(|_| None),
-            state_errors: std::array::from_fn(|_| None),
+            insert_state_errors: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             hold: Cell::new((0.0, 0.0)),
             hold_at: Cell::new(Instant::now()),
         })
@@ -3821,39 +3411,6 @@ impl Engine {
 
 
     // ── the instruments ─────────────────────────────────────────────────────
-
-    /// Load an instrument into `slot` of the running stream.
-    ///
-    /// The other slots are untouched: their instances never leave the callback,
-    /// their rings are not involved, and the piano in slot 0 does not miss a
-    /// block while a pad is loaded into slot 1. **What it does cost the other
-    /// slots is this thread**, for as long as the warm-up below takes.
-    ///
-    /// **This blocks for about five seconds and must not be called from inside
-    /// a frame.** Module load, instantiation and — the expensive part — the
-    /// warm-up: RECORDER-PLAN §8 measured four of six instruments on this
-    /// machine rendering silence if played immediately after instantiation, and
-    /// all four fine five seconds later. `ivory_host::ready` is what decides
-    /// that, run here through its blocking `warm_up` helper because this call is
-    /// blocking by contract. Three slots means a session that fills all three
-    /// waits three times, one after another, which is the strongest argument yet
-    /// for the incremental form below.
-    ///
-    /// The incremental alternative is available and is what the Recorder band
-    /// should eventually use: own a `ready::Readiness`, step it a block at a
-    /// time from this thread, and paint `status_line()` every frame so the
-    /// fifteen-second worst case is a progress bar instead of a frozen window.
-    /// It needs the instance to stay on this thread until the gate closes, which
-    /// is exactly what happens here — the handoff is the last step, after the
-    /// warm-up, not before it.
-    pub fn load_plugin(
-        &mut self,
-        slot: usize,
-        bundle: &Path,
-        class_name: Option<&str>,
-    ) -> Result<Loaded, String> {
-        self.load_plugin_with_state(slot, bundle, class_name, None)
-    }
 
     /// As [`Engine::load_plugin`], and restore `state` into the instrument
     /// before it is warmed up or handed over.
@@ -3922,6 +3479,13 @@ impl Engine {
             }
             self.hand_off_insert(strip, slot, PluginBox(None));
             self.inserts_loaded[strip][slot] = None;
+            if let Some(e) = self
+                .insert_state_errors
+                .get_mut(strip)
+                .and_then(|r| r.get_mut(slot))
+            {
+                *e = None;
+            }
             return Ok(None);
         };
         let module = Module::open(bundle)?;
@@ -3992,7 +3556,6 @@ impl Engine {
         // every relaunch, which until now they did.
         let editor_handle = inst.editor_handle();
         let state_handle = inst.state_handle();
-        let _ = &state_error;
         let loaded = Loaded {
             bundle: bundle.to_path_buf(),
             class: class.name.clone(),
@@ -4046,7 +3609,28 @@ impl Engine {
             *h = Some(state_handle);
         }
         self.inserts_loaded[strip][slot] = Some(loaded.clone());
+        if let Some(e) = self
+            .insert_state_errors
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *e = state_error.map(|err| err.to_string());
+        }
         Ok(Some(loaded))
+    }
+
+    /// Why the state handed to [`Engine::load_insert`] was not restored into
+    /// this bay.
+    ///
+    /// `None` is the normal answer: nothing was offered, or it was restored.
+    /// `Some` means the plugin came up with its defaults and the user's
+    /// preset did not survive — worth saying out loud, because the symptom is
+    /// "it keeps forgetting my piano" and nothing else in the app would know.
+    pub fn insert_state_error(&self, strip: usize, slot: usize) -> Option<&str> {
+        self.insert_state_errors
+            .get(strip)?
+            .get(slot)?
+            .as_deref()
     }
 
     /// What is in one insert, if anything.
@@ -4077,306 +3661,7 @@ impl Engine {
         }
     }
 
-    pub fn load_plugin_with_state(
-        &mut self,
-        slot: usize,
-        bundle: &Path,
-        class_name: Option<&str>,
-        state: Option<&[u8]>,
-    ) -> Result<Loaded, String> {
-        // Checked FIRST, before five seconds of work that would have nowhere to
-        // go, and returned as an error rather than an index because this is
-        // called from the UI.
-        if slot >= SLOTS {
-            return Err(format!(
-                "there is no instrument slot {slot}; there are {SLOTS}, numbered from 0"
-            ));
-        }
-        let module = Module::open(bundle)?;
-        let classes = module.audio_modules();
-        if classes.is_empty() {
-            return Err(format!(
-                "{} has no Audio Module Class, so it is an effect or a shell rather than an instrument",
-                bundle.display()
-            ));
-        }
-        let class = match class_name {
-            Some(want) => classes
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(want))
-                .or_else(|| {
-                    let want = want.to_lowercase();
-                    classes.iter().find(|c| c.name.to_lowercase().contains(&want))
-                })
-                .ok_or_else(|| {
-                    format!(
-                        "{} has no class matching {want:?}; it offers {}",
-                        bundle.display(),
-                        classes
-                            .iter()
-                            .map(|c| c.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                })?
-                .clone(),
-            None => classes[0].clone(),
-        };
-
-        // **A slot is fed MIDI**, so an effect loaded into one would take a
-        // second, succeed, and produce silence for ever. The owner's words
-        // were that a Pro-R or a VintageVerb owner "will be irked that they
-        // load their vst and nothing happens" — a broken promise rather than a
-        // missing feature, so it is refused with a sentence instead.
-        //
-        // Refused HERE rather than filtered out of the picker: the picker is a
-        // filesystem walk that never opens a bundle, and reading
-        // `subCategories` for every VST3 on the machine is a scan with a cache
-        // and a crash boundary, which is a subsystem, not a check. The bundle
-        // is open by now and the answer is free.
-        //
-        // Short on purpose: the band wraps it in the bundle's name and a
-        // pointer at the built-in, and the three have to fit on one line.
-        if class.kind() == ivory_host::scan::Kind::Effect {
-            return Err(format!("{} is an effect, not an instrument", class.name));
-        }
-        let setup = Setup {
-            sample_rate: f64::from(self.output.sample_rate),
-            max_block: MAX_BLOCK,
-        };
-        let mut inst = Instance::create(&module, &class, setup)?;
-        let channels = inst
-            .audio_outputs()
-            .first()
-            .map(|b| b.channels.max(0) as usize)
-            .unwrap_or(0);
-        if channels == 0 {
-            return Err(format!("{} has no audio output channels", class.name));
-        }
-
-        // BEFORE the warm-up. See this function's docs: a preset change makes a
-        // sampled instrument reload, so state that arrives after the gate has
-        // closed means the gate waited for the wrong load.
-        let state_error = match state {
-            Some(bytes) => inst.load_state(bytes).err(),
-            None => None,
-        };
-
-        let gate = ivory_host::ready::warm_up(&mut inst, ivory_host::Policy::default());
-        if gate.state() == ivory_host::ReadyState::Failed {
-            return Err(gate
-                .reason()
-                .unwrap_or("the instrument failed to warm up")
-                .to_string());
-        }
-        let warm = WarmUp {
-            heard: gate.evidence() != Some(ivory_host::ready::Evidence::Timeout),
-            elapsed: gate.elapsed(),
-            peak: gate.peak_seen(),
-        };
-
-        // ── the editor's only chance to get a reference ─────────────────────
-        //
-        // **Taken here and nowhere else.** One line below, `inst` is moved into
-        // a `Hosted`, into a `PluginBox`, and across a ring into the audio
-        // callback, and from that moment there is no `&Instance` on this thread
-        // and no safe way to make one. `IEditController` is a reference-counted
-        // COM object, so a second reference costs an atomic increment and keeps
-        // working after the instance has gone; it is `!Send`, so it can only
-        // ever be used from here.
-        //
-        // The alternatives were considered and are worse:
-        //
-        // * **Retire the plugin to borrow it back.** `hand_off(PluginBox(None))`
-        //   would return the instance, but the callback renders silence for the
-        //   whole round trip and any note in the MIDI ring during it is dropped
-        //   — a click and a hole in the middle of playing, every time somebody
-        //   opens a window.
-        // * **Create the view at load time.** Builds Pianoteq's entire UI on
-        //   every load whether or not anyone wants it, and leaves a view alive
-        //   with nowhere to be attached.
-        //
-        // The audio thread's side of this is unchanged: it calls `process` and
-        // nothing else, which is condition 3 of `PluginBox`'s safety argument
-        // and is exactly the split VST3 specifies — the controller is a
-        // main-thread object and every call this file makes on it is on this
-        // thread.
-        let editor_handle = inst.editor_handle();
-        // The same trick, one line later and for the same reason: after the
-        // handoff there is no `&Instance` here to ask for its state either.
-        // `IComponent` is reference-counted, the handle is `!Send`, and
-        // `getState` is a main-thread call — which is this thread.
-        let state_handle = inst.state_handle();
-
-        let loaded = Loaded {
-            bundle: bundle.to_path_buf(),
-            class: class.name.clone(),
-            vendor: module.vendor().to_string(),
-            channels: channels as u16,
-            sample_rate: self.output.sample_rate,
-        };
-        let hosted = Hosted {
-            inst,
-            module,
-            // Pre-grown to a full block so `Instance::process`'s `resize` is a
-            // length change and never an allocation.
-            bufs: vec![vec![0.0; MAX_BLOCK as usize]; channels],
-            channels,
-            // A slot is fed MIDI by construction; this is the path the racks
-            // learned the flag FROM.
-            voice: true,
-        };
-
-        // Whatever was in THIS slot is going away, so its editor and then its
-        // controller reference must go first — see `unload_plugin`. `hand_off`
-        // is where the old instance is dropped, and dropping it terminates the
-        // controller the old handle points at. The other slots' editors and
-        // handles are not touched, because their instruments are not.
-        self.close_editor(slot);
-        if let Some(h) = self.editor_handles.get_mut(slot) {
-            *h = None;
-        }
-        if let Some(h) = self.state_handles.get_mut(slot) {
-            *h = None;
-        }
-        self.hand_off(slot, PluginBox(Some(Box::new(hosted))));
-        // Written through `get_mut` rather than indexed even though `slot` was
-        // bounded at the top: the bound and the write are forty lines apart, and
-        // the next edit to this function is the one that separates them further.
-        if let Some(h) = self.editor_handles.get_mut(slot) {
-            *h = editor_handle;
-        }
-        if let Some(h) = self.state_handles.get_mut(slot) {
-            *h = Some(state_handle);
-        }
-        if let Some(e) = self.state_errors.get_mut(slot) {
-            *e = state_error;
-        }
-        if let Some(l) = self.loaded.get_mut(slot) {
-            *l = Some(loaded.clone());
-        }
-        if let Some(w) = self.warm.get_mut(slot) {
-            *w = Some(warm);
-        }
-        Ok(loaded)
-    }
-
-    /// Take one slot's instrument out of the running stream and release it here.
-    ///
-    /// A no-op for an empty slot and for a slot that does not exist. The other
-    /// two keep playing, which is the whole reason the handoff is per slot.
-    ///
-    /// **That slot's editor closes first, and that ordering is not optional.**
-    /// The window holds an `IPlugView` the plugin's edit controller made, and
-    /// the instance's `Drop` calls `IEditController::terminate`. Unloading with
-    /// a window still open would leave a view — and a plugin's `NSView` inside
-    /// our `NSView` — belonging to a terminated object, and the crash would land
-    /// wherever AppKit next asked it to draw.
-    pub fn unload_plugin(&mut self, slot: usize) {
-        if slot >= SLOTS {
-            return;
-        }
-        self.close_editor(slot);
-        if let Some(h) = self.editor_handles.get_mut(slot) {
-            *h = None;
-        }
-        // Before the instance goes, and for the same reason the editor handle
-        // does: `Instance::drop` calls `IComponent::terminate`.
-        if let Some(h) = self.state_handles.get_mut(slot) {
-            *h = None;
-        }
-        if let Some(e) = self.state_errors.get_mut(slot) {
-            *e = None;
-        }
-        if self.loaded.get(slot).is_none_or(Option::is_none) {
-            return;
-        }
-        if let Some(l) = self.loaded.get_mut(slot) {
-            *l = None;
-        }
-        if let Some(w) = self.warm.get_mut(slot) {
-            *w = None;
-        }
-        self.hand_off(slot, PluginBox(None));
-    }
-
     // ── the plugins' own editors ────────────────────────────────────────────
-
-    /// Whether the instrument in `slot` offers an editor to open.
-    ///
-    /// `false` for an empty slot, for a slot that does not exist, and for a
-    /// plugin that has no UI — which is the honest thing to grey a menu row on.
-    /// The first call after a load is not free (VST3 has no `hasEditor`, so the
-    /// only way to ask is to build a view and throw it away); every call after
-    /// that is a cached bool.
-    pub fn has_editor(&self, slot: usize) -> bool {
-        self.editor_handles
-            .get(slot)
-            .and_then(Option::as_ref)
-            .is_some_and(ivory_host::EditorHandle::has_editor)
-    }
-
-    /// Open one slot's editor, or bring it to the front if it is already open.
-    ///
-    /// **Main thread, and not from inside the audio callback** — but that is
-    /// already true of every `&mut self` method here, because `Engine` is
-    /// `!Send`.
-    ///
-    /// The window is independent of the audio: opening it does not interrupt a
-    /// single block, and closing it does not stop the instrument. Call
-    /// [`Engine::poll_editor`] once a frame so a window the user closes is
-    /// noticed and released. Three windows can be open at once and they do not
-    /// know about each other.
-    pub fn open_editor(&mut self, slot: usize) -> Result<(), String> {
-        if slot >= SLOTS {
-            return Err(format!(
-                "there is no instrument slot {slot}; there are {SLOTS}, numbered from 0"
-            ));
-        }
-        // A window the user closed one frame ago is still `Some` here until
-        // something notices. Noticing first is what stops "Open" reviving a
-        // window that then vanishes again on the next `poll_editor`.
-        self.poll_editor();
-        if let Some(editor) = self.editors.get(slot).and_then(Option::as_ref) {
-            // Already open. Raising it is what "open the editor" means the
-            // second time somebody clicks the row.
-            editor.focus();
-            return Ok(());
-        }
-        let Some(handle) = self.editor_handles.get(slot).and_then(Option::as_ref) else {
-            return Err(format!("no instrument is loaded in slot {}", slot + 1));
-        };
-        // The slot is IN the title, and it is not decoration: the same piano
-        // loaded twice for two different mic positions gives two windows that
-        // are otherwise character-for-character identical, and the user has to
-        // be able to tell which fader belongs to the one they are editing.
-        let title = match self.loaded.get(slot).and_then(Option::as_ref) {
-            Some(l) => format!("{} - Tangent, instrument {}", l.class, slot + 1),
-            None => format!("Instrument {} - Tangent", slot + 1),
-        };
-        let editor =
-            ivory_host::Editor::open_handle(handle, &title).map_err(|e| e.to_string())?;
-        if let Some(e) = self.editors.get_mut(slot) {
-            *e = Some(editor);
-        }
-        Ok(())
-    }
-
-    /// Close one slot's editor window if it is open. Safe to call when it is
-    /// not, and for a slot that does not exist.
-    ///
-    /// Dropping the [`ivory_host::Editor`] is the teardown: `IPlugView::removed`
-    /// and then the window, in that order.
-    pub fn close_editor(&mut self, slot: usize) {
-        if let Some(e) = self.editors.get_mut(slot) {
-            *e = None;
-        }
-    }
-
-    /// Is this slot's editor window open right now?
-    pub fn editor_open(&self, slot: usize) -> bool {
-        self.editors.get(slot).is_some_and(Option::is_some)
-    }
 
     /// One insert's own window: open it, or raise it if it is already up.
     ///
@@ -4434,6 +3719,21 @@ impl Engine {
         }
     }
 
+    /// Whether the plugin in this bay offers an editor to open.
+    ///
+    /// `false` for an empty bay, for one that does not exist, and for a
+    /// plugin that has no UI — which is the honest thing to grey a control
+    /// on. The first call after a load is not free (VST3 has no `hasEditor`,
+    /// so the only way to ask is to build a view and throw it away); every
+    /// call after that is a cached bool.
+    pub fn insert_has_editor(&self, strip: usize, slot: usize) -> bool {
+        self.insert_editor_handles
+            .get(strip)
+            .and_then(|r| r.get(slot))
+            .and_then(Option::as_ref)
+            .is_some_and(ivory_host::EditorHandle::has_editor)
+    }
+
     /// Is this insert's window open right now?
     pub fn insert_editor_open(&self, strip: usize, slot: usize) -> bool {
         self.insert_editors
@@ -4451,13 +3751,8 @@ impl Engine {
     /// concerned, and the menu row keeps saying Close for a window that is not
     /// there.
     pub fn poll_editor(&mut self) {
-        for editor in &mut self.editors {
-            if editor.as_ref().is_some_and(ivory_host::Editor::closed) {
-                *editor = None;
-            }
-        }
-        // **And the racks', in the same sweep.** An insert's window closed by
-        // its own close button would otherwise stay "open" here for ever, and
+        // An insert's window closed by its own close button would otherwise
+        // stay "open" here for ever, and
         // the click that should reopen it would silently raise nothing.
         for rack in &mut self.insert_editors {
             for editor in rack {
@@ -4466,45 +3761,6 @@ impl Engine {
                 }
             }
         }
-    }
-
-    /// Give one slot's callback `next` and wait for whatever it was holding, so
-    /// the old instance is dropped on **this** thread.
-    ///
-    /// Condition 4 of [`PluginBox`]'s safety argument in one function. The wait
-    /// is bounded: a callback that is not running cannot return anything, and
-    /// then the instance goes down with the stream instead.
-    ///
-    /// It waits for *this slot's* ring and no other, so a slot whose handoff
-    /// timed out (a device that vanished) costs the next load one timeout in
-    /// that slot rather than blocking every slot behind it.
-    fn hand_off(&mut self, slot: usize, next: PluginBox) {
-        let Some(h) = self.handoff.get_mut(slot) else {
-            // Nowhere to send it, so it is dropped here — on this thread, which
-            // is the only place `Instance::drop` is allowed to run anyway.
-            return;
-        };
-        // Anything already returned is dropped here, now, before another
-        // handoff can fill the ring.
-        while h.from_audio.pop().is_ok() {}
-        if h.to_audio.push(next).is_err() {
-            // Only reachable if a previous handoff was never collected, which
-            // the wait below is there to prevent.
-            return;
-        }
-        let deadline = Instant::now() + RETIRE_TIMEOUT;
-        while Instant::now() < deadline {
-            if let Ok(old) = h.from_audio.pop() {
-                drop(old);
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    /// What is loaded in `slot`, or `None` for an empty or absent one.
-    pub fn plugin(&self, slot: usize) -> Option<&Loaded> {
-        self.loaded.get(slot).and_then(Option::as_ref)
     }
 
     /// Is anything loaded at all?
@@ -4527,9 +3783,7 @@ impl Engine {
 
     /// One general channel's fader.
     pub fn set_channel_gain(&self, ch: usize, linear: f32) {
-        if let Some(cell) = self.shared.channel_gains.get(ch) {
-            cell.store(sane_gain(linear).to_bits(), Ordering::Relaxed);
-        }
+        self.shared.set_channel_gain(ch, linear);
     }
 
     /// Which channel each capture pick feeds: desk indices, `None` unbound.
@@ -4537,12 +3791,6 @@ impl Engine {
         for (cell, strip) in self.shared.pick_strip.iter().zip(strips) {
             cell.store(strip.map_or(-1, |s| s as i64), Ordering::Relaxed);
         }
-    }
-
-    pub fn set_builtin_slot(&mut self, slot: Option<usize>) {
-        self.shared
-            .builtin_slot
-            .store(slot.map_or(-1, |s| s as i32), Ordering::Relaxed);
     }
 
     /// Load a patch into the built-in.
@@ -4556,9 +3804,6 @@ impl Engine {
         }
     }
 
-    pub fn any_plugin_loaded(&self) -> bool {
-        self.loaded.iter().any(Option::is_some)
-    }
     /// Whether a backing track is loaded, playing or not.
     ///
     /// Loaded is the question, not playing: a take is armed before the
@@ -4568,44 +3813,7 @@ impl Engine {
         self.shared.track_loaded.load(Ordering::Relaxed)
     }
 
-    /// What one slot's warm-up concluded. `heard: false` means the instrument
-    /// never made a sound and was declared ready by timeout.
-    pub fn warm_up(&self, slot: usize) -> Option<&WarmUp> {
-        self.warm.get(slot).and_then(Option::as_ref)
-    }
-
     // ── the instruments' state ──────────────────────────────────────────────
-
-    /// What the instrument in `slot` sounds like right now, as opaque bytes to
-    /// be written somewhere and handed back to
-    /// [`Engine::load_plugin_with_state`] next session.
-    ///
-    /// `None` for an empty slot, for a slot that does not exist, and for a
-    /// plugin that refused — the three are deliberately not distinguished,
-    /// because the only thing a caller can do with any of them is write nothing
-    /// for that slot.
-    ///
-    /// **Main thread, and it does not interrupt the audio.** The instance is
-    /// inside the callback; this goes through a second reference to its
-    /// processor taken at load time, exactly as the editor does. `getState`
-    /// while `process` runs on another thread is the arrangement VST3 specifies
-    /// and the one every DAW uses to save a project mid-playback — the
-    /// alternative, retiring the instrument across the handoff to borrow it
-    /// back, would cost a block of silence and every note in flight each time
-    /// the settings file is written. See `ivory_host::StateHandle`.
-    ///
-    /// **Size**: measured on Pianoteq 9, one slot is about 40 KB (41,233 bytes,
-    /// of which 41,215 are the processor's and none the controller's). Three
-    /// full slots is around 120 KB, or 165 KB base64'd into a JSON settings
-    /// file — large for a settings file and small for a disk. A sampler that
-    /// embeds its content could be far larger; `ivory_host::MAX_STATE_BYTES` is
-    /// the ceiling either way.
-    pub fn save_slot_state(&self, slot: usize) -> Option<Vec<u8>> {
-        self.state_handles
-            .get(slot)
-            .and_then(Option::as_ref)
-            .and_then(|h| h.save().ok())
-    }
 
     /// Which channels' rack voices ignore the note stream, as one mask.
     ///
@@ -4625,20 +3833,6 @@ impl Engine {
             .get(slot)?
             .as_ref()
             .and_then(|h| h.save().ok())
-    }
-
-    /// Why the state handed to [`Engine::load_plugin_with_state`] was not
-    /// restored into `slot`.
-    ///
-    /// `None` is the normal answer: nothing was offered, or it was restored.
-    /// `Some` means the instrument came up with its defaults and the user's
-    /// preset did not survive — worth saying out loud, because the symptom is
-    /// "it keeps forgetting my piano" and nothing else in the app would know.
-    pub fn state_error(&self, slot: usize) -> Option<&str> {
-        self.state_errors
-            .get(slot)
-            .and_then(Option::as_ref)
-            .map(String::as_str)
     }
 
     pub fn output(&self) -> &OutputInfo {
@@ -4770,34 +3964,12 @@ impl Engine {
         self.shared.delay_ns.load(Ordering::Relaxed)
     }
 
-    /// The instrument fault first, because it is the actionable one; then
-    /// whatever cpal last reported about the device.
-    ///
-    /// It names the slot, because with three of them "the instrument stopped
-    /// rendering" is a sentence the user cannot act on.
+    /// Whatever cpal last reported about the device.
     pub fn fault(&self) -> Option<String> {
-        if let Some(why) = self.shared.instrument_fault() {
-            return Some(why);
-        }
         self.fault.lock().ok().and_then(|g| g.clone())
     }
 
     // ── gains ───────────────────────────────────────────────────────────────
-
-    /// One slot's gain. Linear, not dB: 1.0 is unity; above that is deliberate
-    /// make-up gain and is clamped at 8x in the callback so a fader dragged into
-    /// a text field cannot produce a full-scale square wave.
-    ///
-    /// **Three instruments at unity is up to three times the level of one**, and
-    /// nothing here stops that: it is the user's mix, the clip indicator is
-    /// honest about it, and quietly scaling the sum by the number of loaded
-    /// slots would make loading a pad change the volume of the piano.
-    ///
-    /// A slot that does not exist is ignored rather than indexed — this comes
-    /// from the UI, and a panic here reaches the user as a dialog and `exit(1)`.
-    pub fn set_slot_gain(&self, slot: usize, linear: f32) {
-        self.shared.set_slot_gain(slot, linear);
-    }
 
     /// The three effect knobs, 0..=1.
     pub fn set_effects(&self, sends: crate::effects::Sends) {
@@ -4881,14 +4053,6 @@ impl Engine {
         self.shared.monitor_on.store(on, Ordering::Relaxed);
     }
 
-    /// The monitor's level — the microphone fader, which is also what scales
-    /// the input into the take.
-    pub fn set_monitor_gain(&self, input: usize, linear: f32) {
-        if let Some(g) = self.shared.monitor_gain.get(input) {
-            g.store(sane_gain(linear).to_bits(), Ordering::Relaxed);
-        }
-    }
-
     /// What the monitoring path is holding, in milliseconds.
     ///
     /// **Latency the panel could not see.** The estimate beside it is one
@@ -4899,12 +4063,6 @@ impl Engine {
     pub fn monitor_backlog_ms(&self) -> f64 {
         let rate = f64::from(self.output.sample_rate.max(1));
         f64::from(self.shared.monitor_backlog.load(Ordering::Relaxed)) * 1000.0 / rate
-    }
-
-    /// Frames of monitoring dropped because they were stale rather than in
-    /// flight. See `mix_monitor`.
-    pub fn monitor_slip(&self) -> u64 {
-        self.shared.monitor_slip.load(Ordering::Relaxed)
     }
 
     /// Hand the renderer the live input's ring. `None` takes it away.
@@ -5131,9 +4289,6 @@ impl Drop for Engine {
                 let _ = self.load_insert(strip, slot, None, None);
             }
         }
-        for slot in 0..SLOTS {
-            self.unload_plugin(slot);
-        }
     }
 }
 
@@ -5142,7 +4297,6 @@ impl std::fmt::Debug for Engine {
         // cpal::Stream is not Debug.
         f.debug_struct("Engine")
             .field("output", &self.output)
-            .field("plugins", &self.loaded)
             .field("running", &self.is_running())
             .finish()
     }
@@ -5442,6 +4596,9 @@ pub fn plugin_test(filter: Option<String>) {
     /// Every slot at the same gain, so the peaks below are comparable, and low
     /// enough that three of them summed still fit under full scale.
     const LAYER_GAIN: f32 = 0.5;
+    /// Three layers, one per channel: the count the old three-slot rack had,
+    /// kept because +6.0/+9.5 dB are the numbers the table below explains.
+    const LAYERS: usize = 3;
     /// Long enough to cover the phrase and its release tail.
     const MEASURE_SECONDS: f64 = 3.5;
 
@@ -5465,11 +4622,15 @@ pub fn plugin_test(filter: Option<String>) {
     println!("output:   {} ({})", engine.output().device, engine.output().latency_line());
 
     println!(
-        "loading:  {} into slot 1 (this blocks for the warm-up)",
+        "loading:  {} into channel 1's first bay (this blocks for the warm-up)",
         bundle.display()
     );
-    let loaded = match engine.load_plugin(0, &bundle, None) {
-        Ok(l) => l,
+    let loaded = match engine.load_insert(0, 0, Some(&bundle), None) {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            eprintln!("the bay refused the path");
+            std::process::exit(1);
+        }
         Err(why) => {
             eprintln!("could not load the instrument: {why}");
             std::process::exit(1);
@@ -5479,33 +4640,21 @@ pub fn plugin_test(filter: Option<String>) {
         "instrument: {} [{}], {} channels at {} Hz",
         loaded.class, loaded.vendor, loaded.channels, loaded.sample_rate
     );
-    if let Some(w) = engine.warm_up(0) {
-        println!(
-            "warm-up:  {:.1} s, peak {:.4}{}",
-            w.elapsed.as_secs_f32(),
-            w.peak,
-            if w.heard {
-                ""
-            } else {
-                " - NEVER MADE A SOUND, declared ready by timeout"
-            }
-        );
-    }
 
     // ── the state, which is what makes a preset survive a restart ───────────
     //
-    // Read here rather than at the end, because the other two slots are loaded
-    // WITH it: the layering measurement below rests on the three instruments
-    // being identical, and "restored from slot 1's own bytes" is a stronger
-    // claim than "the same plugin file".
-    let preset = engine.save_slot_state(0);
+    // Read here rather than at the end, because the other two channels are
+    // loaded WITH it: the layering measurement below rests on the three
+    // instruments being identical, and "restored from channel 1's own bytes"
+    // is a stronger claim than "the same plugin file".
+    let preset = engine.save_insert_state(0, 0);
     match &preset {
-        Some(b) => println!("state:    {} bytes from slot 1", b.len()),
+        Some(b) => println!("state:    {} bytes from channel 1", b.len()),
         None => println!("state:    this instrument handed over none"),
     }
 
-    for slot in 0..SLOTS {
-        engine.set_slot_gain(slot, LAYER_GAIN);
+    for ch in 0..LAYERS {
+        engine.set_channel_gain(ch, LAYER_GAIN);
     }
     engine.set_metronome_gain(0.6);
     engine.set_beats_per_bar(4);
@@ -5629,22 +4778,18 @@ pub fn plugin_test(filter: Option<String>) {
     // The metronome stays OFF through this: the peaks below are supposed to be
     // the instruments and nothing else, and a click landing inside the window
     // would be counted as part of the sum.
-    println!("\nlayering: the same instrument in each slot, every slot at gain {LAYER_GAIN}");
+    println!(
+        "\nlayering: the same instrument on each of three channels, every fader at gain {LAYER_GAIN}"
+    );
     let mut rows: Vec<(usize, f32, f32, Option<f64>)> = Vec::new();
-    for slot in 0..SLOTS {
+    for slot in 0..LAYERS {
         if slot > 0 {
-            println!("  loading slot {} with the same instrument...", slot + 1);
+            println!("  loading channel {} with the same instrument...", slot + 1);
             if let Err(why) =
-                engine.load_plugin_with_state(slot, &bundle, None, preset.as_deref())
+                engine.load_insert(slot, 0, Some(&bundle), preset.as_deref())
             {
-                println!("  slot {} would not load: {why}", slot + 1);
+                println!("  channel {} would not load: {why}", slot + 1);
                 break;
-            }
-            if let Some(why) = engine.state_error(slot) {
-                // Not fatal — the slot is loaded, on its defaults — but it
-                // means the three instruments are no longer known to match,
-                // which is exactly what the dB column below assumes.
-                println!("  slot {}: the saved state was refused: {why}", slot + 1);
             }
         }
         let (peak, in_tap, cores) = measure(
@@ -5658,7 +4803,7 @@ pub fn plugin_test(filter: Option<String>) {
         rows.push((slot + 1, peak, in_tap, cores));
     }
 
-    println!("\n  slots  device peak   tap peak   tap vs one   process CPU");
+    println!("\n  chans  device peak   tap peak   tap vs one   process CPU");
     let one = rows.first().map(|r| r.2).unwrap_or(0.0);
     for (n, peak, in_tap, cores) in &rows {
         let db = if one > 0.0 && *in_tap > 0.0 {
@@ -5675,7 +4820,7 @@ pub fn plugin_test(filter: Option<String>) {
     println!(
         "  two slots must be about +6.0 dB on one and three about +9.5 dB: the same\n  \
          instrument playing the same notes sums coherently, so a peak that did not\n  \
-         move is a slot that never got the note. Read the TAP column for that -\n  \
+         move is a channel that never got the note. Read the TAP column for that -\n  \
          the device column is what you hear, which includes the click."
     );
 
@@ -5689,19 +4834,19 @@ pub fn plugin_test(filter: Option<String>) {
     // make.
     println!(
         "\neditor:   {}",
-        if engine.has_editor(0) {
+        if engine.insert_has_editor(0, 0) {
             "yes"
         } else {
             "this plugin has none"
         }
     );
-    if engine.has_editor(0) {
+    if engine.insert_has_editor(0, 0) {
         // This process will never call `[NSApp run]`: `main.rs` exits before
         // eframe starts. Without this the window opens behind everything, never
         // takes the keyboard, and looks broken.
         ivory_host::editor::become_foreground();
-        match engine.open_editor(0) {
-            Ok(()) => println!("          slot 1 open. Close the window to end this probe."),
+        match engine.open_insert_editor(0, 0) {
+            Ok(()) => println!("          channel 1 open. Close the window to end this probe."),
             Err(why) => println!("          could not open it: {why}"),
         }
     }
@@ -5714,7 +4859,7 @@ pub fn plugin_test(filter: Option<String>) {
     // always did. With an editor open it runs until the window is closed, and
     // the phrase repeats so there is always something playing while the
     // instrument is being changed underneath it.
-    let deadline = if engine.editor_open(0) {
+    let deadline = if engine.insert_editor_open(0, 0) {
         None
     } else {
         Some(Instant::now() + Duration::from_secs(5))
@@ -5728,7 +4873,7 @@ pub fn plugin_test(filter: Option<String>) {
         // 16 ms, so this loop runs at the rate the app's own frame loop would.
         ivory_host::editor::pump(Duration::from_millis(16));
         engine.poll_editor();
-        if deadline.is_none() && !engine.editor_open(0) {
+        if deadline.is_none() && !engine.insert_editor_open(0, 0) {
             println!("\neditor closed.");
             break;
         }
@@ -5762,7 +4907,7 @@ pub fn plugin_test(filter: Option<String>) {
     // Did anything the user did in the editor reach the bytes? This is the one
     // end of the persistence feature no test can check: pick a different piano
     // in Pianoteq's own UI, close the window, and watch the state change.
-    match (preset.as_deref(), engine.save_slot_state(0)) {
+    match (preset.as_deref(), engine.save_insert_state(0, 0)) {
         (Some(before), Some(after)) if before == after.as_slice() => {
             println!("state:           unchanged, {} bytes", after.len());
         }
@@ -5780,8 +4925,8 @@ pub fn plugin_test(filter: Option<String>) {
     // The other slots must keep playing while one is retired, which is the
     // property the per-slot handoff exists for. Slot 2 goes and slots 1 and 3
     // are asked to make a sound afterwards.
-    if rows.len() == SLOTS {
-        engine.unload_plugin(1);
+    if rows.len() == LAYERS {
+        let _ = engine.load_insert(1, 0, None, None);
         engine.meters();
         play_phrase(&engine);
         let until = Instant::now() + Duration::from_secs(2);
@@ -5792,13 +4937,13 @@ pub fn plugin_test(filter: Option<String>) {
             ivory_host::editor::pump(Duration::from_millis(16));
         }
         println!(
-            "\nslot 2 unloaded: peak {after:.4} from the other two - unloading one \
+            "\nchannel 2 unloaded: peak {after:.4} from the other two - unloading one \
              instrument must not silence its neighbours"
         );
         println!(
             "loaded now:      {:?}",
-            (0..SLOTS)
-                .map(|s| engine.plugin(s).map(|l| l.class.as_str()))
+            (0..LAYERS)
+                .map(|s| engine.insert(s, 0).map(|l| l.class.as_str()))
                 .collect::<Vec<_>>()
         );
         peak = peak.max(after);
@@ -6021,102 +5166,6 @@ mod tests {
         assert_eq!(dst, [0.0, 0.0]);
     }
 
-    // ── layering: what each slot contributes, and how they add ─────────────
-
-    #[test]
-    fn a_mono_slot_is_summed_into_both_sides_of_the_stereo_bus() {
-        // Resolved HERE and not after the sum: once a mono pad has been added to
-        // a stereo piano there is nothing left that knows the pad was mono, and
-        // it would end up in the left speaker only.
-        let bufs = vec![vec![0.5, -0.25]];
-        let (l, r) = stereo_of(&bufs, 1, 2);
-        assert_eq!(l, [0.5, -0.25]);
-        assert_eq!(r, [0.5, -0.25], "a mono slot heard on one side reads as broken");
-    }
-
-    #[test]
-    fn a_multi_output_slot_contributes_only_its_first_two_channels() {
-        // Pianoteq's eight are stem outputs of the SAME performance; summing
-        // them would be the same piano eight times, 18 dB up and clipped.
-        let bufs: Vec<Vec<f32>> = (0..8).map(|c| vec![c as f32; 4]).collect();
-        let (l, r) = stereo_of(&bufs, 8, 4);
-        assert_eq!(l, [0.0; 4]);
-        assert_eq!(r, [1.0; 4]);
-    }
-
-    #[test]
-    fn a_slot_that_rendered_nothing_contributes_nothing_rather_than_stale_samples() {
-        // Zero channels is an empty slot or one whose `process` was refused, and
-        // its buffers still hold the last block it did render. Replaying those
-        // is the last 10 ms looping forever at full level.
-        let bufs = vec![vec![0.9; 8], vec![0.9; 8]];
-        assert_eq!(stereo_of(&bufs, 0, 8), (&[][..], &[][..]));
-        // And a buffer shorter than the block is refused for the same reason:
-        // the tail of it would be whatever was there before.
-        assert_eq!(stereo_of(&bufs, 2, 9), (&[][..], &[][..]));
-        assert_eq!(stereo_of(&[], 2, 4), (&[][..], &[][..]));
-    }
-
-    #[test]
-    fn three_slots_at_the_same_gain_are_three_times_one_of_them() {
-        // The whole feature in one assertion: the same signal in three slots
-        // sums coherently. A sum that assigned rather than accumulated would
-        // read 1.0x here, which is exactly what "only the last instrument is
-        // audible" looks like from the outside.
-        let src = vec![vec![0.1, 0.2], vec![-0.1, -0.2]];
-        let mut mix = vec![0.0f32; 2 * TAP_CHANNELS];
-        let mut aux = vec![0.0f32; mix.len()];
-        for _ in 0..3 {
-            let (l, r) = stereo_of(&src, 2, 2);
-            let mut gain = 1.0;
-            mix_in(&mut mix, &mut aux, l, r, &mut gain, 1.0, 0.0, 1.0);
-        }
-        assert!((mix[0] - 0.3).abs() < 1e-6, "{mix:?}");
-        assert!((mix[1] + 0.3).abs() < 1e-6, "{mix:?}");
-        assert!((mix[2] - 0.6).abs() < 1e-6, "{mix:?}");
-        assert!((mix[3] + 0.6).abs() < 1e-6, "{mix:?}");
-    }
-
-    #[test]
-    fn a_slot_at_zero_gain_is_not_in_the_sum_at_all() {
-        let src = vec![vec![1.0; 2], vec![1.0; 2]];
-        let (l, r) = stereo_of(&src, 2, 2);
-        let mut mix = vec![0.0f32; 2 * TAP_CHANNELS];
-        let mut aux = vec![0.0f32; mix.len()];
-        let mut gain = 0.0;
-        mix_in(&mut mix, &mut aux, l, r, &mut gain, 0.0, 0.0, 1.0);
-        assert_eq!(mix, vec![0.0; 4], "a fader at zero still let something through");
-    }
-
-    #[test]
-    fn a_slot_that_contributes_nothing_still_advances_its_own_gain() {
-        // Otherwise a slot loaded a minute after its fader moved starts at the
-        // gain the fader used to have and jumps to the one it has now, which is
-        // a click on the first note of the new instrument.
-        let mut mix = vec![0.0f32; 64 * TAP_CHANNELS];
-        let mut aux = vec![0.0f32; mix.len()];
-        let mut gain = 1.0;
-        mix_in(&mut mix, &mut aux, &[], &[], &mut gain, 0.0, 0.0, 0.1);
-        assert!(gain < 0.01, "the smoother stopped with the signal ({gain})");
-        assert_eq!(mix, vec![0.0; 64 * TAP_CHANNELS]);
-    }
-
-    #[test]
-    fn a_gain_change_arrives_as_a_ramp_across_the_block_and_not_as_a_step() {
-        // The first sample must still be near the OLD gain and the last near
-        // the new one. A per-block gain is a staircase, and a staircase at
-        // 48 kHz is a buzz on every fader move.
-        let src = vec![vec![1.0; 512], vec![1.0; 512]];
-        let (l, r) = stereo_of(&src, 2, 512);
-        let mut mix = vec![0.0f32; 512 * TAP_CHANNELS];
-        let mut aux = vec![0.0f32; mix.len()];
-        let mut gain = 1.0;
-        mix_in(&mut mix, &mut aux, l, r, &mut gain, 0.0, 0.0, gain_coefficient(RATE));
-        assert!(mix[0] > 0.99, "the ramp began somewhere other than the old gain");
-        assert!(mix[1022] < 0.4, "10 ms of a 10 ms smoother went nowhere");
-        assert!(mix[1022] > 0.2, "it arrived far too fast to be one time constant");
-    }
-
     // ── the beat clock ─────────────────────────────────────────────────────
 
     /// Run the beat clock for `frames` and return every beat it fired, with the
@@ -6289,108 +5338,14 @@ mod tests {
         // And the handoff, which is the whole point of the newtype.
         assert_send::<PluginBox>();
         assert_send::<MidiEvent>();
-        // A slot, and the whole renderer, are `Send` because every field of
+        // A rack, and the whole renderer, are `Send` because every field of
         // them is — DERIVED, not asserted. `unsafe impl Send` appears exactly
         // once in this file and a second one would mean something is being
         // shared rather than moved. cpal requires this of the closure it takes,
         // so it is checked here rather than discovered at the call site.
-        assert_send::<Slot>();
-        assert_send::<[Slot; SLOTS]>();
+        assert_send::<Rack>();
+        assert_send::<[Rack; STRIPS + 1]>();
         assert_send::<Renderer>();
-    }
-
-    /// A renderer whose slots have live handoff rings at both ends, so the swap
-    /// protocol can be driven with no plugin anywhere: `PluginBox(None)` is a
-    /// legal value and an empty slot travels the same rings a full one does.
-    fn renderer_with_handoffs(shared: Arc<Shared>) -> (Renderer, [Handoff; SLOTS]) {
-        let (tap_tx, _rx) = RingBuffer::<f32>::new(1 << 12);
-        let mut r = test_renderer(shared, tap_tx, 2);
-        let mut ends: Vec<Handoff> = Vec::with_capacity(SLOTS);
-        for slot in &mut r.slots {
-            let (to_audio, incoming) = RingBuffer::<PluginBox>::new(2);
-            let (retiring, from_audio) = RingBuffer::<PluginBox>::new(2);
-            slot.incoming = incoming;
-            slot.retiring = retiring;
-            ends.push(Handoff {
-                to_audio,
-                from_audio,
-            });
-        }
-        let mut ends = ends.into_iter();
-        (
-            r,
-            std::array::from_fn(|_| ends.next().expect("one Handoff per slot")),
-        )
-    }
-
-    #[test]
-    fn a_swap_hands_the_old_instance_back_instead_of_dropping_it_in_the_callback() {
-        // Condition 4 of `PluginBox`'s safety argument: `Instance::drop` calls
-        // `terminate`, which frees sample memory and joins worker threads, and
-        // that is unbounded work under a real-time deadline.
-        let shared = Arc::new(Shared::new());
-        let (mut r, mut ends) = renderer_with_handoffs(Arc::clone(&shared));
-        ends[1].to_audio.push(PluginBox(None)).expect("room to send");
-        assert_eq!(r.swap_plugins(), 1);
-        assert!(
-            ends[1].from_audio.pop().is_ok(),
-            "the old instance never came back, so the callback dropped it"
-        );
-        assert_eq!(shared.swaps.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn a_slot_refuses_a_new_instrument_when_it_has_nowhere_to_put_the_old_one() {
-        // Accepting one with a full retire ring leaves the callback holding two
-        // instances and no way to give one back, and the only way out of that is
-        // to drop one — on the audio thread, which is the thing that must never
-        // happen. The room is checked BEFORE the pop for exactly this reason.
-        let shared = Arc::new(Shared::new());
-        let (mut r, mut ends) = renderer_with_handoffs(Arc::clone(&shared));
-        for _ in 0..2 {
-            ends[0].to_audio.push(PluginBox(None)).expect("room to send");
-        }
-        assert_eq!(r.swap_plugins(), 1);
-        assert_eq!(r.swap_plugins(), 1, "the retire ring holds two");
-        // Nothing has collected them, so the retire ring is now full.
-        ends[0].to_audio.push(PluginBox(None)).expect("room to send");
-        assert_eq!(
-            r.swap_plugins(),
-            0,
-            "a new instrument was taken with nowhere to return the old one"
-        );
-        // And once the UI thread collects, it works again — which is what
-        // `hand_off` does before every push.
-        while ends[0].from_audio.pop().is_ok() {}
-        assert_eq!(r.swap_plugins(), 1);
-    }
-
-    #[test]
-    fn a_handoff_to_one_slot_leaves_the_other_slots_alone() {
-        // The reason there are six rings rather than one pair carrying a slot
-        // index: the ring an instance arrives on IS which slot it belongs to,
-        // so there is no number to get wrong and no shared queue for one slot's
-        // load to sit in front of another's.
-        let shared = Arc::new(Shared::new());
-        let (mut r, mut ends) = renderer_with_handoffs(Arc::clone(&shared));
-        for f in &shared.slot_faulted {
-            f.store(true, Ordering::Relaxed);
-        }
-        ends[2].to_audio.push(PluginBox(None)).expect("room to send");
-        assert_eq!(r.swap_plugins(), 1);
-        assert!(ends[0].from_audio.pop().is_err(), "slot 1 was retired too");
-        assert!(ends[1].from_audio.pop().is_err(), "slot 2 was retired too");
-        assert!(ends[2].from_audio.pop().is_ok());
-        assert!(
-            !shared.slot_faulted[2].load(Ordering::Relaxed),
-            "the new instrument's slot must start unfaulted"
-        );
-        assert!(
-            shared.slot_faulted[0].load(Ordering::Relaxed)
-                && shared.slot_faulted[1].load(Ordering::Relaxed),
-            "loading one instrument cleared another slot's fault, so the band \
-             would stop reporting a plugin that is still broken"
-        );
     }
 
     /// A tap and its producer, with no device anywhere.
@@ -6556,7 +5511,6 @@ mod tests {
             aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],
             click_taped: vec![0.0; MAX_BLOCK as usize],
-            instrument_gain: 1.0,
             fx_return_gain: 1.0,
             track: None,
             pos: 0,
@@ -6572,19 +5526,8 @@ mod tests {
             timebase: Timebase::new(),
             rate: RATE,
             dev_channels: dev_ch,
-            slots: std::array::from_fn(|_| {
-                let (_, incoming) = RingBuffer::<PluginBox>::new(2);
-                let (retiring, _) = RingBuffer::<PluginBox>::new(2);
-                Slot {
-                    plugin: PluginBox(None),
-                    incoming,
-                    retiring,
-                    gain: 1.0,
-                }
-            }),
             mix: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
-            builtin_gain: 1.0,
             channel_gain: [1.0; CHANNELS],
             midi,
             pending: None,
@@ -6592,7 +5535,6 @@ mod tests {
             builtin: crate::dx7::Dx7::new(RATE as f32),
             effects: crate::effects::Effects::new_send(RATE as f32),
             effect_params: crate::effects::Params::default(),
-            builtin_slot: None,
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
             tap,
             tap_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
@@ -6956,41 +5898,6 @@ mod tests {
         assert_eq!(bits.len(), n, "two strips share a bit");
     }
 
-    /// **A strip's fader and its send are one pass over one signal.**
-    ///
-    /// The send is post-fader, which is the whole of what this asserts: pull
-    /// the channel down and its reverb comes down with it.
-    #[test]
-    fn a_send_is_a_percentage_of_what_leaves_the_fader() {
-        let frames = 4;
-        let mut mix = vec![1.0_f32; frames * TAP_CHANNELS];
-        let mut aux = vec![0.0_f32; frames * TAP_CHANNELS];
-        let mut gain = 0.5;
-        // `coeff` of 1.0 reaches the target on the first frame, so the
-        // arithmetic can be checked without modelling the slew.
-        let _ = fold_strip(&mut mix, &mut aux, frames, &mut gain, 0.5, 0.25, 1.0);
-        for (i, v) in mix.iter().enumerate() {
-            assert!((v - 0.5).abs() < 1.0e-6, "frame {i} left the fader at {v}");
-        }
-        for (i, v) in aux.iter().enumerate() {
-            assert!(
-                (v - 0.125).abs() < 1.0e-6,
-                "frame {i} sent {v}, not a quarter of what left the fader"
-            );
-        }
-
-        // A muted strip sends nothing, because its target is zero and the send
-        // is taken from what LEAVES it.
-        let mut mix = vec![1.0_f32; frames * TAP_CHANNELS];
-        let mut aux = vec![0.0_f32; frames * TAP_CHANNELS];
-        let mut gain = 0.0;
-        let _ = fold_strip(&mut mix, &mut aux, frames, &mut gain, 0.0, 1.0, 1.0);
-        assert!(
-            aux.iter().all(|v| v.abs() < 1.0e-9),
-            "a silent strip still fed the effects bus"
-        );
-    }
-
     /// The bus comes back at its own fader, and adds rather than replaces.
     #[test]
     fn the_effects_bus_returns_at_its_own_level() {
@@ -7344,31 +6251,6 @@ mod tests {
         );
     }
 
-    /// **A slot naming a plugin that will not load must not silence the app.**
-    ///
-    /// A Linux tester opened a build whose settings named a dead VST3 — the
-    /// app's own display plugin, which has no audio by design — and reported
-    /// the app came up silent. From the renderer's side a failed load is a slot
-    /// with nothing in it, so the built-in should carry on: this is the test
-    /// that says which of those is true.
-    #[test]
-    fn a_slot_whose_plugin_failed_to_load_still_leaves_the_builtin_audible() {
-        let (mut r, mut tx, _) = renderer_with_midi(2);
-        // What a failed load leaves behind: no instance in the slot, and no
-        // claim on the built-in either — the sentinel was never chosen.
-        assert!(r.slots.iter().all(|s| s.plugin.0.is_none()));
-        r.shared.builtin_slot.store(-1, Ordering::Relaxed);
-
-        queue(&mut tx, 0, [0x90, 60, 100]);
-        let mut out = vec![0.0_f32; 2 * 4096];
-        r.render(&mut out, 0, 0);
-        let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
-        assert!(
-            peak > 0.01,
-            "a dead slot silenced the built-in: peak {peak}, which is silence"
-        );
-    }
-
     #[test]
     fn events_are_placed_at_their_own_frame_inside_the_block_they_belong_to() {
         let (mut r, mut tx, _) = renderer_with_midi(2);
@@ -7555,7 +6437,6 @@ mod tests {
             queue(&mut tx, 0, [0x90, 40 + i, 100]);
         }
         let mut out = vec![0.0f32; 512 * 2];
-        assert!(r.slots.iter().all(|s| s.plugin.0.is_none()));
         r.render(&mut out, 0, 0);
         assert_eq!(r.midi.slots(), 0);
     }
@@ -7810,71 +6691,55 @@ mod tests {
     }
 
     #[test]
-    fn a_slot_gain_reaches_zero_without_a_step_discontinuity() {
+    fn a_channel_fader_reaches_zero_without_a_step_discontinuity() {
         // A gain that jumps is a click, which is the one thing the metronome is
         // supposed to have a monopoly on. The smoother runs whether or not the
-        // slot has an instrument in it, so that a slot filled a minute after the
-        // fader moved does not start at the gain the fader used to have and jump
-        // to the one it has now.
+        // channel has anything on it, so that a channel filled a minute after
+        // its fader moved does not start at the gain the fader used to have
+        // and jump to the one it has now.
         let shared = Arc::new(Shared::new());
         let (tap_tx, _rx) = RingBuffer::<f32>::new(1 << 16);
         let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
         r.gain_coeff = gain_coefficient(RATE);
-        for slot in &mut r.slots {
-            slot.gain = 1.0;
-        }
-        shared.set_slot_gain(0, 0.0);
+        r.channel_gain = [1.0; CHANNELS];
+        shared.set_channel_gain(0, 0.0);
         let mut out = vec![0.0f32; 8 * 2];
         r.render(&mut out, 0, 0);
         assert!(
-            r.slots[0].gain > 0.9,
+            r.channel_gain[0] > 0.9,
             "a 10 ms smoother must not cross most of its range in 8 frames \
              (it reached {})",
-            r.slots[0].gain
+            r.channel_gain[0]
         );
         // 600 blocks of 8 frames is 4800 frames, 100 ms, ten time constants.
         for _ in 0..600 {
             r.render(&mut out, 0, 0);
         }
         assert!(
-            r.slots[0].gain < 0.01,
+            r.channel_gain[0] < 0.01,
             "the smoother never arrived ({})",
-            r.slots[0].gain
+            r.channel_gain[0]
         );
         assert_eq!(
-            (r.slots[1].gain, r.slots[2].gain),
+            (r.channel_gain[1], r.channel_gain[2]),
             (1.0, 1.0),
-            "one fader moved and took the other two with it"
+            "one fader moved and took its neighbours with it"
         );
     }
 
     #[test]
-    fn a_gain_written_to_a_slot_that_does_not_exist_is_ignored_rather_than_panicking() {
+    fn a_gain_written_to_a_channel_that_does_not_exist_is_ignored_rather_than_panicking() {
         // Reached from UI code, where this app's panic hook turns a panic into a
         // dialog and `exit(1)`. A menu that got its arithmetic wrong should
         // misbehave, not end the session.
         let shared = Shared::new();
-        shared.set_slot_gain(SLOTS, 0.25);
-        shared.set_slot_gain(usize::MAX, 0.25);
-        for cell in &shared.slot_gains {
-            assert_eq!(Shared::f32_of(cell), 1.0, "a real slot was written instead");
+        shared.set_channel_gain(CHANNELS, 0.25);
+        shared.set_channel_gain(usize::MAX, 0.25);
+        for cell in &shared.channel_gains {
+            assert_eq!(Shared::f32_of(cell), 1.0, "a real channel was written instead");
         }
-        shared.set_slot_gain(SLOTS - 1, 0.25);
-        assert_eq!(Shared::f32_of(&shared.slot_gains[SLOTS - 1]), 0.25);
-    }
-
-    #[test]
-    fn a_faulted_slot_is_named_so_that_the_other_two_are_not_blamed_for_it() {
-        // "The instrument stopped rendering" is a sentence a user with three of
-        // them cannot act on.
-        let shared = Shared::new();
-        assert!(shared.instrument_fault().is_none());
-        shared.slot_faulted[1].store(true, Ordering::Relaxed);
-        let why = shared.instrument_fault().expect("a fault was latched");
-        assert!(why.contains("instrument 2"), "{why}");
-        shared.slot_faulted[2].store(true, Ordering::Relaxed);
-        let why = shared.instrument_fault().expect("two faults were latched");
-        assert!(why.contains("2, 3"), "both faulted slots must be named: {why}");
+        shared.set_channel_gain(CHANNELS - 1, 0.25);
+        assert_eq!(Shared::f32_of(&shared.channel_gains[CHANNELS - 1]), 0.25);
     }
 
     #[test]
@@ -7985,8 +6850,10 @@ mod tests {
         // click does not wait for a VST3.
         let mut engine = Engine::start(None).expect("an audio output");
         assert!(engine.is_running());
-        assert!(!engine.any_plugin_loaded());
-        assert!((0..SLOTS).all(|s| engine.plugin(s).is_none()));
+        assert!(
+            (0..=STRIPS).all(|st| (0..INSERTS).all(|b| engine.insert(st, b).is_none())),
+            "a fresh engine has something loaded"
+        );
         engine.set_metronome_enabled(true);
         engine.set_tempo(120.0);
         std::thread::sleep(Duration::from_millis(600));
@@ -8047,8 +6914,8 @@ mod tests {
 
     #[test]
     #[ignore = "needs an audio output device and a real VST3 instrument; run with \
-                `cargo test -p ivory -- --ignored a_slots_state --nocapture`"]
-    fn a_slots_state_can_be_saved_while_it_plays_and_handed_back_to_the_next_load() {
+                `cargo test -p ivory -- --ignored a_bays_state --nocapture`"]
+    fn a_bays_state_can_be_saved_while_it_plays_and_handed_back_to_the_next_load() {
         // The engine's half of the persistence story: the instance is inside
         // the audio callback the whole time, so this exercises the second
         // reference to its processor rather than any path that stops the audio.
@@ -8058,33 +6925,33 @@ mod tests {
         // bad blob costs the preset rather than the piano.
         let bundle = pianoteq();
         let mut engine = Engine::start(None).expect("an audio output");
-        engine.load_plugin(0, &bundle, None).expect("load");
-        assert!(engine.state_error(0).is_none());
+        engine.load_insert(0, 0, Some(&bundle), None).expect("load");
+        assert!(engine.insert_state_error(0, 0).is_none());
 
         let now = engine.timebase().now();
         engine.send_midi(now, &[0x90, 60, 100]);
         let bytes = engine
-            .save_slot_state(0)
-            .expect("a loaded slot has state to save");
+            .save_insert_state(0, 0)
+            .expect("a loaded bay has state to save");
         engine.send_midi(engine.timebase().now(), &[0x80, 60, 64]);
-        println!("slot 0 state: {} bytes", bytes.len());
+        println!("bay 0 state: {} bytes", bytes.len());
         assert!(bytes.len() > 18, "only the container came back");
         assert!(engine.is_running(), "saving state stopped the stream");
         assert!(engine.fault().is_none(), "{:?}", engine.fault());
 
-        // An empty slot has nothing to save, and neither has a slot that does
-        // not exist. Both are `None` rather than an error, because the caller's
+        // An empty bay has nothing to save, and neither has one that does not
+        // exist. Both are `None` rather than an error, because the caller's
         // only move either way is to write nothing.
-        assert!(engine.save_slot_state(1).is_none());
-        assert!(engine.save_slot_state(SLOTS).is_none());
+        assert!(engine.save_insert_state(0, 1).is_none());
+        assert!(engine.save_insert_state(STRIPS + 1, 0).is_none());
 
         engine
-            .load_plugin_with_state(0, &bundle, None, Some(&bytes))
+            .load_insert(0, 0, Some(&bundle), Some(&bytes))
             .expect("reload with state");
         assert!(
-            engine.state_error(0).is_none(),
+            engine.insert_state_error(0, 0).is_none(),
             "a blob this engine just wrote was refused: {:?}",
-            engine.state_error(0)
+            engine.insert_state_error(0, 0)
         );
 
         // And the case that will actually happen: a settings file that has been
@@ -8093,17 +6960,17 @@ mod tests {
         let mut broken = bytes.clone();
         broken.truncate(broken.len() / 2);
         engine
-            .load_plugin_with_state(0, &bundle, None, Some(&broken))
+            .load_insert(0, 0, Some(&bundle), Some(&broken))
             .expect("a corrupt blob must not stop the instrument loading");
         assert!(
-            engine.state_error(0).is_some(),
+            engine.insert_state_error(0, 0).is_some(),
             "a truncated blob was silently accepted, which is how 'it keeps \
              forgetting my piano' becomes unreportable"
         );
-        assert!(engine.plugin(0).is_some(), "the instrument did not load");
-        // ...and the error does not outlive the slot.
-        engine.unload_plugin(0);
-        assert!(engine.state_error(0).is_none());
+        assert!(engine.insert(0, 0).is_some(), "the instrument did not load");
+        // ...and the error does not outlive the bay.
+        let _ = engine.load_insert(0, 0, None, None);
+        assert!(engine.insert_state_error(0, 0).is_none());
     }
 
     #[test]
@@ -8112,10 +6979,11 @@ mod tests {
     fn a_real_instrument_is_heard_and_can_be_swapped_while_the_stream_runs() {
         let bundle = pianoteq();
         let mut engine = Engine::start(None).expect("an audio output");
-        let loaded = engine.load_plugin(0, &bundle, None).expect("load");
-        assert_eq!(engine.plugin(0), Some(&loaded));
-        assert!(engine.any_plugin_loaded());
-        assert!(engine.warm_up(0).is_some_and(|w| w.heard), "warmed up silent");
+        let loaded = engine
+            .load_insert(0, 0, Some(&bundle), None)
+            .expect("load")
+            .expect("a real bundle in a real bay");
+        assert_eq!(engine.insert(0, 0), Some(&loaded));
 
         let now = engine.timebase().now();
         engine.send_midi(now, &[0x90, 60, 100]);
@@ -8130,10 +6998,9 @@ mod tests {
         // The swap: the stream keeps running and the tap keeps its width.
         let mut tap = engine.take_recorder_tap().expect("a tap");
         assert_eq!(tap.channels(), TAP_CHANNELS);
-        engine.unload_plugin(0);
-        assert!(engine.plugin(0).is_none());
-        assert!(!engine.any_plugin_loaded());
-        engine.load_plugin(0, &bundle, None).expect("reload");
+        let _ = engine.load_insert(0, 0, None, None);
+        assert!(engine.insert(0, 0).is_none());
+        engine.load_insert(0, 0, Some(&bundle), None).expect("reload");
         assert_eq!(tap.channels(), TAP_CHANNELS, "the tap changed width mid-take");
         assert!(engine.is_running());
         let mut out = Vec::new();
@@ -8143,31 +7010,32 @@ mod tests {
 
     #[test]
     #[ignore = "needs a real VST3 instrument installed; run with \
-                `cargo test -p ivory -- --ignored two_slots --nocapture`"]
-    fn two_slots_holding_the_same_instrument_are_twice_as_loud_as_one() {
+                `cargo test -p ivory -- --ignored two_channels --nocapture`"]
+    fn two_channels_holding_the_same_instrument_are_twice_as_loud_as_one() {
         // The claim of the whole feature, measured rather than asserted: the
         // same instrument playing the same notes twice sums coherently, so the
-        // peak must double. It is the only way to tell "both slots got the
-        // notes" from "one slot got them and the other is silent", which every
+        // peak must double. It is the only way to tell "both channels got the
+        // notes" from "one got them and the other is silent", which every
         // structural test in this file would happily pass.
         let bundle = pianoteq();
         let mut engine = Engine::start(None).expect("an audio output");
-        engine.load_plugin(0, &bundle, None).expect("slot 1");
-        for slot in 0..SLOTS {
-            engine.set_slot_gain(slot, 0.4);
+        engine.load_insert(0, 0, Some(&bundle), None).expect("channel 1");
+        for ch in 0..CHANNELS {
+            engine.set_channel_gain(ch, 0.4);
         }
         let one = chord_peak(&engine);
-        engine.load_plugin(1, &bundle, None).expect("slot 2");
+        engine.load_insert(1, 0, Some(&bundle), None).expect("channel 2");
         let two = chord_peak(&engine);
-        println!("one slot {one:.4}, two slots {two:.4}, ratio {:.2}x", two / one);
+        println!("one channel {one:.4}, two {two:.4}, ratio {:.2}x", two / one);
         assert!(one > 0.001, "the first instrument was never heard ({one})");
         // Wide bounds on purpose: a real piano's peak is a transient and the
-        // two instances are separately seeded. 1.5x rules out "the second slot
-        // is silent" (1.0x) and 2.5x rules out "something is summing twice".
+        // two instances are separately seeded. 1.5x rules out "the second
+        // channel is silent" (1.0x) and 2.5x rules out "something is summing
+        // twice".
         assert!(
             (1.5..2.5).contains(&(two / one)),
-            "two slots measured {:.2}x one, which is neither a layered pair \
-             (2.0x) nor a slot that heard nothing (1.0x)",
+            "two channels measured {:.2}x one, which is neither a layered pair \
+             (2.0x) nor a channel that heard nothing (1.0x)",
             two / one
         );
         assert!(engine.fault().is_none(), "{:?}", engine.fault());
@@ -8175,28 +7043,27 @@ mod tests {
 
     #[test]
     #[ignore = "needs a real VST3 instrument installed; run with \
-                `cargo test -p ivory -- --ignored unloading_one_slot`"]
-    fn unloading_one_slot_leaves_the_others_playing() {
-        // The per-slot handoff in one test: the rings slot 1 uses are not the
-        // rings slot 0 uses, so retiring one instrument cannot take the other
-        // with it.
+                `cargo test -p ivory -- --ignored unloading_one_channel`"]
+    fn unloading_one_channel_leaves_the_others_playing() {
+        // The per-bay handoff in one test: the rings channel 2's bay uses are
+        // not the rings channel 1's uses, so retiring one instrument cannot
+        // take the other with it.
         let bundle = pianoteq();
         let mut engine = Engine::start(None).expect("an audio output");
-        engine.load_plugin(0, &bundle, None).expect("slot 1");
-        engine.load_plugin(1, &bundle, None).expect("slot 2");
-        for slot in 0..SLOTS {
-            engine.set_slot_gain(slot, 0.4);
+        engine.load_insert(0, 0, Some(&bundle), None).expect("channel 1");
+        engine.load_insert(1, 0, Some(&bundle), None).expect("channel 2");
+        for ch in 0..CHANNELS {
+            engine.set_channel_gain(ch, 0.4);
         }
         assert!(chord_peak(&engine) > 0.001);
 
-        engine.unload_plugin(1);
-        assert!(engine.plugin(1).is_none());
-        assert!(engine.plugin(0).is_some(), "the wrong slot was retired");
-        assert!(engine.any_plugin_loaded());
+        let _ = engine.load_insert(1, 0, None, None);
+        assert!(engine.insert(1, 0).is_none());
+        assert!(engine.insert(0, 0).is_some(), "the wrong bay was retired");
         let alone = chord_peak(&engine);
         assert!(
             alone > 0.001,
-            "unloading slot 2 silenced slot 1 as well ({alone})"
+            "unloading channel 2 silenced channel 1 as well ({alone})"
         );
         assert!(engine.is_running());
         assert!(engine.fault().is_none(), "{:?}", engine.fault());
@@ -8204,22 +7071,28 @@ mod tests {
 
     #[test]
     #[ignore = "needs a real VST3 instrument installed; run with \
-                `cargo test -p ivory -- --ignored a_slot_that_does_not_exist`"]
-    fn a_slot_that_does_not_exist_is_an_error_and_never_a_panic() {
+                `cargo test -p ivory -- --ignored a_bay_that_does_not_exist`"]
+    fn a_bay_that_does_not_exist_is_a_no_op_and_never_a_panic() {
         // Every one of these is reachable from a menu, and a panic here goes
         // through the app's hook to a dialog and `exit(1)`.
         let bundle = pianoteq();
         let mut engine = Engine::start(None).expect("an audio output");
-        assert!(engine.load_plugin(SLOTS, &bundle, None).is_err());
-        assert!(engine.open_editor(SLOTS).is_err());
-        engine.unload_plugin(SLOTS);
-        engine.close_editor(SLOTS);
-        engine.set_slot_gain(SLOTS, 0.5);
-        assert!(!engine.has_editor(SLOTS));
-        assert!(!engine.editor_open(SLOTS));
-        assert!(engine.plugin(SLOTS).is_none());
-        assert!(engine.warm_up(SLOTS).is_none());
-        assert!(engine.is_running(), "a bad slot number stopped the stream");
+        assert!(matches!(
+            engine.load_insert(STRIPS + 1, 0, Some(&bundle), None),
+            Ok(None)
+        ));
+        assert!(matches!(
+            engine.load_insert(0, INSERTS, Some(&bundle), None),
+            Ok(None)
+        ));
+        assert!(engine.open_insert_editor(STRIPS + 1, 0).is_ok());
+        let _ = engine.load_insert(STRIPS + 1, 0, None, None);
+        engine.close_insert_editor(STRIPS + 1, 0);
+        engine.set_channel_gain(CHANNELS, 0.5);
+        assert!(!engine.insert_has_editor(STRIPS + 1, 0));
+        assert!(!engine.insert_editor_open(STRIPS + 1, 0));
+        assert!(engine.insert(STRIPS + 1, 0).is_none());
+        assert!(engine.is_running(), "a bad bay number stopped the stream");
     }
 
     /// The one instrument every one of these tests needs, found the way the

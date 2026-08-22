@@ -147,39 +147,6 @@ impl Meters {
 /// the count is bounded by what a row can legibly hold, not by the space.
 pub const SLOTS: usize = 5;
 
-/// One instrument slot, as the band draws it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SlotView<'a> {
-    /// What is loaded. `None` is an empty slot, which is still drawn — three
-    /// visible slots means three, not "as many as are full".
-    pub name: Option<&'a str>,
-    /// Named in settings but would not load this time. Distinct from empty:
-    /// a licence server that was unreachable this morning is not the same as a
-    /// slot nobody has filled.
-    pub missing: bool,
-    /// Linear gain for this slot.
-    pub gain: f32,
-    /// This instrument offers an editor. A plugin without one is legal VST3.
-    pub has_editor: bool,
-    /// Its window is on screen.
-    pub editor_open: bool,
-}
-
-impl SlotView<'_> {
-    pub const EMPTY: SlotView<'static> = SlotView {
-        name: None,
-        missing: false,
-        gain: 1.0,
-        has_editor: false,
-        editor_open: false,
-    };
-
-    /// Whether there is an instrument here at all — loaded or merely named.
-    pub fn filled(&self) -> bool {
-        self.name.is_some()
-    }
-}
-
 /// A camera frame that has already been uploaded to the GPU by the host.
 ///
 /// `ivory-ui` never touches a camera: the binary owns the device, converts the
@@ -259,10 +226,6 @@ pub struct RecorderView<'a> {
     pub editing: Option<&'a NumEdit>,
     /// What the folder will be called, computed by `ivory_record::take`.
     pub folder_preview: &'a str,
-    /// The three instrument slots, always all three — an empty one is still
-    /// drawn, because "three visible slots" is what makes layering discoverable
-    /// rather than a thing you have to know about.
-    pub slots: [SlotView<'a>; SLOTS],
     /// The four faders, as LINEAR gains (not fader positions). See
     /// [`gain_to_fader`] for turning one into a knob angle.
     pub gains: Gains,
@@ -345,7 +308,6 @@ impl RecorderView<'_> {
             name_focused: false,
             editing: None,
             folder_preview: "",
-            slots: [SlotView::EMPTY; SLOTS],
             gains: Gains::default(),
             fx: FxSends { reverb: 0.0, delay: 0.0, chorus: 0.0, hpf: 0.0, lpf: 0.0, limiter: 0.0 },
             fx_units: [crate::ports::KnobUnit::Percent; 6],
@@ -376,26 +338,13 @@ impl RecorderView<'_> {
 /// five call sites.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Gains {
-    /// One per instrument slot, so a layered sound can be balanced.
-    ///
-    /// An array rather than three fields: every consumer wants to iterate them,
-    /// and a fourth slot should be a constant change rather than a fourth
-    /// field, a fourth fader and a fourth settings key.
-    pub slots: [f32; SLOTS],
-    /// One per general channel — the fader of each of the eight, whatever the
-    /// channel's kind. The slot and input arrays above are the legacy rack's
-    /// and die with it.
+    /// One per general channel — the fader of each of the eight, whatever
+    /// the channel's kind.
     pub channels: [f32; CHANNELS],
     /// The click. Applies to what you hear; whether it reaches the FILE is
     /// `metronome_in_take`, which is a separate question with a separate
     /// answer.
     pub metronome: f32,
-    /// The inputs being recorded, one fader each.
-    ///
-    /// **An array for the same reason the slots are one**: the band shows the
-    /// first and the mixer shows all of them, and two fields for one number is
-    /// how a fader and its second view disagree.
-    pub inputs: [f32; INPUTS],
     /// **The master.** Last on the instrument bus, after the limiter, on both
     /// what you hear and what is written. Not the click, which has its own.
     pub master: f32,
@@ -728,10 +677,8 @@ impl Default for Gains {
     /// hand within a minute otherwise.
     fn default() -> Self {
         Self {
-            slots: [1.0; SLOTS],
             channels: [1.0; CHANNELS],
             metronome: 0.5,
-            inputs: [1.0; INPUTS],
             master: 1.0,
             track: 1.0,
             fx_return: 1.0,
@@ -797,9 +744,6 @@ pub struct RecorderState {
     pub camera_name: Option<String>,
     /// The camera named in settings is not present right now.
     pub camera_missing: bool,
-    /// The loaded instrument's display name.
-    /// One per slot, filled by the host each frame.
-    pub slots: [SlotState; SLOTS],
     /// The inputs of the interface that are open, one strip each.
     pub inputs: [InputState; INPUTS],
     pub audio_name: Option<String>,
@@ -862,13 +806,6 @@ impl RecorderState {
             name_focused,
             editing,
             folder_preview: &self.folder_preview,
-            slots: std::array::from_fn(|i| SlotView {
-                name: self.slots[i].name.as_deref(),
-                missing: self.slots[i].missing,
-                gain: knobs.gains.slots[i],
-                has_editor: self.slots[i].has_editor,
-                editor_open: self.slots[i].editor_open,
-            }),
             gains: knobs.gains,
             metronome_on: knobs.metronome_on,
             metronome_in_take: knobs.metronome_in_take,
@@ -965,15 +902,6 @@ impl Default for Knobs {
     }
 }
 
-/// The owned half of [`SlotView`].
-#[derive(Debug, Clone, Default)]
-pub struct SlotState {
-    pub name: Option<String>,
-    pub missing: bool,
-    pub has_editor: bool,
-    pub editor_open: bool,
-}
-
 /// Something the band asked the host to do, drained after the frame.
 ///
 /// The **request pattern**, for the same reason the directory picker uses it:
@@ -1000,18 +928,14 @@ pub enum RecorderRequest {
     Stop,
     /// Put out every clip latch: the user has seen it.
     DismissClip,
-    /// Open slot `n`'s OWN editor — the plugin's window, with its presets and
-    /// its knobs.
+    /// Open one insert's OWN editor — the plugin's window, with its presets
+    /// and its knobs: `(desk index, bay)`.
     ///
     /// A request rather than a dialog, because the window is not ours: the
     /// plugin draws into a native window the host creates after the frame. VST3
     /// requires it on the main thread, and creating an AppKit window with an
     /// egui frame still on the stack is the same re-entrancy the folder picker
     /// avoids.
-    OpenPluginEditor(usize),
-    /// Open one insert's own window: `(desk index, bay)`. Deferred for exactly
-    /// the same reason as `OpenPluginEditor` — a native window may not be
-    /// built with an egui frame on the stack.
     OpenInsertEditor(usize, usize),
     /// The green button: audition from the playhead, no take. Pressed while
     /// auditioning, it stops and the playhead returns to 0:00. The host
@@ -1925,14 +1849,9 @@ pub fn gain_text(gain: f32) -> String {
 /// identity of the field being edited has to outlive that.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NumField {
-    Slot(usize),
-    Metronome,
-    Input,
-    /// The master, typed in **decibels** like the faders it shares a curve
-    /// with — not a percentage. It is a level.
+    /// The master, typed in **decibels** like the fader curve it shares —
+    /// not a percentage. It is a level.
     Master,
-    /// The backing track's level, in decibels like the faders beside it.
-    Track,
     /// One of the six effect knobs, typed as a PERCENT. Every other field
     /// here is typed in the unit it is displayed in, and "40" for four tenths
     /// wet is the only reading of a send anybody has ever wanted to write.
@@ -2644,8 +2563,8 @@ mod fader_tests {
     fn the_click_starts_under_the_music_and_out_of_the_file() {
         let k = Knobs::default();
         assert!(
-            k.gains.slots.iter().all(|g| k.gains.metronome < *g),
-            "the click starts under EVERY instrument, not just the first"
+            k.gains.channels.iter().all(|g| k.gains.metronome < *g),
+            "the click starts under EVERY channel, not just the first"
         );
         assert!(!k.metronome_in_take, "a click in the file is a ruined take");
         assert!(!k.metronome_on, "and it does not start clicking on its own");
@@ -2736,7 +2655,7 @@ mod typing_tests {
 
     #[test]
     fn one_point_and_a_minus_only_in_front() {
-        let mut e = NumEdit::new(NumField::Input);
+        let mut e = NumEdit::new(NumField::Master);
         for ch in "-1.2.3-".chars() {
             e.push(ch);
         }
@@ -2748,7 +2667,7 @@ mod typing_tests {
     fn a_field_starts_empty_so_the_first_digit_replaces() {
         // Seeded with the current reading, "+0.0 dB", somebody wanting -6 would
         // have to delete seven characters before typing anything.
-        assert_eq!(NumEdit::new(NumField::Slot(0)).text, "");
+        assert_eq!(NumEdit::new(NumField::Master).text, "");
     }
 
     #[test]

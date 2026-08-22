@@ -1685,8 +1685,6 @@ mod shot {
         settings.limiter_mix = 0.75;
         settings.master_gain = 0.7;
         settings.metronome_gain = 0.5;
-        settings.input_gains = [1.0; ivory_ui::recorder::INPUTS];
-        settings.plugin_slots[0] = Some(ivory_ui::dialogs::BUILTIN_PATH.to_owned());
         let mut app = IvoryApp::new(c.context(), settings, ivory_ui::host::Caps::DESKTOP);
         app.set_effect_defaults(crate::desktop::effect_defaults_for_shot());
         if std::env::var("IVORY_SHOT_METER").is_ok() {
@@ -1712,7 +1710,7 @@ mod shot {
                 4.5,
             );
         }
-        if let Ok(what) = std::env::var("IVORY_SHOT_TRACK") {
+        if std::env::var("IVORY_SHOT_TRACK").is_ok() {
             // A waveform with a quiet lead-in and a quiet tail, which is what
             // somebody actually trims off.
             let wave: Vec<f32> = (0..1000)
@@ -1723,15 +1721,12 @@ mod shot {
                     (0.35 + 0.6 * ((i as f32 * 0.7).sin().abs())) * body * env
                 })
                 .collect();
-            app.set_track_for_shot(
-                ivory_ui::ports::TrackInfo {
-                    name: "Blue Bossa - backing.mp3".to_owned(),
-                    seconds: 214.0,
-                    wave,
-                    error: String::new(),
-                },
-                what == "open",
-            );
+            app.set_track_for_shot(ivory_ui::ports::TrackInfo {
+                name: "Blue Bossa - backing.mp3".to_owned(),
+                seconds: 214.0,
+                wave,
+                error: String::new(),
+            });
         }
         // **The desk, with things on it.** The mixer is the one panel whose
         // faults are all proportional — a rack too narrow to read, a tick too
@@ -1845,7 +1840,6 @@ mod shot {
         };
         let mut settings = ivory_ui::settings::Settings::default();
         settings.show_recorder = true;
-        settings.plugin_slots[0] = Some(ivory_ui::dialogs::BUILTIN_PATH.to_owned());
         let mut app = IvoryApp::new(c.context(), settings, ivory_ui::host::Caps::DESKTOP);
         app.open_mixer_for_shot();
         let mut shoot = |app: &IvoryApp| {
