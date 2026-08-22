@@ -382,6 +382,10 @@ pub struct Gains {
     /// and a fourth slot should be a constant change rather than a fourth
     /// field, a fourth fader and a fourth settings key.
     pub slots: [f32; SLOTS],
+    /// One per general channel — the fader of each of the eight, whatever the
+    /// channel's kind. The slot and input arrays above are the legacy rack's
+    /// and die with it.
+    pub channels: [f32; CHANNELS],
     /// The click. Applies to what you hear; whether it reaches the FILE is
     /// `metronome_in_take`, which is a separate question with a separate
     /// answer.
@@ -409,30 +413,70 @@ pub struct Gains {
 /// rather than the same by inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Strip {
-    /// One instrument slot. **One strip each, loaded or not.**
+    /// One general channel, which is MIDI or AUDIO by the user's choice.
     ///
-    /// There used to be a single "instrument" channel for the sum of them,
-    /// which was wrong the moment somebody loaded a second: a rack of five
-    /// with one fader is not a mixer, it is a master with extra steps. An
-    /// empty slot still gets a strip, drawn as an outline you can load into.
-    Slot(usize),
-    /// One input of the interface. **One strip each, chosen or not.**
-    ///
-    /// A rig is not one microphone. The owner's case is a vocal on input 6 and
-    /// a synth across 4/5, live at the same time, and one lumped "input"
-    /// channel for both is a master with extra steps — the same argument that
-    /// gave every instrument slot a strip of its own.
-    ///
-    /// One INTERFACE, though. A second device is a second clock and is
-    /// declined on purpose; anyone with that rig makes an aggregate device,
-    /// which presents as one device and arrives here as the ordinary case.
-    Input(usize),
+    /// **The instrument/input split died here.** There used to be five
+    /// instrument slots and four input strips, two different kinds of column
+    /// with two different rule books. A channel is a channel now: its KIND
+    /// (see [`ChannelKind`]) decides what feeds it — the note stream into a
+    /// bay-1 instrument, or one of the interface's inputs — and its three
+    /// bays take any plugin either way. The kind lives in the settings, NOT
+    /// in this enum, so cycling a channel between MIDI and AUDIO keeps its
+    /// fader, its send, its colour, its name and its inserts.
+    Channel(usize),
     Track,
     Click,
     /// The return from the effects bus. It has no send of its own: a bus that
     /// could feed itself is a bus that howls.
     Fx,
 }
+
+/// What feeds a general channel, or nothing yet.
+///
+/// Plain data the settings hold as a number: 0 unused, 1 MIDI, 2 AUDIO. A
+/// channel that is `None` here is a column with a plus in it — drawn, so the
+/// desk never changes shape, but not yet a track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelKind {
+    Midi,
+    Audio,
+}
+
+impl ChannelKind {
+    /// The settings byte, and back. See `Settings::channel_kinds`.
+    pub fn from_u8(n: u8) -> Option<Self> {
+        match n {
+            1 => Some(ChannelKind::Midi),
+            2 => Some(ChannelKind::Audio),
+            _ => None,
+        }
+    }
+
+    pub fn as_u8(kind: Option<Self>) -> u8 {
+        match kind {
+            None => 0,
+            Some(ChannelKind::Midi) => 1,
+            Some(ChannelKind::Audio) => 2,
+        }
+    }
+
+    /// The other one — the icon's click.
+    pub fn cycled(self) -> Self {
+        match self {
+            ChannelKind::Midi => ChannelKind::Audio,
+            ChannelKind::Audio => ChannelKind::Midi,
+        }
+    }
+}
+
+/// How many general channels the desk has.
+///
+/// **Eight, even, by the owner's word** — nine columns was the accident of
+/// five slots plus four inputs. Fixed, like everything about the desk's
+/// shape: an app whose strips appear and disappear is a desk that changes
+/// shape under your hands, so an unused channel is drawn as a plus rather
+/// than not drawn.
+pub const CHANNELS: usize = 8;
 
 /// How many effect inserts a channel has room for.
 ///
@@ -456,7 +500,7 @@ pub const INSERTS: usize = 3;
 pub const INPUTS: usize = 4;
 
 /// How many channels the desk has, master aside.
-pub const STRIPS: usize = SLOTS + INPUTS + 3;
+pub const STRIPS: usize = CHANNELS + 3;
 
 /// A mixer COLUMN, which is not a desk index and may never be used as one.
 ///
@@ -503,38 +547,36 @@ impl Column {
 /// Re-exported from `mixer_panel::COLUMNS` would be the other direction and
 /// this crate's panels do not depend on each other, so it is stated here and
 /// `a_column_and_a_strip_agree_about_the_desk` holds the two together.
-pub const COLUMNS_FOR_TEST: usize = SLOTS + INPUTS + 2;
+pub const COLUMNS_FOR_TEST: usize = CHANNELS + 3;
 
 impl Strip {
-    /// The channels the MIXER draws, in order.
+    /// The channels the MIXER draws, in order: the eight, the backing track,
+    /// and — for the first time — the CLICK, between BACKING and MASTER.
     ///
-    /// **Not all of them.** The click and the effects return have controls of
-    /// their own everywhere else — the click's fader is in the band and the
-    /// bus's three knobs are the band's — so a column each in the mixer was
-    /// two columns of duplication and a narrower strip for everything that had
-    /// nowhere else to be. They keep their place on the desk: the sends and
-    /// the mute masks are unchanged, they are simply not drawn.
-    pub fn shown() -> [Strip; SLOTS + INPUTS + 1] {
+    /// The click's fader used to live in the band; the band's fader rows are
+    /// going, so the click is a column like everything else. The effects
+    /// return still has no column: its three knobs are the band's, and a bus
+    /// that could be soloed against its own sources is a desk with a feedback
+    /// question in it.
+    pub fn shown() -> [Strip; CHANNELS + 2] {
         std::array::from_fn(|i| {
-            if i < SLOTS {
-                Strip::Slot(i)
-            } else if i < SLOTS + INPUTS {
-                Strip::Input(i - SLOTS)
-            } else {
+            if i < CHANNELS {
+                Strip::Channel(i)
+            } else if i == CHANNELS {
                 Strip::Track
+            } else {
+                Strip::Click
             }
         })
     }
 
-    /// Every strip, in the order they are drawn.
+    /// Every strip, in desk order.
     pub fn all() -> [Strip; STRIPS] {
         std::array::from_fn(|i| {
-            if i < SLOTS {
-                Strip::Slot(i)
-            } else if i < SLOTS + INPUTS {
-                Strip::Input(i - SLOTS)
+            if i < CHANNELS {
+                Strip::Channel(i)
             } else {
-                [Strip::Track, Strip::Click, Strip::Fx][i - SLOTS - INPUTS]
+                [Strip::Track, Strip::Click, Strip::Fx][i - CHANNELS]
             }
         })
     }
@@ -548,17 +590,21 @@ impl Strip {
     /// Its place in `Desk`'s arrays.
     pub const fn index(self) -> usize {
         match self {
-            Strip::Slot(i) => i,
-            Strip::Input(i) => SLOTS + i,
-            Strip::Track => SLOTS + INPUTS,
-            Strip::Click => SLOTS + INPUTS + 1,
-            Strip::Fx => SLOTS + INPUTS + 2,
+            Strip::Channel(i) => i,
+            Strip::Track => CHANNELS,
+            Strip::Click => CHANNELS + 1,
+            Strip::Fx => CHANNELS + 2,
         }
     }
 
-    /// Whether it can send to the effects bus. Everything but the bus itself.
+    /// Whether it can send to the effects bus.
+    ///
+    /// Not the bus itself — a bus that could feed itself howls — and **not the
+    /// click**: a metronome feeding the reverb is not something anyone asked
+    /// for, and the send that existed for it was zero on every desk ever
+    /// saved. Deleted rather than defaulted, on the cue-bus decision.
     pub const fn sends(self) -> bool {
-        !matches!(self, Strip::Fx)
+        !matches!(self, Strip::Fx | Strip::Click)
     }
 
     /// What the strip is called where a sentence has to name it.
@@ -568,11 +614,9 @@ impl Strip {
     /// five is not an instruction anybody can follow.
     pub fn label(self) -> String {
         match self {
-            Strip::Slot(i) => format!("instrument {}", i + 1),
-            // Numbered only when there could be more than one of them on the
-            // desk, which there can be — "the input is muted" with two open is
-            // not something anybody can act on.
-            Strip::Input(i) => format!("input {}", i + 1),
+            // Numbered because there are eight of them and "the channel is
+            // muted" is not something anybody can act on.
+            Strip::Channel(i) => format!("channel {}", i + 1),
             Strip::Track => "the backing track".to_owned(),
             Strip::Click => "the click".to_owned(),
             Strip::Fx => "the effects bus".to_owned(),
@@ -634,10 +678,15 @@ impl Default for Desk {
         // anything.** That is what an insert on the instrument bus was, so a
         // settings file written before any of this existed comes up sounding
         // exactly as it did.
+        // **The first channel sends everything, and nothing else sends
+        // anything.** Channel 0 is the desk's default instrument — the DX7 a
+        // fresh install plays — and the send is what an insert on the
+        // instrument bus was, so a new install comes up sounding exactly as
+        // the old one did. Channels ADDED later get their send set to 1.0 at
+        // the gesture instead, so a fresh track gets reverb without an index
+        // here having to guess its kind.
         let mut send = [0.0; STRIPS];
-        for i in 0..SLOTS {
-            send[i] = 1.0;
-        }
+        send[0] = 1.0;
         Self {
             send,
             muted: [false; STRIPS],
@@ -680,6 +729,7 @@ impl Default for Gains {
     fn default() -> Self {
         Self {
             slots: [1.0; SLOTS],
+            channels: [1.0; CHANNELS],
             metronome: 0.5,
             inputs: [1.0; INPUTS],
             master: 1.0,
@@ -3229,9 +3279,9 @@ mod missing_tests {
     fn it_names_what_is_lost_and_where_to_fix_it() {
         assert_eq!(missing_from_take(&[]), None, "nothing muted, nothing to say");
 
-        let one = missing_from_take(&[Strip::Input(0)]).expect("a muted input is news");
+        let one = missing_from_take(&[Strip::Channel(0)]).expect("a muted channel is news");
         assert!(
-            one.contains("input 1 is muted") && one.contains("will not have it"),
+            one.contains("channel 1 is muted") && one.contains("will not have it"),
             "{one}"
         );
         assert!(
@@ -3243,22 +3293,22 @@ mod missing_tests {
         // A list anybody would say out loud, and the verb agreeing with it.
         // "instrument 2 are muted" is the kind of thing that makes a person
         // trust the rest of the line less.
-        let many = missing_from_take(&[Strip::Slot(1), Strip::Input(0), Strip::Track])
+        let many = missing_from_take(&[Strip::Channel(1), Strip::Channel(0), Strip::Track])
             .expect("three of them is still news");
         assert!(
-            many.contains("instrument 2, input 1 and the backing track"),
+            many.contains("channel 2, channel 1 and the backing track"),
             "{many}"
         );
         assert!(many.contains("are muted") && many.contains("have them"), "{many}");
     }
 
-    /// A slot says WHICH slot. "the instrument is muted" on a rack of five is
-    /// not something anybody can act on.
+    /// A channel says WHICH channel. "the channel is muted" on a desk of
+    /// eight is not something anybody can act on.
     #[test]
-    fn a_slot_says_which_one() {
-        for i in 0..SLOTS {
-            let said = Strip::Slot(i).label();
-            assert_eq!(said, format!("instrument {}", i + 1));
+    fn a_channel_says_which_one() {
+        for i in 0..crate::recorder::CHANNELS {
+            let said = Strip::Channel(i).label();
+            assert_eq!(said, format!("channel {}", i + 1));
         }
     }
 }

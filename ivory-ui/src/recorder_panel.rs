@@ -2799,6 +2799,13 @@ fn toward(c: Color32, bg: Color32, t: f32) -> Color32 {
 /// second ink over a filled body is two shades of mud, while a gap in a solid
 /// shape stays a gap however small it gets.
 fn draw_metronome(painter: &Painter, b: Rect, ink: Color32, p: &Palette) {
+    draw_metronome_on(painter, b, ink, p.bg);
+}
+
+/// The metronome with the pendulum cut out in an EXPLICIT background — the
+/// mixer's strips have faces of their own, and a pendulum cut in the band's
+/// leather would print the wrong panel through the icon.
+pub(crate) fn draw_metronome_on(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
     let s = b.width();
     let (cx, top, bottom) = (b.center().x, b.top() + s * 0.06, b.bottom() - s * 0.06);
     painter.add(egui::Shape::convex_polygon(
@@ -2815,12 +2822,12 @@ fn draw_metronome(painter: &Painter, b: Rect, ink: Color32, p: &Palette) {
     // metronome nobody recognises.
     let foot = Pos2::new(cx - s * 0.03, bottom - s * 0.07);
     let head = Pos2::new(cx + s * 0.19, top + s * 0.05);
-    painter.line_segment([foot, head], Stroke::new((s * 0.075).max(1.0), p.bg));
+    painter.line_segment([foot, head], Stroke::new((s * 0.075).max(1.0), bg));
     let along = |t: f32| Pos2::new(foot.x + (head.x - foot.x) * t, foot.y + (head.y - foot.y) * t);
     painter.rect_filled(
         Rect::from_center_size(along(0.36), Vec2::new(s * 0.17, s * 0.085)),
         1.0,
-        p.bg,
+        bg,
     );
 }
 
@@ -6984,6 +6991,7 @@ mod tests {
                                 // silence, past unity, and the click's default.
                                 gains: Gains {
                                     slots: [3.98, 0.0, 1.0, 0.5, 0.25],
+                                    channels: [0.7; crate::recorder::CHANNELS],
                                     metronome: 0.0,
                                     inputs: [0.5; crate::recorder::INPUTS],
                                     master: if dark { 1.0 } else { 0.35 },

@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 11;
+const SETTINGS_VERSION: u64 = 12;
 
 /// Where a desk channel written before the INPUT STRIPS ended up.
 ///
@@ -112,8 +112,168 @@ const V11_INSERTS: usize = 3;
 /// `Strip::Fx.index()` at version 11: five slots, four inputs, then the backing
 /// track and the click before it.
 const V11_FX_INDEX: usize = 11;
+/// The desk's shape at version 12: eight general channels, then the backing
+/// track, the click and the bus. Frozen like everything a migration reads.
+const V12_CHANNELS: usize = 8;
+const V12_STRIPS: usize = 11;
 
 /// Move every desk array from the one-input layout to this one.
+/// Version 12: the instrument/input split dies. Five slots and four inputs
+/// become eight general channels; the track, the click, the bus and the
+/// master all move down one.
+///
+/// **An occupancy pass, not a table.** Old generals are walked in order —
+/// slots 0..5, then inputs 0..4 — and the OCCUPIED ones (a slot with a plugin,
+/// input 0 always, an extra input that was chosen) take the first new indices,
+/// so nobody's working channels land after their empty ones. The unoccupied
+/// fill what is left in the same order, and the ninth — there are nine old
+/// generals and eight new channels — is dropped from the END of the
+/// unoccupied, where it can only ever be an empty column.
+///
+/// A slot's INSTRUMENT moves into bay 1 of its channel, pushing its effects
+/// down; a slot that had an instrument and three effects keeps the first two
+/// and drops the third — four things do not fit in three bays, and the
+/// instrument is the one that cannot be re-chosen from a picker of effects.
+///
+/// Numbers frozen as [`V12_CHANNELS`]/[`V12_STRIPS`], per the rule the test
+/// `the_historical_migrations_do_not_read_todays_constants` enforces.
+fn migrate_split_desk(s: &mut Settings, desk: &mut LegacyDesk) {
+    const OLD_GENERALS: usize = V10_SLOTS + V10_INPUTS; // 9, at v11
+    let get = |v: &Vec<i64>, i: usize| v.get(i).copied().unwrap_or(0);
+    let gets = |v: &Vec<String>, i: usize| v.get(i).cloned().unwrap_or_default();
+    let getf = |v: &Vec<f64>, i: usize| v.get(i).copied().unwrap_or(0.0);
+
+    // ── occupancy ───────────────────────────────────────────────────────────
+    // Old general k: k < V10_SLOTS is slot k, else input k - V10_SLOTS.
+    let occupied = |k: usize| -> bool {
+        if k < V10_SLOTS {
+            s.plugin_slots.get(k).is_some_and(Option::is_some)
+        } else {
+            let j = k - V10_SLOTS;
+            j == 0
+                || s.record_extra_inputs
+                    .get(j - 1)
+                    .is_some_and(|u| !u.is_empty())
+        }
+    };
+    let mut order: Vec<usize> = (0..OLD_GENERALS).filter(|k| occupied(*k)).collect();
+    order.extend((0..OLD_GENERALS).filter(|k| !occupied(*k)));
+    // old general k -> new channel, or None for the dropped ninth.
+    let mut to_new = [None::<usize>; OLD_GENERALS];
+    for (new, old) in order.iter().take(V12_CHANNELS).enumerate() {
+        to_new[*old] = Some(new);
+    }
+
+    // Every desk row, old index -> new index. Track 9->8, click 10->9,
+    // fx 11->10, master 12->11.
+    let moved = |old: usize| -> Option<usize> {
+        if old < OLD_GENERALS {
+            to_new[old]
+        } else {
+            Some(old - 1)
+        }
+    };
+
+    // ── rebuild the staging vectors at the new shape ────────────────────────
+    let mut colors = vec![0i64; V12_STRIPS + 1];
+    let mut names = vec![String::new(); V12_STRIPS + 1];
+    let mut sends = vec![0.0f64; V12_STRIPS];
+    let mut inserts = vec![String::new(); (V12_STRIPS + 1) * V11_INSERTS];
+    for old in 0..=OLD_GENERALS + 3 {
+        let Some(new) = moved(old) else { continue };
+        if new <= V12_STRIPS {
+            colors[new] = get(&desk.colors, old);
+            names[new] = gets(&desk.names, old);
+        }
+        if new < V12_STRIPS {
+            sends[new] = getf(&desk.sends, old);
+        }
+        if new <= V12_STRIPS {
+            for bay in 0..V11_INSERTS {
+                inserts[new * V11_INSERTS + bay] = gets(&desk.inserts, old * V11_INSERTS + bay);
+            }
+        }
+    }
+
+    // ── kinds, gains, and the instrument into bay 1 ─────────────────────────
+    let mut kinds = [0u8; V12_CHANNELS];
+    let mut gains = [1.0f64; V12_CHANNELS];
+    for old in 0..OLD_GENERALS {
+        let Some(new) = to_new[old] else { continue };
+        if old < V10_SLOTS {
+            gains[new] = s.plugin_gains.get(old).copied().unwrap_or(1.0);
+            if let Some(Some(instrument)) = s.plugin_slots.get(old) {
+                kinds[new] = 1;
+                // The instrument takes bay 1; the effects shuffle down and the
+                // third, if there was one, goes. Silently — the alternative is
+                // a dialog about a bay on a desk the user has not seen yet.
+                let row = new * V11_INSERTS;
+                let (b0, b1) = (inserts[row].clone(), inserts[row + 1].clone());
+                inserts[row] = instrument.clone();
+                inserts[row + 1] = b0;
+                inserts[row + 2] = b1;
+            }
+            // An empty old slot stays unused: it was a "click to load" column
+            // and the plus is exactly that.
+        } else {
+            let j = old - V10_SLOTS;
+            gains[new] = s.input_gains.get(j).copied().unwrap_or(1.0);
+            if occupied(old) {
+                kinds[new] = 2;
+            }
+        }
+    }
+
+    // **The default sound survives the upgrade.** Most v11 desks never loaded
+    // a VST — the built-in played whenever no slot was filled. That fallback
+    // is gone with the slots, so a desk with no instrument anywhere gets the
+    // DX7 seeded into its first unused channel, which is the same sound
+    // arriving by the new road.
+    let any_instrument = kinds
+        .iter()
+        .enumerate()
+        .any(|(n, k)| *k == 1 && !inserts[n * V11_INSERTS].is_empty());
+    if !any_instrument {
+        if let Some(free) = kinds.iter().position(|k| *k == 0) {
+            kinds[free] = 1;
+            inserts[free * V11_INSERTS] = crate::dialogs::BUILTIN_PATH.to_owned();
+            sends[free] = 1.0;
+        }
+    }
+
+    // ── masks, by the same map ──────────────────────────────────────────────
+    let move_mask = |mask: u32| -> u32 {
+        let mut out = 0u32;
+        for old in 0..=OLD_GENERALS + 3 {
+            if mask & (1 << old) != 0 {
+                if let Some(new) = moved(old) {
+                    out |= 1 << new;
+                }
+            }
+        }
+        out
+    };
+    s.strip_muted = move_mask(s.strip_muted);
+    s.strip_soloed = move_mask(s.strip_soloed);
+
+    // The click has a column now and a stored zero is not a choice — nobody
+    // could paint a column that did not exist. Amber, distinct from the
+    // master's red and the track's violet.
+    if colors[9] == 0 {
+        colors[9] = 8;
+    }
+
+    desk.colors = colors;
+    desk.names = names;
+    desk.sends = sends;
+    desk.inserts = inserts;
+    s.channel_kinds = kinds;
+    s.channel_gains = gains;
+    // The slots are spent: their instruments live in bays now, and a slot
+    // array that still named them would be a second copy to disagree.
+    s.plugin_slots = std::array::from_fn(|_| None);
+}
+
 fn migrate_desk_channels(s: &mut Settings, desk: &mut LegacyDesk) {
     // **On the staging arrays**, which are at the file's own length — see
     // `LegacyDesk`. Grown rather than bounds-checked against today's constant:
@@ -563,6 +723,14 @@ pub struct Settings {
     /// Linear gain per slot. Linear because that is what the audio path
     /// multiplies by; the band converts to dB to draw.
     pub plugin_gains: [f64; crate::recorder::SLOTS],
+    /// One fader per general channel, whatever its kind. The slot and input
+    /// gain arrays above are the legacy rack's; the v12 migration folds them
+    /// in here and they die with the rack.
+    pub channel_gains: [f64; crate::recorder::CHANNELS],
+    /// What feeds each general channel: 0 unused, 1 MIDI, 2 AUDIO. See
+    /// `recorder::ChannelKind` — kept as bytes so a hand-edited file cannot
+    /// hold a kind this build has no picture for.
+    pub channel_kinds: [u8; crate::recorder::CHANNELS],
     /// The three effect knobs, 0..=1. All off by default: a first launch has to
     /// sound like the instrument, not like a room.
     pub reverb_mix: f64,
@@ -857,6 +1025,16 @@ impl Default for Settings {
             video_defaults_lowered: false,
             plugin_slots: [const { None }; crate::recorder::SLOTS],
             plugin_gains: [1.0; crate::recorder::SLOTS],
+            channel_gains: [1.0; crate::recorder::CHANNELS],
+            // **Channel 0 ships as the DX7.** The default sound lives in a
+            // pre-added MIDI channel with the built-in in bay 1 — see
+            // `Default::default`'s `strip_inserts` — so a fresh install makes
+            // a sound and the desk shows why.
+            channel_kinds: {
+                let mut k = [0u8; crate::recorder::CHANNELS];
+                k[0] = 1;
+                k
+            },
             reverb_mix: 0.0,
             delay_mix: 0.0,
             chorus_mix: 0.0,
@@ -877,8 +1055,8 @@ impl Default for Settings {
                 // instruments nor each other, and a colour each says so before
                 // the labels are read.
                 let mut c = [0; crate::recorder::STRIPS + 1];
-                c[crate::recorder::Strip::Input(0).index()] = 16; // teal
                 c[crate::recorder::Strip::Track.index()] = 23; // violet
+                c[crate::recorder::Strip::Click.index()] = 8; // amber
                 c[crate::recorder::STRIPS] = crate::mixer_panel::MASTER_COLOR as i64;
                 c
             },
@@ -892,7 +1070,14 @@ impl Default for Settings {
                 if i < crate::recorder::SLOTS { 1.0 } else { 0.0 }
             }),
             strip_names: Vec::new(),
-            strip_inserts: Vec::new(),
+            // Channel 0's bay 1 holds the built-in — the pre-added DX7 that
+            // is a fresh install's sound. See `channel_kinds` above.
+            strip_inserts: {
+                let mut v =
+                    vec![String::new(); (crate::recorder::STRIPS + 1) * crate::recorder::INSERTS];
+                v[0] = crate::dialogs::BUILTIN_PATH.to_owned();
+                v
+            },
             input_alias: String::new(),
             strip_muted: 0,
             strip_soloed: 0,
@@ -1532,6 +1717,26 @@ impl Settings {
                 s.plugin_gains[0] = g;
             }
         }
+        if let Some(Value::Array(items)) = map.shift_remove("channel_gains") {
+            for (gain, item) in s.channel_gains.iter_mut().zip(items) {
+                if let Some(g) = item.as_f64() {
+                    if g.is_finite() && (0.0..=MAX_GAIN).contains(&g) {
+                        *gain = g;
+                    }
+                }
+            }
+        }
+        if let Some(Value::Array(items)) = map.shift_remove("channel_kinds") {
+            for (kind, item) in s.channel_kinds.iter_mut().zip(items) {
+                if let Some(k) = item.as_u64() {
+                    // A byte this build has no picture for reads as unused
+                    // rather than as whichever kind is variant 3 next year.
+                    if k <= 2 {
+                        *kind = k as u8;
+                    }
+                }
+            }
+        }
         if let Some(Value::Object(m)) = map.shift_remove("effect_params") {
             s.effect_params = m;
         }
@@ -1699,6 +1904,9 @@ impl Settings {
             // and everything indexed by a channel moved with it. See
             // `desk_channel_moved`.
             migrate_desk_channels(self, desk);
+        }
+        if was < 12 {
+            migrate_split_desk(self, desk);
         }
         if was < 9 {
             // **The limiter's dial turned round.** It used to be off at zero
@@ -2143,6 +2351,25 @@ impl Settings {
             ),
         );
         map.insert(
+            "channel_gains".into(),
+            Value::Array(
+                self.channel_gains
+                    .iter()
+                    .filter_map(|g| serde_json::Number::from_f64(*g))
+                    .map(Value::Number)
+                    .collect(),
+            ),
+        );
+        map.insert(
+            "channel_kinds".into(),
+            Value::Array(
+                self.channel_kinds
+                    .iter()
+                    .map(|k| Value::Number((*k as u64).into()))
+                    .collect(),
+            ),
+        );
+        map.insert(
             "effect_params".into(),
             Value::Object(self.effect_params.clone()),
         );
@@ -2464,6 +2691,7 @@ impl Settings {
         crate::recorder::Knobs {
             gains: crate::recorder::Gains {
                 slots: std::array::from_fn(|i| self.plugin_gains[i] as f32),
+                channels: std::array::from_fn(|i| self.channel_gains[i] as f32),
                 metronome: self.metronome_gain as f32,
                 inputs: std::array::from_fn(|i| self.input_gains[i] as f32),
                 master: self.master_gain as f32,
@@ -2712,10 +2940,17 @@ mod tests {
             crate::mixer_panel::PALETTE_V1_TO_V2[6],
             "the backing track's colour landed on another channel"
         );
+        // The one input there was is OCCUPIED by definition, so the v12
+        // occupancy pass gives it the first channel.
         assert_eq!(
-            s.strip_colors[Strip::Input(0).index()] as usize,
+            s.strip_colors[Strip::Channel(0).index()] as usize,
             crate::mixer_panel::PALETTE_V1_TO_V2[4],
-            "the one input there was is not the first of the four"
+            "the one input there was is not the first channel"
+        );
+        assert_eq!(
+            s.channel_kinds[0],
+            2,
+            "the input's channel does not know it is audio"
         );
         assert_eq!(
             s.strip_colors[crate::recorder::STRIPS] as usize,
@@ -2732,12 +2967,20 @@ mod tests {
             1 << Strip::Click.index(),
             "the muted click now mutes something else"
         );
-        // The new input strips come up unmuted and uncoloured, because nobody
-        // has ever said anything about them.
-        for i in 1..crate::recorder::INPUTS {
-            assert_eq!(s.strip_colors[Strip::Input(i).index()], 0, "input {i}");
-            assert_eq!(s.strip_muted & (1 << Strip::Input(i).index()), 0);
+        // The channels the empty old slots became come up unmuted and
+        // uncoloured, because nobody ever said anything about them.
+        for ch in 2..crate::recorder::CHANNELS {
+            assert_eq!(s.strip_colors[Strip::Channel(ch).index()], 0, "channel {ch}");
+            assert_eq!(s.strip_muted & (1 << Strip::Channel(ch).index()), 0);
         }
+        // And a desk with no instrument anywhere gets the DX7 seeded into its
+        // first unused channel, so the upgrade does not go silent.
+        assert_eq!(s.channel_kinds[1], 1, "no channel took the built-in");
+        assert_eq!(
+            s.strip_inserts[Strip::Channel(1).index() * crate::recorder::INSERTS].as_str(),
+            crate::dialogs::BUILTIN_PATH,
+            "the seeded channel has no instrument in bay 1"
+        );
     }
 
     /// **A palette is a set of indices somebody has already saved.**
@@ -2753,7 +2996,7 @@ mod tests {
         use crate::recorder::Strip;
         // The old defaults: 4 was teal and 6 was violet.
         let old = Settings::from_json(r#"{"strip_colors": [0, 0, 0, 0, 0, 4, 6, 0, 0, 1]}"#);
-        let teal = old.strip_colors[Strip::Input(0).index()] as usize;
+        let teal = old.strip_colors[Strip::Channel(0).index()] as usize;
         let violet = old.strip_colors[Strip::Track.index()] as usize;
         assert_eq!(teal, PALETTE_V1_TO_V2[4], "the microphone changed colour");
         assert_eq!(violet, PALETTE_V1_TO_V2[6], "the backing track changed colour");
@@ -2765,7 +3008,7 @@ mod tests {
 
         // A file already written by this build is taken at face value.
         let new = Settings::from_json(r#"{"strip_colors_v2": [0, 0, 0, 0, 0, 26, 0, 0, 0, 5]}"#);
-        assert_eq!(new.strip_colors[Strip::Input(0).index()], 26);
+        assert_eq!(new.strip_colors[Strip::Channel(0).index()], 26);
 
         // And what is written back is the NEW key, or the next launch would
         // migrate the already-migrated numbers a second time.
@@ -3609,6 +3852,161 @@ mod tests {
         assert!(
             order.0 < order.1,
             "the desk is clamped before the migration can move anything"
+        );
+    }
+
+    /// **The split desk migrates whole: a working v11 desk sounds and looks
+    /// the same on the v12 one.**
+    ///
+    /// The fixture is the hard case: two loaded slots (one with a full rack of
+    /// three effects), the always-open input plus one extra, colours, names,
+    /// sends and a muted input — nine old generals into eight channels, with
+    /// the occupied ones taking the front seats.
+    #[test]
+    fn a_v11_desk_survives_the_split() {
+        use crate::recorder::{Strip, INSERTS};
+        // The insert rows are built by OLD INDEX rather than counted by hand:
+        // 39 strings is exactly the shape a miscounted fixture silently
+        // shifts, which is the fault the migration exists to prevent.
+        let mut old_inserts = vec![String::new(); 13 * INSERTS];
+        let put = |v: &mut Vec<String>, row: usize, bay: usize, p: &str| {
+            v[row * INSERTS + bay] = p.to_owned();
+        };
+        put(&mut old_inserts, 0, 0, "/x/Pro-R 2.vst3"); // slot 0, full rack
+        put(&mut old_inserts, 0, 1, "/x/Pro-Q 4.vst3");
+        put(&mut old_inserts, 0, 2, "/x/Saturn 2.vst3");
+        put(&mut old_inserts, 2, 0, "/x/Pro-C 3.vst3"); // slot 2, one effect
+        put(&mut old_inserts, 9, 0, "/x/Pro-G.vst3"); // the backing track's
+        put(&mut old_inserts, 12, 0, "/x/Pro-L 2.vst3"); // the master's
+        let inserts_json = old_inserts
+            .iter()
+            .map(|p| format!("{p:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{
+            "settings_version": 11,
+            "plugin_slots": ["/x/Pianoteq 8.vst3", null, "/x/Diva.vst3", null, null],
+            "plugin_gains": [0.8, 1.0, 0.6, 1.0, 1.0],
+            "input_gains": [0.9, 0.7, 1.0, 1.0],
+            "record_extra_inputs": ["uid-4"],
+            "strip_colors_v2": [3, 0, 7, 0, 0, 16, 21, 0, 0, 23, 0, 0, 5],
+            "strip_names": ["Piano", "", "Lead", "", "", "Mic", "Amp", "", "", "", "", "", "Sum"],
+            "strip_sends": [1.0, 1.0, 0.4, 1.0, 1.0, 0.0, 0.2, 0.0, 0.0, 0.1, 0.0, 0.5],
+            "strip_muted": 32,
+            "strip_inserts": [{inserts_json}]
+        }}"#
+        );
+        let s = Settings::from_json(&json);
+
+        // Occupancy: slot0, slot2, input0, input1 are occupied -> channels
+        // 0..4. Unoccupied fill 4..8: slot1, slot3, slot4, input2; input3 is
+        // the dropped ninth.
+        assert_eq!(s.channel_kinds[..4], [1, 1, 2, 2], "the occupied four");
+        assert_eq!(s.channel_kinds[4..], [0, 0, 0, 0], "the unoccupied rest");
+
+        // Slot 0's instrument went to bay 1, its three effects kept two.
+        let bays = |ch: usize| {
+            let row = Strip::Channel(ch).index() * INSERTS;
+            (
+                s.strip_inserts[row].as_str(),
+                s.strip_inserts[row + 1].as_str(),
+                s.strip_inserts[row + 2].as_str(),
+            )
+        };
+        assert_eq!(
+            bays(0),
+            ("/x/Pianoteq 8.vst3", "/x/Pro-R 2.vst3", "/x/Pro-Q 4.vst3"),
+            "channel 0 is not the piano with its first two effects"
+        );
+        assert_eq!(
+            bays(1),
+            ("/x/Diva.vst3", "/x/Pro-C 3.vst3", ""),
+            "channel 1 is not the lead with its one effect"
+        );
+        // The slots are spent.
+        assert!(s.plugin_slots.iter().all(Option::is_none));
+
+        // Gains followed their channels.
+        assert!((s.channel_gains[0] - 0.8).abs() < 1e-9, "the piano's fader moved");
+        assert!((s.channel_gains[1] - 0.6).abs() < 1e-9, "the lead's fader moved");
+        assert!((s.channel_gains[2] - 0.9).abs() < 1e-9, "input 1's fader moved");
+        assert!((s.channel_gains[3] - 0.7).abs() < 1e-9, "input 2's fader moved");
+
+        // Colours and names followed too.
+        assert_eq!(s.strip_colors[0], 3, "the piano lost its colour");
+        assert_eq!(s.strip_colors[1], 7, "the lead lost its colour");
+        assert_eq!(s.strip_colors[2], 16, "the mic lost its teal");
+        assert_eq!(s.strip_names[0], "Piano");
+        assert_eq!(s.strip_names[1], "Lead");
+        assert_eq!(s.strip_names[2], "Mic");
+        assert_eq!(s.strip_names[3], "Amp");
+        assert_eq!(
+            s.strip_names[crate::recorder::STRIPS], "Sum",
+            "the master lost its name in the shrink - the LegacyDesk bug again"
+        );
+
+        // Sends: the piano's 1.0, the lead's 0.4, and the track's 0.1 now at
+        // the track's NEW index.
+        assert!((s.strip_sends[0] - 1.0).abs() < 1e-9);
+        assert!((s.strip_sends[1] - 0.4).abs() < 1e-9);
+        assert!(
+            (s.strip_sends[Strip::Track.index()] - 0.1).abs() < 1e-9,
+            "the backing track's send did not move down with it"
+        );
+        // The click's send is DELETED, whatever the file said.
+        // (Old click send was 0.0 here; the rule is structural: Strip::sends.)
+        assert!(!Strip::Click.sends());
+
+        // The muted input (old bit 5, input 0) is still the muted MIC, which
+        // is channel 2 now.
+        assert_eq!(
+            s.strip_muted,
+            1 << Strip::Channel(2).index(),
+            "the mute followed the wrong channel"
+        );
+
+        // The master's rack survived the move down.
+        assert_eq!(
+            s.strip_inserts[crate::recorder::STRIPS * INSERTS].as_str(),
+            "/x/Pro-L 2.vst3",
+            "the master's limiter vanished"
+        );
+        // The track's own insert moved with the track.
+        assert_eq!(
+            s.strip_inserts[Strip::Track.index() * INSERTS].as_str(),
+            "/x/Pro-G.vst3",
+            "the track's gate vanished"
+        );
+        // And the master's rack is at the master's row, not a bay adrift.
+        assert_eq!(
+            s.strip_inserts[crate::recorder::STRIPS * INSERTS + 1].as_str(),
+            "",
+            "something leaked into the master's second bay"
+        );
+
+        // The click got its seeded amber, because a stored zero is not a
+        // choice for a column that never existed.
+        assert_eq!(s.strip_colors[Strip::Click.index()], 8);
+    }
+
+    /// A v11 desk that never loaded a VST keeps making a sound: the DX7 is
+    /// seeded into the first unused channel.
+    #[test]
+    fn a_desk_with_no_instruments_gets_the_dx7_seeded() {
+        use crate::recorder::{Strip, INSERTS};
+        let s = Settings::from_json(r#"{"settings_version": 11}"#);
+        // Input 0 is always occupied -> channel 0, audio. The seed lands on
+        // channel 1, the first unused.
+        assert_eq!(s.channel_kinds[0], 2);
+        assert_eq!(s.channel_kinds[1], 1, "nothing took the built-in");
+        assert_eq!(
+            s.strip_inserts[Strip::Channel(1).index() * INSERTS].as_str(),
+            crate::dialogs::BUILTIN_PATH
+        );
+        assert!(
+            (s.strip_sends[1] - 1.0).abs() < 1e-9,
+            "the seeded instrument does not reach the reverb"
         );
     }
 

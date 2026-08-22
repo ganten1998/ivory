@@ -1643,8 +1643,7 @@ impl IvoryApp {
         match hit {
             H::Fader(i) => {
                 let to = match i.strip() {
-                    Some(Strip::Slot(n)) => d.plugin_gains.get(n).copied().unwrap_or(1.0),
-                    Some(Strip::Input(n)) => d.input_gains.get(n).copied().unwrap_or(1.0),
+                    Some(Strip::Channel(n)) => d.channel_gains.get(n).copied().unwrap_or(1.0),
                     Some(Strip::Track) => d.track_gain,
                     Some(Strip::Click) => d.metronome_gain,
                     Some(Strip::Fx) => d.fx_return_gain,
@@ -1681,13 +1680,8 @@ impl IvoryApp {
             // used to land on the metronome — a fader that did not move and
             // moved another one instead.
             H::Fader(i) => match i.strip() {
-                Some(Strip::Slot(n)) => {
-                    if let Some(g) = self.settings.plugin_gains.get_mut(n) {
-                        *g = gain;
-                    }
-                }
-                Some(Strip::Input(n)) => {
-                    if let Some(g) = self.settings.input_gains.get_mut(n) {
+                Some(Strip::Channel(n)) => {
+                    if let Some(g) = self.settings.channel_gains.get_mut(n) {
                         *g = gain;
                     }
                 }
@@ -1709,23 +1703,42 @@ impl IvoryApp {
             // value is ignored.
             H::Mute(i) => self.settings.strip_muted ^= 1 << i.desk_index(),
             H::Solo(i) => self.settings.strip_soloed ^= 1 << i.desk_index(),
-            // The plus on an empty slot: the same picker the rack opens, so
-            // there is one way to choose an instrument and two ways to reach it.
+            // **The icon, and the plus that stands where it will be.**
+            //
+            // On an UNUSED channel the whole panel is this target and pressing
+            // it ADDS a track: the channel becomes MIDI — one icon-click away
+            // from AUDIO, which is the prompt collapsed into the cycle — and
+            // its send comes up at 1.0 so a fresh track reaches the reverb the
+            // way the old instrument slots always did.
+            //
+            // On a USED channel the icon CYCLES the kind. Nothing else moves:
+            // the fader, the send, the colour, the name and all three bays
+            // stay, which is the whole reason the kind lives beside the
+            // channel rather than in it.
             H::Add(i) => {
                 match i.strip() {
-                    Some(Strip::Slot(n)) => self.open_plugin_picker(n),
-                    // **The first input is the band's own picker**, because it
-                    // is the same choice: the row in the band and the first
-                    // column of the desk are two views of one microphone.
-                    Some(Strip::Input(0)) => {
-                        self.open_device_picker(dialogs::DeviceKind::AudioInput);
-                    }
-                    Some(Strip::Input(n)) => {
-                        self.open_device_picker(dialogs::DeviceKind::ExtraInput(n));
-                    }
-                    // The waveform above BACKING. Same question again: what is
-                    // playing on this channel.
+                    Some(Strip::Channel(n)) => match self.channel_kind(n) {
+                        None => {
+                            self.set_channel_kind(n, Some(recorder::ChannelKind::Midi));
+                            if let Some(send) =
+                                self.settings.strip_sends.get_mut(Strip::Channel(n).index())
+                            {
+                                *send = 1.0;
+                            }
+                            self.save_settings();
+                        }
+                        Some(kind) => {
+                            self.set_channel_kind(n, Some(kind.cycled()));
+                        }
+                    },
+                    // The waveform above BACKING. Same question as ever: what
+                    // is playing on this channel.
                     Some(Strip::Track) => self.ask_for_track(),
+                    // The metronome IS the click switch, here as in the band.
+                    Some(Strip::Click) => {
+                        self.settings.metronome_on = !self.settings.metronome_on;
+                        self.save_settings();
+                    }
                     _ => {}
                 }
                 return;
@@ -1739,10 +1752,15 @@ impl IvoryApp {
             // cannot use — which is what a rack was until now.
             H::Insert(i, n) => {
                 let at = i.desk_index();
-                if self.insert(at, n).is_some() {
-                    self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(at, n));
-                } else {
-                    self.open_insert_picker(at, n);
+                match self.insert(at, n) {
+                    // **The built-in has no window to open.** Its bay shows
+                    // the patch picker, which IS its editor — one gesture,
+                    // "click the bay to see the instrument", not two.
+                    Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(at),
+                    Some(_) => self.request_recorder(
+                        recorder::RecorderRequest::OpenInsertEditor(at, n),
+                    ),
+                    None => self.open_insert_picker(at, n),
                 }
                 return;
             }
@@ -1865,37 +1883,39 @@ impl IvoryApp {
         // not anything is plugged in.
         let strip = |s: Strip| {
             let i = s.index();
+            let kind = match s {
+                Strip::Channel(n) => self.channel_kind(n),
+                _ => None,
+            };
             let (name, detail, gain, empty) = match s {
-                // **A slot is a strip whether or not anything is in it.** The
-                // built-in counts: it occupies a slot like any plugin, so it
-                // gets a channel like any plugin.
-                Strip::Slot(n) => {
-                    let loaded = self.chosen_plugin(n);
+                // **A channel is a strip whether or not it is used.** An
+                // unused one is drawn as a plus, so the desk never changes
+                // shape; a used one's DEFAULT name is what feeds it — the
+                // bay-1 instrument on MIDI, the input's label on AUDIO, the
+                // kind's own word before either is chosen. A typed name still
+                // wins, below.
+                Strip::Channel(n) => {
+                    let default = match kind {
+                        None => "",
+                        Some(recorder::ChannelKind::Midi) => self
+                            .insert(s.index(), 0)
+                            .map(plugin_display_name)
+                            .filter(|d| !d.is_empty())
+                            .unwrap_or("MIDI"),
+                        Some(recorder::ChannelKind::Audio) => self
+                            .audio_ordinal(n)
+                            .and_then(|k| self.recorder.inputs.get(k))
+                            .map(|st| st.label.as_str())
+                            .filter(|l| !l.is_empty())
+                            .unwrap_or("AUDIO"),
+                    };
                     (
-                        loaded.map_or("", plugin_display_name),
+                        default,
                         "",
-                        g.slots.get(n).copied().unwrap_or(1.0),
-                        loaded.is_none(),
+                        g.channels.get(n).copied().unwrap_or(1.0),
+                        kind.is_none(),
                     )
                 }
-                // **An input strip is a strip whether or not one is chosen**,
-                // for the same reason a slot is: five sources that appear one
-                // at a time as they are picked is a desk that changes shape
-                // under your hands.
-                // **The first input is never "empty".** It is the microphone
-                // row the band has always had: a column that says INPUT with
-                // nothing under it is what a rig with no interface looks like,
-                // and an outline with a plus in its place would be a channel
-                // that had disappeared.
-                // The host assembles the label — see `InputState::label`.
-                Strip::Input(n) => (
-                    self.recorder.inputs.get(n).map_or("INPUT", |st| {
-                        if st.label.is_empty() { "INPUT" } else { st.label.as_str() }
-                    }),
-                    "",
-                    g.inputs.get(n).copied().unwrap_or(1.0),
-                    n > 0 && self.recorder.inputs.get(n).is_none_or(|st| st.label.is_empty()),
-                ),
                 // **No file name.** A track is called
                 // "Blue Bossa - backing (final 2).mp3" and a mixer strip is a
                 // hundred points wide: it never fitted, and a name cut to
@@ -1921,14 +1941,14 @@ impl IvoryApp {
                 // A mono microphone whose two bars are identical is a meter
                 // claiming a stereo signal; the input knows its own width and
                 // an instrument's is on its `Loaded`.
-                stereo: match s {
-                    // A strip with nothing on it draws the pair, like every
-                    // other empty channel: one bar is a claim about a device,
-                    // and there is no device to make a claim about.
-                    Strip::Input(n) => self
-                        .recorder
-                        .inputs
-                        .get(n)
+                stereo: match (s, kind) {
+                    // An AUDIO channel's width is its input's. Anything else —
+                    // including an audio channel with no input yet — draws the
+                    // pair, because one bar is a claim about a device and
+                    // there is no device to make a claim about.
+                    (Strip::Channel(n), Some(recorder::ChannelKind::Audio)) => self
+                        .audio_ordinal(n)
+                        .and_then(|k| self.recorder.inputs.get(k))
                         .is_none_or(|st| st.label.is_empty() || st.stereo),
                     _ => true,
                 },
@@ -1936,6 +1956,7 @@ impl IvoryApp {
                 inserts: std::array::from_fn(|n| {
                     self.insert(i, n).map_or("", plugin_display_name)
                 }),
+                kind,
                 empty,
                 gain,
                 send: desk.send[i],
@@ -1966,6 +1987,7 @@ impl IvoryApp {
                         self.insert(crate::recorder::STRIPS, n)
                             .map_or("", plugin_display_name)
                     }),
+                    kind: None,
                     empty: false,
                     gain: g.master,
                     send: 0.0,
@@ -4060,10 +4082,14 @@ impl IvoryApp {
     pub fn open_mixer_for_shot(&mut self) {
         self.mixer_open = true;
         let strips = crate::recorder::STRIPS;
+        // A plausible desk: two MIDI channels, one AUDIO, the rest unused —
+        // through the ordinary setters, so the picture is what a settings
+        // file would produce.
+        self.set_channel_kind(1, Some(recorder::ChannelKind::Midi));
+        self.set_channel_kind(2, Some(recorder::ChannelKind::Audio));
         for (at, name) in [
-            (crate::recorder::Strip::Slot(0), "Rhodes"),
-            (crate::recorder::Strip::Input(0), "x - 3"),
-            (crate::recorder::Strip::Input(1), "x - 4 vox"),
+            (crate::recorder::Strip::Channel(1), "Rhodes"),
+            (crate::recorder::Strip::Channel(2), "x - 3 vox"),
         ] {
             // Through the strip's own column, because `commit_mixer_name`
             // takes a COLUMN — the type exists so a desk index cannot be
@@ -4075,9 +4101,9 @@ impl IvoryApp {
         // A long name and a short one, in the first bay and the last, so the
         // picture shows both what fits and what has to be cut.
         for (strip, slot, path) in [
-            (crate::recorder::Strip::Slot(0).index(), 0, "/x/FabFilter Pro-R 2.vst3"),
-            (crate::recorder::Strip::Slot(0).index(), 2, "/x/Pro-Q 4.vst3"),
-            (crate::recorder::Strip::Input(0).index(), 0, "/x/Pro-C 3.vst3"),
+            (crate::recorder::Strip::Channel(1).index(), 0, "/x/FabFilter Pro-R 2.vst3"),
+            (crate::recorder::Strip::Channel(1).index(), 2, "/x/Pro-Q 4.vst3"),
+            (crate::recorder::Strip::Channel(2).index(), 0, "/x/Pro-C 3.vst3"),
             (crate::recorder::Strip::Track.index(), 1, "/x/Saturn 2.vst3"),
             (strips, 0, "/x/Pro-L 2.vst3"),
         ] {
@@ -4086,10 +4112,44 @@ impl IvoryApp {
         if let Some(c) = self
             .settings
             .strip_colors
-            .get_mut(crate::recorder::Strip::Slot(0).index())
+            .get_mut(crate::recorder::Strip::Channel(1).index())
         {
             *c = 3;
         }
+    }
+
+    /// What feeds general channel `n`, or `None` for a channel not yet added.
+    pub fn channel_kind(&self, n: usize) -> Option<recorder::ChannelKind> {
+        self.settings
+            .channel_kinds
+            .get(n)
+            .and_then(|k| recorder::ChannelKind::from_u8(*k))
+    }
+
+    /// Set it, saving. The kind lives BESIDE the channel — fader, send,
+    /// colour, name and bays all stay put when it cycles.
+    pub fn set_channel_kind(&mut self, n: usize, kind: Option<recorder::ChannelKind>) {
+        if let Some(slot) = self.settings.channel_kinds.get_mut(n) {
+            *slot = recorder::ChannelKind::as_u8(kind);
+            self.save_settings();
+        }
+    }
+
+    /// Which capture PICK an audio channel reads: the k-th AUDIO channel takes
+    /// pick k, in channel order. `None` for a channel that is not audio or is
+    /// past the interface's pick count.
+    ///
+    /// An ordering rather than a stored binding, so the desk after the
+    /// migration hears exactly what the input strips heard — and so an unused
+    /// pick can never be orphaned by a deleted channel.
+    pub fn audio_ordinal(&self, n: usize) -> Option<usize> {
+        if self.channel_kind(n) != Some(recorder::ChannelKind::Audio) {
+            return None;
+        }
+        let k = (0..n)
+            .filter(|m| self.channel_kind(*m) == Some(recorder::ChannelKind::Audio))
+            .count();
+        (k < recorder::INPUTS).then_some(k)
     }
 
     pub fn set_insert(&mut self, strip: usize, slot: usize, path: Option<&str>) {
@@ -7063,6 +7123,22 @@ impl IvoryApp {
                         Some(crate::mixer_panel::Hit::Insert(i, n)) => {
                             self.set_insert(i.desk_index(), n, None);
                         }
+                        // **The icon on an AUDIO channel: choose its input.**
+                        // Left-click cycles the kind; the other button picks
+                        // WHICH input feeds it. Ordered by pick: the k-th
+                        // audio channel takes pick k, so the first opens the
+                        // interface's own picker and the rest add extras.
+                        Some(crate::mixer_panel::Hit::Add(col)) => {
+                            if let Some(crate::recorder::Strip::Channel(n)) = col.strip() {
+                                if let Some(k) = self.audio_ordinal(n) {
+                                    self.open_device_picker(if k == 0 {
+                                        dialogs::DeviceKind::AudioInput
+                                    } else {
+                                        dialogs::DeviceKind::ExtraInput(k)
+                                    });
+                                }
+                            }
+                        }
                         // A control, and not one that answers this button.
                         Some(_) => {}
                         // Bare panel: the paint. Not the master — see
@@ -7081,11 +7157,22 @@ impl IvoryApp {
             // gesture. Read before the press, because the same frame carries
             // both and the press would grab it into a drag.
             let double = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+            // And RENAME is a double-click too, by the owner's word: a name
+            // is the thing on a desk you touch least and mis-touch most, so
+            // the single click stopped opening it. egui fires the double on
+            // the second RELEASE, after this block has seen two presses — the
+            // press routing below deliberately does nothing for `Name`, so the
+            // two presses commit any open field and the double opens the new
+            // one.
             if double {
                 if let Some(pos) = ctx.pointer_interact_pos().filter(|p| rect.contains(*p)) {
                     let view = self.mixer_view();
-                    if let Some(hit) = crate::mixer_panel::hit_test(rect, &view, pos) {
-                        self.reset_mixer_hit(hit);
+                    match crate::mixer_panel::hit_test(rect, &view, pos) {
+                        Some(hit @ crate::mixer_panel::Hit::Name(_)) => {
+                            self.apply_mixer_hit(hit, 0.0);
+                        }
+                        Some(hit) => self.reset_mixer_hit(hit),
+                        None => {}
                     }
                 }
             }
@@ -7118,10 +7205,13 @@ impl IvoryApp {
                         | crate::mixer_panel::Hit::Insert(..)
                         | crate::mixer_panel::Hit::Paint(..)
                         | crate::mixer_panel::Hit::Palette(_)
-                        | crate::mixer_panel::Hit::Db(_)
-                        | crate::mixer_panel::Hit::Name(_))) => {
+                        | crate::mixer_panel::Hit::Db(_))) => {
                             self.apply_mixer_hit(hit, 0.0);
                         }
+                        // A single press on a NAME does nothing: rename is a
+                        // double-click now, and the half-open field a single
+                        // press used to leave was the collision.
+                        Some(crate::mixer_panel::Hit::Name(_)) => {}
                         Some(hit) => {
                             self.mixer_grab = Some(MixerGrab {
                                 hit,
@@ -7613,12 +7703,12 @@ mod tests {
 
         // A send is a percentage and lands where the host reads it.
         app.apply_mixer_hit(
-            Hit::Send(Strip::Input(0).column_of().expect("an input has a column")),
+            Hit::Send(Strip::Channel(3).column_of().expect("a channel has a column")),
             0.4,
         );
         assert!(
-            (app.desk().send[Strip::Input(0).index()] - 0.4).abs() < 1.0e-6,
-            "the input's send did not stick"
+            (app.desk().send[Strip::Channel(3).index()] - 0.4).abs() < 1.0e-6,
+            "the channel's send did not stick"
         );
 
         // Mute and solo toggle, and they are separate switches. Pressed by
@@ -7979,8 +8069,7 @@ mod tests {
         use crate::mixer_panel::Hit;
         use crate::recorder::{Strip, COLUMNS_FOR_TEST};
         let snapshot = |s: &Settings| {
-            let mut v: Vec<f64> = s.plugin_gains.to_vec();
-            v.extend_from_slice(&s.input_gains);
+            let mut v: Vec<f64> = s.channel_gains.to_vec();
             v.push(s.track_gain);
             v.push(s.metronome_gain);
             v.push(s.fx_return_gain);
@@ -7998,14 +8087,10 @@ mod tests {
                 .collect();
             // Which slot in the snapshot this column owns.
             let want = match col.strip() {
-                Some(Strip::Slot(n)) => n,
-                Some(Strip::Input(n)) => crate::recorder::SLOTS + n,
-                Some(s) => crate::recorder::SLOTS + crate::recorder::INPUTS
-                    + match s {
-                        Strip::Track => 0,
-                        Strip::Click => 1,
-                        _ => 2,
-                    },
+                Some(Strip::Channel(n)) => n,
+                Some(Strip::Track) => crate::recorder::CHANNELS,
+                Some(Strip::Click) => crate::recorder::CHANNELS + 1,
+                Some(Strip::Fx) => crate::recorder::CHANNELS + 2,
                 None => before.len() - 1,
             };
             assert_eq!(

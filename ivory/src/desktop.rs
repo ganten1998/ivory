@@ -1400,15 +1400,22 @@ impl DesktopApp {
             let want = want_at(i);
             self.recorder.inserts_loaded[i] = want.clone();
             if let Some(e) = self.recorder.engine.as_mut() {
-                let path = want.as_ref().map(std::path::Path::new);
+                // **The built-in is not a bundle.** Its sentinel path rides in
+                // the bay like any plugin's — that is what lets it be picked,
+                // saved and named by the same code — but the ENGINE renders it
+                // in `mix_channels`, not in the rack, so the bay itself is
+                // handed nothing. See `set_builtin_strip`, pushed each frame.
+                let engine_want = want
+                    .as_deref()
+                    .filter(|p| *p != ivory_ui::dialogs::BUILTIN_PATH);
+                let path = engine_want.map(std::path::Path::new);
                 // **With the bay's saved preset, when one belongs to this
                 // plugin.** The same bargain the instrument slots have had for
                 // a while and the racks never did: an effect whose settings
                 // died at every relaunch, silently, because nothing ever asked
                 // its instance for them. See `insert_state_path`.
-                let state = want
-                    .as_deref()
-                    .and_then(|p| saved_insert_state(i / inserts, i % inserts, p));
+                let state =
+                    engine_want.and_then(|p| saved_insert_state(i / inserts, i % inserts, p));
                 match e.load_insert(i / inserts, i % inserts, path, state.as_deref()) {
                     Ok(_) => self.recorder.engine_error = None,
                     Err(err) => {
@@ -2495,6 +2502,39 @@ impl DesktopApp {
         // desk, so the desk's own fader is the whole of it, and the second
         // copy would have been the fader applied to everything in the file
         // rather than to the microphone.
+        // The eight general channels: their faders, which capture pick feeds
+        // which of them, which one holds the built-in, and which are NOT fed
+        // MIDI — four views of one fact, the channel_kinds array, pushed
+        // together so the callback can never see them disagree for long.
+        let mut midi_off = 0u32;
+        let mut picks: [Option<usize>; ivory_ui::recorder::INPUTS] =
+            [None; ivory_ui::recorder::INPUTS];
+        let mut next_pick = 0usize;
+        let mut builtin: Option<usize> = None;
+        for ch in 0..ivory_ui::recorder::CHANNELS {
+            e.set_channel_gain(ch, gains.channels[ch]);
+            match self.app.channel_kind(ch) {
+                Some(ivory_ui::recorder::ChannelKind::Midi) => {
+                    if builtin.is_none()
+                        && self.app.insert(ch, 0)
+                            == Some(ivory_ui::dialogs::BUILTIN_PATH)
+                    {
+                        builtin = Some(ch);
+                    }
+                }
+                Some(ivory_ui::recorder::ChannelKind::Audio) => {
+                    midi_off |= 1 << ch;
+                    if next_pick < picks.len() {
+                        picks[next_pick] = Some(ch);
+                        next_pick += 1;
+                    }
+                }
+                None => midi_off |= 1 << ch,
+            }
+        }
+        e.set_midi_off(midi_off);
+        e.set_pick_strips(picks);
+        e.set_builtin_strip(builtin);
         for (i, g) in gains.inputs.iter().enumerate() {
             e.set_monitor_gain(i, *g);
         }
@@ -2562,21 +2602,24 @@ impl DesktopApp {
         let desk = self.app.desk();
         let engine = self.recorder.engine.as_ref();
         let mut lost: Vec<Strip> = Vec::new();
-        for i in 0..ivory_ui::recorder::SLOTS {
-            // Loaded, not merely chosen: a slot whose plugin failed to open is
-            // already being reported by the row that failed.
-            let loaded = self.app.chosen_plugin(i) == Some(ivory_ui::dialogs::BUILTIN_PATH)
-                || engine.is_some_and(|e| e.plugin(i).is_some());
-            if loaded && !desk.heard(Strip::Slot(i)) {
-                lost.push(Strip::Slot(i));
-            }
-        }
-        // Every input that is OPEN, by name. A strip nobody has filled is not
-        // a loss; a microphone that is plugged in and muted is.
-        for i in 0..ivory_ui::recorder::INPUTS {
-            let open = self.recorder.input_names.get(i).is_some_and(|n| !n.is_empty());
-            if open && !desk.heard(Strip::Input(i)) {
-                lost.push(Strip::Input(i));
+        // Every channel with something ON it, by name: a MIDI channel with an
+        // instrument in bay 1, an AUDIO channel whose pick is open. An unused
+        // channel is not a loss; a piano that is loaded and muted is.
+        for ch in 0..ivory_ui::recorder::CHANNELS {
+            let strip = Strip::Channel(ch);
+            let live = match self.app.channel_kind(ch) {
+                Some(ivory_ui::recorder::ChannelKind::Midi) => {
+                    self.app.insert(strip.index(), 0).is_some()
+                }
+                Some(ivory_ui::recorder::ChannelKind::Audio) => self
+                    .app
+                    .audio_ordinal(ch)
+                    .and_then(|k| self.recorder.input_names.get(k))
+                    .is_some_and(|n| !n.is_empty()),
+                None => false,
+            };
+            if live && !desk.heard(strip) {
+                lost.push(strip);
             }
         }
         if engine.is_some_and(crate::instrument::Engine::track_loaded)

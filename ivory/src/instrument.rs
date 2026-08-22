@@ -468,14 +468,18 @@ fn is_pedal(status: u8, data1: u8) -> bool {
 /// either does not get a bit that would have to be defended against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strip {
-    /// One instrument slot, loaded or not. See the UI's own `Strip`.
-    Slot(usize),
-    /// One input of the interface. See the UI's own `Strip`.
-    Input(usize),
+    /// One general channel, MIDI or AUDIO by the desk's choice. See the UI's
+    /// own `Strip` — the kind is not in the enum there either, and for the
+    /// same reason: cycling a channel must not renumber it.
+    Channel(usize),
     Track,
     Click,
     Fx,
 }
+
+/// How many general channels the desk has. Mirrors the UI's constant; the
+/// `From` impl below is what keeps the two enums provably the same shape.
+pub const CHANNELS: usize = ivory_ui::recorder::CHANNELS;
 
 /// How many inputs of one interface the desk has room for.
 ///
@@ -487,17 +491,16 @@ pub enum Strip {
 pub const INPUTS: usize = ivory_ui::recorder::INPUTS;
 
 /// How many channels the desk has, master aside.
-pub const STRIPS: usize = SLOTS + INPUTS + 3;
+pub const STRIPS: usize = CHANNELS + 3;
 
 impl Strip {
     /// Its place in the arrays, and the bit it owns.
     pub const fn index(self) -> usize {
         match self {
-            Strip::Slot(i) => i,
-            Strip::Input(i) => SLOTS + i,
-            Strip::Track => SLOTS + INPUTS,
-            Strip::Click => SLOTS + INPUTS + 1,
-            Strip::Fx => SLOTS + INPUTS + 2,
+            Strip::Channel(i) => i,
+            Strip::Track => CHANNELS,
+            Strip::Click => CHANNELS + 1,
+            Strip::Fx => CHANNELS + 2,
         }
     }
 
@@ -514,8 +517,7 @@ impl From<ivory_ui::recorder::Strip> for Strip {
     fn from(ui: ivory_ui::recorder::Strip) -> Self {
         use ivory_ui::recorder::Strip as Ui;
         match ui {
-            Ui::Slot(i) => Strip::Slot(i),
-            Ui::Input(i) => Strip::Input(i),
+            Ui::Channel(i) => Strip::Channel(i),
             Ui::Track => Strip::Track,
             Ui::Click => Strip::Click,
             Ui::Fx => Strip::Fx,
@@ -1048,6 +1050,20 @@ struct Shared {
     /// reader iterates them, and because a fourth slot should be a change to
     /// one constant rather than a fourth field in four structs.
     slot_gains: [AtomicU32; SLOTS],
+    /// One fader per general channel, whatever the channel's kind. The slot
+    /// and monitor gain arrays are the legacy rack's plumbing and die with it.
+    channel_gains: [AtomicU32; CHANNELS],
+    /// Which general channel the built-in DX7 belongs to: a DESK INDEX, or -1
+    /// for none. It stopped being a slot when the slots stopped existing on
+    /// the desk; the migration guarantees a desk with no instrument anywhere
+    /// gets one channel seeded with the built-in, so there is no silent
+    /// fallback left to need.
+    builtin_strip: AtomicI64,
+    /// Which general channel each capture PICK feeds: desk indices, -1 for an
+    /// unbound pick. The k-th AUDIO channel takes pick k — the HOST computes
+    /// the order, the callback only reads it, which is the same trust split
+    /// every other mask here follows.
+    pick_strip: [AtomicI64; INPUTS],
     metro_gain: AtomicU32,
     /// The backing track's level, linear.
     track_gain: AtomicU32,
@@ -1267,6 +1283,9 @@ impl Shared {
     fn new() -> Self {
         Self {
             slot_gains: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            channel_gains: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            builtin_strip: AtomicI64::new(-1),
+            pick_strip: std::array::from_fn(|_| AtomicI64::new(-1)),
             metro_gain: AtomicU32::new(0.7f32.to_bits()),
             // Both effects OFF by default. A first launch has to sound like the
             // instrument and not like a room, and `Effects::process` skips its
@@ -1287,10 +1306,12 @@ impl Shared {
             monitor_backlog: AtomicU32::new(0),
             midi_off: AtomicU32::new(0),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
-            // The routing every build before the mixer had, written down: the
-            // instruments send everything and nothing else sends anything.
+            // The first channel — the desk's default instrument — sends
+            // everything and nothing else sends anything, which is the same
+            // sound the old five-slots-send-all default made. See the UI's
+            // `Desk::default`, which this mirrors.
             send: std::array::from_fn(|i| {
-                AtomicU32::new(if i < SLOTS { 1.0f32 } else { 0.0f32 }.to_bits())
+                AtomicU32::new(if i == 0 { 1.0f32 } else { 0.0f32 }.to_bits())
             }),
             fx_return: AtomicU32::new(1.0f32.to_bits()),
             strip_peak: std::array::from_fn(|_| [AtomicU32::new(0), AtomicU32::new(0)]),
@@ -1756,6 +1777,9 @@ struct Renderer {
     /// Where the built-in's slot gain has slewed to. Same treatment as a
     /// plugin's: stepping a gain at a block boundary is a click.
     builtin_gain: f32,
+    /// Where each general channel's fader has slewed to. Per channel, because
+    /// the eight move independently — the same treatment every fader gets.
+    channel_gain: [f32; CHANNELS],
     /// Reverb, delay and chorus on the instrument sum. Free at rest.
     /// The effects BUS: reverb, delay and chorus, fed by the strips' sends.
     ///
@@ -2111,13 +2135,11 @@ impl Renderer {
         // cost: they are published at human speed.
         let muted = self.shared.muted.load(Ordering::Relaxed);
         let soloed = self.shared.soloed.load(Ordering::Relaxed);
-        let slot_targets: [f32; SLOTS] = std::array::from_fn(|i| {
-            if strip_is_heard(Strip::Slot(i), muted, soloed) {
-                Shared::f32_of(&self.shared.slot_gains[i]).clamp(0.0, 8.0)
-            } else {
-                0.0
-            }
-        });
+        // The legacy slots have no strips on the desk any more, so their
+        // gains are raw: nothing can mute what nothing draws. They render
+        // only in the plugin test harness now.
+        let slot_targets: [f32; SLOTS] =
+            std::array::from_fn(|i| Shared::f32_of(&self.shared.slot_gains[i]).clamp(0.0, 8.0));
         let metro_target = Shared::f32_of(&self.shared.metro_gain).clamp(0.0, 8.0);
         let metro_on = self.shared.metro_on.load(Ordering::Relaxed);
         let in_take = self.shared.metro_in_take.load(Ordering::Relaxed);
@@ -2171,7 +2193,7 @@ impl Renderer {
             }
             let widths = self.render_slots(n);
             self.sum_slots(n, &widths, &slot_targets);
-            self.render_builtin(n, &widths, &slot_targets);
+            self.mix_channels(n, muted, soloed);
 
             // A parameter change, if one is waiting and the lock is free this
             // block. Same shape as the DX7's pending voice, and for the same
@@ -2319,6 +2341,50 @@ impl Renderer {
                     if let Some(v) = self.aux.get_mut(at + c) {
                         *v += click * click_send;
                     }
+                }
+            }
+            // **The click's rack, run here in strip order** — the same
+            // window every other channel's runs in — over the buffer that
+            // both destinations read. The SUMMING stays post-master (see the
+            // fold below), which is the cue-bus rule: the click is processed
+            // with the channels and added after the ceiling, so it can never
+            // push a take into the limiter and never be ducked by one.
+            // Bit-identical for an empty rack, which is every desk until
+            // somebody fills a bay.
+            if !self.racks[Strip::Click.index()].is_empty() {
+                for c in 0..TAP_CHANNELS {
+                    if let Some(dst) = self.fx_in.get_mut(c) {
+                        for (f, d) in dst.iter_mut().take(n).enumerate() {
+                            *d = self.click_out[f];
+                        }
+                    }
+                }
+                {
+                    let armed = self.shared.midi_off.load(Ordering::Relaxed)
+                        & (1 << Strip::Click.index().min(31))
+                        == 0;
+                    let notes: &[ivory_host::Note] = if armed { &self.notes } else { &[] };
+                    let controls: &[ivory_host::Control] =
+                        if armed { &self.controls } else { &[] };
+                    run_rack(
+                        &mut self.racks[Strip::Click.index()],
+                        &mut self.fx_in,
+                        n,
+                        &mut self.fx_out,
+                        notes,
+                        controls,
+                    );
+                }
+                // Back into BOTH buffers, and the take's keeps its gate: a
+                // frame the take was not carrying stays absent however the
+                // rack coloured it.
+                click_peak = 0.0;
+                for i in 0..n {
+                    let wet = self.fx_in.first().map_or(0.0, |b| b[i]);
+                    let gate = if self.click_taped[i] != 0.0 { 1.0 } else { 0.0 };
+                    self.click_out[i] = wet;
+                    self.click_taped[i] = wet * gate;
+                    click_peak = click_peak.max(wet.abs());
                 }
             }
             // The click is one voice on both sides.
@@ -2663,10 +2729,17 @@ impl Renderer {
             }
             let at_ch = offset;
             offset += width;
-            let strip = Strip::Input(input);
+            // **Which CHANNEL this pick feeds**, mapped by the host: the k-th
+            // AUDIO channel takes pick k. An unbound pick still drains — the
+            // ring has to keep moving — but is nobody's audio.
+            let bound = self.shared.pick_strip[input].load(Ordering::Relaxed);
+            let Some(strip) = usize::try_from(bound).ok().filter(|b| *b < CHANNELS).map(Strip::Channel) else {
+                self.monitor_gain[input] = 0.0;
+                continue;
+            };
             let heard = strip_is_heard(strip, muted, soloed);
             let target = if heard {
-                Shared::f32_of(&self.shared.monitor_gain[input])
+                Shared::f32_of(&self.shared.channel_gains[strip.index()]).clamp(0.0, 8.0)
             } else {
                 0.0
             };
@@ -2889,97 +2962,141 @@ impl Renderer {
         self.shared.note_strip_peak(Strip::Track, peak);
     }
 
-    fn render_builtin(&mut self, frames: usize, widths: &[usize; SLOTS], targets: &[f32; SLOTS]) {
-        // Asked for by name, or nothing else is playing. The second is what
-        // makes a fresh install audible; the first is what makes the picker's
-        // top entry mean something once a plugin has been loaded elsewhere.
+    /// The eight general channels: the built-in, the bay voices, and their
+    /// effect bays — everything except AUDIO channels, whose racks run where
+    /// their input arrives (see `mix_monitor`).
+    ///
+    /// Replaces `render_builtin`, and generalises exactly what that function
+    /// already did for one synth: render into a private buffer, run the
+    /// channel's rack, fold at the channel's fader and send, note the peak.
+    fn mix_channels(&mut self, frames: usize, muted: u32, soloed: u32) {
         // A patch change, if one is waiting and the lock is free this block.
         if let Ok(mut g) = self.shared.pending_voice.try_lock() {
             if let Some(v) = g.take() {
                 self.builtin.set_voice(v);
             }
         }
-        let wanted = self.shared.builtin_slot.load(Ordering::Relaxed);
-        self.builtin_slot = (wanted >= 0).then_some(wanted as usize);
-        if self.builtin_slot.is_none() && widths.iter().any(|w| *w > 0) {
-            // Something real is playing. Keep the built-in silent AND clear, so
-            // unloading a plugin mid-note does not resurrect a stale one.
-            if self.builtin.active() {
-                self.builtin.all_notes_off();
+        let wanted = self.shared.builtin_strip.load(Ordering::Relaxed);
+        let builtin_at = (wanted >= 0).then_some(wanted as usize);
+        let midi_off = self.shared.midi_off.load(Ordering::Relaxed);
+        // The built-in's notes, fed once — not per channel, it is one synth.
+        // Only while its channel is MIDI and armed: a channel cycled to AUDIO
+        // has its bit set, and the keys must come up rather than hold.
+        let builtin_armed =
+            builtin_at.is_some_and(|ch| midi_off & (1 << ch.min(31)) == 0);
+        if builtin_armed {
+            for n in &self.notes {
+                let Ok(pitch) = u8::try_from(n.pitch) else {
+                    continue;
+                };
+                if n.on {
+                    self.builtin.note_on(pitch, n.velocity);
+                } else {
+                    self.builtin.note_off(pitch);
+                }
             }
-            return;
+            // CC 64 is the damper. Half scale is the switch point every synth
+            // uses, and what a half-pedalled continuous controller means.
+            for c in &self.controls {
+                if c.controller == 64 {
+                    self.builtin.set_pedal(c.value >= 64);
+                }
+            }
+        } else if self.builtin.active() {
+            self.builtin.all_notes_off();
         }
-        for n in &self.notes {
-            // `Note::pitch` is the VST3 shape, an `i16`; anything outside a
-            // MIDI key is not a note this instrument can sound.
-            let Ok(pitch) = u8::try_from(n.pitch) else {
+
+        let coeff = self.gain_coeff;
+        for ch in 0..CHANNELS {
+            let is_builtin = builtin_at == Some(ch);
+            let rack_live = !self.racks[ch].is_empty();
+            // An AUDIO channel's bit is set and its rack runs in
+            // `mix_monitor`, over its input — running it here too would fold
+            // its effect tails twice.
+            let armed = midi_off & (1 << ch.min(31)) == 0;
+            if !armed || (!is_builtin && !rack_live) {
+                // **The gain is advanced whether or not anything renders.** A
+                // fader moved during a rest has to have arrived by the next
+                // note, or it comes in at the old level and slides.
+                let target = if strip_is_heard(Strip::Channel(ch), muted, soloed) {
+                    Shared::f32_of(&self.shared.channel_gains[ch]).clamp(0.0, 8.0)
+                } else {
+                    0.0
+                };
+                for _ in 0..frames {
+                    self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
+                }
+                continue;
+            }
+            // The channel's own signal, planar for the rack.
+            if is_builtin && self.builtin.active() {
+                let want = frames * TAP_CHANNELS;
+                let Some(scratch) = self.builtin_scratch.get_mut(..want) else {
+                    continue;
+                };
+                scratch.fill(0.0);
+                self.builtin.render(scratch, frames, TAP_CHANNELS);
+                for c in 0..TAP_CHANNELS {
+                    let Some(dst) = self.fx_in.get_mut(c) else { continue };
+                    for f in 0..frames {
+                        dst[f] = scratch[f * TAP_CHANNELS + c];
+                    }
+                }
+            } else {
+                // Silence in: a bay-1 voice REPLACES it, an effect transforms
+                // it, and a rack of effects over silence is silence.
+                for c in 0..TAP_CHANNELS {
+                    if let Some(dst) = self.fx_in.get_mut(c) {
+                        dst[..frames].fill(0.0);
+                    }
+                }
+                if !rack_live {
+                    continue;
+                }
+            }
+            if rack_live {
+                run_rack(
+                    &mut self.racks[ch],
+                    &mut self.fx_in,
+                    frames,
+                    &mut self.fx_out,
+                    &self.notes,
+                    &self.controls,
+                );
+            }
+            // The fold: fader, send, peak — the channel's own, exactly as
+            // every other strip does it.
+            let target = if strip_is_heard(Strip::Channel(ch), muted, soloed) {
+                Shared::f32_of(&self.shared.channel_gains[ch]).clamp(0.0, 8.0)
+            } else {
+                0.0
+            };
+            let send = f32::from_bits(
+                self.shared.send[Strip::Channel(ch).index()].load(Ordering::Relaxed),
+            )
+            .clamp(0.0, 1.0);
+            let want = frames * TAP_CHANNELS;
+            let (Some(mix), Some(aux)) = (
+                self.mix.get_mut(..want),
+                self.aux.get_mut(..want),
+            ) else {
                 continue;
             };
-            if n.on {
-                self.builtin.note_on(pitch, n.velocity);
-            } else {
-                self.builtin.note_off(pitch);
+            let mut peak = [0.0f32; 2];
+            for f in 0..frames {
+                self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
+                let g = self.channel_gain[ch];
+                let l = self.fx_in.first().map_or(0.0, |b| b[f]) * g;
+                let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g;
+                peak[0] = peak[0].max(l.abs());
+                peak[1] = peak[1].max(r.abs());
+                mix[f * TAP_CHANNELS] += l;
+                mix[f * TAP_CHANNELS + 1] += r;
+                aux[f * TAP_CHANNELS] += l * send;
+                aux[f * TAP_CHANNELS + 1] += r * send;
             }
+            self.shared.note_strip_peak(Strip::Channel(ch), peak);
         }
-        // CC 64 is the damper. Half scale is the switch point every synth
-        // uses, and it is what a half-pedalled continuous controller means.
-        for c in &self.controls {
-            if c.controller == 64 {
-                self.builtin.set_pedal(c.value >= 64);
-            }
-        }
-        // **The gain is advanced whether or not anything is rendered.** A
-        // fader moved while the patch is silent has to have arrived by the
-        // time the next note does, or the first note after every rest comes in
-        // at the old level and slides.
-        // **A slot, even when nobody assigned it one.** The built-in also
-        // plays as a FALLBACK — nothing loaded anywhere, so a fresh install
-        // makes a sound — and in that mode it used to belong to no channel at
-        // all and run at unity past every fader, mute and send on the desk.
-        // The first slot is the honest home for it: it is the one the rack
-        // shows first and the one somebody reaching for "the instrument"
-        // means.
-        let slot = self.builtin_slot.unwrap_or(0);
-        let target = targets.get(slot).copied().unwrap_or(1.0);
-        let coeff = self.gain_coeff;
-        if !self.builtin.active() {
-            for _ in 0..frames {
-                self.builtin_gain += (target - self.builtin_gain) * coeff;
-            }
-            return;
-        }
-        let want = frames * TAP_CHANNELS;
-        // **And the bus, because the built-in is a channel like any other.**
-        // It occupies a slot, so it has that slot's fader, that slot's send
-        // and that slot's mute — a fader that cared which KIND of instrument
-        // was in the slot would be a rack with a hole in it.
-        let (Some(mix), Some(aux), Some(scratch)) = (
-            self.mix.get_mut(..want),
-            self.aux.get_mut(..want),
-            self.builtin_scratch.get_mut(..want),
-        ) else {
-            return;
-        };
-        // Its own buffer, then summed with its slot's gain — the same shape
-        // as a plugin.
-        scratch.fill(0.0);
-        self.builtin.render(scratch, frames, TAP_CHANNELS);
-        let send =
-            f32::from_bits(self.shared.send[slot].load(Ordering::Relaxed)).clamp(0.0, 1.0);
-        let mut peak = [0.0f32; 2];
-        for i in 0..frames {
-            self.builtin_gain += (target - self.builtin_gain) * coeff;
-            let g = self.builtin_gain;
-            let l = scratch[i * TAP_CHANNELS] * g;
-            let r = scratch[i * TAP_CHANNELS + 1] * g;
-            peak[0] = peak[0].max(l.abs());
-            peak[1] = peak[1].max(r.abs());
-            mix[i * TAP_CHANNELS] += l;
-            mix[i * TAP_CHANNELS + 1] += r;
-            aux[i * TAP_CHANNELS] += l * send;
-            aux[i * TAP_CHANNELS + 1] += r * send;
-        }
-        self.shared.note_strip_peak(Strip::Slot(slot), peak);
     }
 
     fn render_slots(&mut self, frames: usize) -> [usize; SLOTS] {
@@ -3105,9 +3222,8 @@ impl Renderer {
             };
             peaks[i] = mix_in(mix, aux, left, right, gain, *target, send, coeff);
         }
-        for (i, peak) in peaks.into_iter().enumerate() {
-            self.shared.note_strip_peak(Strip::Slot(i), peak);
-        }
+        // No peaks: the legacy slots have no strips on the desk to show them.
+        let _ = peaks;
     }
 
     /// Push the recorder's mix, whole frames only.
@@ -3611,6 +3727,7 @@ impl Engine {
             builtin: crate::dx7::Dx7::new(rate as f32),
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             builtin_gain: 1.0,
+            channel_gain: [1.0; CHANNELS],
             effects: crate::effects::Effects::new_send(rate as f32),
             master_effects: crate::effects::Effects::new(rate as f32),
             room_effects: crate::effects::Effects::new(rate as f32),
@@ -4399,6 +4516,29 @@ impl Engine {
     ///
     /// A slot holding it is not a plugin: nothing is opened, nothing can fail,
     /// and it is playing on the next block.
+    /// Which general CHANNEL the built-in DX7 belongs to. See
+    /// `Shared::builtin_strip`: the host computes it from bay 1's sentinel and
+    /// the channel's kind; the callback only reads it.
+    pub fn set_builtin_strip(&self, strip: Option<usize>) {
+        self.shared
+            .builtin_strip
+            .store(strip.map_or(-1, |s| s as i64), Ordering::Relaxed);
+    }
+
+    /// One general channel's fader.
+    pub fn set_channel_gain(&self, ch: usize, linear: f32) {
+        if let Some(cell) = self.shared.channel_gains.get(ch) {
+            cell.store(sane_gain(linear).to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// Which channel each capture pick feeds: desk indices, `None` unbound.
+    pub fn set_pick_strips(&self, strips: [Option<usize>; INPUTS]) {
+        for (cell, strip) in self.shared.pick_strip.iter().zip(strips) {
+            cell.store(strip.map_or(-1, |s| s as i64), Ordering::Relaxed);
+        }
+    }
+
     pub fn set_builtin_slot(&mut self, slot: Option<usize>) {
         self.shared
             .builtin_slot
@@ -6445,6 +6585,7 @@ mod tests {
             mix: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             builtin_gain: 1.0,
+            channel_gain: [1.0; CHANNELS],
             midi,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
@@ -6473,6 +6614,11 @@ mod tests {
     /// `send_midi` queues them.
     fn renderer_with_midi(dev_ch: usize) -> (Renderer, Producer<MidiEvent>, Arc<Shared>) {
         let shared = Arc::new(Shared::new());
+        // **The fresh desk's own shape**: channel 0 is MIDI with the built-in
+        // in bay 1, exactly what `Settings::default` produces and the host
+        // pushes. The silent auto-fallback died with the slots, so a renderer
+        // under test says so the way the app does — by assignment.
+        shared.builtin_strip.store(0, Ordering::Relaxed);
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
         let (midi_tx, midi_rx) = RingBuffer::<MidiEvent>::new(1024);
         let mut r = test_renderer(Arc::clone(&shared), tap_tx, dev_ch);
@@ -6779,14 +6925,14 @@ mod tests {
             assert!(strip_is_heard(*s, none, none), "{s:?} was silent for no reason");
         }
         // One muted: it alone is silent.
-        let m = Input(0).bit();
-        assert!(!strip_is_heard(Input(0), m, none));
+        let m = Channel(0).bit();
+        assert!(!strip_is_heard(Channel(0), m, none));
         assert!(strip_is_heard(Track, m, none));
         // One soloed: it alone is heard, and mute does not enter into it.
         let so = Track.bit();
         assert!(strip_is_heard(Track, none, so));
-        assert!(!strip_is_heard(Input(0), none, so));
-        assert!(!strip_is_heard(Slot(0), none, so));
+        assert!(!strip_is_heard(Channel(0), none, so));
+        assert!(!strip_is_heard(Channel(4), none, so));
         // Soloed AND muted: heard, because pressing solo asked for it.
         assert!(
             strip_is_heard(Track, Track.bit(), Track.bit()),
@@ -6796,12 +6942,12 @@ mod tests {
         let two = Track.bit() | Fx.bit();
         assert!(strip_is_heard(Track, none, two) && strip_is_heard(Fx, none, two));
         assert!(!strip_is_heard(Click, none, two));
-        // **Each slot is its own channel.** Muting one instrument must not
-        // take the other four with it, which is the whole reason the lumped
-        // instrument strip had to go.
-        let one = Slot(2).bit();
-        assert!(!strip_is_heard(Slot(2), one, none));
-        assert!(strip_is_heard(Slot(3), one, none), "muting one slot muted another");
+        // **Each channel is its own strip.** Muting one must not take its
+        // neighbour with it, which is the whole reason the lumped instrument
+        // strip had to go.
+        let one = Channel(2).bit();
+        assert!(!strip_is_heard(Channel(2), one, none));
+        assert!(strip_is_heard(Channel(3), one, none), "muting one channel muted another");
         // Every strip owns a bit of its own, or two of them would mute together.
         let mut bits: Vec<u32> = all.iter().map(|s| s.bit()).collect();
         let n = bits.len();
@@ -6874,11 +7020,14 @@ mod tests {
     #[test]
     fn a_muted_instrument_reaches_neither_the_speakers_nor_the_bus() {
         let (mut r, mut tx, shared) = renderer_with_midi(2);
-        // Every slot muted: the built-in is in one of them and this is a test
-        // about the strip, not about which slot it landed in.
+        // Every general channel muted: the built-in is on one of them and
+        // this is a test about the strip, not about which channel it landed
+        // on. Assigned explicitly — the silent auto-fallback died with the
+        // slots, so a renderer under test says where the DX7 lives.
+        shared.builtin_strip.store(0, Ordering::Relaxed);
         let mut mask = 0;
-        for i in 0..SLOTS {
-            mask |= Strip::Slot(i).bit();
+        for i in 0..CHANNELS {
+            mask |= Strip::Channel(i).bit();
         }
         shared.muted.store(mask, Ordering::Relaxed);
         // Everything the bus could carry it with, turned up.
@@ -7085,9 +7234,11 @@ mod tests {
     fn the_builtin_is_moved_by_its_own_slot_fader() {
         let level = |gain: f32| {
             let (mut r, mut tx, shared) = renderer_with_midi(2);
-            shared.builtin_slot.store(0, Ordering::Relaxed);
-            shared.set_slot_gain(0, gain);
-            r.builtin_gain = gain;
+            // The built-in is CHANNEL 0's now; its fader is the channel's.
+            if let Some(cell) = shared.channel_gains.first() {
+                cell.store(gain.to_bits(), Ordering::Relaxed);
+            }
+            r.channel_gain[0] = gain;
             queue(&mut tx, 0, [0x90, 60, 100]);
             let mut out = vec![0.0_f32; 2 * 4096];
             r.render(&mut out, 0, 0);
@@ -7519,8 +7670,12 @@ mod tests {
         r.monitor_widths = [1, 0, 0, 0];
         r.monitor_block = BLOCK;
         r.monitor_scratch = vec![0.0; 8192];
-        shared.monitor_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
-        r.monitor_gain[0] = 1.0;
+        // Pick 0 feeds channel 1 — an AUDIO channel by assignment, exactly
+        // what the host pushes for the first audio-kind channel.
+        shared.pick_strip[0].store(1, Ordering::Relaxed);
+        shared.midi_off.store(1 << 1, Ordering::Relaxed);
+        shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+        r.channel_gain[1] = 1.0;
         shared.monitor_on.store(true, Ordering::Relaxed);
         r.room_gain = 1.0;
 
@@ -7582,8 +7737,12 @@ mod tests {
             r.monitor_widths = [1, 0, 0, 0];
             r.monitor_scratch = vec![0.0; 8192];
             // At the fader's destination rather than on its way there: the
-            // slews are per sample and this test is about routing.
-            shared.monitor_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+            // slews are per sample and this test is about routing. The pick
+            // feeds channel 1, an AUDIO channel by assignment.
+            shared.pick_strip[0].store(1, Ordering::Relaxed);
+            shared.midi_off.store(1 << 1, Ordering::Relaxed);
+            shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+            r.channel_gain[1] = 1.0;
             r.monitor_gain[0] = 1.0;
             shared.monitor_on.store(monitored, Ordering::Relaxed);
             r.room_gain = if monitored { 1.0 } else { 0.0 };

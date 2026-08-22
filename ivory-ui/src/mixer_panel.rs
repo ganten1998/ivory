@@ -31,6 +31,9 @@ pub struct StripView<'a> {
     /// What is in each of this channel's three insert slots, by short name.
     /// Empty for an empty slot, which is drawn as somewhere to put one.
     pub inserts: [&'a str; INSERTS],
+    /// What feeds a general channel, for its icon. `None` on everything else
+    /// and on an unused channel.
+    pub kind: Option<crate::recorder::ChannelKind>,
     /// Index into [`STRIP_COLORS`]. Zero is the desk's own wood.
     pub color: usize,
     /// An instrument slot with nothing in it.
@@ -265,7 +268,8 @@ const SEND_TRAVEL: f32 = 420.0;
 /// Every instrument slot, every input of the interface, the backing track and
 /// the master. The click and the effects return keep their place on the desk
 /// and are not drawn — their controls are the band's.
-pub const COLUMNS: usize = SLOTS + crate::recorder::INPUTS + 2;
+// Eight general channels, the backing track, the click, and the master.
+pub const COLUMNS: usize = crate::recorder::CHANNELS + 3;
 
 pub struct Layout {
     pub strips: [StripStrip; COLUMNS],
@@ -474,9 +478,13 @@ impl Layout {
         // choose the file — which is why the instrument needed a glyph of its
         // own. The bus, the click and the master have no source to choose and
         // keep the room for their names.
+        // Every source channel carries one — the eight generals (whose glyph
+        // is their KIND, and clicking it cycles the kind), the backing track,
+        // and now the click. The bus and the master have nothing to pick and
+        // keep the room for their names.
         let has_icon = matches!(
             view.strip,
-            Some(Strip::Input(_) | Strip::Track | Strip::Slot(_))
+            Some(Strip::Channel(_) | Strip::Track | Strip::Click)
         );
         // **Under the name, not over it.** The master has no source to choose
         // and so no icon, and with the icon on top every other channel's name
@@ -769,17 +777,23 @@ fn strip(
             p.engrave,
         );
     }
-    let named = match v.strip {
-        Some(Strip::Input(_)) => {
+    let named = match (v.strip, v.kind) {
+        // A general channel's icon IS its kind, which is why clicking it
+        // cycles: the keyboard says MIDI, the microphone says AUDIO.
+        (Some(Strip::Channel(_)), Some(crate::recorder::ChannelKind::Midi)) => {
+            crate::recorder_panel::draw_instrument_icon(painter, l.icon, ink);
+            true
+        }
+        (Some(Strip::Channel(_)), Some(crate::recorder::ChannelKind::Audio)) => {
             crate::recorder_panel::draw_microphone(painter, l.icon, ink);
             true
         }
-        Some(Strip::Track) => {
+        (Some(Strip::Track), _) => {
             crate::recorder_panel::draw_waveform_icon(painter, l.icon, ink);
             true
         }
-        Some(Strip::Slot(_)) => {
-            crate::recorder_panel::draw_instrument_icon(painter, l.icon, ink);
+        (Some(Strip::Click), _) => {
+            crate::recorder_panel::draw_metronome_on(painter, l.icon, ink, face);
             true
         }
         _ => false,
@@ -1395,6 +1409,10 @@ mod tests {
             name: "CHANNEL",
             detail: "",
             inserts: [""; INSERTS],
+            // A used general channel in the tests is MIDI unless a test says
+            // otherwise; track/click/master ignore it.
+            kind: (!empty && matches!(strip, Some(Strip::Channel(_))))
+                .then_some(crate::recorder::ChannelKind::Midi),
             color: 0,
             stereo: true,
             gr_db: 0.0,
@@ -1426,7 +1444,8 @@ mod tests {
     /// The index of the last channel before the master.
     const MASTER: usize = COLUMNS - 1;
     /// The effects return, which is the channel before that.
-    const FX: usize = COLUMNS - 2;
+    /// The click's column, which is the one before the master.
+    const CLICK: usize = COLUMNS - 2;
 
     fn rect() -> Rect {
         Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1300.0, 420.0))
@@ -1490,10 +1509,16 @@ mod tests {
         assert!(!master.solo.is_positive(), "the master was given a solo");
         assert!(master.fader.is_positive(), "the master has no fader");
 
-        // The channel before the master is the backing track now, and it is an
-        // ordinary one: a fader, a send and both switches.
-        let last = &l.strips[FX];
-        assert!(last.send.is_positive() && last.mute.is_positive());
+        // The click, before the master: a fader and both switches but NO
+        // send — a metronome feeding the reverb is not a thing, and the send
+        // was deleted rather than defaulted to zero.
+        let click = &l.strips[CLICK];
+        assert!(!click.send.is_positive(), "the click was given a send");
+        assert!(click.mute.is_positive() && click.solo.is_positive());
+        assert!(click.fader.is_positive(), "the click has no fader");
+        // And the backing track before it is an ordinary channel.
+        let track = &l.strips[CLICK - 1];
+        assert!(track.send.is_positive() && track.mute.is_positive());
     }
 
     /// A strip with no send gives that room to its meter rather than leaving a
@@ -1670,22 +1695,21 @@ mod tests {
     /// Every instrument slot is a channel, filled or not.
     #[test]
     fn the_desk_has_a_strip_for_every_slot() {
-        use crate::recorder::SLOTS;
+        use crate::recorder::CHANNELS;
         let channels = Strip::shown();
-        for n in 0..SLOTS {
-            assert_eq!(channels[n], Strip::Slot(n), "slot {n} is not a channel");
+        for n in 0..CHANNELS {
+            assert_eq!(channels[n], Strip::Channel(n), "channel {n} has no column");
         }
-        // **Drawn, not all of them.** The click and the effects return keep
-        // their place on the desk and have controls of their own elsewhere;
-        // the mixer shows the slots, the input, the backing track and the
-        // master.
+        // **Drawn: the eight, the track, and — new — the click.** Only the
+        // effects return keeps its off-desk life: its three knobs are the
+        // band's, and a soloable bus is a feedback question.
         assert_eq!(
             COLUMNS,
-            SLOTS + crate::recorder::INPUTS + 2,
+            crate::recorder::CHANNELS + 3,
             "a drawn channel went missing"
         );
-        assert_eq!(channels.len(), SLOTS + crate::recorder::INPUTS + 1);
-        assert!(!channels.contains(&Strip::Click), "the click is drawn twice");
+        assert_eq!(channels.len(), crate::recorder::CHANNELS + 2);
+        assert!(channels.contains(&Strip::Click), "the click lost its column");
         assert!(!channels.contains(&Strip::Fx), "the bus is drawn twice");
         // Every strip owns a distinct place in the arrays, or two of them
         // would share a send and mute together.
@@ -1748,7 +1772,7 @@ mod tests {
         // effect chips on a channel with no instrument in it would be three
         // controls for something that is not there.
         let mut empty = a_view();
-        empty.strips[0] = a_strip(Some(Strip::Slot(0)), true);
+        empty.strips[0] = a_strip(Some(Strip::Channel(0)), true);
         let l = Layout::new(r, &empty);
         assert!(!l.strips[0].inserts[0].is_positive());
     }
@@ -1780,7 +1804,7 @@ mod tests {
         // and a name field on it would be a control for a channel that is not
         // there yet.
         let mut empty = a_view();
-        empty.strips[0] = a_strip(Some(Strip::Slot(0)), true);
+        empty.strips[0] = a_strip(Some(Strip::Channel(0)), true);
         let l = Layout::new(r, &empty);
         assert!(!l.strips[0].name.is_positive(), "an empty slot got a name field");
         assert_eq!(hit_test(r, &empty, l.strips[0].panel.center()), Some(Hit::Add(Column(0))));
