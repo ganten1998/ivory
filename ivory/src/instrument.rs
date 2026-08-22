@@ -6118,7 +6118,13 @@ mod tests {
         assert!(came_back, "the displaced clip never came back on the ring");
 
         // 7. A note sounding when the transport stops is ENDED, not stranded.
-        queue(&mut tx, r.timebase.now(), [0x90, 60, 100]);
+        //
+        // Stamp 0, not `timebase.now()`: the renderer's clock is only a few
+        // hundred frames old, and the WALL clock is however long this test
+        // has been running — on a slower machine that stamp lands beyond the
+        // next block and the note is correctly held as not-yet-due, which
+        // reads as a failure here. Zero is already due on any machine.
+        queue(&mut tx, 0, [0x90, 60, 100]);
         let mut out = vec![0.0_f32; 2 * 64];
         r.render(&mut out, 0, 0);
         assert_ne!(r.sounding & (1 << 60), 0, "the note-on was never seen");
