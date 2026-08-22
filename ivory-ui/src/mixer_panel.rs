@@ -10,7 +10,7 @@
 //! [`Layout::targets`] is the single source of truth both are derived from. No
 //! state, no `egui::Ui`, and nothing here can open a device or read a file.
 
-use crate::recorder::{gain_text, gain_to_fader, Column, Strip, INSERTS, SLOTS};
+use crate::recorder::{gain_text, gain_to_fader, ChannelKind, Column, Strip, INSERTS, SLOTS};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 /// One channel, as the painter sees it.
@@ -57,6 +57,11 @@ pub struct StripView<'a> {
     pub gr_db: f32,
     pub muted: bool,
     pub soloed: bool,
+    /// Whether the channel can be taken off the desk — a used general
+    /// channel, or the backing track while a file is loaded. Decided by the
+    /// APP, because "is there a track" is app state a painter cannot know.
+    /// A removable channel wears a small × at its top right.
+    pub removable: bool,
 }
 
 impl StripView<'_> {
@@ -94,6 +99,17 @@ pub struct MixerView<'a> {
     pub typing: Option<(Column, &'a str)>,
     /// The channel whose NAME is being typed, and what is in the field.
     pub naming: Option<(Column, &'a str)>,
+    /// A loaded insert bay whose two-entry menu is open: delete or replace.
+    ///
+    /// **A right-click used to unload the bay outright.** One gesture, no
+    /// confirmation, aimed at a chip twelve points tall — which is how a
+    /// plugin somebody had spent an evening dialling in went away by accident.
+    /// The menu is the palette's own pattern: drawn over the strip in the
+    /// same frame, hit-tested first, dismissed by a press anywhere else.
+    pub fx_menu: Option<(Column, usize)>,
+    /// The empty channel being asked what it should become: MIDI or AUDIO.
+    /// Same overlay pattern as [`MixerView::fx_menu`].
+    pub add_ask: Option<Column>,
 }
 
 impl MixerView<'_> {
@@ -143,6 +159,25 @@ pub enum Hit {
     /// once — which is the only rename that fits and the only one anybody
     /// wants to type more than once.
     Name(Column),
+    /// The × at the top right of a removable channel: take it off the desk.
+    Remove(Column),
+    /// One of the two rows of an open insert menu — or, with
+    /// [`FxAction::Dismiss`], a press anywhere else while it is up.
+    FxMenu(Column, usize, FxAction),
+    /// One of the two rows of the MIDI-or-AUDIO ask on an empty channel.
+    /// `None` is a press anywhere else, which closes it without adding.
+    AddKind(Column, Option<ChannelKind>),
+}
+
+/// What a press on an open insert menu means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FxAction {
+    /// Take the plugin out of the bay.
+    Delete,
+    /// Open the picker aimed at this bay, so choosing swaps it in place.
+    Replace,
+    /// Anywhere that is not a row: close the menu and do nothing.
+    Dismiss,
 }
 
 impl Hit {
@@ -158,6 +193,9 @@ impl Hit {
             | Hit::Palette(i)
             | Hit::Db(i)
             | Hit::Name(i)
+            | Hit::Remove(i)
+            | Hit::FxMenu(i, ..)
+            | Hit::AddKind(i, _)
             | Hit::Paint(i, _) => i,
         }
     }
@@ -172,7 +210,8 @@ impl Hit {
             Hit::Fader(_) => Some(DragAxis::Vertical),
             Hit::Send(_) => Some(DragAxis::Vertical),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..) | Hit::Paint(..)
-            | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) => None,
+            | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_)
+            | Hit::FxMenu(..) | Hit::AddKind(..) => None,
         }
     }
 
@@ -182,7 +221,8 @@ impl Hit {
             Hit::Fader(_) => Some(FADER_TRAVEL),
             Hit::Send(_) => Some(SEND_TRAVEL),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..) | Hit::Paint(..)
-            | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) => None,
+            | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_)
+            | Hit::FxMenu(..) | Hit::AddKind(..) => None,
         }
     }
 }
@@ -292,6 +332,8 @@ pub struct StripStrip {
     pub inserts: [Rect; INSERTS],
     /// The plus on an empty slot.
     pub add: Rect,
+    /// The × at the top right of a removable channel. `NOTHING` on the rest.
+    pub close: Rect,
 }
 
 impl StripStrip {
@@ -312,6 +354,7 @@ impl StripStrip {
         solo: Rect::NOTHING,
         inserts: [Rect::NOTHING; INSERTS],
         add: Rect::NOTHING,
+        close: Rect::NOTHING,
     };
 }
 
@@ -486,6 +529,19 @@ impl Layout {
             view.strip,
             Some(Strip::Channel(_) | Strip::Track | Strip::Click)
         );
+        // **The way OFF the desk, where every window puts it.** Subtle — a
+        // small mark in faded ink, drawn by `strip` — but a real target, and
+        // only on a channel there is something to remove from. The name band
+        // gives up its right end so the two can never contend.
+        let close = if view.removable {
+            let side = (panel.height() * 0.052).clamp(9.0, 15.0).min(panel.width() * 0.4);
+            Rect::from_min_size(
+                Pos2::new(panel.right() - 4.0 - side, panel.top() + 4.0),
+                Vec2::splat(side),
+            )
+        } else {
+            Rect::NOTHING
+        };
         // **Under the name, not over it.** The master has no source to choose
         // and so no icon, and with the icon on top every other channel's name
         // sat a band lower than the master's — twelve labels at one height and
@@ -504,8 +560,19 @@ impl Layout {
             // fifteenth of the strip each, which at any usable window size is
             // three times the height of what is written in them: the plate
             // behind them then reads as a panel with a word lost in it.
-            // The same band on every channel now, master included.
-            name: cut(0.022, 0.078),
+            // The same band on every channel now, master included — trimmed
+            // where the × took the corner, so the two are never one target.
+            name: {
+                let full = cut(0.022, 0.078);
+                if close.is_positive() {
+                    Rect::from_min_max(
+                        full.min,
+                        Pos2::new((close.left() - 3.0).max(full.left() + 1.0), full.max.y),
+                    )
+                } else {
+                    full
+                }
+            },
             detail: if has_icon { cut(0.152, 0.19) } else { cut(0.086, 0.128) },
             meter: Rect::from_min_max(travel.min, Pos2::new(split, travel.max.y)),
             send,
@@ -519,6 +586,7 @@ impl Layout {
             // a plus and a filled one draws its icon, and both open the picker
             // that answers it.
             add: icon,
+            close,
         }
     }
 
@@ -542,6 +610,7 @@ impl Layout {
                 (s.inserts[2], Hit::Insert(i, 2)),
                 (s.db, Hit::Db(i)),
                 (s.name, Hit::Name(i)),
+                (s.close, Hit::Remove(i)),
             ] {
                 if r.is_positive() {
                     out.push((r, hit));
@@ -570,6 +639,37 @@ pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
                 return Some(Hit::Paint(at, usize::MAX));
             }
         }
+    }
+    // **The insert menu, and it is MODAL across the whole mixer.** The
+    // palette only swallows its own strip, which is right for a colour — a
+    // press on the next fader is somebody done choosing. A menu offering
+    // DELETE is different: while it is up, everything that is not one of its
+    // two rows is a dismissal and nothing else, because the mis-click this
+    // exists to prevent is exactly a press that lands somewhere it should not.
+    if let Some((at, bay)) = view.fx_menu {
+        if let Some(s) = l.strips.get(at.0) {
+            let rows = fx_menu_over(s, bay);
+            if rows[0].contains(pos) {
+                return Some(Hit::FxMenu(at, bay, FxAction::Delete));
+            }
+            if rows[1].contains(pos) {
+                return Some(Hit::FxMenu(at, bay, FxAction::Replace));
+            }
+        }
+        return Some(Hit::FxMenu(at, bay, FxAction::Dismiss));
+    }
+    // The MIDI-or-AUDIO ask, on the same modal terms.
+    if let Some(at) = view.add_ask {
+        if let Some(s) = l.strips.get(at.0) {
+            let rows = ask_over(s);
+            if rows[0].contains(pos) {
+                return Some(Hit::AddKind(at, Some(ChannelKind::Midi)));
+            }
+            if rows[1].contains(pos) {
+                return Some(Hit::AddKind(at, Some(ChannelKind::Audio)));
+            }
+        }
+        return Some(Hit::AddKind(at, None));
     }
     l.targets()
         .into_iter()
@@ -682,6 +782,44 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
                     egui::StrokeKind::Inside,
                 );
             }
+        }
+    }
+    // The insert menu and the kind ask, on the palette's terms: a veil over
+    // the strip they belong to, then their rows on top. `two_rows` because
+    // they are the same drawing with different words on it.
+    let two_rows = |anchor: &StripStrip, rows: [Rect; 2], labels: [&str; 2]| {
+        painter.rect_filled(anchor.panel, 3.0, Color32::from_black_alpha(180));
+        for (r, label) in rows.iter().zip(labels) {
+            if !r.is_positive() {
+                continue;
+            }
+            painter.rect_filled(*r, 2.0, p.face);
+            painter.rect_stroke(
+                *r,
+                2.0,
+                Stroke::new(1.0, p.engrave.gamma_multiply(0.4)),
+                egui::StrokeKind::Inside,
+            );
+            centred(
+                painter,
+                *r,
+                label,
+                FontId::new(
+                    (r.height() * 0.5).clamp(7.5, 11.0),
+                    crate::fonts::courier_bold(),
+                ),
+                p.engrave,
+            );
+        }
+    };
+    if let Some((at, bay)) = view.fx_menu {
+        if let Some(s) = l.strips.get(at.0) {
+            two_rows(s, fx_menu_over(s, bay), ["DELETE FX", "REPLACE FX"]);
+        }
+    }
+    if let Some(at) = view.add_ask {
+        if let Some(s) = l.strips.get(at.0) {
+            two_rows(s, ask_over(s), ["MIDI", "AUDIO"]);
         }
     }
 }
@@ -801,6 +939,23 @@ fn strip(
     let _ = named;
     if naming.is_none() {
         centred(painter, l.name, v.name, cap((h * 0.032).clamp(7.5, 12.0)), p.engrave);
+    }
+    // **The × that takes the channel off the desk.** Subtle — thin strokes in
+    // faded ink, on the plate the name shares — but where every window in the
+    // world puts its close, which is what makes it clear.
+    if l.close.is_positive() {
+        let c = l.close.center();
+        let arm = l.close.width().min(l.close.height()) * 0.26;
+        let ink = p.engrave.gamma_multiply(0.5);
+        let w = (arm * 0.45).clamp(1.0, 1.8);
+        painter.line_segment(
+            [Pos2::new(c.x - arm, c.y - arm), Pos2::new(c.x + arm, c.y + arm)],
+            Stroke::new(w, ink),
+        );
+        painter.line_segment(
+            [Pos2::new(c.x - arm, c.y + arm), Pos2::new(c.x + arm, c.y - arm)],
+            Stroke::new(w, ink),
+        );
     }
     if !v.detail.is_empty() {
         centred(
@@ -936,6 +1091,64 @@ fn strip(
         switch(painter, l.mute, "M", v.muted, p.mute, p);
         switch(painter, l.solo, "S", v.soloed, p.solo, p);
     }
+}
+
+/// The two rows of an open insert menu: delete on top, replace under it.
+///
+/// Anchored at the bay the right-click landed on, as wide as the strip, and
+/// clamped inside the panel — the palette's rule: a row that overhung the
+/// neighbour would be a menu whose press can land on someone else's fader.
+fn fx_menu_over(l: &StripStrip, bay: usize) -> [Rect; 2] {
+    let panel = l.panel;
+    if !panel.is_positive() {
+        return [Rect::NOTHING; 2];
+    }
+    let anchor = l
+        .inserts
+        .get(bay)
+        .copied()
+        .filter(Rect::is_positive)
+        .unwrap_or(panel);
+    // Taller than the chip it serves: the chip's height is a reading size,
+    // and these are pressing sizes.
+    let gap = 3.0;
+    let h = (anchor.height() * 1.6)
+        .clamp(16.0, 28.0)
+        .min((panel.height() - 8.0 - gap).max(2.0) * 0.5);
+    let w = (panel.width() - 8.0).max(1.0);
+    let total = h * 2.0 + gap;
+    let top = anchor
+        .top()
+        .clamp(panel.top() + 4.0, (panel.bottom() - 4.0 - total).max(panel.top() + 4.0));
+    let row = |i: f32| {
+        Rect::from_min_size(
+            Pos2::new(panel.left() + 4.0, top + (h + gap) * i),
+            Vec2::new(w, h),
+        )
+    };
+    [row(0.0), row(1.0)]
+}
+
+/// The two rows of the MIDI-or-AUDIO ask, centred on the empty strip.
+fn ask_over(l: &StripStrip) -> [Rect; 2] {
+    let panel = l.panel;
+    if !panel.is_positive() {
+        return [Rect::NOTHING; 2];
+    }
+    let gap = 6.0;
+    let h = (panel.height() * 0.09)
+        .clamp(16.0, 30.0)
+        .min((panel.height() - 8.0 - gap).max(2.0) * 0.5);
+    let w = (panel.width() - 12.0).max(1.0);
+    let c = panel.center();
+    let top = c.y - h - gap * 0.5;
+    let row = |i: f32| {
+        Rect::from_min_size(
+            Pos2::new(c.x - w * 0.5, top + (h + gap) * i),
+            Vec2::new(w, h),
+        )
+    };
+    [row(0.0), row(1.0)]
 }
 
 /// The swatches, over the strip whose colour is being chosen.
@@ -1422,6 +1635,8 @@ mod tests {
             peak: [0.0; 2],
             muted: false,
             soloed: false,
+            // What the app decides: a used general channel can be removed.
+            removable: !empty && matches!(strip, Some(Strip::Channel(_))),
         }
     }
 
@@ -1436,6 +1651,8 @@ mod tests {
             palette_open: None,
             typing: None,
             naming: None,
+            fx_menu: None,
+            add_ask: None,
             dark_mode: true,
             wood: (0x4A, 0x3B, 0x2C),
         }
@@ -1927,6 +2144,122 @@ mod tests {
         assert_eq!(
             hit_test(r, &open, l.strips[1].fader.center()),
             Some(Hit::Fader(Column(1)))
+        );
+    }
+
+    /// **The insert menu offers two rows and swallows everything else.**
+    ///
+    /// A right-click used to unload the bay in one gesture; the menu is what
+    /// stands between an evening of dialled-in settings and a mis-click. It
+    /// is modal across the whole mixer: while it is up, a press is DELETE,
+    /// REPLACE, or a dismissal — never someone else's fader.
+    #[test]
+    fn the_insert_menu_offers_delete_and_replace_and_nothing_else() {
+        let mut v = a_view();
+        v.fx_menu = Some((Column(0), 1));
+        let r = rect();
+        let l = Layout::new(r, &v);
+        let rows = fx_menu_over(&l.strips[0], 1);
+        for (i, row) in rows.iter().enumerate() {
+            assert!(row.is_positive(), "row {i} has no area");
+            assert!(
+                l.strips[0].panel.contains(row.min) && l.strips[0].panel.contains(row.max),
+                "row {i} hangs outside its own strip"
+            );
+        }
+        assert_eq!(
+            hit_test(r, &v, rows[0].center()),
+            Some(Hit::FxMenu(Column(0), 1, FxAction::Delete))
+        );
+        assert_eq!(
+            hit_test(r, &v, rows[1].center()),
+            Some(Hit::FxMenu(Column(0), 1, FxAction::Replace))
+        );
+        // A press on ANOTHER strip's fader is a dismissal, not a fader.
+        assert_eq!(
+            hit_test(r, &v, l.strips[3].fader.center()),
+            Some(Hit::FxMenu(Column(0), 1, FxAction::Dismiss))
+        );
+        // And with no menu open the same point is the fader again.
+        assert_eq!(
+            hit_test(r, &a_view(), l.strips[3].fader.center()),
+            Some(Hit::Fader(Column(3)))
+        );
+    }
+
+    /// **An empty channel asks MIDI or AUDIO before it becomes anything.**
+    #[test]
+    fn the_kind_ask_offers_midi_and_audio_and_dismisses_elsewhere() {
+        let mut v = a_view();
+        v.strips[2] = a_strip(Some(Strip::Channel(2)), true);
+        v.add_ask = Some(Column(2));
+        let r = rect();
+        let l = Layout::new(r, &v);
+        let rows = ask_over(&l.strips[2]);
+        for (i, row) in rows.iter().enumerate() {
+            assert!(row.is_positive(), "row {i} has no area");
+            assert!(
+                l.strips[2].panel.contains(row.min) && l.strips[2].panel.contains(row.max),
+                "row {i} hangs outside its own strip"
+            );
+        }
+        assert_eq!(
+            hit_test(r, &v, rows[0].center()),
+            Some(Hit::AddKind(Column(2), Some(ChannelKind::Midi)))
+        );
+        assert_eq!(
+            hit_test(r, &v, rows[1].center()),
+            Some(Hit::AddKind(Column(2), Some(ChannelKind::Audio)))
+        );
+        assert_eq!(
+            hit_test(r, &v, l.strips[0].fader.center()),
+            Some(Hit::AddKind(Column(2), None)),
+            "a press elsewhere should dismiss the ask and do nothing"
+        );
+    }
+
+    /// **Only a removable channel wears the ×, and it can be pressed.**
+    ///
+    /// The master, the click and the bus cannot be taken off the desk, and a
+    /// close button on them would be a control with no meaning behind it. On
+    /// a channel that wears one, the name gives up the corner rather than
+    /// sharing it.
+    #[test]
+    fn only_a_removable_channel_wears_the_x() {
+        let v = a_view();
+        let r = rect();
+        let l = Layout::new(r, &v);
+        for (i, s) in l.strips.iter().enumerate() {
+            let want = v.strips[i].removable;
+            assert_eq!(
+                s.close.is_positive(),
+                want,
+                "column {i}: removable={want} but the × disagrees"
+            );
+            if want {
+                assert_eq!(
+                    hit_test(r, &v, s.close.center()),
+                    Some(Hit::Remove(Column(i))),
+                    "column {i}'s × cannot be pressed"
+                );
+                assert!(
+                    s.close.left() >= s.name.right(),
+                    "column {i}'s × sits on its own name field"
+                );
+            }
+        }
+        // The master never wears one.
+        assert!(!l.strips[MASTER].close.is_positive());
+        // The backing track wears one exactly when the app says there is a
+        // track to remove.
+        let mut with_track = a_view();
+        let track_col = CLICK - 1;
+        with_track.strips[track_col].removable = true;
+        let l = Layout::new(r, &with_track);
+        assert!(l.strips[track_col].close.is_positive());
+        assert_eq!(
+            hit_test(r, &with_track, l.strips[track_col].close.center()),
+            Some(Hit::Remove(Column(track_col)))
         );
     }
 

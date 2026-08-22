@@ -1138,6 +1138,21 @@ impl DesktopApp {
             if closed {
                 self.save_plugin_states();
             }
+            // **While any plugin window is open, keep the frames coming.**
+            // On Linux the poll above IS the plugin GUI's run loop — its
+            // timers and X events fire from `Editor::closed` — so an app
+            // that idles freezes every open editor. 16 ms is the cadence
+            // plugin animations are written against; on the other platforms
+            // the OS drives the windows and this only makes the close button
+            // noticed within a frame rather than on the next mouse move.
+            let any_open = self
+                .recorder
+                .engine
+                .as_ref()
+                .is_some_and(|e| bays.iter().any(|&(st, b)| e.insert_editor_open(st, b)));
+            if any_open {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
         }
 
         // The always-on MIDI tap, drained whether or not a take is running, and
@@ -1352,8 +1367,26 @@ impl DesktopApp {
                 let state =
                     engine_want.and_then(|p| saved_insert_state(i / inserts, i % inserts, p));
                 match e.load_insert(i / inserts, i % inserts, path, state.as_deref()) {
-                    Ok(_) => self.recorder.engine_error = None,
+                    Ok(_) => {
+                        self.recorder.engine_error = None;
+                        // **The window, the moment the load lands.** Only for
+                        // the pick that just happened — the app's flag answers
+                        // once and never for a launch restore — and only when
+                        // something was actually loaded: an unload has no
+                        // window to show.
+                        if path.is_some()
+                            && self.app.take_open_insert_on_load(i / inserts, i % inserts)
+                        {
+                            if let Err(err) = e.open_insert_editor(i / inserts, i % inserts) {
+                                self.recorder.engine_error = Some(format!(
+                                    "could not open the plugin's window: {err}"
+                                ));
+                            }
+                        }
+                    }
                     Err(err) => {
+                        // The auto-open belongs to a load that happened.
+                        let _ = self.app.take_open_insert_on_load(i / inserts, i % inserts);
                         let which = want
                             .as_deref()
                             .and_then(|p| p.rsplit('/').next())
@@ -1461,6 +1494,20 @@ impl DesktopApp {
                 R::Locate(seconds) => {
                     self.recorder.transport.locate(seconds);
                 }
+                // The × on the BACKING strip. Everything about the file goes:
+                // the engine's copy, the decoded samples, the waveform, and
+                // the remembered path — or next launch would quietly load the
+                // track somebody just removed. The transport goes home too: a
+                // playhead at 2:31 of nothing is not a position.
+                R::ClearTrack => {
+                    if let Some(e) = self.recorder.engine.as_mut() {
+                        e.set_track(None);
+                    }
+                    self.track = None;
+                    self.app.set_track_info(ivory_ui::ports::TrackInfo::default());
+                    self.app.set_track_path(String::new());
+                    self.recorder.transport.stop();
+                }
                 R::Toggle => {
                     // **Whatever the last take had to say, it is not about
                     // this one.** Stale post-take advice that outlives the
@@ -1501,14 +1548,13 @@ impl DesktopApp {
                     self.recorder.session.toggle(&root, name.as_deref(), wait, spec);
                 }
                 // **One stop for both machines.** The square ends whichever
-                // is running: the take by the session's own stop, the audition
-                // by the transport's toggle — and either way the falling edge
-                // in `Transport::push` is what returns the playhead to 0:00.
+                // is running — the take by the session's own stop, the
+                // audition by the transport's — and `Transport::stop` is what
+                // sends the playhead home. Play's own second press is a PAUSE
+                // now, so this is the only button that returns to 0:00.
                 R::Stop => {
                     self.recorder.session.stop();
-                    if self.recorder.transport.playing() {
-                        self.recorder.transport.toggle_play();
-                    }
+                    self.recorder.transport.stop();
                 }
                 // **Every latch, or the light does not go out.** The warning
                 // is an OR across the input tracker, the take summary and the
@@ -2160,6 +2206,35 @@ impl DesktopApp {
         }
     }
 
+    /// Hand the decoded backing track to the engine that exists NOW.
+    ///
+    /// A fresh engine starts with no track whatever the last one held, and the
+    /// launch-time decode ran before any engine existed at all. The clip is
+    /// decoded at a fixed rate; an engine running at a different one gets a
+    /// re-decode from the remembered path rather than samples at the wrong
+    /// pitch.
+    #[cfg(feature = "recorder")]
+    fn push_track_to_engine(&mut self) {
+        let Some(clip) = self.track.clone() else {
+            return;
+        };
+        let rate = self
+            .recorder
+            .engine
+            .as_ref()
+            .map(|e| e.output().sample_rate);
+        if rate == Some(clip.rate) {
+            if let Some(e) = self.recorder.engine.as_mut() {
+                e.set_track(Some(crate::instrument::Placed { clip, start: 0 }));
+            }
+            return;
+        }
+        let path = self.app.track_settings();
+        if !path.is_empty() {
+            self.load_track(std::path::Path::new(&path));
+        }
+    }
+
     /// Write every loaded bay's plugin state beside the settings.
     ///
     /// Called on quit and whenever an editor closes — the second matters more
@@ -2299,6 +2374,14 @@ impl DesktopApp {
                         e.set_builtin_voice(v);
                     }
                 }
+                // **The backing track, now that there is an engine to hold
+                // it.** The launch-time load runs before the band has opened a
+                // device, so `load_track` had no engine to hand the clip to —
+                // and a rebuilt engine starts empty whatever the old one held.
+                // Without this, a track remembered across sessions drew its
+                // waveform on the timeline and played nothing: the one owner
+                // of the samples was `self.track`, and no engine ever saw it.
+                self.push_track_to_engine();
             }
             Err(e) => {
                 self.recorder.engine_error = Some(format!("no audio output: {e}"));

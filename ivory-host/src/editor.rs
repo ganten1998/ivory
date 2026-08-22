@@ -36,6 +36,15 @@
 //! `NSView` to hand a plugin and cannot acquire one. So the editor gets an
 //! `NSWindow` of its own, made with AppKit directly.
 //!
+//! # The same shape on every platform
+//!
+//! The sequence above is VST3's, not AppKit's, and each platform module spells
+//! it in its own windowing: `mac` hands the plugin an `NSView`, `win` an
+//! `HWND` whose messages ride the thread's own pump, and `x11` an X11 window
+//! id — plus the `Linux::IRunLoop` the plugin's GUI cannot draw without,
+//! which that module's docs explain. One `Editor`, one teardown order, three
+//! spellings.
+//!
 //! **That does not need a second event loop, and the reason is worth stating:**
 //! on macOS `winit`'s event loop *is* `NSApplication`'s run loop — it calls
 //! `[NSApp run]` and services `NSEvent`s — so a window created by anyone in the
@@ -74,23 +83,33 @@ use crate::instance::Instance;
 
 #[cfg(target_os = "macos")]
 use mac::Window as Inner;
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+use win::Window as Inner;
+#[cfg(target_os = "linux")]
+use x11::Window as Inner;
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 use stub::Window as Inner;
 
 /// Whether this build can host a plugin's own window at all.
 ///
-/// macOS today. See `stub::Window::open`, which is what the other platforms
-/// compile, and [`EditorError::Unsupported`].
-pub const EDITORS_SUPPORTED: bool = cfg!(target_os = "macos");
+/// macOS, Windows and Linux — each with the window its VST3 platform type
+/// names: an `NSView`, an `HWND`, an X11 window id. See `stub::Window::open`,
+/// which is what anything else compiles, and [`EditorError::Unsupported`].
+pub const EDITORS_SUPPORTED: bool = cfg!(any(
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "linux"
+));
 
 /// Why an editor could not be opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorError {
     /// This build has no window binding for plugin editors.
     ///
-    /// Windows and Linux, today. The UI should grey the row rather than offer
-    /// something that will fail — see [`Instance::has_editor`], which answers
-    /// the same question without trying.
+    /// No shipped platform, today — macOS, Windows and Linux all have one.
+    /// The UI should grey the row rather than offer something that will fail
+    /// — see [`Instance::has_editor`], which answers the same question
+    /// without trying.
     Unsupported,
     /// The plugin builds no editor. Legal, and true of a few instruments.
     NoEditor,
@@ -111,7 +130,7 @@ impl std::fmt::Display for EditorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unsupported => {
-                write!(f, "plugin editors are only implemented on macOS so far")
+                write!(f, "plugin editors are not implemented on this platform")
             }
             Self::NoEditor => write!(f, "this plugin has no editor"),
             Self::WrongPlatform(want) => {
@@ -252,8 +271,16 @@ impl Editor {
     ///
     /// Poll it once a frame. It stays `false` for a window that is merely
     /// hidden, minimised or behind something else — this is a real
-    /// `windowWillClose:` and not a guess from visibility, which would report a
-    /// minimised window as closed and throw the user's editor away for them.
+    /// `windowWillClose:` (or `WM_CLOSE`, or `WM_DELETE_WINDOW`) and not a
+    /// guess from visibility, which would report a minimised window as closed
+    /// and throw the user's editor away for them.
+    ///
+    /// **On Linux this poll is also the editor's heartbeat.** The plugin's
+    /// GUI runs off the host's `IRunLoop` — the timers and fds it registered
+    /// — and this call is what fires them, drains the window's own X events,
+    /// and flushes. A caller that stops polling has a plugin window that
+    /// stops painting; the app polls every frame and keeps a frame coming
+    /// while any editor is open, which is the whole contract.
     pub fn closed(&self) -> bool {
         self.inner.closed()
     }
@@ -293,7 +320,11 @@ impl Editor {
 pub fn pump(timeout: Duration) {
     #[cfg(target_os = "macos")]
     mac::pump(timeout);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    win::pump(timeout);
+    #[cfg(target_os = "linux")]
+    x11::pump(timeout);
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     let _ = timeout;
 }
 
@@ -741,6 +772,868 @@ pub fn become_foreground() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Windows
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The same four-step sequence as macOS, spelled in Win32: `CreateWindowExW`
+/// makes the window, `attached(hwnd, "HWND")` hands it to the plugin, and the
+/// plugin's own message handling rides the THREAD's message pump — in Tangent
+/// that is winit's `GetMessage` loop, which dispatches to every window the
+/// thread owns, ours included, with no cooperation from the app. `pump` below
+/// is only for processes that have no such loop (`--plugin-test`).
+///
+/// **`WM_CLOSE` is swallowed, never obeyed.** The default handler would
+/// destroy the window while the plugin's view is still inside it — the exact
+/// crash `removed()`-before-teardown exists to prevent. The close button only
+/// sets a flag; the app polls it, drops the [`Editor`], and the `Drop` runs
+/// the VST3 half before `DestroyWindow`.
+#[cfg(target_os = "windows")]
+mod win {
+    use std::cell::Cell;
+    use std::ffi::c_void;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    use vst3::Steinberg::{
+        kInvalidArgument, kPlatformTypeHWND, kResultOk, tresult, IPlugFrame, IPlugFrameTrait,
+        IPlugView, IPlugViewTrait, ViewRect,
+    };
+    use vst3::{Class, ComPtr, ComRef, ComWrapper};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows_sys::Win32::Graphics::Gdi::COLOR_WINDOW;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+        GetWindowLongPtrW, LoadCursorW, PeekMessageW, RegisterClassW, SetForegroundWindow,
+        SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CW_USEDEFAULT,
+        GWLP_USERDATA, IDC_ARROW, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW,
+        WM_CLOSE, WNDCLASSW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    };
+
+    use super::EditorError;
+
+    /// Fallback content size for a plugin whose `getSize` fails. See `mac`.
+    const FALLBACK_SIZE: (i32, i32) = (800, 600);
+
+    /// The window style: titled, closable, minimisable — and NOT resizable by
+    /// the user, for the reason the module docs give. The plugin resizes us.
+    const STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+
+    /// The facts the window procedure publishes and [`Window`] reads.
+    #[derive(Default)]
+    pub(super) struct State {
+        closed: Cell<bool>,
+        resizes: Cell<u64>,
+        size: Cell<(i32, i32)>,
+    }
+
+    /// NUL-terminated UTF-16, which is the only string Win32 wants.
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// The class name. A process-global symbol in a process full of foreign
+    /// code, so it is named distinctively — the same reasoning as the macOS
+    /// delegate class.
+    fn class_name() -> &'static [u16] {
+        static NAME: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+        NAME.get_or_init(|| wide("TangentVst3EditorWindow"))
+    }
+
+    /// Register the window class once per process. `RegisterClassW` fails on
+    /// the second call with the same name, which is not an error here.
+    fn ensure_class() -> bool {
+        static DONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DONE.get_or_init(|| {
+            // SAFETY: a fully-formed WNDCLASSW; the class name outlives the
+            // process (OnceLock above).
+            unsafe {
+                let wc = WNDCLASSW {
+                    style: 0,
+                    lpfnWndProc: Some(wndproc),
+                    cbClsExtra: 0,
+                    cbWndExtra: 0,
+                    hInstance: GetModuleHandleW(std::ptr::null()),
+                    hIcon: std::ptr::null_mut(),
+                    hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+                    hbrBackground: (COLOR_WINDOW + 1) as usize as _,
+                    lpszMenuName: std::ptr::null(),
+                    lpszClassName: class_name().as_ptr(),
+                };
+                RegisterClassW(&wc) != 0
+            }
+        })
+    }
+
+    /// The window procedure: swallow the close, default everything else.
+    ///
+    /// # Safety
+    /// Called by the OS with a window this module created; `GWLP_USERDATA`
+    /// holds either null or a pointer to the [`State`] the owning [`Window`]
+    /// keeps alive, cleared in `Drop` before the state can die.
+    unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        if msg == WM_CLOSE {
+            // SAFETY: see above — null before `open` finishes and after
+            // teardown starts, live in between.
+            let state = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const State;
+            if !state.is_null() {
+                // SAFETY: live for as long as the window has a procedure.
+                unsafe { (*state).closed.set(true) };
+            }
+            return 0;
+        }
+        // SAFETY: the default handler, with the arguments as given.
+        unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    }
+
+    /// The host's `IPlugFrame`: how the plugin asks for a different size.
+    struct PlugFrame {
+        hwnd: HWND,
+        state: Rc<State>,
+    }
+
+    // SAFETY: `PlugFrame` implements the one interface it declares.
+    impl Class for PlugFrame {
+        type Interfaces = (IPlugFrame,);
+    }
+
+    impl IPlugFrameTrait for PlugFrame {
+        unsafe fn resizeView(&self, view: *mut IPlugView, new_size: *mut ViewRect) -> tresult {
+            if new_size.is_null() {
+                return kInvalidArgument;
+            }
+            // SAFETY: a caller-provided ViewRect, checked non-null.
+            let rect = unsafe { *new_size };
+            let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+            if w < 1 || h < 1 {
+                return kInvalidArgument;
+            }
+            let mut frame = RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            // SAFETY: a live window this struct's owner holds; the rect is
+            // ours. Client size in, window size out, then the resize.
+            unsafe {
+                AdjustWindowRectEx(&mut frame, STYLE, 0, 0);
+                SetWindowPos(
+                    self.hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    frame.right - frame.left,
+                    frame.bottom - frame.top,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            self.state.size.set((w, h));
+            self.state.resizes.set(self.state.resizes.get() + 1);
+            // Resize, THEN tell the view — the SDK's own order. See `mac`.
+            if !view.is_null() {
+                // SAFETY: a borrowed pointer the plugin owns for this call.
+                if let Some(v) = unsafe { ComRef::<IPlugView>::from_raw(view) } {
+                    // SAFETY: live view, valid ViewRect.
+                    unsafe { v.onSize(new_size) };
+                }
+            }
+            kResultOk
+        }
+    }
+
+    /// The window and the plugin's view inside it. Field order is teardown
+    /// order, exactly as on macOS.
+    pub(super) struct Window {
+        view: ComPtr<IPlugView>,
+        /// Held, never read: the plugin has a bare pointer to it.
+        #[allow(dead_code, reason = "kept alive for the plugin's pointer, not read")]
+        frame: ComWrapper<PlugFrame>,
+        hwnd: HWND,
+        state: Rc<State>,
+        /// `HWND` is a raw pointer and already makes this `!Send`; the marker
+        /// says it is the CONTRACT, not an accident of representation.
+        _not_send: std::marker::PhantomData<*const ()>,
+    }
+
+    impl Window {
+        pub(super) fn open(view: ComPtr<IPlugView>, title: &str) -> Result<Self, EditorError> {
+            // Ask before assuming, exactly as on macOS.
+            // SAFETY: live view; the platform type is a static C string.
+            if unsafe { view.isPlatformTypeSupported(kPlatformTypeHWND) } != kResultOk {
+                return Err(EditorError::WrongPlatform("HWND"));
+            }
+            if !ensure_class() {
+                return Err(EditorError::Refused(
+                    "could not register the editor's window class".to_string(),
+                ));
+            }
+            let mut rect = ViewRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            // SAFETY: live view, valid out-parameter.
+            let sized = unsafe { view.getSize(&mut rect) };
+            let (w, h) = if sized == kResultOk {
+                (
+                    (rect.right - rect.left).max(1),
+                    (rect.bottom - rect.top).max(1),
+                )
+            } else {
+                FALLBACK_SIZE
+            };
+            let mut outer = RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            let title_w = wide(title);
+            // SAFETY: registered class, valid strings, no parent. The window
+            // is sized so its CLIENT area is what the plugin asked for.
+            let hwnd = unsafe {
+                AdjustWindowRectEx(&mut outer, STYLE, 0, 0);
+                CreateWindowExW(
+                    0,
+                    class_name().as_ptr(),
+                    title_w.as_ptr(),
+                    STYLE,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    outer.right - outer.left,
+                    outer.bottom - outer.top,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    GetModuleHandleW(std::ptr::null()),
+                    std::ptr::null(),
+                )
+            };
+            if hwnd.is_null() {
+                return Err(EditorError::Refused(
+                    "CreateWindowExW refused to make the editor's window".to_string(),
+                ));
+            }
+            let state = Rc::new(State::default());
+            state.size.set((w, h));
+            // SAFETY: our window; the pointer stays valid until `Drop` clears
+            // it before the state can die.
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::as_ptr(&state) as isize);
+            }
+
+            let frame = ComWrapper::new(PlugFrame {
+                hwnd,
+                state: Rc::clone(&state),
+            });
+            let Some(frame_ptr) = frame.to_com_ptr::<IPlugFrame>() else {
+                // SAFETY: our window, not yet attached to anything.
+                unsafe { DestroyWindow(hwnd) };
+                return Err(EditorError::Refused(
+                    "could not build the host's IPlugFrame".to_string(),
+                ));
+            };
+            // Before `attached`, as the SDK sequences it.
+            // SAFETY: live view; the frame outlives it (field order).
+            unsafe { view.setFrame(frame_ptr.as_ptr()) };
+
+            // SAFETY: `hwnd` is a live window owned by this struct and the
+            // platform type matches it.
+            let attached = unsafe { view.attached(hwnd as *mut c_void, kPlatformTypeHWND) };
+            if attached != kResultOk {
+                // Nothing attached, so `removed()` is not owed. See `mac`.
+                // SAFETY: live view; dropping the frame it was given, then
+                // the window nothing is inside any more.
+                unsafe {
+                    view.setFrame(std::ptr::null_mut());
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    DestroyWindow(hwnd);
+                }
+                return Err(EditorError::Refused(format!(
+                    "the plugin refused to attach to an HWND (tresult {attached})"
+                )));
+            }
+
+            // SAFETY: our window.
+            unsafe {
+                ShowWindow(hwnd, SW_SHOW);
+                SetForegroundWindow(hwnd);
+            }
+            Ok(Self {
+                view,
+                frame,
+                hwnd,
+                state,
+                _not_send: std::marker::PhantomData,
+            })
+        }
+
+        pub(super) fn closed(&self) -> bool {
+            self.state.closed.get()
+        }
+
+        pub(super) fn focus(&self) {
+            // SAFETY: our window.
+            unsafe {
+                ShowWindow(self.hwnd, SW_SHOW);
+                SetForegroundWindow(self.hwnd);
+            }
+        }
+
+        pub(super) fn size(&self) -> (i32, i32) {
+            self.state.size.get()
+        }
+
+        pub(super) fn resizes(&self) -> u64 {
+            self.state.resizes.get()
+        }
+    }
+
+    impl Drop for Window {
+        /// The order that matters — the same four steps as macOS.
+        fn drop(&mut self) {
+            // SAFETY: live view, attached exactly once in `open`.
+            unsafe { self.view.removed() };
+            // SAFETY: live view; the frame is about to go.
+            unsafe { self.view.setFrame(std::ptr::null_mut()) };
+            // SAFETY: our window. The state pointer is cleared BEFORE the
+            // destroy, so no message arriving during teardown can read a
+            // state that `Drop` is about to free.
+            unsafe {
+                SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+                DestroyWindow(self.hwnd);
+            }
+        }
+    }
+
+    /// Drain and dispatch this thread's message queue for up to `timeout`.
+    ///
+    /// Only for a process with no other message loop — the examples and
+    /// `--plugin-test`. Tangent must never call this: winit owns the loop.
+    pub(super) fn pump(timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // SAFETY: a standard PeekMessage pump on the calling thread.
+            unsafe {
+                let mut msg = std::mem::zeroed();
+                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            // Short slices rather than a blocking wait: the callers
+            // interleave their own work and a 5 ms nap is below anything a
+            // GUI can show.
+            std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Linux
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// X11, and the run loop the platform does not provide.
+///
+/// The window itself is the easy half: our own connection (x11rb, pure Rust),
+/// one window with `WM_DELETE_WINDOW` in its protocols, and
+/// `attached(window_id, "X11EmbedWindowID")` — the id travels IN the pointer's
+/// bits, which is the VST3 convention for this platform type.
+///
+/// **The half that actually makes plugins work is `IRunLoop`.** On macOS and
+/// Windows a plugin's GUI rides the process's own event machinery; X11 has no
+/// such thing, so VST3 makes the HOST provide it: the plugin queries the
+/// `IPlugFrame` for `Linux::IRunLoop` and registers the fds of its own X
+/// connection and the timers its animations run on. A host that does not
+/// answer gets a window that draws once and then freezes — which is what
+/// every first Linux VST3 host ships, and why this one answers. The frame
+/// here implements both interfaces; [`Service::service`] fires what is due.
+///
+/// **Serviced from `closed()`**, which the app already polls every frame —
+/// there is no other loop to ride, because winit may be on Wayland while the
+/// plugin is on XWayland and the two share nothing. `pump` services every
+/// live editor for the processes that have no frame loop.
+#[cfg(target_os = "linux")]
+mod x11 {
+    use std::cell::{Cell, RefCell};
+    use std::ffi::{c_int, c_void};
+    use std::rc::{Rc, Weak};
+    use std::time::{Duration, Instant};
+
+    use vst3::Steinberg::Linux::{
+        FileDescriptor, IEventHandler, IEventHandlerTrait, IRunLoop, IRunLoopTrait,
+        ITimerHandler, ITimerHandlerTrait, TimerInterval,
+    };
+    use vst3::Steinberg::{
+        kInvalidArgument, kPlatformTypeX11EmbedWindowID, kResultOk, tresult, IPlugFrame,
+        IPlugFrameTrait, IPlugView, IPlugViewTrait, ViewRect,
+    };
+    use vst3::{Class, ComPtr, ComRef, ComWrapper};
+    use x11rb::connection::Connection;
+    use x11rb::properties::WmSizeHints;
+    use x11rb::protocol::xproto::{
+        Atom, AtomEnum, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux, EventMask,
+        PropMode, StackMode, WindowClass,
+    };
+    use x11rb::protocol::Event;
+    use x11rb::rust_connection::RustConnection;
+    use x11rb::wrapper::ConnectionExt as _;
+    use x11rb::COPY_DEPTH_FROM_PARENT;
+
+    use super::EditorError;
+
+    /// Fallback content size for a plugin whose `getSize` fails. See `mac`.
+    const FALLBACK_SIZE: (i32, i32) = (800, 600);
+
+    /// The facts the event stream publishes and [`Window`] reads.
+    #[derive(Default)]
+    pub(super) struct State {
+        closed: Cell<bool>,
+        resizes: Cell<u64>,
+        size: Cell<(i32, i32)>,
+    }
+
+    /// One registered fd, by the identity the plugin will unregister with.
+    struct FdSlot {
+        ident: usize,
+        fd: c_int,
+        handler: ComPtr<IEventHandler>,
+    }
+
+    /// One registered timer. `due` is absolute so a slow frame fires it late
+    /// rather than never.
+    struct TimerSlot {
+        ident: usize,
+        every: Duration,
+        due: Instant,
+        handler: ComPtr<ITimerHandler>,
+    }
+
+    /// The connection, the window, and the plugin's registered machinery —
+    /// everything one service pass touches. Shared by [`Window`] (which
+    /// drives it) and the frame (which fills it).
+    pub(super) struct Service {
+        conn: RustConnection,
+        window: u32,
+        wm_protocols: Atom,
+        wm_delete: Atom,
+        state: State,
+        handlers: RefCell<Vec<FdSlot>>,
+        timers: RefCell<Vec<TimerSlot>>,
+    }
+
+    impl Service {
+        /// One pass: our X events, the plugin's fds, the plugin's timers.
+        ///
+        /// Everything is cloned out of the `RefCell`s before any plugin code
+        /// runs, because a handler is allowed to unregister itself — or
+        /// register another — from inside its own callback, and a borrow held
+        /// across that is a panic wearing a plugin's name.
+        fn service(&self) {
+            while let Ok(Some(ev)) = self.conn.poll_for_event() {
+                if let Event::ClientMessage(m) = ev {
+                    if m.window == self.window
+                        && m.type_ == self.wm_protocols
+                        && m.data.as_data32()[0] == self.wm_delete
+                    {
+                        self.state.closed.set(true);
+                    }
+                }
+            }
+            let fds: Vec<(c_int, ComPtr<IEventHandler>)> = self
+                .handlers
+                .borrow()
+                .iter()
+                .map(|s| (s.fd, s.handler.clone()))
+                .collect();
+            if !fds.is_empty() {
+                let mut polls: Vec<libc::pollfd> = fds
+                    .iter()
+                    .map(|(fd, _)| libc::pollfd {
+                        fd: *fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    })
+                    .collect();
+                // SAFETY: `polls` is ours and outlives the call; a zero
+                // timeout cannot block the frame this runs inside.
+                let n = unsafe {
+                    libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 0)
+                };
+                if n > 0 {
+                    for (p, (fd, handler)) in polls.iter().zip(&fds) {
+                        if p.revents != 0 {
+                            // SAFETY: a live handler the plugin registered
+                            // and has not unregistered.
+                            unsafe { handler.onFDIsSet(*fd) };
+                        }
+                    }
+                }
+            }
+            let now = Instant::now();
+            let due: Vec<ComPtr<ITimerHandler>> = {
+                let mut timers = self.timers.borrow_mut();
+                timers
+                    .iter_mut()
+                    .filter(|t| now >= t.due)
+                    .map(|t| {
+                        t.due = now + t.every;
+                        t.handler.clone()
+                    })
+                    .collect()
+            };
+            for t in due {
+                // SAFETY: a live handler the plugin registered.
+                unsafe { t.onTimer() };
+            }
+            let _ = self.conn.flush();
+        }
+    }
+
+    thread_local! {
+        /// Every live editor's service, for [`pump`]. Weak, so a dropped
+        /// [`Window`] needs no unregister call that a panic could skip.
+        static LIVE: RefCell<Vec<Weak<Service>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// The host's `IPlugFrame` — and, on this platform, its `IRunLoop`.
+    /// The plugin reaches the second by `queryInterface` on the first.
+    struct PlugFrame {
+        service: Rc<Service>,
+    }
+
+    // SAFETY: `PlugFrame` implements both interfaces it declares.
+    impl Class for PlugFrame {
+        type Interfaces = (IPlugFrame, IRunLoop);
+    }
+
+    impl IPlugFrameTrait for PlugFrame {
+        unsafe fn resizeView(&self, view: *mut IPlugView, new_size: *mut ViewRect) -> tresult {
+            if new_size.is_null() {
+                return kInvalidArgument;
+            }
+            // SAFETY: a caller-provided ViewRect, checked non-null.
+            let rect = unsafe { *new_size };
+            let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+            if w < 1 || h < 1 {
+                return kInvalidArgument;
+            }
+            let s = &self.service;
+            // The min=max clamp is what makes the window non-resizable, so it
+            // has to move to the NEW size before the resize or the window
+            // manager clamps the resize to the old one.
+            let mut hints = WmSizeHints::new();
+            hints.min_size = Some((w, h));
+            hints.max_size = Some((w, h));
+            let _ = hints.set(&s.conn, s.window, AtomEnum::WM_NORMAL_HINTS);
+            let _ = s.conn.configure_window(
+                s.window,
+                &ConfigureWindowAux::new().width(w as u32).height(h as u32),
+            );
+            let _ = s.conn.flush();
+            s.state.size.set((w, h));
+            s.state.resizes.set(s.state.resizes.get() + 1);
+            // Resize, THEN tell the view — the SDK's own order. See `mac`.
+            if !view.is_null() {
+                // SAFETY: a borrowed pointer the plugin owns for this call.
+                if let Some(v) = unsafe { ComRef::<IPlugView>::from_raw(view) } {
+                    // SAFETY: live view, valid ViewRect.
+                    unsafe { v.onSize(new_size) };
+                }
+            }
+            kResultOk
+        }
+    }
+
+    impl IRunLoopTrait for PlugFrame {
+        unsafe fn registerEventHandler(
+            &self,
+            handler: *mut IEventHandler,
+            fd: FileDescriptor,
+        ) -> tresult {
+            // SAFETY: a caller-provided interface pointer, checked non-null
+            // by `from_raw`; `to_com_ptr` takes its own reference.
+            let Some(h) = (unsafe { ComRef::<IEventHandler>::from_raw(handler) }) else {
+                return kInvalidArgument;
+            };
+            self.service.handlers.borrow_mut().push(FdSlot {
+                ident: handler as usize,
+                fd,
+                handler: h.to_com_ptr(),
+            });
+            kResultOk
+        }
+
+        unsafe fn unregisterEventHandler(&self, handler: *mut IEventHandler) -> tresult {
+            let mut hs = self.service.handlers.borrow_mut();
+            let before = hs.len();
+            hs.retain(|s| s.ident != handler as usize);
+            if hs.len() == before {
+                kInvalidArgument
+            } else {
+                kResultOk
+            }
+        }
+
+        unsafe fn registerTimer(
+            &self,
+            handler: *mut ITimerHandler,
+            milliseconds: TimerInterval,
+        ) -> tresult {
+            // SAFETY: as `registerEventHandler`.
+            let Some(h) = (unsafe { ComRef::<ITimerHandler>::from_raw(handler) }) else {
+                return kInvalidArgument;
+            };
+            // A zero interval means "every service pass" and must not divide
+            // the pass into an infinite catch-up loop: floor it at 1 ms.
+            let every = Duration::from_millis(milliseconds.max(1));
+            self.service.timers.borrow_mut().push(TimerSlot {
+                ident: handler as usize,
+                every,
+                due: Instant::now() + every,
+                handler: h.to_com_ptr(),
+            });
+            kResultOk
+        }
+
+        unsafe fn unregisterTimer(&self, handler: *mut ITimerHandler) -> tresult {
+            let mut ts = self.service.timers.borrow_mut();
+            let before = ts.len();
+            ts.retain(|t| t.ident != handler as usize);
+            if ts.len() == before {
+                kInvalidArgument
+            } else {
+                kResultOk
+            }
+        }
+    }
+
+    /// The window, the connection it lives on, and the plugin's view inside
+    /// it. Field order is teardown order, exactly as on macOS.
+    pub(super) struct Window {
+        view: ComPtr<IPlugView>,
+        /// Held, never read: the plugin has a bare pointer to it.
+        #[allow(dead_code, reason = "kept alive for the plugin's pointer, not read")]
+        frame: ComWrapper<PlugFrame>,
+        service: Rc<Service>,
+        /// The `Rc` already makes this `!Send`; the marker says it is the
+        /// CONTRACT, not an accident of representation.
+        _not_send: std::marker::PhantomData<*const ()>,
+    }
+
+    /// x11rb's errors into the one sentence the UI can show.
+    fn xerr(what: &str, e: impl std::fmt::Display) -> EditorError {
+        EditorError::Refused(format!("{what}: {e}"))
+    }
+
+    impl Window {
+        pub(super) fn open(view: ComPtr<IPlugView>, title: &str) -> Result<Self, EditorError> {
+            // Ask before assuming, exactly as on macOS.
+            // SAFETY: live view; the platform type is a static C string.
+            if unsafe { view.isPlatformTypeSupported(kPlatformTypeX11EmbedWindowID) }
+                != kResultOk
+            {
+                return Err(EditorError::WrongPlatform("X11EmbedWindowID"));
+            }
+            let (conn, screen_num) =
+                x11rb::connect(None).map_err(|e| xerr("no X display", e))?;
+            let mut rect = ViewRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            // SAFETY: live view, valid out-parameter.
+            let sized = unsafe { view.getSize(&mut rect) };
+            let (w, h) = if sized == kResultOk {
+                (
+                    (rect.right - rect.left).max(1),
+                    (rect.bottom - rect.top).max(1),
+                )
+            } else {
+                FALLBACK_SIZE
+            };
+            let screen = &conn.setup().roots[screen_num];
+            let root = screen.root;
+            let black = screen.black_pixel;
+            let window = conn.generate_id().map_err(|e| xerr("no window id", e))?;
+            conn.create_window(
+                COPY_DEPTH_FROM_PARENT,
+                window,
+                root,
+                0,
+                0,
+                w as u16,
+                h as u16,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new()
+                    .background_pixel(black)
+                    .event_mask(EventMask::STRUCTURE_NOTIFY),
+            )
+            .map_err(|e| xerr("could not create the editor's window", e))?;
+
+            let atom = |name: &[u8]| {
+                conn.intern_atom(false, name)
+                    .map_err(|e| xerr("no atom", e))?
+                    .reply()
+                    .map(|r| r.atom)
+                    .map_err(|e| xerr("no atom", e))
+            };
+            let wm_protocols = atom(b"WM_PROTOCOLS")?;
+            let wm_delete = atom(b"WM_DELETE_WINDOW")?;
+            let net_wm_name = atom(b"_NET_WM_NAME")?;
+            let utf8 = atom(b"UTF8_STRING")?;
+            let _ = conn.change_property32(
+                PropMode::REPLACE,
+                window,
+                wm_protocols,
+                AtomEnum::ATOM,
+                &[wm_delete],
+            );
+            let _ = conn.change_property8(
+                PropMode::REPLACE,
+                window,
+                AtomEnum::WM_NAME,
+                AtomEnum::STRING,
+                title.as_bytes(),
+            );
+            let _ =
+                conn.change_property8(PropMode::REPLACE, window, net_wm_name, utf8, title.as_bytes());
+            // min = max is what "the user cannot resize it" is spelled as in
+            // ICCCM; the plugin's own path goes through `resizeView`, which
+            // moves both.
+            let mut hints = WmSizeHints::new();
+            hints.min_size = Some((w, h));
+            hints.max_size = Some((w, h));
+            let _ = hints.set(&conn, window, AtomEnum::WM_NORMAL_HINTS);
+            conn.map_window(window)
+                .map_err(|e| xerr("could not map the editor's window", e))?;
+            conn.flush().map_err(|e| xerr("lost the X connection", e))?;
+
+            let state = State::default();
+            state.size.set((w, h));
+            let service = Rc::new(Service {
+                conn,
+                window,
+                wm_protocols,
+                wm_delete,
+                state,
+                handlers: RefCell::new(Vec::new()),
+                timers: RefCell::new(Vec::new()),
+            });
+            let frame = ComWrapper::new(PlugFrame {
+                service: Rc::clone(&service),
+            });
+            let Some(frame_ptr) = frame.to_com_ptr::<IPlugFrame>() else {
+                let _ = service.conn.destroy_window(window);
+                let _ = service.conn.flush();
+                return Err(EditorError::Refused(
+                    "could not build the host's IPlugFrame".to_string(),
+                ));
+            };
+            // Before `attached`, as the SDK sequences it — and on this
+            // platform doubly so: the frame is where the plugin finds the
+            // run loop it needs to draw at all.
+            // SAFETY: live view; the frame outlives it (field order).
+            unsafe { view.setFrame(frame_ptr.as_ptr()) };
+
+            // The id travels in the pointer's BITS: X11EmbedWindowID's
+            // contract, not a pointer to anything.
+            // SAFETY: live view; the window id is live and ours.
+            let attached = unsafe {
+                view.attached(window as usize as *mut c_void, kPlatformTypeX11EmbedWindowID)
+            };
+            if attached != kResultOk {
+                // Nothing attached, so `removed()` is not owed. See `mac`.
+                // SAFETY: live view.
+                unsafe { view.setFrame(std::ptr::null_mut()) };
+                let _ = service.conn.destroy_window(window);
+                let _ = service.conn.flush();
+                return Err(EditorError::Refused(format!(
+                    "the plugin refused to attach to an X11 window (tresult {attached})"
+                )));
+            }
+            LIVE.with(|l| l.borrow_mut().push(Rc::downgrade(&service)));
+            Ok(Self {
+                view,
+                frame,
+                service,
+                _not_send: std::marker::PhantomData,
+            })
+        }
+
+        pub(super) fn closed(&self) -> bool {
+            // The poll IS the run loop here — see the module docs.
+            self.service.service();
+            self.service.state.closed.get()
+        }
+
+        pub(super) fn focus(&self) {
+            let s = &self.service;
+            let _ = s.conn.map_window(s.window);
+            let _ = s
+                .conn
+                .configure_window(s.window, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+            let _ = s.conn.flush();
+        }
+
+        pub(super) fn size(&self) -> (i32, i32) {
+            self.service.state.size.get()
+        }
+
+        pub(super) fn resizes(&self) -> u64 {
+            self.service.state.resizes.get()
+        }
+    }
+
+    impl Drop for Window {
+        /// The order that matters — the same steps as macOS. The connection
+        /// closes when the `Service` drops, after the plugin has let go.
+        fn drop(&mut self) {
+            // SAFETY: live view, attached exactly once in `open`.
+            unsafe { self.view.removed() };
+            // SAFETY: live view; the frame is about to go.
+            unsafe { self.view.setFrame(std::ptr::null_mut()) };
+            let _ = self.service.conn.destroy_window(self.service.window);
+            let _ = self.service.conn.flush();
+        }
+    }
+
+    /// Service every live editor for up to `timeout`.
+    ///
+    /// Only for a process with no frame loop — the examples and
+    /// `--plugin-test`. Tangent's own editors are serviced from `closed()`,
+    /// polled once a frame.
+    pub(super) fn pump(timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Upgrade first, service after, so a service pass that drops a
+            // window cannot invalidate the list mid-iteration.
+            let live: Vec<Rc<Service>> = LIVE.with(|l| {
+                let mut l = l.borrow_mut();
+                l.retain(|w| w.strong_count() > 0);
+                l.iter().filter_map(Weak::upgrade).collect()
+            });
+            for s in &live {
+                s.service();
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Everywhere else
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -748,11 +1641,12 @@ pub fn become_foreground() {
 ///
 /// An **uninhabited** `Window`, so [`Editor`] keeps exactly one definition and
 /// one set of doc comments on every platform while being impossible to
-/// construct here. When Windows arrives it is this module that grows a real
-/// body: `kPlatformTypeHWND` and a `CreateWindowExW`, or `kPlatformTypeX11EmbedWindowID`
-/// and an X11 window, into the same four methods below. Nothing in
-/// [`Editor`] or in `instance.rs` has to change for either.
-#[cfg(not(target_os = "macos"))]
+/// construct here. Windows and Linux both arrived exactly the way this doc
+/// used to promise — `kPlatformTypeHWND` and a `CreateWindowExW`,
+/// `kPlatformTypeX11EmbedWindowID` and an X11 window, into the same methods —
+/// and nothing in [`Editor`] or in `instance.rs` had to change. What remains
+/// here compiles only for targets the app does not ship on.
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 mod stub {
     use super::EditorError;
     use vst3::ComPtr;
@@ -810,7 +1704,10 @@ mod tests {
         // And the platform gate agrees with the platform: a build that returns
         // `Unsupported` from `open` must not advertise editors, or the UI
         // offers a button whose only outcome is that message.
-        assert_eq!(EDITORS_SUPPORTED, cfg!(target_os = "macos"));
+        assert_eq!(
+            EDITORS_SUPPORTED,
+            cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux"))
+        );
         for e in [
             EditorError::Unsupported,
             EditorError::NoEditor,

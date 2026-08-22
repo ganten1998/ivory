@@ -850,7 +850,10 @@ impl Layout {
         // **The master takes the right edge of the transport.** It is the end
         // of the signal path and it is where the eye already goes last, which
         // is the same reason it is on the right of every desk ever made.
-        let right = slice_h(t, FADER_COL + 0.04, MASTER_COL);
+        // 0.02 off the timeline's rule rather than 0.04: the VU faces are
+        // sized by this column's width, and the margin was twice what the
+        // rule between them needs.
+        let right = slice_h(t, FADER_COL + 0.02, MASTER_COL);
         let master_col = slice_h(t, MASTER_COL + 0.02, 1.00);
         self.meter = slice_v(right, 0.0, METER_SHARE);
         let knobs = slice_v(right, METER_SHARE + 0.03, 1.0);
@@ -868,7 +871,11 @@ impl Layout {
         // the face was measured in (see `draw_knob`). At a four percent gap
         // the word HPF landed on the reverb knob's skirt.
         let row = |top: f32, bottom: f32| slice_v(knobs, top, bottom);
-        let (top, bottom) = (row(0.00, 0.45), row(0.55, 1.00));
+        // 46/54: the dials took one more percent each out of the gap between
+        // the rows. Eight percent of the column still stands between HPF's
+        // word and the reverb knob's skirt, which is twice the gap that
+        // collision happened at.
+        let (top, bottom) = (row(0.00, 0.46), row(0.54, 1.00));
         let cells = [
             slice_h(top, 0.00, 0.32),
             slice_h(top, 0.34, 0.66),
@@ -1868,16 +1875,33 @@ fn draw_transport(painter: &Painter, l: &Layout, playing: bool, p: &Palette) {
         let c = r.center();
         let h = r.height() * 0.5;
         let w = r.width() * 0.44;
-        let ink = if playing { PLAY_GREEN } else { toward(PLAY_GREEN, p.bg, 0.35) };
-        painter.add(egui::Shape::convex_polygon(
-            vec![
-                Pos2::new(c.x - w * 0.7, c.y - h),
-                Pos2::new(c.x - w * 0.7, c.y + h),
-                Pos2::new(c.x + w * 1.1, c.y),
-            ],
-            ink,
-            Stroke::new(1.5_f32, p.line),
-        ));
+        if playing {
+            // **The button says what pressing it DOES now, not what it did.**
+            // While the audition rolls a second press pauses, so the glyph is
+            // the pause bars — lit, because the transport is live. Two bars of
+            // together the triangle's weight, each a stroke wide enough to
+            // read from the bench.
+            let bw = w * 0.55;
+            let gap = bw * 0.6;
+            for side in [-1.0_f32, 1.0] {
+                let x = c.x + side * (gap + bw) * 0.5;
+                painter.rect_filled(
+                    Rect::from_center_size(Pos2::new(x, c.y), Vec2::new(bw, h * 2.0)),
+                    1.0,
+                    PLAY_GREEN,
+                );
+            }
+        } else {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(c.x - w * 0.7, c.y - h),
+                    Pos2::new(c.x - w * 0.7, c.y + h),
+                    Pos2::new(c.x + w * 1.1, c.y),
+                ],
+                toward(PLAY_GREEN, p.bg, 0.35),
+                Stroke::new(1.5_f32, p.line),
+            ));
+        }
     }
     if l.record.is_positive() {
         let c = l.record.center();
@@ -3149,7 +3173,11 @@ const MASTER_CAP: Color32 = Color32::from_rgb(0xc4, 0x2f, 0x22);
 /// them one group. Smaller than it: the transport's job is Record, and three
 /// buttons the size of the thing next to them read as the loudest object in
 /// the band — which they are not; the meters are.
-const TRANSPORT_SIDE: f32 = 0.72;
+///
+/// **0.82, up from 0.72.** The desk rework left the band with more room than
+/// its controls were sized for, and the owner's word was to spend it: every
+/// dial, button and meter up rather than empty wood between them.
+const TRANSPORT_SIDE: f32 = 0.82;
 
 /// The tempo box's share of the fader column's height.
 ///
@@ -3172,10 +3200,21 @@ const FADER_COL: f32 = 0.46;
 /// certain diameter is three grey rings, and there are eight of them. The
 /// meters gave up eight percent of the column and every knob on the panel is a
 /// sixth bigger for it.
-const METER_SHARE: f32 = 0.40;
+///
+/// **And 0.36 now, for the same reason again.** The VU faces are sized by the
+/// COLUMN'S WIDTH (see `draw_meter` — height stopped being their limit long
+/// ago), so the strip they stand in was holding height the needles could not
+/// use while the dials below were the thing that wanted it. The width the
+/// faces do want came from the column edges — see `fill_transport`.
+const METER_SHARE: f32 = 0.36;
 
 /// Where the transport's right column stops and the master column starts.
-const MASTER_COL: f32 = 0.78;
+///
+/// 0.80: the master column lent the VU-and-knobs column a fiftieth of the
+/// band. Its ladders are read against the scale beside them and lose nothing
+/// legible at the width that remains; the VU faces are width-bound and grow
+/// by exactly what anything to their left or right gives up.
+const MASTER_COL: f32 = 0.80;
 
 
 /// The dB scale's share of the master column's width, **at each side**. What

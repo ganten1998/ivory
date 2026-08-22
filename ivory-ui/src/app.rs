@@ -279,6 +279,14 @@ pub struct IvoryApp {
     /// different characters, commit to different places and are drawn in
     /// different rows, and a shared one would need a tag at every use.
     mixer_naming: Option<(crate::recorder::Column, String)>,
+    /// The loaded insert bay whose Delete/Replace menu is open, if any.
+    mixer_fx_menu: Option<(crate::recorder::Column, usize)>,
+    /// The bay whose editor should open the moment its plugin loads — the
+    /// pick that just happened, never a restore at launch. The host takes it
+    /// after a successful `load_insert`; see `take_open_insert_on_load`.
+    open_insert_on_load: Option<(usize, usize)>,
+    /// The empty channel being asked MIDI or AUDIO, if any.
+    mixer_add_ask: Option<crate::recorder::Column>,
     /// Where the mixer was last drawn, so a press can be tested against it.
     mixer_rect: Option<Rect>,
     /// The OS's own file panel is on screen right now.
@@ -752,6 +760,9 @@ impl IvoryApp {
             mixer_palette: None,
             mixer_typing: None,
             mixer_naming: None,
+            mixer_fx_menu: None,
+            mixer_add_ask: None,
+            open_insert_on_load: None,
             mixer_rect: None,
             native_panel_up: false,
             factory_cartridge: false,
@@ -1616,7 +1627,8 @@ impl IvoryApp {
                 .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
             H::Send(i) => view.strips.get(i.0).map_or(0.0, |s| s.send),
             H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..) | H::Paint(..)
-            | H::Palette(_) | H::Db(_) | H::Name(_) => 0.0,
+            | H::Palette(_) | H::Db(_) | H::Name(_) | H::Remove(_) | H::FxMenu(..)
+            | H::AddKind(..) => 0.0,
         }
     }
 
@@ -1712,14 +1724,13 @@ impl IvoryApp {
             H::Add(i) => {
                 match i.strip() {
                     Some(Strip::Channel(n)) => match self.channel_kind(n) {
+                        // **The prompt is back, as itself.** Adding used to
+                        // collapse the question into "MIDI now, one icon-click
+                        // to AUDIO" — a rule you had to know. A press on an
+                        // empty channel now ASKS, in two words, and the track
+                        // is added as whichever one was meant.
                         None => {
-                            self.set_channel_kind(n, Some(recorder::ChannelKind::Midi));
-                            if let Some(send) =
-                                self.settings.strip_sends.get_mut(Strip::Channel(n).index())
-                            {
-                                *send = 1.0;
-                            }
-                            self.save_settings();
+                            self.mixer_add_ask = Some(i);
                         }
                         Some(kind) => {
                             self.set_channel_kind(n, Some(kind.cycled()));
@@ -1804,8 +1815,88 @@ impl IvoryApp {
                 }
                 return;
             }
+            // The × at the top right: take the channel off the desk. A
+            // general channel goes back to being an empty slot; the backing
+            // track unloads its file, which is the host's to do.
+            H::Remove(i) => {
+                match i.strip() {
+                    Some(Strip::Channel(n)) => self.remove_channel(n),
+                    Some(Strip::Track) => {
+                        self.request_recorder(recorder::RecorderRequest::ClearTrack);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            // A row of the insert menu, or a press anywhere else while it is
+            // up. Either way the menu closes: it answers one press.
+            H::FxMenu(i, n, action) => {
+                self.mixer_fx_menu = None;
+                match action {
+                    crate::mixer_panel::FxAction::Delete => {
+                        self.set_insert(i.desk_index(), n, None);
+                    }
+                    crate::mixer_panel::FxAction::Replace => {
+                        self.open_insert_picker(i.desk_index(), n);
+                    }
+                    crate::mixer_panel::FxAction::Dismiss => {}
+                }
+                return;
+            }
+            // The MIDI-or-AUDIO answer. The send comes up at 1.0 on a fresh
+            // track so it reaches the reverb, the way the old instrument
+            // slots always did.
+            H::AddKind(i, kind) => {
+                self.mixer_add_ask = None;
+                if let (Some(Strip::Channel(n)), Some(kind)) = (i.strip(), kind) {
+                    self.set_channel_kind(n, Some(kind));
+                    if let Some(send) =
+                        self.settings.strip_sends.get_mut(Strip::Channel(n).index())
+                    {
+                        *send = 1.0;
+                    }
+                    self.save_settings();
+                }
+                return;
+            }
         }
         self.save_settings_soon();
+    }
+
+    /// Put one general channel back to an empty slot.
+    ///
+    /// **Everything the channel accumulated goes with it** — kind, name,
+    /// colour, mute, solo, all three bays, and its levels back to shipped.
+    /// Leaving any of it behind would make the next thing added here inherit
+    /// a stranger's settings, which is worse than either keeping the channel
+    /// or losing it.
+    fn remove_channel(&mut self, n: usize) {
+        use crate::recorder::Strip;
+        let d = Settings::default();
+        let at = Strip::Channel(n).index();
+        if let Some(k) = self.settings.channel_kinds.get_mut(n) {
+            *k = recorder::ChannelKind::as_u8(None);
+        }
+        if let Some(g) = self.settings.channel_gains.get_mut(n) {
+            *g = d.channel_gains.get(n).copied().unwrap_or(1.0);
+        }
+        if let Some(s) = self.settings.strip_sends.get_mut(at) {
+            *s = d.strip_sends.get(at).copied().unwrap_or(0.0);
+        }
+        if let Some(c) = self.settings.strip_colors.get_mut(at) {
+            *c = 0;
+        }
+        if let Some(name) = self.settings.strip_names.get_mut(at) {
+            name.clear();
+        }
+        self.settings.strip_muted &= !(1 << at);
+        self.settings.strip_soloed &= !(1 << at);
+        // The bays last, through `set_insert` so the host's reconcile unloads
+        // whatever was running in them.
+        for bay in 0..crate::recorder::INSERTS {
+            self.set_insert(at, bay, None);
+        }
+        self.save_settings();
     }
 
     /// What the neck's interval column should say, or nothing when it is off.
@@ -1947,6 +2038,15 @@ impl IvoryApp {
                 peak: peaks[i],
                 muted: desk.muted[i],
                 soloed: desk.soloed[i],
+                // What the × means, where it means anything: a used general
+                // channel goes back to being an empty slot, and the backing
+                // track unloads its file. The click and the bus are the
+                // desk's own and stay.
+                removable: match s {
+                    Strip::Channel(_) => kind.is_some(),
+                    Strip::Track => !self.track.name.is_empty(),
+                    Strip::Click | Strip::Fx => false,
+                },
             }
         };
         let channels = Strip::shown();
@@ -1985,10 +2085,13 @@ impl IvoryApp {
                     gr_db: self.recorder.gr_db,
                     muted: false,
                     soloed: false,
+                    removable: false,
                 },
             }),
             any_solo: desk.any_solo(),
             palette_open: self.mixer_palette,
+            fx_menu: self.mixer_fx_menu,
+            add_ask: self.mixer_add_ask,
             typing: self
                 .mixer_typing
                 .as_ref()
@@ -3518,6 +3621,20 @@ impl IvoryApp {
             }
             None => self.open_insert_picker(strip, bay),
         }
+    }
+
+    /// Whether THIS bay's editor should open now that its plugin has loaded.
+    ///
+    /// Answers once — the flag is taken — and only for the bay a pick just
+    /// aimed at. The host asks after every successful `load_insert`, and the
+    /// distinction this draws is the one that matters: a plugin the user just
+    /// chose opens its window; thirty-six bays restored at launch open none.
+    pub fn take_open_insert_on_load(&mut self, strip: usize, bay: usize) -> bool {
+        if self.open_insert_on_load == Some((strip, bay)) {
+            self.open_insert_on_load = None;
+            return true;
+        }
+        false
     }
 
     /// The host has read the patch being edited. Show it.
@@ -5376,6 +5493,18 @@ impl IvoryApp {
                 // The host notices the change by watching `insert()`.
                 if let Some((strip, at)) = self.picker_insert.take() {
                     self.set_insert(strip, at, path.as_deref());
+                    // **And the face opens itself.** Load-then-hunt-for-the-
+                    // click was the old shape: pick a plugin, then find the
+                    // bay again to see its window. What was picked is what
+                    // somebody wants to look at NOW — the built-in's face is
+                    // the patch picker and opens here; a VST3's is a window
+                    // only the host can make, so the host is told to make it
+                    // the moment the load lands. See `take_open_insert_on_load`.
+                    match path.as_deref() {
+                        Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
+                        Some(_) => self.open_insert_on_load = Some((strip, at)),
+                        None => {}
+                    }
                 }
             }
             DialogAction::ChoosePatch { slot, index } => {
@@ -6930,12 +7059,17 @@ impl IvoryApp {
                 if let Some(pos) = ctx.pointer_interact_pos().filter(|p| rect.contains(*p)) {
                     let view = self.mixer_view();
                     match crate::mixer_panel::hit_test(rect, &view, pos) {
-                        // **The only right-click that does something.** An
-                        // effect is put in with a press and taken out with the
-                        // other button, which is one gesture each way and no
-                        // second control to draw in a bay this size.
+                        // **A loaded bay answers with its menu, not with the
+                        // deed.** Right-click used to unload the plugin in one
+                        // gesture — no confirmation, aimed at a chip twelve
+                        // points tall — which is how an evening of dialled-in
+                        // settings went away by accident. The menu offers the
+                        // deed and its gentler sibling: delete, or replace.
+                        // An EMPTY bay has nothing to delete and stays quiet.
                         Some(crate::mixer_panel::Hit::Insert(i, n)) => {
-                            self.set_insert(i.desk_index(), n, None);
+                            if self.insert(i.desk_index(), n).is_some() {
+                                self.mixer_fx_menu = Some((i, n));
+                            }
                         }
                         // **The icon on an AUDIO channel: choose its input.**
                         // Left-click cycles the kind; the other button picks
@@ -7019,6 +7153,9 @@ impl IvoryApp {
                         | crate::mixer_panel::Hit::Insert(..)
                         | crate::mixer_panel::Hit::Paint(..)
                         | crate::mixer_panel::Hit::Palette(_)
+                        | crate::mixer_panel::Hit::Remove(_)
+                        | crate::mixer_panel::Hit::FxMenu(..)
+                        | crate::mixer_panel::Hit::AddKind(..)
                         | crate::mixer_panel::Hit::Db(_))) => {
                             self.apply_mixer_hit(hit, 0.0);
                         }
@@ -8178,6 +8315,158 @@ mod tests {
         assert_eq!(
             app.take_recorder_request(),
             Some(recorder::RecorderRequest::OpenInsertEditor(0, 1))
+        );
+    }
+
+    /// **What was picked is what somebody wants to look at now.** Choosing a
+    /// VST3 marks its bay so the host opens the editor the moment the load
+    /// lands; choosing the built-in opens the patch picker right here, because
+    /// that IS its face. The flag answers once, so a launch restore of the
+    /// same bay opens nothing.
+    #[test]
+    fn picking_a_plugin_opens_its_face_by_default() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.open_insert_picker(1, 2);
+        app.apply_dialog_action(DialogAction::LoadPlugin {
+            path: Some("/x/Pianoteq 8.vst3".into()),
+        });
+        assert_eq!(app.insert(1, 2), Some("/x/Pianoteq 8.vst3"));
+        assert!(
+            app.take_open_insert_on_load(1, 2),
+            "the picked bay was not marked to open"
+        );
+        assert!(!app.take_open_insert_on_load(1, 2), "the flag answers once");
+
+        app.open_insert_picker(0, 0);
+        app.apply_dialog_action(DialogAction::LoadPlugin {
+            path: Some(dialogs::BUILTIN_PATH.into()),
+        });
+        assert!(
+            matches!(app.dialog, Some(dialogs::Dialog::PatchPicker { .. })),
+            "the built-in's face is the patch picker and it did not open"
+        );
+        assert!(
+            !app.take_open_insert_on_load(0, 0),
+            "the built-in has no window to ask the host for"
+        );
+
+        app.dialog = None;
+        app.open_insert_picker(1, 2);
+        app.apply_dialog_action(DialogAction::LoadPlugin { path: None });
+        assert!(
+            !app.take_open_insert_on_load(1, 2),
+            "an unload has no window to show"
+        );
+    }
+
+    /// **The insert menu: delete deletes, replace opens the picker, and a
+    /// dismissal does nothing at all.** The one-gesture right-click delete is
+    /// gone — the menu is what stands between an evening of dialled-in
+    /// settings and a mis-click.
+    #[test]
+    fn the_insert_menu_deletes_replaces_or_does_nothing() {
+        use crate::mixer_panel::{FxAction, Hit};
+        use crate::recorder::Column;
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.set_insert(0, 1, Some("/x/Pianoteq 8.vst3"));
+
+        app.mixer_fx_menu = Some((Column(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Delete), 0.0);
+        assert_eq!(app.insert(0, 1), None, "delete did not delete");
+        assert_eq!(app.mixer_fx_menu, None, "the menu answers one press");
+
+        app.set_insert(0, 1, Some("/x/Pianoteq 8.vst3"));
+        app.mixer_fx_menu = Some((Column(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Replace), 0.0);
+        assert!(
+            app.insert(0, 1).is_some(),
+            "replace must keep the plugin until a choice is made"
+        );
+        assert!(
+            matches!(app.dialog, Some(dialogs::Dialog::PluginPicker { .. })),
+            "replace did not open the picker"
+        );
+        assert_eq!(
+            app.picker_insert,
+            Some((0, 1)),
+            "the picker is not aimed at the bay that asked"
+        );
+        assert_eq!(app.mixer_fx_menu, None);
+
+        app.dialog = None;
+        app.mixer_fx_menu = Some((Column(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Dismiss), 0.0);
+        assert!(app.insert(0, 1).is_some(), "a dismissal deleted something");
+        assert!(app.dialog.is_none());
+        assert_eq!(app.mixer_fx_menu, None);
+    }
+
+    /// **An empty channel asks before it becomes anything**, and the answer
+    /// is what it becomes. The old rule — MIDI now, one icon-click to AUDIO —
+    /// was a prompt collapsed into a cycle you had to know about.
+    #[test]
+    fn an_empty_channel_asks_and_the_answer_adds_the_kind() {
+        use crate::mixer_panel::Hit;
+        use crate::recorder::{ChannelKind, Column, Strip};
+        let (_, mut app) = headless(Caps::DESKTOP);
+        let n = (0..crate::recorder::CHANNELS)
+            .find(|n| app.channel_kind(*n).is_none())
+            .expect("a fresh desk has an unused channel");
+
+        app.apply_mixer_hit(Hit::Add(Column(n)), 0.0);
+        assert_eq!(app.mixer_add_ask, Some(Column(n)), "the press did not ask");
+        assert_eq!(app.channel_kind(n), None, "asking must not add yet");
+
+        app.apply_mixer_hit(Hit::AddKind(Column(n), Some(ChannelKind::Audio)), 0.0);
+        assert_eq!(app.channel_kind(n), Some(ChannelKind::Audio));
+        assert_eq!(app.mixer_add_ask, None);
+        let at = Strip::Channel(n).index();
+        assert!(
+            (app.settings.strip_sends[at] - 1.0).abs() < 1e-9,
+            "a fresh track's send should come up at 1.0"
+        );
+
+        // And a dismissal adds nothing.
+        let m = (0..crate::recorder::CHANNELS)
+            .find(|m| app.channel_kind(*m).is_none())
+            .expect("another unused channel");
+        app.apply_mixer_hit(Hit::Add(Column(m)), 0.0);
+        app.apply_mixer_hit(Hit::AddKind(Column(m), None), 0.0);
+        assert_eq!(app.channel_kind(m), None);
+        assert_eq!(app.mixer_add_ask, None);
+    }
+
+    /// **The × empties the channel completely.** Kind, bays, name, colour,
+    /// mute — anything left behind is inherited by the next thing added
+    /// there. And the track's × asks the host to unload the file, which only
+    /// the host can do.
+    #[test]
+    fn the_x_returns_a_channel_to_an_empty_slot_and_unloads_the_track() {
+        use crate::mixer_panel::Hit;
+        use crate::recorder::Column;
+        let (_, mut app) = headless(Caps::DESKTOP);
+        // Channel 0 ships used (the DX7). Dress it further, then remove it.
+        app.set_insert(0, 1, Some("/x/Pianoteq 8.vst3"));
+        app.settings
+            .strip_names
+            .resize(crate::recorder::STRIPS + 1, String::new());
+        app.settings.strip_names[0] = "BELL KEYS".to_owned();
+        app.settings.strip_colors[0] = 14;
+        app.settings.strip_muted |= 1;
+        app.apply_mixer_hit(Hit::Remove(Column(0)), 0.0);
+        assert_eq!(app.channel_kind(0), None, "the channel is still a kind");
+        assert_eq!(app.insert(0, 0), None, "bay 0 survived the removal");
+        assert_eq!(app.insert(0, 1), None, "bay 1 survived the removal");
+        assert!(app.settings.strip_names[0].is_empty(), "the name survived");
+        assert_eq!(app.settings.strip_colors[0], 0, "the colour survived");
+        assert_eq!(app.settings.strip_muted & 1, 0, "the mute survived");
+
+        while app.take_recorder_request().is_some() {}
+        app.apply_mixer_hit(Hit::Remove(Column(crate::recorder::CHANNELS)), 0.0);
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::ClearTrack),
+            "the track's × did not ask the host to unload"
         );
     }
 

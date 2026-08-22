@@ -59,6 +59,30 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSString",
 ] }
 
+# ── the editor window, Windows ───────────────────────────────────────────────
+#
+# The 0.60 line is ALREADY in the lock file (winit's own windowing pulls it),
+# so this adds no new crate. Features enumerated for the same reason AppKit's
+# are: each one is a header's worth of compile time.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# ── the editor window, Linux ─────────────────────────────────────────────────
+#
+# `x11rb` is a pure-Rust X11 client: no libX11, no C toolchain, which is what
+# lets cargo-zigbuild keep cross-building Linux from the Mac — the same
+# property the vst3 crate was chosen for. Already in the lock (arboard pulls
+# it). `libc` is for `poll(2)` over the fds a plugin registers with the
+# host's IRunLoop; nothing in std polls a foreign fd without blocking.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"
+libc = "0.2"
+
 [dev-dependencies]
 # Examples only, and `check-firewall.sh` walks `--edges normal`, so this does
 # not put the recorder into the host's shipped dependency graph. It is here so

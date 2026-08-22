@@ -938,9 +938,14 @@ pub enum RecorderRequest {
     /// avoids.
     OpenInsertEditor(usize, usize),
     /// The green button: audition from the playhead, no take. Pressed while
-    /// auditioning, it stops and the playhead returns to 0:00. The host
-    /// ignores it while a take is writing — record owns the transport then.
+    /// auditioning, it PAUSES in place; Stop is what returns to 0:00. The
+    /// host ignores it while a take is writing — record owns the transport
+    /// then.
     Play,
+    /// Unload the backing track: the ×  on its mixer strip. The file, the
+    /// waveform and the remembered path all go; the audio that was decoded
+    /// is the host's to drop, which is why this is a request.
+    ClearTrack,
     /// Put the playhead at this many SECONDS from 0:00. Seconds, because
     /// seconds survive a device that changes rate; the host converts at the
     /// engine's own rate. Legal while rolling — that is what the generation

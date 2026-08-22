@@ -45,9 +45,10 @@ pub struct Transport {
     /// Whether PLAY is held down — the audition, distinct from a take rolling.
     /// A take is the session's business; this is the green button's.
     playing: bool,
-    /// The session's rolling level as of the last push, for the falling edge
-    /// that returns the playhead to 0:00.
-    was_rolling: bool,
+    /// The SESSION's rolling level as of the last push, for the falling edge
+    /// that returns the playhead to 0:00 when a take ends. The audition's own
+    /// falling edge is a PAUSE and deliberately not part of this.
+    session_was_rolling: bool,
 }
 
 impl Transport {
@@ -56,7 +57,7 @@ impl Transport {
             pos_s: 0.0,
             generation: 1,
             playing: false,
-            was_rolling: false,
+            session_was_rolling: false,
         }
     }
 
@@ -69,14 +70,18 @@ impl Transport {
     }
 
     /// The green button. Starts the audition from the playhead; pressed while
-    /// auditioning, stops and returns to 0:00 — the owner's rule, not a pause.
+    /// auditioning, PAUSES — the playhead stays put, and the next press picks
+    /// up from there. Going home to 0:00 is the stop button's job, which is
+    /// what makes the pair a tape transport rather than two spellings of stop.
     pub fn toggle_play(&mut self) {
-        if self.playing {
-            self.playing = false;
-            self.locate(0.0);
-        } else {
-            self.playing = true;
-        }
+        self.playing = !self.playing;
+    }
+
+    /// The square. Ends the audition if one is running and sends the playhead
+    /// home — from a pause as well, because "stop" from anywhere means 0:00.
+    pub fn stop(&mut self) {
+        self.playing = false;
+        self.locate(0.0);
     }
 
     /// Whether the audition is running.
@@ -110,8 +115,20 @@ impl Transport {
     /// block rolls at zero on the way down).
     pub fn push(&mut self, engine: Option<&Engine>, session_rolling: bool) {
         let rolling = session_rolling || self.playing;
+        // The falling edge of a TAKE returns the playhead to 0:00. Only a
+        // take's: the audition's own falling edge is a pause and keeps its
+        // place — see `toggle_play`. And not even a take's when the audition
+        // is still running through it, or stopping a take somebody recorded
+        // over a rolling audition would yank the music back to the top.
+        //
+        // Before the engine is even unwrapped: the playhead is this struct's,
+        // and a take that ends in the gap while an engine is being rebuilt
+        // still ended.
+        if self.session_was_rolling && !session_rolling && !self.playing {
+            self.locate(0.0);
+        }
+        self.session_was_rolling = session_rolling;
         let Some(e) = engine else {
-            self.was_rolling = rolling;
             return;
         };
         let rate = f64::from(e.output().sample_rate).max(1.0);
@@ -121,13 +138,6 @@ impl Transport {
         if rolling && e.transport_acked(self.generation) {
             self.pos_s = e.transport_position() as f64 / rate;
         }
-        // The falling edge: stop returns to 0:00. Both stops — a take ending
-        // and the audition ending — arrive here, which is what makes the rule
-        // one rule.
-        if self.was_rolling && !rolling {
-            self.locate(0.0);
-        }
-        self.was_rolling = rolling;
         if !e.transport_acked(self.generation) {
             let frames = (self.pos_s.max(0.0) * rate) as u64;
             e.set_transport(self.generation, frames);
@@ -139,5 +149,65 @@ impl Transport {
 impl Default for Transport {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Play pauses in place; only stop goes home.** The second press of
+    /// play used to locate to 0:00, which made it a second stop button — a
+    /// transport where you cannot stop to listen and carry on from there.
+    #[test]
+    fn play_pauses_in_place_and_stop_goes_home() {
+        let mut t = Transport::new();
+        t.locate(83.0);
+        t.toggle_play();
+        assert!(t.playing());
+        t.push(None, false);
+        t.toggle_play();
+        assert!(!t.playing(), "the second press did not pause");
+        t.push(None, false);
+        assert!(
+            (t.position_s(None, 0.0) - 83.0).abs() < 1e-9,
+            "pausing moved the playhead to {}",
+            t.position_s(None, 0.0)
+        );
+        t.stop();
+        assert!(
+            t.position_s(None, 0.0).abs() < 1e-9,
+            "stop did not send the playhead home"
+        );
+    }
+
+    /// A take that ends still returns to 0:00 — that rule kept its half.
+    #[test]
+    fn a_take_ending_still_returns_to_zero() {
+        let mut t = Transport::new();
+        t.locate(10.0);
+        t.push(None, true);
+        t.push(None, false);
+        assert!(
+            t.position_s(None, 0.0).abs() < 1e-9,
+            "a finished take left the playhead at {}",
+            t.position_s(None, 0.0)
+        );
+    }
+
+    /// And a take ending UNDER a running audition does not yank it home.
+    #[test]
+    fn a_take_ending_under_the_audition_leaves_it_rolling() {
+        let mut t = Transport::new();
+        t.locate(45.0);
+        t.toggle_play();
+        t.push(None, true);
+        t.push(None, false);
+        assert!(t.playing());
+        assert!(
+            (t.position_s(None, 0.0) - 45.0).abs() < 1e-9,
+            "the take's end moved a rolling audition to {}",
+            t.position_s(None, 0.0)
+        );
     }
 }
